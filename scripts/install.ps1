@@ -1,41 +1,41 @@
 <#
 .SYNOPSIS
-    Install, upgrade, or uninstall Ollama on Windows.
+    Install, upgrade, or uninstall OAICA on Windows.
 
 .DESCRIPTION
-    Downloads and installs Ollama.
+    Downloads and installs OAICA.
 
     Quick install:
 
-        irm https://ollama.com/install.ps1 | iex
+        irm https://oaica.com/install.ps1 | iex
 
     Specific version:
 
-        $env:OLLAMA_VERSION="0.5.7"; irm https://ollama.com/install.ps1 | iex
+        $env:OAICA_VERSION="0.5.7"; irm https://oaica.com/install.ps1 | iex
 
     Custom install directory:
 
-        $env:OLLAMA_INSTALL_DIR="D:\Ollama"; irm https://ollama.com/install.ps1 | iex
+        $env:OAICA_INSTALL_DIR="D:\OAICA"; irm https://oaica.com/install.ps1 | iex
 
     Uninstall:
 
-        $env:OLLAMA_UNINSTALL=1; irm https://ollama.com/install.ps1 | iex
+        $env:OAICA_UNINSTALL=1; irm https://oaica.com/install.ps1 | iex
 
     Environment variables:
 
-        OLLAMA_VERSION       Target version (default: latest stable)
-        OLLAMA_INSTALL_DIR   Custom install directory
-        OLLAMA_UNINSTALL     Set to 1 to uninstall Ollama
-        OLLAMA_DEBUG         Enable verbose output
+        OAICA_VERSION       Target version (default: latest stable)
+        OAICA_INSTALL_DIR   Custom install directory
+        OAICA_UNINSTALL     Set to 1 to uninstall OAICA
+        OAICA_DEBUG         Enable verbose output
 
 .EXAMPLE
-    irm https://ollama.com/install.ps1 | iex
+    irm https://oaica.com/install.ps1 | iex
 
 .EXAMPLE
-    $env:OLLAMA_VERSION = "0.5.7"; irm https://ollama.com/install.ps1 | iex
+    $env:OAICA_VERSION = "0.5.7"; irm https://oaica.com/install.ps1 | iex
 
 .LINK
-    https://ollama.com
+    https://oaica.com
 #>
 
 $ErrorActionPreference = "Stop"
@@ -45,17 +45,17 @@ $ProgressPreference = "SilentlyContinue"
 # Configuration from environment variables
 # --------------------------------------------------------------------------
 
-$Version      = if ($env:OLLAMA_VERSION) { $env:OLLAMA_VERSION } else { "" }
-$InstallDir   = if ($env:OLLAMA_INSTALL_DIR) { $env:OLLAMA_INSTALL_DIR } else { "" }
-$Uninstall    = $env:OLLAMA_UNINSTALL -eq "1"
-$DebugInstall = [bool]$env:OLLAMA_DEBUG
+$Version      = if ($env:OAICA_VERSION) { $env:OAICA_VERSION } else { "" }
+$InstallDir   = if ($env:OAICA_INSTALL_DIR) { $env:OAICA_INSTALL_DIR } else { "" }
+$Uninstall    = $env:OAICA_UNINSTALL -eq "1"
+$DebugInstall = [bool]$env:OAICA_DEBUG
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
-# OLLAMA_DOWNLOAD_URL for developer testing only
-$DownloadBaseURL = if ($env:OLLAMA_DOWNLOAD_URL) { $env:OLLAMA_DOWNLOAD_URL.TrimEnd('/') } else { "https://ollama.com/download" }
+# OAICA_DOWNLOAD_URL for developer testing only
+$DownloadBaseURL = if ($env:OAICA_DOWNLOAD_URL) { $env:OAICA_DOWNLOAD_URL.TrimEnd('/') } else { "https://oaica.com/download" }
 $InnoSetupUninstallGuid = "{44E83376-CE68-45EB-8FC1-393500EB558C}_is1"
 
 # --------------------------------------------------------------------------
@@ -81,14 +81,13 @@ function Test-Signature {
         return $false
     }
 
-    # Verify it's signed by Ollama Inc. (check exact organization name)
-    # Anchor with comma/boundary to prevent "O=Not Ollama Inc." from matching
+    # TODO: once OAICA has a code-signing cert, pin the organization name
+    # here the same way upstream Ollama pins "O=Ollama Inc." — e.g.
+    #   if ($subject -notmatch "(^|, )O=<Org Name>\.(,|$)") { return $false }
+    # Until then we only verify the binary carries ANY valid Authenticode
+    # signature (tamper/corruption check), not that it's from a specific
+    # signer — this is weaker than upstream's check, not equivalent to it.
     $subject = $sig.SignerCertificate.Subject
-    if ($subject -notmatch "(^|, )O=Ollama Inc\.(,|$)") {
-        Write-Status "  Unexpected signer: $subject"
-        return $false
-    }
-
     Write-Status "  Signature valid: $subject"
     return $true
 }
@@ -111,19 +110,19 @@ function Find-InnoSetupInstall {
 }
 
 function Update-SessionPath {
-    # Update PATH in current session so 'ollama' works immediately
+    # Update PATH in current session so 'oaica' works immediately
     if ($InstallDir) {
-        $ollamaDir = $InstallDir
+        $oaicaDir = $InstallDir
     } else {
-        $ollamaDir = Join-Path $env:LOCALAPPDATA "Programs\Ollama"
+        $oaicaDir = Join-Path $env:LOCALAPPDATA "Programs\OAICA"
     }
 
     # Add to PATH if not already present
-    if (Test-Path $ollamaDir) {
+    if (Test-Path $oaicaDir) {
         $currentPath = $env:PATH -split ';'
-        if ($ollamaDir -notin $currentPath) {
-            $env:PATH = "$ollamaDir;$env:PATH"
-            Write-Status "  Added $ollamaDir to session PATH"
+        if ($oaicaDir -notin $currentPath) {
+            $env:PATH = "$oaicaDir;$env:PATH"
+            Write-Status "  Added $oaicaDir to session PATH"
         }
     }
 }
@@ -204,11 +203,11 @@ function Invoke-Download {
 # --------------------------------------------------------------------------
 
 function Invoke-Uninstall {
-    Write-Step "Uninstalling Ollama"
+    Write-Step "Uninstalling OAICA"
 
     $regKey = Find-InnoSetupInstall
     if (-not $regKey) {
-        Write-Host ">>> Ollama is not installed."
+        Write-Host ">>> OAICA is not installed."
         return
     }
 
@@ -235,7 +234,7 @@ function Invoke-Uninstall {
     if (Find-InnoSetupInstall) {
         Write-Warning "Uninstall may not have completed"
     } else {
-        Write-Host ">>> Ollama has been uninstalled."
+        Write-Host ">>> OAICA has been uninstalled."
     }
 }
 
@@ -246,18 +245,18 @@ function Invoke-Uninstall {
 function Invoke-Install {
     # Determine installer URL
     if ($Version) {
-        $installerUrl = "$DownloadBaseURL/OllamaSetup.exe?version=$Version"
+        $installerUrl = "$DownloadBaseURL/OAICASetup.exe?version=$Version"
     } else {
-        $installerUrl = "$DownloadBaseURL/OllamaSetup.exe"
+        $installerUrl = "$DownloadBaseURL/OAICASetup.exe"
     }
 
     # Download installer
-    Write-Step "Downloading Ollama"
+    Write-Step "Downloading OAICA"
     if (-not $DebugInstall) {
-        Write-Host ">>> Downloading Ollama for Windows..."
+        Write-Host ">>> Downloading OAICA for Windows..."
     }
 
-    $tempInstaller = Join-Path $env:TEMP "OllamaSetup.exe"
+    $tempInstaller = Join-Path $env:TEMP "OAICASetup.exe"
     Invoke-Download -Url $installerUrl -OutFile $tempInstaller
 
     # Verify signature
@@ -275,14 +274,14 @@ function Invoke-Install {
     Write-Status "  Installer args: $installerArgs"
 
     # Run installer
-    Write-Step "Installing Ollama"
+    Write-Step "Installing OAICA"
     if (-not $DebugInstall) {
-        Write-Host ">>> Installing Ollama..."
+        Write-Host ">>> Installing OAICA..."
     }
 
     # Create upgrade marker so the app starts hidden
     # The app checks for this file on startup and removes it after
-    $markerDir = Join-Path $env:LOCALAPPDATA "Ollama"
+    $markerDir = Join-Path $env:LOCALAPPDATA "OAICA"
     $markerFile = Join-Path $markerDir "upgraded"
     if (-not (Test-Path $markerDir)) {
         New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
@@ -291,7 +290,7 @@ function Invoke-Install {
     Write-Status "  Created upgrade marker: $markerFile"
 
     # Start installer and wait for just the installer process (not children)
-    # Using -Wait would wait for Ollama to exit too, which we don't want
+    # Using -Wait would wait for OAICA to exit too, which we don't want
     $proc = Start-Process -FilePath $tempInstaller `
         -ArgumentList $installerArgs `
         -PassThru
@@ -305,11 +304,11 @@ function Invoke-Install {
     # Cleanup
     Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
 
-    # Update PATH in current session so 'ollama' works immediately
+    # Update PATH in current session so 'oaica' works immediately
     Write-Step "Updating session PATH"
     Update-SessionPath
 
-    Write-Host ">>> Install complete. Run 'ollama' from the command line."
+    Write-Host ">>> Install complete. Run 'oaica' from the command line."
 }
 
 # --------------------------------------------------------------------------
