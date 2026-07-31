@@ -239,3 +239,92 @@ func oaicaLoraAdd(name string) (string, error) {
 func oaicaLoraRemove(name string) (string, error) {
 	return oaicaLoraToggle("/v1/lora/remove", name)
 }
+
+// stdinLinesOrArgPrompt splits raw piped stdin into individual lines (so
+// /model and /lora on their own line get parsed, matching how a human
+// typing into the interactive REPL would trigger them). Falls back to
+// treating the whole joined prompt as one line when there's no piped stdin
+// (e.g. `oaica run <model> "some prompt"` with no pipe).
+func stdinLinesOrArgPrompt(stdinRaw, joinedPrompt string) []string {
+	if stdinRaw != "" {
+		return strings.Split(stdinRaw, "\n")
+	}
+	if joinedPrompt != "" {
+		return []string{joinedPrompt}
+	}
+	return nil
+}
+
+// oaicaDispatchLine mirrors generateInteractive's (cmd/interactive.go)
+// /model and /lora handling for the non-TTY one-shot path — same commands,
+// same underlying client calls, just without the readline/spinner UI.
+// Returns (output, true, nil) if the line was a recognized command;
+// (_, false, nil) if it's plain chat text the caller should send itself.
+func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
+	switch {
+	case strings.HasPrefix(line, "/model"):
+		args := strings.Fields(line)
+		if len(args) < 2 {
+			return fmt.Sprintf("Usage:\n  /model <name>\n  /model list\nActive OAICA model: %s", *activeModel), true, nil
+		}
+		if args[1] == "list" {
+			names, err := oaicaListModels()
+			if err != nil {
+				return "", true, err
+			}
+			return "Available models:\n  " + strings.Join(names, "\n  "), true, nil
+		}
+		requested := args[1]
+		ok, names, err := oaicaModelExists(requested)
+		if err != nil {
+			return "", true, err
+		}
+		if !ok {
+			return fmt.Sprintf("Unknown model '%s'. Available models:\n  %s", requested, strings.Join(names, "\n  ")), true, nil
+		}
+		*activeModel = requested
+		return fmt.Sprintf("Switched to model '%s'", *activeModel), true, nil
+
+	case strings.HasPrefix(line, "/lora"):
+		args := strings.Fields(line)
+		if len(args) < 2 {
+			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list", true, nil
+		}
+		switch args[1] {
+		case "list":
+			loras, err := oaicaListLoras()
+			if err != nil {
+				return "", true, err
+			}
+			if len(loras) == 0 {
+				return "No LoRA adapters configured.", true, nil
+			}
+			out := "Configured LoRA adapters:"
+			for _, l := range loras {
+				out += fmt.Sprintf("\n  %s  (model: %s, slot: %d)", l.Name, l.Model, l.ID)
+			}
+			return out, true, nil
+		case "add":
+			if len(args) < 3 {
+				return "Usage: /lora add <name>", true, nil
+			}
+			model, err := oaicaLoraAdd(args[2])
+			if err != nil {
+				return "", true, err
+			}
+			return fmt.Sprintf("LoRA '%s' activated on model '%s'", args[2], model), true, nil
+		case "remove":
+			if len(args) < 3 {
+				return "Usage: /lora remove <name>", true, nil
+			}
+			model, err := oaicaLoraRemove(args[2])
+			if err != nil {
+				return "", true, err
+			}
+			return fmt.Sprintf("LoRA '%s' deactivated on model '%s'", args[2], model), true, nil
+		default:
+			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list", true, nil
+		}
+	}
+	return "", false, nil
+}

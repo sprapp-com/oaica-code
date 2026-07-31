@@ -764,6 +764,9 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	prompts := args[1:]
+	var stdinRaw string // OAICA: raw piped stdin, kept separate from opts.Prompt so
+	// the one-shot path below can parse it line-by-line for /model and /lora
+	// commands instead of joining everything into one chat message.
 	// prepend stdin to the prompt if provided
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		in, err := io.ReadAll(os.Stdin)
@@ -773,6 +776,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 
 		// Only prepend stdin content if it's not empty
 		stdinContent := string(in)
+		stdinRaw = stdinContent
 		if len(stdinContent) > 0 {
 			prompts = append([]string{stdinContent}, prompts...)
 		}
@@ -800,9 +804,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	// option 2) — skip Ollama's client.Show()/PullHandler local-model
 	// resolution entirely (it requires 127.0.0.1:11434, which we don't run)
 	// and go straight into the interactive loop with opts.Model pre-seeded
-	// as the active OAICA model. Non-interactive one-shot `oaica run <model>
-	// "<prompt>"` is not yet supported via this path (out of scope for this
-	// change) — only the interactive REPL entrypoint is fixed here.
+	// as the active OAICA model.
 	{
 		ok, names, err := oaicaModelExists(args[0])
 		if err != nil {
@@ -818,13 +820,35 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		if interactive {
 			return generateInteractive(cmd, opts)
 		}
-		// One-shot (piped stdin, or a prompt given as an extra arg): single
-		// request/response through the same OAICA router, no REPL loop.
-		reply, err := oaicaChat(opts.Model, []oaicaChatMessage{{Role: "user", Content: opts.Prompt}})
-		if err != nil {
-			return fmt.Errorf("OAICA request failed: %w", err)
+		// One-shot (piped stdin, or a prompt given as an extra arg): walk the
+		// input line by line so /model and /lora work the same as they do in
+		// the interactive REPL — piped input is "type these lines at the
+		// prompt", not "send it all as one chat message" (the old behavior:
+		// opts.Prompt was every line joined with spaces, so "/model list"
+		// got sent to the model as literal chat text instead of being run).
+		activeModel := opts.Model
+		lines := stdinLinesOrArgPrompt(stdinRaw, opts.Prompt)
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			reply, handled, err := oaicaDispatchLine(line, &activeModel)
+			if err != nil {
+				return fmt.Errorf("OAICA request failed: %w", err)
+			}
+			if handled {
+				if reply != "" {
+					fmt.Println(reply)
+				}
+				continue
+			}
+			reply, err = oaicaChat(activeModel, []oaicaChatMessage{{Role: "user", Content: line}})
+			if err != nil {
+				return fmt.Errorf("OAICA request failed: %w", err)
+			}
+			fmt.Println(reply)
 		}
-		fmt.Println(reply)
 		return nil
 	}
 
