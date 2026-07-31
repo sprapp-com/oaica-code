@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -28,9 +29,32 @@ func oaicaLaunchHost() string {
 }
 
 func oaicaLaunchAuthorize(req *http.Request) {
-	if key := strings.TrimSpace(os.Getenv("OAICA_API_KEY")); key != "" {
+	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
+	if key == "" {
+		key = oaicaLaunchSavedAPIKey()
+	}
+	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+}
+
+// oaicaLaunchSavedAPIKey duplicates cmd/oaica_client.go's oaicaSavedAPIKey
+// — cmd imports this launch package, so the reverse import isn't
+// possible. Must read the exact same ~/.oaica/api_key file `oaica signin`
+// writes; a session that just signed in only has OAICA_API_KEY set in
+// THAT process's env (os.Setenv in oaicaEnsureSignedIn) — a later
+// invocation is a fresh process with no env var, so without this fallback
+// every launch after the first sign-in silently 401s again.
+func oaicaLaunchSavedAPIKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".oaica", "api_key"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 type oaicaModelEntry struct {
@@ -84,6 +108,22 @@ func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
 	}
 	return entries, nil
+}
+
+// oaicaModelIsReady reports whether name is a real OAICA model, or a valid
+// "<model>+<lora>..." composite of one — the only "readiness" concept that
+// applies to router-served models (see showOrPullWithPolicy's doc comment).
+func oaicaModelIsReady(name string) bool {
+	base := name
+	if idx := strings.Index(name, "+"); idx >= 0 {
+		base = name[:idx]
+	}
+	for _, m := range oaicaLiveModels() {
+		if m == base {
+			return true
+		}
+	}
+	return false
 }
 
 // oaicaLiveModels fetches just the model names (used by modelInventory,

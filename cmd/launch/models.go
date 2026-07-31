@@ -254,7 +254,19 @@ func ensureCloudAuth(ctx context.Context, client *api.Client, modelList string) 
 }
 
 // showOrPullWithPolicy checks if a model exists and applies the provided missing-model policy.
+//
+// OAICA models never need this: they're served live by the api.sprapp.com
+// router, not pulled into a local Ollama registry that doesn't exist in
+// this thin-client fork. client.Show() always 404s for them (no local
+// server), which used to fall through into a real pull attempt —
+// "pulling manifest" / "pull model manifest: file does not exist" — for
+// every single launch. A model got INTO the picker in the first place by
+// being present in oaicaLiveModels() (or being a valid "+"-composite of
+// one), which is the only readiness check that applies here.
 func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string, policy missingModelPolicy, isCloudModel bool) error {
+	if oaicaModelIsReady(model) {
+		return nil
+	}
 	if _, err := client.Show(ctx, &api.ShowRequest{Model: model}); err == nil {
 		return nil
 	} else {
