@@ -75,17 +75,34 @@ type oaicaChatMessage struct {
 	Content string `json:"content"`
 }
 
+type oaicaLoraRequestEntry struct {
+	ID    int     `json:"id"`
+	Scale float64 `json:"scale"`
+}
+
 type oaicaChatRequest struct {
-	Model             string              `json:"model"`
-	Messages          []oaicaChatMessage  `json:"messages"`
-	MaxTokens         int                 `json:"max_tokens,omitempty"`
-	Temperature       float64             `json:"temperature"`
-	Stream            bool                `json:"stream"`
+	Model       string             `json:"model"`
+	Messages    []oaicaChatMessage `json:"messages"`
+	MaxTokens   int                `json:"max_tokens,omitempty"`
+	Temperature float64            `json:"temperature"`
+	Stream      bool               `json:"stream"`
 	// Some backends (small reasoning-tuned models, e.g. Qwen3.5) default to
 	// emitting a hidden <think> block that can consume the entire max_tokens
 	// budget, leaving `content` empty. Off by default; llama.cpp/vLLM ignore
 	// unknown fields so this is a no-op on backends that don't support it.
 	ChatTemplateKwargs map[string]bool `json:"chat_template_kwargs,omitempty"`
+	// llama.cpp-specific sampling fields (ignored by OpenAI-compat backends
+	// that don't recognize them). Small models degenerate into repetition
+	// loops without this — documented, reproduced live via /lora on a
+	// 0.8B model: "for for for for ... Garmin" (see INDUSTRY_LORA_
+	// SUBSCRIPTION_DEMO.md's "Repetition-loop degeneration" finding).
+	RepeatPenalty float64 `json:"repeat_penalty,omitempty"`
+	NoRepeatNgram int     `json:"no_repeat_ngram_size,omitempty"`
+	// Per-request LoRA scale (llama-server native — scoped to THIS request's
+	// slot only, unlike the global POST /v1/lora/add|remove toggle which
+	// affects every concurrent caller of that model). Set via `/lora use`
+	// in the REPL — local to this CLI process, never touches other users.
+	Lora []oaicaLoraRequestEntry `json:"lora,omitempty"`
 }
 
 type oaicaChatResponse struct {
@@ -100,6 +117,12 @@ type oaicaChatResponse struct {
 	} `json:"error"`
 }
 
+// activeLocalLora holds this CLI process's own per-request LoRA choice, set
+// via `/lora use <name>` in the REPL. Local process state ONLY — sent as
+// the request-scoped `lora` field, never the global /v1/lora/add|remove
+// toggle, so it affects nothing outside this session.
+var activeLocalLora *oaicaLoraRequestEntry
+
 // oaicaChat sends a non-streaming chat completion to the router and returns
 // the assistant's reply text.
 func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
@@ -110,6 +133,11 @@ func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
 		Temperature:        0.4,
 		Stream:             false,
 		ChatTemplateKwargs: map[string]bool{"enable_thinking": false},
+		RepeatPenalty:      1.3,
+		NoRepeatNgram:      3,
+	}
+	if activeLocalLora != nil {
+		reqBody.Lora = []oaicaLoraRequestEntry{*activeLocalLora}
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
@@ -278,9 +306,9 @@ func oaicaAdminAuthorize(req *http.Request) (bool, string) {
 }
 
 type oaicaProviderEntry struct {
-	Name         string `json:"name"`
-	Origin       string `json:"origin"`
-	HasAuth      bool   `json:"hasAuth"`
+	Name          string `json:"name"`
+	Origin        string `json:"origin"`
+	HasAuth       bool   `json:"hasAuth"`
 	UpstreamModel string `json:"upstreamModel"`
 }
 
@@ -320,14 +348,14 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 }
 
 type oaicaAuthLoginRequest struct {
-	Name          string `json:"name"`
-	Origin        string `json:"origin"`
+	Name           string `json:"name"`
+	Origin         string `json:"origin"`
 	AuthHeaderName string `json:"authHeaderName,omitempty"`
-	UpstreamModel string `json:"upstreamModel,omitempty"`
+	UpstreamModel  string `json:"upstreamModel,omitempty"`
 }
 
 type oaicaAuthLoginResponse struct {
-	OK    bool   `json:"ok"`
+	OK    bool `json:"ok"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -341,10 +369,10 @@ type oaicaAuthLoginResponse struct {
 // points at it, it does not itself hold or transmit the provider's secret.
 func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 	buf, err := json.Marshal(oaicaAuthLoginRequest{
-		Name:          name,
-		Origin:        origin,
+		Name:           name,
+		Origin:         origin,
 		AuthHeaderName: authHeaderName,
-		UpstreamModel: upstreamModel,
+		UpstreamModel:  upstreamModel,
 	})
 	if err != nil {
 		return err
@@ -507,9 +535,36 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 	case strings.HasPrefix(line, "/lora"):
 		args := strings.Fields(line)
 		if len(args) < 2 {
-			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list", true, nil
+			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off", true, nil
 		}
 		switch args[1] {
+		case "use":
+			if len(args) < 3 {
+				return "Usage: /lora use <name>", true, nil
+			}
+			loras, err := oaicaListLoras()
+			if err != nil {
+				return "", true, err
+			}
+			var found *oaicaLoraListEntry
+			for i := range loras {
+				if loras[i].Name == args[2] {
+					found = &loras[i]
+					break
+				}
+			}
+			if found == nil {
+				names := make([]string, len(loras))
+				for i, l := range loras {
+					names[i] = l.Name
+				}
+				return fmt.Sprintf("Unknown LoRA '%s'. Configured: %s", args[2], strings.Join(names, ", ")), true, nil
+			}
+			activeLocalLora = &oaicaLoraRequestEntry{ID: found.ID, Scale: 1}
+			return fmt.Sprintf("Using LoRA '%s' for this session only (per-request — doesn't affect other users, model: %s)", args[2], found.Model), true, nil
+		case "off":
+			activeLocalLora = nil
+			return "Per-request LoRA disabled for this session.", true, nil
 		case "list":
 			loras, err := oaicaListLoras()
 			if err != nil {
@@ -542,7 +597,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			}
 			return fmt.Sprintf("LoRA '%s' deactivated on model '%s'", args[2], model), true, nil
 		default:
-			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list", true, nil
+			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off", true, nil
 		}
 
 	case strings.HasPrefix(line, "/agent"):

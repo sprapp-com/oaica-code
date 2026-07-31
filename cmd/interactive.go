@@ -536,10 +536,41 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		case strings.HasPrefix(line, "/lora"):
 			args := strings.Fields(line)
 			if len(args) < 2 {
-				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list")
+				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off")
 				continue
 			}
 			switch args[1] {
+			case "use":
+				if len(args) < 3 {
+					fmt.Println("Usage: /lora use <name>")
+					continue
+				}
+				loras, err := oaicaListLoras()
+				if err != nil {
+					fmt.Printf("error: %v\n", err)
+					continue
+				}
+				var found *oaicaLoraListEntry
+				for i := range loras {
+					if loras[i].Name == args[2] {
+						found = &loras[i]
+						break
+					}
+				}
+				if found == nil {
+					fmt.Printf("Unknown LoRA '%s'. Configured: ", args[2])
+					names := make([]string, len(loras))
+					for i, l := range loras {
+						names[i] = l.Name
+					}
+					fmt.Println(strings.Join(names, ", "))
+					continue
+				}
+				activeLocalLora = &oaicaLoraRequestEntry{ID: found.ID, Scale: 1}
+				fmt.Printf("Using LoRA '%s' for this session only (per-request — doesn't affect other users, model: %s)\n", args[2], found.Model)
+			case "off":
+				activeLocalLora = nil
+				fmt.Println("Per-request LoRA disabled for this session.")
 			case "list":
 				loras, err := oaicaListLoras()
 				if err != nil {
@@ -577,7 +608,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				}
 				fmt.Printf("LoRA '%s' deactivated on model '%s'\n", args[2], model)
 			default:
-				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list")
+				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off")
 			}
 			continue
 		case strings.HasPrefix(line, "/agent"):
