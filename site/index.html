@@ -39,13 +39,11 @@ $env:OAICA_API_KEY="&lt;your-key&gt;"          # Windows PowerShell</code></pre>
 &gt; /model list
 Available models:
   flashplan
-  deepseek-chat
   kat-coder-i-compact
-  minimax-m3
   oaica-v4-flash-i-compact
   oaica-v4-flash-mm
   openrouter-gpt4o-mini
-  ...
+  sfc6-i-compact
 &gt; /model flashplan
 Switched to model 'flashplan'</code></pre>
 <p class="hint">Same list from the shell without opening a session: <code>curl -s https://api.sprapp.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-coder-i-compact</code>.</p>
@@ -66,11 +64,33 @@ oaica run oaica-v4-flash-i-compact  # stronger reasoning, slower</code></pre>
 <tr><th>Command</th><th>What it does</th></tr>
 <tr><td><code>/model &lt;name&gt;</code></td><td>Switch the active model for the rest of the session</td></tr>
 <tr><td><code>/model list</code></td><td>List models currently available</td></tr>
-<tr><td><code>/lora add &lt;name&gt;</code></td><td>Activate a LoRA adapter on its backend model</td></tr>
-<tr><td><code>/lora remove &lt;name&gt;</code></td><td>Deactivate it</td></tr>
+<tr><td><code>/lora add &lt;name&gt;</code></td><td>Activate a LoRA adapter <strong>globally</strong> on its backend model</td></tr>
+<tr><td><code>/lora remove &lt;name&gt;</code></td><td>Deactivate it globally</td></tr>
 <tr><td><code>/lora list</code></td><td>List configured adapters</td></tr>
+<tr><td><code>/lora use &lt;name&gt; [name2 ...]</code></td><td>Use adapter(s) <strong>for this session only</strong> — per-request, doesn't touch other users</td></tr>
+<tr><td><code>/lora stack &lt;name&gt;</code></td><td>Add one more adapter to the current session's active set (compose multiple)</td></tr>
+<tr><td><code>/lora off</code></td><td>Clear this session's per-request adapter(s)</td></tr>
 </table>
-<p class="hint">A LoRA is shared across everyone calling that model — toggling it affects all concurrent callers, not just your session.</p>
+
+<h3>Two different LoRA mechanisms — pick the right one</h3>
+<p><code>/lora add</code>/<code>remove</code> is a <strong>global toggle</strong>: it flips the adapter on/off for every concurrent caller of that model, everywhere. Use this only when you actually want a shared, server-wide change (e.g. you administer the box).</p>
+<p><code>/lora use</code>/<code>stack</code>/<code>off</code> is <strong>per-request</strong>: the adapter choice rides along in your own request only, isolated from every other user hitting the same model at the same time. This is what almost everyone wants. Verified concurrently: 3 simultaneous sessions, one using a LoRA, two not — correct/independent output on all 3, zero cross-talk.</p>
+<pre><code>oaica run fitness_en
+&gt; /lora list
+Configured LoRA adapters:
+  fitness_en    (model: fitness_en, slot: 0)
+  nutrition_en  (model: fitness_en, slot: 1)
+&gt; /lora use fitness_en
+Using LoRA(s) [fitness_en] for this session only (per-request — doesn't affect other users)
+&gt; What should I eat before a morning workout?
+...
+&gt; /lora stack nutrition_en
+Stacked LoRA(s) [nutrition_en] for this session only (per-request — doesn't affect other users)
+&gt; What should I eat before a morning workout?
+...(blended answer — both adapters' influence, not just the last one)
+&gt; /lora off
+Per-request LoRA disabled for this session.</code></pre>
+<p class="hint"><strong>Stacked LoRA</strong> composes multiple adapters in one request (e.g. a fitness adapter + a nutrition adapter together) — real weighted composition, verified to produce a blended response distinct from either adapter alone. All stacked adapters must share the same backend model (they need to already be loaded together on one server via multiple <code>--lora</code> flags at launch — this is a private/local-deployment feature, not something the CLI provisions on the fly). Adapters can be toggled/scaled/stacked freely at runtime; loading a brand-new adapter file not already on the server requires a restart — that's a real llama.cpp limitation, not ours.</p>
 
 <h2>Calling the API directly (curl, any language)</h2>
 <pre><code>curl -X POST https://api.sprapp.com/v1/chat/completions \
