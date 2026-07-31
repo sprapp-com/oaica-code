@@ -10,11 +10,19 @@ body { font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Robo
   max-width: 760px; margin: 0 auto; padding: 3rem 1.25rem; }
 h1 { font-weight: 650; }
 h2 { margin-top: 2.5rem; border-bottom: 1px solid rgba(128,128,128,.25); padding-bottom: .3rem; }
-pre { background: #16181f; color: #e8e9ee; padding: 1rem 1.25rem; border-radius: 10px; overflow-x: auto; }
+pre { background: #16181f; color: #e8e9ee; padding: 1rem 1.25rem; border-radius: 10px; overflow-x: auto; position: relative; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .hint { color: #888; font-size: .9rem; }
 table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
 th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(128,128,128,.2); }
+.copy-btn {
+  position: absolute; top: .5rem; right: .5rem;
+  background: rgba(255,255,255,.08); color: #e8e9ee; border: 1px solid rgba(255,255,255,.18);
+  border-radius: 6px; padding: .25rem .55rem; font-size: .75rem; cursor: pointer;
+  font-family: inherit; line-height: 1.4;
+}
+.copy-btn:hover { background: rgba(255,255,255,.16); }
+.copy-btn.copied { background: #2e7d32; border-color: #2e7d32; }
 </style>
 </head>
 <body>
@@ -105,5 +113,22 @@ Per-request LoRA disabled for this session.</code></pre>
 <li>Single shared API key today — no per-user rate limiting. Don't ship the key in a public client bundle.</li>
 <li>Each model runs on exactly one GPU box behind a tunnel — if that box goes down, the model 503s until someone notices and relaunches it. No auto-failover yet.</li>
 </ul>
+<script>
+document.querySelectorAll('pre').forEach(function (pre) {
+  var codeText = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+  var btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.type = 'button';
+  btn.textContent = 'Copy';
+  btn.addEventListener('click', function () {
+    navigator.clipboard.writeText(codeText.trimEnd()).then(function () {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(function () { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    });
+  });
+  pre.appendChild(btn);
+});
+</script>
 </body>
 </html>
