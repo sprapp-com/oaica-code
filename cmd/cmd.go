@@ -795,6 +795,39 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.WordWrap = !nowrap
 
+	// OAICA thin-client short-circuit: this fork talks to api.sprapp.com's
+	// OpenAI-compatible router, not a local Ollama server (OAICA_FORK_PLAN.md
+	// option 2) — skip Ollama's client.Show()/PullHandler local-model
+	// resolution entirely (it requires 127.0.0.1:11434, which we don't run)
+	// and go straight into the interactive loop with opts.Model pre-seeded
+	// as the active OAICA model. Non-interactive one-shot `oaica run <model>
+	// "<prompt>"` is not yet supported via this path (out of scope for this
+	// change) — only the interactive REPL entrypoint is fixed here.
+	{
+		ok, names, err := oaicaModelExists(args[0])
+		if err != nil {
+			return fmt.Errorf("couldn't reach OAICA API: %w", err)
+		}
+		if !ok {
+			fmt.Printf("Unknown model '%s'. Available models:\n", args[0])
+			for _, n := range names {
+				fmt.Printf("  %s\n", n)
+			}
+			return nil
+		}
+		if interactive {
+			return generateInteractive(cmd, opts)
+		}
+		// One-shot (piped stdin, or a prompt given as an extra arg): single
+		// request/response through the same OAICA router, no REPL loop.
+		reply, err := oaicaChat(opts.Model, []oaicaChatMessage{{Role: "user", Content: opts.Prompt}})
+		if err != nil {
+			return fmt.Errorf("OAICA request failed: %w", err)
+		}
+		fmt.Println(reply)
+		return nil
+	}
+
 	// Fill out the rest of the options based on information about the
 	// model.
 	client, err := api.ClientFromEnvironment()

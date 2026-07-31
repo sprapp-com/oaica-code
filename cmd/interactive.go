@@ -37,6 +37,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "  /set            Set session variables")
 		fmt.Fprintln(os.Stderr, "  /show           Show model information")
 		fmt.Fprintln(os.Stderr, "  /load <model>   Load a session or model")
+		fmt.Fprintln(os.Stderr, "  /model <name>   Switch active model (OAICA API — see /model list)")
 		fmt.Fprintln(os.Stderr, "  /save <model>   Save your current session")
 		fmt.Fprintln(os.Stderr, "  /clear          Clear session context")
 		fmt.Fprintln(os.Stderr, "  /bye            Exit")
@@ -135,6 +136,14 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 	var sb strings.Builder
 	var multiline MultilineState
 	var thinkExplicitlySet bool = opts.Think != nil
+	// oaicaActiveModel: when set (via /model, or pre-seeded from `oaica run
+	// <model>`'s opts.Model), subsequent user turns route through the OAICA
+	// OpenAI-compatible router (oaica_client.go) instead of Ollama's native
+	// client.Generate()/chat() path. Empty = fall through to the original
+	// Ollama-native behavior (untouched) — only happens if RunHandler was
+	// invoked without a model name, which cobra's arg validation prevents.
+	oaicaActiveModel := opts.Model
+	var oaicaHistory []oaicaChatMessage
 
 	for {
 		line, err := scanner.Readline()
@@ -486,6 +495,91 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			} else {
 				usage()
 			}
+		case strings.HasPrefix(line, "/model"):
+			args := strings.Fields(line)
+			if len(args) < 2 {
+				fmt.Println("Usage:\n  /model <name>\n  /model list")
+				if oaicaActiveModel != "" {
+					fmt.Printf("Active OAICA model: %s\n", oaicaActiveModel)
+				}
+				continue
+			}
+			if args[1] == "list" {
+				names, err := oaicaListModels()
+				if err != nil {
+					fmt.Printf("error: %v\n", err)
+					continue
+				}
+				fmt.Println("Available models:")
+				for _, n := range names {
+					fmt.Printf("  %s\n", n)
+				}
+				continue
+			}
+			requested := args[1]
+			ok, names, err := oaicaModelExists(requested)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			if !ok {
+				fmt.Printf("Unknown model '%s'. Available models:\n", requested)
+				for _, n := range names {
+					fmt.Printf("  %s\n", n)
+				}
+				continue
+			}
+			oaicaActiveModel = requested
+			oaicaHistory = nil
+			fmt.Printf("Switched to model '%s'\n", oaicaActiveModel)
+			continue
+		case strings.HasPrefix(line, "/lora"):
+			args := strings.Fields(line)
+			if len(args) < 2 {
+				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list")
+				continue
+			}
+			switch args[1] {
+			case "list":
+				loras, err := oaicaListLoras()
+				if err != nil {
+					fmt.Printf("error: %v\n", err)
+					continue
+				}
+				if len(loras) == 0 {
+					fmt.Println("No LoRA adapters configured.")
+					continue
+				}
+				fmt.Println("Configured LoRA adapters:")
+				for _, l := range loras {
+					fmt.Printf("  %s  (model: %s, slot: %d)\n", l.Name, l.Model, l.ID)
+				}
+			case "add":
+				if len(args) < 3 {
+					fmt.Println("Usage: /lora add <name>")
+					continue
+				}
+				model, err := oaicaLoraAdd(args[2])
+				if err != nil {
+					fmt.Printf("error: %v\n", err)
+					continue
+				}
+				fmt.Printf("LoRA '%s' activated on model '%s'\n", args[2], model)
+			case "remove":
+				if len(args) < 3 {
+					fmt.Println("Usage: /lora remove <name>")
+					continue
+				}
+				model, err := oaicaLoraRemove(args[2])
+				if err != nil {
+					fmt.Printf("error: %v\n", err)
+					continue
+				}
+				fmt.Printf("LoRA '%s' deactivated on model '%s'\n", args[2], model)
+			default:
+				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list")
+			}
+			continue
 		case strings.HasPrefix(line, "/exit"), strings.HasPrefix(line, "/bye"):
 			return nil
 		case strings.HasPrefix(line, "/"):
@@ -509,6 +603,22 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			sb.WriteString(line)
 		default:
 			sb.WriteString(line)
+		}
+
+		if sb.Len() > 0 && multiline == MultilineNone && oaicaActiveModel != "" {
+			// OAICA thin-client path: bypass Ollama's native chat() entirely,
+			// speak OpenAI-shaped /v1/chat/completions to api.sprapp.com.
+			oaicaHistory = append(oaicaHistory, oaicaChatMessage{Role: "user", Content: sb.String()})
+			reply, err := oaicaChat(oaicaActiveModel, oaicaHistory)
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				sb.Reset()
+				continue
+			}
+			fmt.Println(reply)
+			oaicaHistory = append(oaicaHistory, oaicaChatMessage{Role: "assistant", Content: reply})
+			sb.Reset()
+			continue
 		}
 
 		if sb.Len() > 0 && multiline == MultilineNone {
