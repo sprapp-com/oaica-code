@@ -8,8 +8,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-
-	"github.com/ollama/ollama/envconfig"
 )
 
 // Claude implements Runner for Claude Code integration.
@@ -65,10 +63,23 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 }
 
 func (c *Claude) envVars(model string) []string {
+	// THIS WAS THE REAL BUG (found via a live user repro that persisted
+	// through multiple other fixes): envconfig.Host() reads OLLAMA_HOST,
+	// defaulting to 127.0.0.1:11434 — a REAL, unrelated local Ollama
+	// server that happens to be running on this box (different models
+	// entirely: qwen2.5:7b, nanbeige-ternary, ...). Every prior fix
+	// (router-side Jinja crash, Auto-mode disable) was real and necessary
+	// but couldn't matter — Claude Code was never even reaching our OAICA
+	// router. Confirmed by direct curl: 127.0.0.1:11434 has no "flashplan"
+	// model, producing the exact "model 'flashplan' not found" error seen
+	// in the user's debug logs. Use oaicaLaunchHost()/OAICA_API_KEY (this
+	// package's own OAICA client, matching cmd/oaica_client.go's
+	// equivalents) instead — the actual router this whole fork exists to
+	// route through.
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + envconfig.Host().String(),
+		"ANTHROPIC_BASE_URL=" + oaicaLaunchHost(),
 		"ANTHROPIC_API_KEY=",
-		"ANTHROPIC_AUTH_TOKEN=ollama",
+		"ANTHROPIC_AUTH_TOKEN=" + oaicaLaunchAPIKeyForEnv(),
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_FEEDBACK_COMMAND=1",

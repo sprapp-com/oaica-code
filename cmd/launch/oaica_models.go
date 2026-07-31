@@ -29,13 +29,22 @@ func oaicaLaunchHost() string {
 }
 
 func oaicaLaunchAuthorize(req *http.Request) {
+	if key := oaicaLaunchAPIKeyForEnv(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+}
+
+// oaicaLaunchAPIKeyForEnv resolves the key the same way oaicaLaunchAuthorize
+// does (env var, falling back to the file `oaica signin` writes) but
+// returns the raw string — used to build ANTHROPIC_AUTH_TOKEN for a
+// launched integration's own process env, not just this package's own
+// HTTP calls.
+func oaicaLaunchAPIKeyForEnv() string {
 	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
 	if key == "" {
 		key = oaicaLaunchSavedAPIKey()
 	}
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
+	return key
 }
 
 // oaicaLaunchSavedAPIKey duplicates cmd/oaica_client.go's oaicaSavedAPIKey
