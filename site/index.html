@@ -34,6 +34,21 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(1
 <pre><code>export OAICA_API_KEY=&lt;your-key&gt;          # macOS/Linux
 $env:OAICA_API_KEY="&lt;your-key&gt;"          # Windows PowerShell</code></pre>
 <p class="hint">Add the export line to your shell profile (<code>~/.bashrc</code>, <code>~/.zshrc</code>) or Windows profile so it persists across sessions.</p>
+<p>Once set, list what's live right now — the roster changes as boxes come and go, so check this instead of hardcoding a name:</p>
+<pre><code>oaica run kat-coder-i-compact
+&gt; /model list
+Available models:
+  flashplan
+  deepseek-chat
+  kat-coder-i-compact
+  minimax-m3
+  oaica-v4-flash-i-compact
+  oaica-v4-flash-mm
+  openrouter-gpt4o-mini
+  ...
+&gt; /model flashplan
+Switched to model 'flashplan'</code></pre>
+<p class="hint">Same list from the shell without opening a session: <code>curl -s https://api.sprapp.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-coder-i-compact</code>.</p>
 
 <h2>Connecting to a specific box (e.g. bitdeer) directly</h2>
 <p>By default <code>oaica</code> talks to <code>api.sprapp.com</code>, which routes to whichever GPU box is currently live. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
