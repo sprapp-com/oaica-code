@@ -2,7 +2,7 @@ package launch
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -86,12 +86,16 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		return cloneLaunchModels(i.models), i.err
 	}
 
-	names := oaicaLiveModels()
-	if names == nil {
+	entries, err := oaicaLiveModelEntriesErr()
+	if err != nil {
 		i.models = nil
-		i.err = errors.New("no models available from OAICA router")
+		i.err = fmt.Errorf("OAICA router: %w (check OAICA_API_KEY / OAICA_HOST)", err)
 		i.loaded = true
 		return nil, i.err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.ID)
 	}
 
 	i.models = make([]LaunchModel, 0, len(names))
