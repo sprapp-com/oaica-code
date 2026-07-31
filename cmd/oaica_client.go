@@ -240,6 +240,149 @@ func oaicaLoraRemove(name string) (string, error) {
 	return oaicaLoraToggle("/v1/lora/remove", name)
 }
 
+// oaicaAdminAuthorize attaches the ADMIN_KEY bearer token — a SEPARATE,
+// higher-privilege credential from OAICA_API_KEY. Only `auth login/list/
+// logout` use this: those calls can add or overwrite ANY model backend for
+// EVERY caller of the router, so they must never share the client-facing
+// key. Regular /model and /lora usage stays on OAICA_API_KEY via
+// oaicaAuthorize above.
+func oaicaAdminAuthorize(req *http.Request) (bool, string) {
+	key := strings.TrimSpace(os.Getenv("OAICA_ADMIN_KEY"))
+	if key == "" {
+		return false, ""
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	return true, key
+}
+
+type oaicaProviderEntry struct {
+	Name         string `json:"name"`
+	Origin       string `json:"origin"`
+	HasAuth      bool   `json:"hasAuth"`
+	UpstreamModel string `json:"upstreamModel"`
+}
+
+type oaicaProviderList struct {
+	Data []oaicaProviderEntry `json:"data"`
+}
+
+// oaicaAuthList fetches the live provider registry (admin-gated). Never
+// returns secret values — the router's GET response only ever includes
+// hasAuth (bool), never the auth header's actual value.
+func oaicaAuthList() ([]oaicaProviderEntry, error) {
+	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/admin/providers", nil)
+	if err != nil {
+		return nil, err
+	}
+	if ok, _ := oaicaAdminAuthorize(req); !ok {
+		return nil, fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var list oaicaProviderList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("bad response from %s: %w", oaicaHost(), err)
+	}
+	return list.Data, nil
+}
+
+type oaicaAuthLoginRequest struct {
+	Name          string `json:"name"`
+	Origin        string `json:"origin"`
+	AuthHeaderName string `json:"authHeaderName,omitempty"`
+	UpstreamModel string `json:"upstreamModel,omitempty"`
+}
+
+type oaicaAuthLoginResponse struct {
+	OK    bool   `json:"ok"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// oaicaAuthLogin registers (or overwrites) a provider backend in the
+// router's live registry — takes effect immediately, no redeploy. The
+// provider's own API key must already be uploaded as a Worker secret named
+// authHeaderName (`wrangler secret put <authHeaderName>` on the router side)
+// before this is called — this command only wires up the ROUTING entry that
+// points at it, it does not itself hold or transmit the provider's secret.
+func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
+	buf, err := json.Marshal(oaicaAuthLoginRequest{
+		Name:          name,
+		Origin:        origin,
+		AuthHeaderName: authHeaderName,
+		UpstreamModel: upstreamModel,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, oaicaHost()+"/v1/admin/providers", bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if ok, _ := oaicaAdminAuthorize(req); !ok {
+		return fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var out oaicaAuthLoginResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	if out.Error != nil {
+		return fmt.Errorf("%s", out.Error.Message)
+	}
+	if !out.OK {
+		return fmt.Errorf("registration failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// oaicaAuthLogout removes a provider from the router's live registry.
+func oaicaAuthLogout(name string) error {
+	req, err := http.NewRequest(http.MethodDelete, oaicaHost()+"/v1/admin/providers/"+name, nil)
+	if err != nil {
+		return err
+	}
+	if ok, _ := oaicaAdminAuthorize(req); !ok {
+		return fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // oaicaAgentHost is the NeMo Agent Toolkit sidecar's base URL — a local
 // FastAPI service wrapping a react_agent workflow (see /tmp/nat_workflow.yml
 // on the box this was built on; the sidecar is NOT api.sprapp.com, it's a

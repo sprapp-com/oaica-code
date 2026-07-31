@@ -2455,6 +2455,86 @@ func NewCLI() *cobra.Command {
 		RunE:    SignoutHandler,
 	}
 
+	// authCmd — opencode-style provider credential management for the
+	// api.sprapp.com router's hot-reloadable KV provider registry. Distinct
+	// from signinCmd/loginCmd above (those are ollama.com's own unrelated
+	// sign-in flow, kept as-is). Requires OAICA_ADMIN_KEY, NOT OAICA_API_KEY
+	// — these commands can add/overwrite ANY model backend for every caller
+	// of the router, so they're gated by a separate operator-only credential
+	// that regular /model and /lora usage never needs.
+	authLoginCmd := &cobra.Command{
+		Use:   "login <provider-name>",
+		Short: "Register a provider backend in the router's live registry (no redeploy needed)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			origin, _ := cmd.Flags().GetString("origin")
+			authHeader, _ := cmd.Flags().GetString("auth-header")
+			upstreamModel, _ := cmd.Flags().GetString("upstream-model")
+			if origin == "" {
+				return fmt.Errorf("--origin is required, e.g. --origin https://api.example.com")
+			}
+			if err := oaicaAuthLogin(name, origin, authHeader, upstreamModel); err != nil {
+				return err
+			}
+			fmt.Printf("Registered '%s' -> %s\n", name, origin)
+			if authHeader != "" {
+				fmt.Printf("Auth: outbound requests will use the router's %s secret (upload it separately with `wrangler secret put %s` on the router side if not already set).\n", authHeader, authHeader)
+			}
+			return nil
+		},
+	}
+	authLoginCmd.Flags().String("origin", "", "Base URL of the provider's API (required)")
+	authLoginCmd.Flags().String("auth-header", "", "Name of the router-side Worker secret holding this provider's API key (omit for origins that need no auth, e.g. our own bitdeer backends)")
+	authLoginCmd.Flags().String("upstream-model", "", "Model string to send upstream if it differs from <provider-name> (e.g. provider expects \"openai/gpt-4o-mini\" but we register it as \"openrouter-gpt4o-mini\")")
+
+	authListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List providers registered in the router's live registry",
+		Args:  cobra.ExactArgs(0),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			entries, err := oaicaAuthList()
+			if err != nil {
+				return err
+			}
+			if len(entries) == 0 {
+				fmt.Println("No providers registered.")
+				return nil
+			}
+			for _, e := range entries {
+				authState := "no-auth"
+				if e.HasAuth {
+					authState = "auth-configured"
+				}
+				line := fmt.Sprintf("  %-28s %-45s %s", e.Name, e.Origin, authState)
+				if e.UpstreamModel != "" {
+					line += fmt.Sprintf("  (upstream model: %s)", e.UpstreamModel)
+				}
+				fmt.Println(line)
+			}
+			return nil
+		},
+	}
+
+	authLogoutCmd := &cobra.Command{
+		Use:   "logout <provider-name>",
+		Short: "Remove a provider from the router's live registry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := oaicaAuthLogout(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("Removed '%s'\n", args[0])
+			return nil
+		},
+	}
+
+	authCmd := &cobra.Command{
+		Use:   "auth",
+		Short: "Manage provider backends on the api.sprapp.com router (requires OAICA_ADMIN_KEY)",
+	}
+	authCmd.AddCommand(authLoginCmd, authListCmd, authLogoutCmd)
+
 	listCmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
@@ -2574,6 +2654,7 @@ func NewCLI() *cobra.Command {
 		deleteCmd,
 		runnerCmd,
 		gpuDiscoverCmd,
+		authCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)
 
