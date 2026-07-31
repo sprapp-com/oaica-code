@@ -2178,11 +2178,18 @@ func NewCLI() *cobra.Command {
 	showCmd.Flags().BoolP("verbose", "v", false, "Show detailed model information")
 
 	runCmd := &cobra.Command{
-		Use:     "run MODEL [PROMPT]",
-		Short:   "Run a model",
-		Args:    cobra.MinimumNArgs(1),
-		PreRunE: checkServerHeartbeat,
-		RunE:    RunHandler,
+		Use:   "run MODEL [PROMPT]",
+		Short: "Run a model",
+		Args:  cobra.MinimumNArgs(1),
+		// No PreRunE: checkServerHeartbeat would try to reach a local
+		// Ollama server (127.0.0.1:11434) that doesn't exist in this
+		// thin-client architecture, and on failure would attempt to
+		// auto-launch one — surfacing "could not connect to ollama
+		// server, run 'ollama serve'" before RunHandler's own OAICA
+		// connectivity check (oaicaModelExists) ever runs. RunHandler
+		// short-circuits to the router directly; no local-server
+		// precondition applies here.
+		RunE: RunHandler,
 	}
 
 	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
