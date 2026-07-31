@@ -505,14 +505,17 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				continue
 			}
 			if args[1] == "list" {
-				names, err := oaicaListModels()
+				entries, err := oaicaListModelsDetailed()
 				if err != nil {
 					fmt.Printf("error: %v\n", err)
 					continue
 				}
 				fmt.Println("Available models:")
-				for _, n := range names {
-					fmt.Printf("  %s\n", n)
+				for _, m := range entries {
+					fmt.Printf("  %-28s %s\n", m.ID, starString(m.Stars))
+					if m.Description != "" {
+						fmt.Printf("  %-28s %s\n", "", m.Description)
+					}
 				}
 				continue
 			}

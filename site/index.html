@@ -37,6 +37,16 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(1
 <pre><code>irm https://oaica.com/install.ps1 | iex</code></pre>
 <p class="hint">Installs to <code>%LOCALAPPDATA%\Programs\OAICA</code> and adds <code>oaica</code> to your session PATH. Set <code>$env:OAICA_INSTALL_DIR</code> first for a custom location.</p>
 
+<h3>Upgrade</h3>
+<p>Same command as install — it overwrites the existing copy cleanly, no separate upgrade command needed:</p>
+<pre><code>curl -fsSL https://oaica.com/install.sh | bash          # macOS/Linux
+irm https://oaica.com/install.ps1 | iex                 # Windows</code></pre>
+
+<h3>Uninstall</h3>
+<pre><code>curl -fsSL https://oaica.com/install.sh | OAICA_UNINSTALL=1 bash          # macOS/Linux
+$env:OAICA_UNINSTALL=1; irm https://oaica.com/install.ps1 | iex           # Windows</code></pre>
+<p class="hint">Removes the binary and its lib directory. Doesn't touch <code>OAICA_API_KEY</code> or any shell profile export you added yourself.</p>
+
 <h2>Get an API key</h2>
 <p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>). Set it once:</p>
 <pre><code>export OAICA_API_KEY=&lt;your-key&gt;          # macOS/Linux

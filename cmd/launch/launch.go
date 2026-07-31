@@ -1213,24 +1213,31 @@ func (c *launcherClient) recommendations(ctx context.Context) []ModelItem {
 // that's combinatorial; use oaica-code's own `/lora stack` for anything
 // beyond a single adapter).
 func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelItem, error) {
-	names := oaicaLiveModels()
-	if len(names) == 0 {
+	modelEntries := oaicaLiveModelEntries()
+	if len(modelEntries) == 0 {
 		return nil, errors.New("no models available from OAICA router")
 	}
 	loraEntries := oaicaLiveLoraEntries()
 
-	items := make([]ModelItem, 0, len(names)+len(loraEntries))
-	for _, name := range names {
+	items := make([]ModelItem, 0, len(modelEntries)+len(loraEntries))
+	for _, m := range modelEntries {
+		desc := m.Description
+		if desc == "" {
+			desc = "OAICA model (api.sprapp.com) — unrated"
+		}
+		if m.Stars > 0 {
+			desc = strings.Repeat("★", m.Stars) + strings.Repeat("☆", 5-m.Stars) + "  " + desc
+		}
 		items = append(items, ModelItem{
-			Name:        name,
-			Description: "OAICA model (api.sprapp.com)",
-			Recommended: true,
+			Name:        m.ID,
+			Description: desc,
+			Recommended: m.Stars >= 4,
 		})
 	}
 	for _, entry := range loraEntries {
 		items = append(items, ModelItem{
 			Name:        entry.model + "+" + entry.name,
-			Description: "OAICA model (api.sprapp.com) with LoRA '" + entry.name + "' active — stacked further via oaica-code's /lora stack",
+			Description: "Stacked LoRA: '" + entry.name + "' active on " + entry.model + " — compose further via oaica-code's /lora stack",
 			Recommended: false,
 		})
 	}

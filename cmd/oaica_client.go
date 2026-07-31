@@ -36,14 +36,24 @@ func oaicaAuthorize(req *http.Request) {
 	}
 }
 
-type oaicaModelList struct {
-	Data []struct {
-		ID string `json:"id"`
-	} `json:"data"`
+type oaicaModelListEntry struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Stars       int    `json:"stars"`
 }
 
-// oaicaListModels fetches the live model list from the router's /v1/models.
-func oaicaListModels() ([]string, error) {
+type oaicaModelList struct {
+	Data []oaicaModelListEntry `json:"data"`
+}
+
+// oaicaListModelsDetailed fetches the live model list from the router's
+// /v1/models, including each model's "recommended for" description and
+// 1-5 star rating (both set once via the router's admin API — a single
+// source of truth every client reads, rather than duplicating quality
+// claims in this CLI, the site, and the launch picker separately).
+// Unrated models have Stars == 0 and empty Description — never fabricate
+// a rating client-side.
+func oaicaListModelsDetailed() ([]oaicaModelListEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/models", nil)
 	if err != nil {
 		return nil, err
@@ -63,8 +73,33 @@ func oaicaListModels() ([]string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil, fmt.Errorf("bad response from %s: %w", oaicaHost(), err)
 	}
-	names := make([]string, 0, len(list.Data))
-	for _, m := range list.Data {
+	return list.Data, nil
+}
+
+func starString(n int) string {
+	if n <= 0 {
+		return "unrated"
+	}
+	s := ""
+	for i := 0; i < 5; i++ {
+		if i < n {
+			s += "★"
+		} else {
+			s += "☆"
+		}
+	}
+	return s
+}
+
+// oaicaListModels fetches just the model names — used by the existence
+// gate and anywhere only the name (not the description/stars) matters.
+func oaicaListModels() ([]string, error) {
+	entries, err := oaicaListModelsDetailed()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, m := range entries {
 		names = append(names, m.ID)
 	}
 	return names, nil
@@ -528,11 +563,18 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			return fmt.Sprintf("Usage:\n  /model <name>\n  /model list\nActive OAICA model: %s", *activeModel), true, nil
 		}
 		if args[1] == "list" {
-			names, err := oaicaListModels()
+			entries, err := oaicaListModelsDetailed()
 			if err != nil {
 				return "", true, err
 			}
-			return "Available models:\n  " + strings.Join(names, "\n  "), true, nil
+			out := "Available models:"
+			for _, m := range entries {
+				out += fmt.Sprintf("\n  %-28s %s", m.ID, starString(m.Stars))
+				if m.Description != "" {
+					out += fmt.Sprintf("\n  %-28s %s", "", m.Description)
+				}
+			}
+			return out, true, nil
 		}
 		requested := args[1]
 		ok, names, err := oaicaModelExists(requested)

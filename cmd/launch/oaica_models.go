@@ -31,11 +31,21 @@ func oaicaLaunchAuthorize(req *http.Request) {
 	}
 }
 
-// oaicaLiveModels fetches /v1/models. Returns (nil, nil) rather than an
-// error on any failure — this feeds the launch picker's recommendation
-// list, and per the existing "fail open" convention in recommendations(),
-// a reachability problem here should fall back gracefully, not block launch.
-func oaicaLiveModels() []string {
+type oaicaModelEntry struct {
+	ID          string
+	Description string
+	Stars       int
+}
+
+// oaicaLiveModelEntries fetches /v1/models including each model's
+// "recommended for" description and 1-5 star rating — set once via the
+// router's admin API, a single source of truth every client (this picker,
+// oaica-code's `/model list`, oaica.com) reads rather than duplicating
+// quality claims. Returns nil on any failure — this feeds the launch
+// picker's recommendation list, and per the existing "fail open"
+// convention in recommendations(), a reachability problem here should
+// fall back gracefully, not block launch.
+func oaicaLiveModelEntries() []oaicaModelEntry {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
 	if err != nil {
 		return nil
@@ -52,14 +62,30 @@ func oaicaLiveModels() []string {
 	}
 	var list struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID          string `json:"id"`
+			Description string `json:"description"`
+			Stars       int    `json:"stars"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil
 	}
-	names := make([]string, 0, len(list.Data))
+	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
+		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
+	}
+	return entries
+}
+
+// oaicaLiveModels fetches just the model names (used by modelInventory,
+// which doesn't need descriptions/stars).
+func oaicaLiveModels() []string {
+	entries := oaicaLiveModelEntries()
+	if entries == nil {
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, m := range entries {
 		names = append(names, m.ID)
 	}
 	return names
