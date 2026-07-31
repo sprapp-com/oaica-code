@@ -881,32 +881,69 @@ func SigninHandler(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Already signed in (key ending ...%s). Run 'oaica signout' first to switch keys.\n", lastN(existing, 4))
 		return nil
 	}
-
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
+	signedIn, err := oaicaInteractiveSignin()
+	if err != nil {
+		return err
+	}
+	if !signedIn {
 		return errors.New("signin requires an interactive terminal — set OAICA_API_KEY directly instead")
+	}
+	return nil
+}
+
+// oaicaInteractiveSignin prompts for and saves an OAICA_API_KEY. Returns
+// (false, nil) — not an error — when stdin isn't a terminal, since piped
+// input can't safely prompt; the caller decides what that means for it
+// (SigninHandler treats it as an error, oaicaEnsureSignedIn treats it as
+// "let the real request surface whatever error it surfaces").
+func oaicaInteractiveSignin() (bool, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return false, nil
 	}
 
 	fmt.Print("Enter your OAICA API key (from api.sprapp.com): ")
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return err
+		return false, err
 	}
 	key := strings.TrimSpace(line)
 	if key == "" {
-		return errors.New("no key entered")
+		return false, errors.New("no key entered")
 	}
 
 	fmt.Println("Verifying...")
 	os.Setenv("OAICA_API_KEY", key)
 	if _, err := oaicaListModels(); err != nil {
-		return fmt.Errorf("key rejected: %w", err)
+		return false, fmt.Errorf("key rejected: %w", err)
 	}
 
 	if err := oaicaSaveAPIKey(key); err != nil {
-		return fmt.Errorf("verified but couldn't save key to disk: %w", err)
+		return false, fmt.Errorf("verified but couldn't save key to disk: %w", err)
 	}
 	fmt.Println("Signed in. Key saved — future sessions won't need OAICA_API_KEY set.")
+	return true, nil
+}
+
+// oaicaEnsureSignedIn prompts for sign-in exactly once, only when no key is
+// available yet (env var or saved) AND stdin is an interactive terminal —
+// used as a PreRunE hook on commands that would otherwise fail with a bare
+// 401. Silently does nothing if a key already exists or the session can't
+// prompt (piped/non-interactive) — the real request's own error is a
+// better signal than a login prompt no one can answer.
+func oaicaEnsureSignedIn(cmd *cobra.Command, args []string) error {
+	if strings.TrimSpace(os.Getenv("OAICA_API_KEY")) != "" || oaicaSavedAPIKey() != "" {
+		return nil
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return nil
+	}
+	fmt.Println("No OAICA API key found — sign in once and it's saved for future sessions.")
+	if _, err := oaicaInteractiveSignin(); err != nil {
+		// Don't block the command on a signin failure — let the real
+		// request underneath surface its own (equally real) error.
+		fmt.Printf("Signin failed: %v\n", err)
+	}
 	return nil
 }
 
@@ -2178,15 +2215,16 @@ func NewCLI() *cobra.Command {
 		Use:   "run MODEL [PROMPT]",
 		Short: "Run a model",
 		Args:  cobra.MinimumNArgs(1),
-		// No PreRunE: checkServerHeartbeat would try to reach a local
-		// Ollama server (127.0.0.1:11434) that doesn't exist in this
-		// thin-client architecture, and on failure would attempt to
-		// auto-launch one — surfacing "could not connect to ollama
-		// server, run 'ollama serve'" before RunHandler's own OAICA
-		// connectivity check (oaicaModelExists) ever runs. RunHandler
-		// short-circuits to the router directly; no local-server
-		// precondition applies here.
-		RunE: RunHandler,
+		// PreRunE is oaicaEnsureSignedIn, not checkServerHeartbeat — the
+		// latter would try to reach a local Ollama server (127.0.0.1:11434)
+		// that doesn't exist in this thin-client architecture, and on
+		// failure would attempt to auto-launch one — surfacing "could not
+		// connect to ollama server, run 'ollama serve'" before RunHandler's
+		// own OAICA connectivity check (oaicaModelExists) ever runs.
+		// oaicaEnsureSignedIn prompts for a key if none is configured yet
+		// (interactive only) instead — the real precondition here.
+		PreRunE: oaicaEnsureSignedIn,
+		RunE:    RunHandler,
 	}
 
 	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
@@ -2416,7 +2454,12 @@ func NewCLI() *cobra.Command {
 		copyCmd,
 		deleteCmd,
 		authCmd,
-		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
+		// oaicaEnsureSignedIn, not checkServerHeartbeat — same dead-local-
+		// server bug as runCmd above; LaunchCmd's PreRunE calls whatever's
+		// passed here before every launch subcommand (barring restore/
+		// skip-heartbeat cases), so this is the actual precondition that
+		// applies (a configured OAICA key), not an Ollama server heartbeat.
+		launch.LaunchCmd(oaicaEnsureSignedIn, runInteractiveTUI),
 	)
 
 	return rootCmd
