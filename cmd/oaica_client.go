@@ -117,11 +117,15 @@ type oaicaChatResponse struct {
 	} `json:"error"`
 }
 
-// activeLocalLora holds this CLI process's own per-request LoRA choice, set
-// via `/lora use <name>` in the REPL. Local process state ONLY — sent as
-// the request-scoped `lora` field, never the global /v1/lora/add|remove
-// toggle, so it affects nothing outside this session.
-var activeLocalLora *oaicaLoraRequestEntry
+// activeLocalLoras holds this CLI process's own per-request LoRA choice(s),
+// set via `/lora use <name>` (replaces) or `/lora stack <name>` (adds) in
+// the REPL. Local process state ONLY — sent as the request-scoped `lora`
+// field, never the global /v1/lora/add|remove toggle, so it affects
+// nothing outside this session. Multiple entries = stacked/composed
+// adapters (llama-server applies every {id,scale} pair in the array
+// together) — requires the backend to have loaded all of them at launch
+// via multiple --lora flags; not something this client can provision.
+var activeLocalLoras []oaicaLoraRequestEntry
 
 // oaicaChat sends a non-streaming chat completion to the router and returns
 // the assistant's reply text.
@@ -136,8 +140,8 @@ func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
 		RepeatPenalty:      1.3,
 		NoRepeatNgram:      3,
 	}
-	if activeLocalLora != nil {
-		reqBody.Lora = []oaicaLoraRequestEntry{*activeLocalLora}
+	if len(activeLocalLoras) > 0 {
+		reqBody.Lora = activeLocalLoras
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
@@ -535,35 +539,51 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 	case strings.HasPrefix(line, "/lora"):
 		args := strings.Fields(line)
 		if len(args) < 2 {
-			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off", true, nil
+			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name> [name2 ...]\n  /lora stack <name>\n  /lora off", true, nil
 		}
 		switch args[1] {
-		case "use":
+		case "use", "stack":
 			if len(args) < 3 {
-				return "Usage: /lora use <name>", true, nil
+				return fmt.Sprintf("Usage: /lora %s <name> [name2 ...]", args[1]), true, nil
 			}
 			loras, err := oaicaListLoras()
 			if err != nil {
 				return "", true, err
 			}
-			var found *oaicaLoraListEntry
-			for i := range loras {
-				if loras[i].Name == args[2] {
-					found = &loras[i]
-					break
-				}
+			byName := map[string]oaicaLoraListEntry{}
+			for _, l := range loras {
+				byName[l.Name] = l
 			}
-			if found == nil {
-				names := make([]string, len(loras))
-				for i, l := range loras {
-					names[i] = l.Name
-				}
-				return fmt.Sprintf("Unknown LoRA '%s'. Configured: %s", args[2], strings.Join(names, ", ")), true, nil
+			entries := []oaicaLoraRequestEntry{}
+			models := map[string]bool{}
+			if args[1] == "stack" {
+				entries = append(entries, activeLocalLoras...)
 			}
-			activeLocalLora = &oaicaLoraRequestEntry{ID: found.ID, Scale: 1}
-			return fmt.Sprintf("Using LoRA '%s' for this session only (per-request — doesn't affect other users, model: %s)", args[2], found.Model), true, nil
+			var addedNames []string
+			for _, name := range args[2:] {
+				found, ok := byName[name]
+				if !ok {
+					names := make([]string, len(loras))
+					for i, l := range loras {
+						names[i] = l.Name
+					}
+					return fmt.Sprintf("Unknown LoRA '%s'. Configured: %s", name, strings.Join(names, ", ")), true, nil
+				}
+				entries = append(entries, oaicaLoraRequestEntry{ID: found.ID, Scale: 1})
+				models[found.Model] = true
+				addedNames = append(addedNames, name)
+			}
+			if len(models) > 1 {
+				return "Stacked LoRAs must all belong to the same backend model (they load together into one llama-server) — mixed models given.", true, nil
+			}
+			activeLocalLoras = entries
+			verb := "Using"
+			if args[1] == "stack" {
+				verb = "Stacked"
+			}
+			return fmt.Sprintf("%s LoRA(s) [%s] for this session only (per-request — doesn't affect other users)", verb, strings.Join(addedNames, ", ")), true, nil
 		case "off":
-			activeLocalLora = nil
+			activeLocalLoras = nil
 			return "Per-request LoRA disabled for this session.", true, nil
 		case "list":
 			loras, err := oaicaListLoras()

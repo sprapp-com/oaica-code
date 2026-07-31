@@ -536,13 +536,13 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		case strings.HasPrefix(line, "/lora"):
 			args := strings.Fields(line)
 			if len(args) < 2 {
-				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off")
+				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name> [name2 ...]\n  /lora stack <name>\n  /lora off")
 				continue
 			}
 			switch args[1] {
-			case "use":
+			case "use", "stack":
 				if len(args) < 3 {
-					fmt.Println("Usage: /lora use <name>")
+					fmt.Printf("Usage: /lora %s <name> [name2 ...]\n", args[1])
 					continue
 				}
 				loras, err := oaicaListLoras()
@@ -550,26 +550,48 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					fmt.Printf("error: %v\n", err)
 					continue
 				}
-				var found *oaicaLoraListEntry
-				for i := range loras {
-					if loras[i].Name == args[2] {
-						found = &loras[i]
+				byName := map[string]oaicaLoraListEntry{}
+				for _, l := range loras {
+					byName[l.Name] = l
+				}
+				entries := []oaicaLoraRequestEntry{}
+				models := map[string]bool{}
+				if args[1] == "stack" {
+					entries = append(entries, activeLocalLoras...)
+				}
+				var addedNames []string
+				unknown := false
+				for _, name := range args[2:] {
+					found, ok := byName[name]
+					if !ok {
+						fmt.Printf("Unknown LoRA '%s'. Configured: ", name)
+						names := make([]string, len(loras))
+						for i, l := range loras {
+							names[i] = l.Name
+						}
+						fmt.Println(strings.Join(names, ", "))
+						unknown = true
 						break
 					}
+					entries = append(entries, oaicaLoraRequestEntry{ID: found.ID, Scale: 1})
+					models[found.Model] = true
+					addedNames = append(addedNames, name)
 				}
-				if found == nil {
-					fmt.Printf("Unknown LoRA '%s'. Configured: ", args[2])
-					names := make([]string, len(loras))
-					for i, l := range loras {
-						names[i] = l.Name
-					}
-					fmt.Println(strings.Join(names, ", "))
+				if unknown {
 					continue
 				}
-				activeLocalLora = &oaicaLoraRequestEntry{ID: found.ID, Scale: 1}
-				fmt.Printf("Using LoRA '%s' for this session only (per-request — doesn't affect other users, model: %s)\n", args[2], found.Model)
+				if len(models) > 1 {
+					fmt.Println("Stacked LoRAs must all belong to the same backend model (they load together into one llama-server) — mixed models given.")
+					continue
+				}
+				activeLocalLoras = entries
+				verb := "Using"
+				if args[1] == "stack" {
+					verb = "Stacked"
+				}
+				fmt.Printf("%s LoRA(s) [%s] for this session only (per-request — doesn't affect other users)\n", verb, strings.Join(addedNames, ", "))
 			case "off":
-				activeLocalLora = nil
+				activeLocalLoras = nil
 				fmt.Println("Per-request LoRA disabled for this session.")
 			case "list":
 				loras, err := oaicaListLoras()
