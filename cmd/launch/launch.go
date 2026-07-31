@@ -1213,9 +1213,12 @@ func (c *launcherClient) recommendations(ctx context.Context) []ModelItem {
 // that's combinatorial; use oaica-code's own `/lora stack` for anything
 // beyond a single adapter).
 func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelItem, error) {
-	modelEntries := oaicaLiveModelEntries()
+	modelEntries, err := oaicaLiveModelEntriesErr()
+	if err != nil {
+		return nil, fmt.Errorf("OAICA router: %w (check OAICA_API_KEY / OAICA_HOST)", err)
+	}
 	if len(modelEntries) == 0 {
-		return nil, errors.New("no models available from OAICA router")
+		return nil, errors.New("OAICA router returned zero models")
 	}
 	loraEntries := oaicaLiveLoraEntries()
 

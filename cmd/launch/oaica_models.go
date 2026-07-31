@@ -12,6 +12,8 @@ package launch
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -41,24 +43,31 @@ type oaicaModelEntry struct {
 // "recommended for" description and 1-5 star rating — set once via the
 // router's admin API, a single source of truth every client (this picker,
 // oaica-code's `/model list`, oaica.com) reads rather than duplicating
-// quality claims. Returns nil on any failure — this feeds the launch
-// picker's recommendation list, and per the existing "fail open"
-// convention in recommendations(), a reachability problem here should
-// fall back gracefully, not block launch.
+// quality claims. Returns nil (discarding the reason) on any failure —
+// used only by oaicaLiveModels() below; requestRecommendations calls
+// oaicaLiveModelEntriesErr instead so it can surface the REAL reason
+// (401 missing key, network unreachable, etc) instead of a generic
+// "no models available" that gives no signal on what actually broke.
 func oaicaLiveModelEntries() []oaicaModelEntry {
+	entries, _ := oaicaLiveModelEntriesErr()
+	return entries
+}
+
+func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	oaicaLaunchAuthorize(req)
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaLaunchHost(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, oaicaLaunchHost(), strings.TrimSpace(string(body)))
 	}
 	var list struct {
 		Data []struct {
@@ -68,13 +77,13 @@ func oaicaLiveModelEntries() []oaicaModelEntry {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil
+		return nil, fmt.Errorf("bad response from %s: %w", oaicaLaunchHost(), err)
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
 		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
 	}
-	return entries
+	return entries, nil
 }
 
 // oaicaLiveModels fetches just the model names (used by modelInventory,
