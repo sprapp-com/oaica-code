@@ -196,8 +196,17 @@ func oaicaModelExists(name string) (bool, []string, error) {
 	if err != nil {
 		return false, nil, err
 	}
+	// Composite "<model>+<lora1>+<lora2>" names (router's stacked-LoRA
+	// syntax, see prism-api-router's extractModelName) never appear in
+	// /v1/models — they're generated syntax, not enumerated entries.
+	// Only the base model needs to exist here; the router validates the
+	// lora segments itself and returns a clear error if any are bad.
+	checkName := name
+	if idx := strings.Index(name, "+"); idx >= 0 {
+		checkName = name[:idx]
+	}
 	for _, n := range names {
-		if n == name {
+		if n == checkName {
 			return true, names, nil
 		}
 	}
