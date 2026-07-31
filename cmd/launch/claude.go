@@ -167,6 +167,18 @@ func (c *Claude) modelEnvVars(model string) []string {
 		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + model,
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + model,
 		"CLAUDE_CODE_SUBAGENT_MODEL=" + model,
+		// Claude Code's "Auto" model-tier carousel (2.1.x+) issues its own
+		// background classifier calls against a model id that is NOT covered
+		// by ANTHROPIC_DEFAULT_*_MODEL/CLAUDE_CODE_SUBAGENT_MODEL above. Against
+		// a third-party router that doesn't recognize Anthropic's real model
+		// IDs, those background calls 404 with error.type=model_not_found,
+		// which the CLI surfaces to the user as "There's an issue with the
+		// selected model (<model>). It may not exist or you may not have
+		// access to it." even though the explicitly selected model works fine.
+		// Disable Auto mode and pin its classifier model as a belt-and-suspenders
+		// fallback so it can't independently address a model our router doesn't have.
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
+		"CLAUDE_CODE_AUTO_MODE_MODEL=" + model,
 	}
 
 	if isCloudModelName(model) {
