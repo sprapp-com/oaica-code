@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -29,11 +30,82 @@ func oaicaHost() string {
 
 // oaicaAuthorize attaches the bearer token the router requires on every
 // route except /router-health. Reads OAICA_API_KEY each call (not cached)
-// so a key set mid-session takes effect on the next request.
+// so a key set mid-session takes effect on the next request. Falls back to
+// a key saved via `oaica signin` (~/.oaica/api_key) when the env var isn't
+// set — the env var always wins if both are present.
 func oaicaAuthorize(req *http.Request) {
-	if key := strings.TrimSpace(os.Getenv("OAICA_API_KEY")); key != "" {
+	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
+	if key == "" {
+		key = oaicaSavedAPIKey()
+	}
+	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+}
+
+func oaicaConfigDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica"), nil
+}
+
+func oaicaAPIKeyPath() (string, error) {
+	dir, err := oaicaConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "api_key"), nil
+}
+
+// oaicaSavedAPIKey reads the key saved by `oaica signin`, or "" if none
+// (missing file, unreadable, or never signed in — never an error the
+// caller needs to handle, since the env var is always the primary path).
+func oaicaSavedAPIKey() string {
+	path, err := oaicaAPIKeyPath()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func oaicaSaveAPIKey(key string) error {
+	dir, err := oaicaConfigDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path, err := oaicaAPIKeyPath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(key+"\n"), 0o600)
+}
+
+func oaicaClearAPIKey() error {
+	path, err := oaicaAPIKeyPath()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func lastN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 type oaicaModelListEntry struct {

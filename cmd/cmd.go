@@ -27,7 +27,6 @@ import (
 	"github.com/containerd/console"
 	"github.com/mattn/go-runewidth"
 	"github.com/olekukonko/tablewriter"
-	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
@@ -871,57 +870,55 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// SigninHandler prompts for an OAICA_API_KEY (the client-facing key the
+// api.sprapp.com router requires — separate from ADMIN_KEY / provider
+// registration, see cmd/oaica_client.go and the authCmd family below) and
+// persists it to disk so it doesn't need to be exported every session.
+// Rewritten from upstream Ollama's ollama.com OAuth-signin flow, which
+// doesn't apply here — this fork never talks to ollama.com.
 func SigninHandler(cmd *cobra.Command, args []string) error {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return err
-	}
-
-	user, err := client.Whoami(cmd.Context())
-	if err != nil {
-		var aErr api.AuthorizationError
-		if errors.As(err, &aErr) && aErr.StatusCode == http.StatusUnauthorized {
-			fmt.Println("You need to be signed in to Ollama to run Cloud models.")
-			fmt.Println()
-
-			if aErr.SigninURL != "" {
-				_ = browser.OpenURL(aErr.SigninURL)
-				fmt.Printf(ConnectInstructions, aErr.SigninURL)
-			}
-			return nil
-		}
-		return err
-	}
-
-	if user != nil && user.Name != "" {
-		fmt.Printf("You are already signed in as user '%s'\n", user.Name)
-		fmt.Println()
+	if existing := oaicaSavedAPIKey(); existing != "" {
+		fmt.Printf("Already signed in (key ending ...%s). Run 'oaica signout' first to switch keys.\n", lastN(existing, 4))
 		return nil
 	}
 
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("signin requires an interactive terminal — set OAICA_API_KEY directly instead")
+	}
+
+	fmt.Print("Enter your OAICA API key (from api.sprapp.com): ")
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	key := strings.TrimSpace(line)
+	if key == "" {
+		return errors.New("no key entered")
+	}
+
+	fmt.Println("Verifying...")
+	os.Setenv("OAICA_API_KEY", key)
+	if _, err := oaicaListModels(); err != nil {
+		return fmt.Errorf("key rejected: %w", err)
+	}
+
+	if err := oaicaSaveAPIKey(key); err != nil {
+		return fmt.Errorf("verified but couldn't save key to disk: %w", err)
+	}
+	fmt.Println("Signed in. Key saved — future sessions won't need OAICA_API_KEY set.")
 	return nil
 }
 
 func SignoutHandler(cmd *cobra.Command, args []string) error {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
+	if oaicaSavedAPIKey() == "" {
+		fmt.Println("Not signed in (no saved key).")
+		return nil
+	}
+	if err := oaicaClearAPIKey(); err != nil {
 		return err
 	}
-
-	err = client.Signout(cmd.Context())
-	if err != nil {
-		var aErr api.AuthorizationError
-		if errors.As(err, &aErr) && aErr.StatusCode == http.StatusUnauthorized {
-			fmt.Println("You are not signed in to ollama.com")
-			fmt.Println()
-			return nil
-		} else {
-			return err
-		}
-	}
-
-	fmt.Println("You have signed out of ollama.com")
-	fmt.Println()
+	fmt.Println("Signed out — saved key removed.")
 	return nil
 }
 
@@ -2232,37 +2229,33 @@ func NewCLI() *cobra.Command {
 	pushCmd.Flags().Bool("insecure", false, "Use an insecure registry")
 
 	signinCmd := &cobra.Command{
-		Use:     "signin",
-		Short:   "Sign in to ollama.com",
-		Args:    cobra.ExactArgs(0),
-		PreRunE: checkServerHeartbeat,
-		RunE:    SigninHandler,
+		Use:   "signin",
+		Short: "Sign in with your OAICA API key",
+		Args:  cobra.ExactArgs(0),
+		RunE:  SigninHandler,
 	}
 
 	loginCmd := &cobra.Command{
-		Use:     "login",
-		Short:   "Sign in to ollama.com",
-		Hidden:  true,
-		Args:    cobra.ExactArgs(0),
-		PreRunE: checkServerHeartbeat,
-		RunE:    SigninHandler,
+		Use:    "login",
+		Short:  "Sign in with your OAICA API key",
+		Hidden: true,
+		Args:   cobra.ExactArgs(0),
+		RunE:   SigninHandler,
 	}
 
 	signoutCmd := &cobra.Command{
-		Use:     "signout",
-		Short:   "Sign out from ollama.com",
-		Args:    cobra.ExactArgs(0),
-		PreRunE: checkServerHeartbeat,
-		RunE:    SignoutHandler,
+		Use:   "signout",
+		Short: "Remove your saved OAICA API key",
+		Args:  cobra.ExactArgs(0),
+		RunE:  SignoutHandler,
 	}
 
 	logoutCmd := &cobra.Command{
-		Use:     "logout",
-		Short:   "Sign out from ollama.com",
-		Hidden:  true,
-		Args:    cobra.ExactArgs(0),
-		PreRunE: checkServerHeartbeat,
-		RunE:    SignoutHandler,
+		Use:    "logout",
+		Short:  "Remove your saved OAICA API key",
+		Hidden: true,
+		Args:   cobra.ExactArgs(0),
+		RunE:   SignoutHandler,
 	}
 
 	// authCmd — opencode-style provider credential management for the

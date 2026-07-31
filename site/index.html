@@ -48,7 +48,14 @@ $env:OAICA_UNINSTALL=1; irm https://oaica.com/install.ps1 | iex           # Wind
 <p class="hint">Removes the binary and its lib directory. Doesn't touch <code>OAICA_API_KEY</code> or any shell profile export you added yourself.</p>
 
 <h2>Get an API key</h2>
-<p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>). Set it once:</p>
+<p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>).</p>
+<p><strong>Recommended: sign in once, it's saved for you</strong> — no need to export anything every session:</p>
+<pre><code>oaica signin
+Enter your OAICA API key (from api.sprapp.com): &lt;paste your key&gt;
+Verifying...
+Signed in. Key saved — future sessions won't need OAICA_API_KEY set.</code></pre>
+<p class="hint">Saved to <code>~/.oaica/api_key</code> (mode 0600, your user only). <code>oaica signout</code> removes it. An <code>OAICA_API_KEY</code> environment variable, if set, always takes priority over the saved key.</p>
+<p>Or set it directly via environment variable instead, if you prefer:</p>
 <pre><code>export OAICA_API_KEY=&lt;your-key&gt;          # macOS/Linux
 $env:OAICA_API_KEY="&lt;your-key&gt;"          # Windows PowerShell</code></pre>
 <p class="hint">Add the export line to your shell profile (<code>~/.bashrc</code>, <code>~/.zshrc</code>) or Windows profile so it persists across sessions.</p>
