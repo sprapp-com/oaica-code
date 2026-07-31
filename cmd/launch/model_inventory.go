@@ -2,6 +2,7 @@ package launch
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -66,8 +67,15 @@ func (i *modelInventory) Refresh(ctx context.Context) ([]LaunchModel, error) {
 	return i.load(ctx, true)
 }
 
+// load sources the inventory from the OAICA router (/v1/models) rather
+// than Ollama's native local-server List() API, which this thin-client
+// fork never runs (see oaica_models.go's doc comment). Unlike Ollama's
+// response, ours carries no size/context/capability metadata — those
+// fields are left at zero value, which downstream code already treats as
+// "unknown" (WithCloudLimits falls back to lookupCloudModelLimit, which
+// simply won't match our model names and leaves them as-is).
 func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, error) {
-	if i == nil || i.client == nil {
+	if i == nil {
 		return nil, nil
 	}
 
@@ -78,17 +86,17 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		return cloneLaunchModels(i.models), i.err
 	}
 
-	resp, err := i.client.List(ctx)
-	if err != nil {
+	names := oaicaLiveModels()
+	if names == nil {
 		i.models = nil
-		i.err = err
+		i.err = errors.New("no models available from OAICA router")
 		i.loaded = true
-		return nil, err
+		return nil, i.err
 	}
 
-	i.models = make([]LaunchModel, 0, len(resp.Models))
-	for _, model := range resp.Models {
-		i.models = append(i.models, launchModelFromListResponse(model))
+	i.models = make([]LaunchModel, 0, len(names))
+	for _, name := range names {
+		i.models = append(i.models, LaunchModel{Name: name, Remote: true}.WithCloudLimits())
 	}
 	i.err = nil
 	i.loaded = true

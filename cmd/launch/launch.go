@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"slices"
@@ -1198,47 +1197,35 @@ func (c *launcherClient) recommendations(ctx context.Context) []ModelItem {
 	return append([]ModelItem(nil), recommendations...)
 }
 
+// requestRecommendations sources the launch picker's model list from the
+// real OAICA router (/v1/models) instead of Ollama's native
+// ModelRecommendationsExperimental cloud-catalog API — the latter doesn't
+// know about this fork's actual backends and was surfacing Ollama's
+// generic upstream catalog (glm-5.2:cloud, kimi-k2.7-code:cloud, ...) in
+// the picker. LoRA adapters (/v1/lora) are listed for visibility in the
+// description but aren't independently selectable here yet: the picker
+// hands a single `model` string on to the launched tool (e.g. Claude
+// Code), and the router doesn't yet parse a composite model+lora name —
+// that's a real follow-up, not something to fake here.
 func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelItem, error) {
-	resp, err := c.apiClient.ModelRecommendationsExperimental(ctx)
-	if err != nil {
-		return nil, err
+	names := oaicaLiveModels()
+	if len(names) == 0 {
+		return nil, errors.New("no models available from OAICA router")
 	}
-	items := make([]ModelItem, 0, len(resp.Recommendations))
-	seen := make(map[string]struct{}, len(resp.Recommendations))
+	loraNames := oaicaLiveLoraNames()
+	loraSuffix := ""
+	if len(loraNames) > 0 {
+		loraSuffix = " · LoRA adapters available: " + strings.Join(loraNames, ", ") + " (use `/lora use <name>` inside the model, not selectable here yet)"
+	}
 
-	for _, rec := range resp.Recommendations {
-		name := strings.TrimSpace(rec.Model)
-		if name == "" {
-			continue
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-
-		if isCloudModelName(name) && (rec.ContextLength <= 0 || rec.MaxOutputTokens <= 0) {
-			slog.Warn("skipping cloud recommendation with missing limits", "model", name)
-			continue
-		}
-
-		description := strings.TrimSpace(rec.Description)
-		if description == "" {
-			description = "Recommended model"
-		}
-
+	items := make([]ModelItem, 0, len(names))
+	for _, name := range names {
 		items = append(items, ModelItem{
-			Name:            name,
-			Description:     description,
-			Recommended:     true,
-			VRAMBytes:       rec.VRAMBytes,
-			MaxOutputTokens: rec.MaxOutputTokens,
-			RequiredPlan:    strings.TrimSpace(rec.RequiredPlan),
-			Details: api.ModelDetails{
-				ContextLength: rec.ContextLength,
-			},
+			Name:        name,
+			Description: "OAICA model (api.sprapp.com)" + loraSuffix,
+			Recommended: true,
 		})
 	}
-
 	return items, nil
 }
 

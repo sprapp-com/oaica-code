@@ -42,6 +42,37 @@ esac
 VER_PARAM="${OAICA_VERSION:+?version=$OAICA_VERSION}"
 
 ###########################################
+# Uninstall
+###########################################
+# OAICA_UNINSTALL=1 curl -fsSL https://oaica.com/install.sh | bash
+if [ -n "${OAICA_UNINSTALL:-}" ]; then
+    UNINSTALL_SUDO=
+    [ "$(id -u)" -ne 0 ] && available sudo && UNINSTALL_SUDO="sudo"
+
+    FOUND=0
+    for BINDIR in /usr/local/bin /usr/bin /bin; do
+        if [ -e "$BINDIR/oaica" ]; then
+            status "Removing $BINDIR/oaica"
+            $UNINSTALL_SUDO rm -f "$BINDIR/oaica"
+            FOUND=1
+        fi
+        INSTALL_DIR="$(dirname "$BINDIR")"
+        if [ -d "$INSTALL_DIR/lib/oaica" ]; then
+            status "Removing $INSTALL_DIR/lib/oaica"
+            $UNINSTALL_SUDO rm -rf "$INSTALL_DIR/lib/oaica"
+            FOUND=1
+        fi
+    done
+
+    if [ "$FOUND" -eq 0 ]; then
+        status "OAICA is not installed."
+    else
+        status "OAICA has been uninstalled."
+    fi
+    exit 0
+fi
+
+###########################################
 # macOS
 ###########################################
 
