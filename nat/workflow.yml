@@ -1,0 +1,20 @@
+general:
+  use_uvloop: true
+
+llms:
+  oaica_llm:
+    _type: openai
+    api_key: ${OAICA_API_KEY}
+    base_url: https://api.sprapp.com/v1
+    model_name: flashplan
+
+functions:
+  current_time:
+    _type: current_datetime
+
+workflow:
+  _type: react_agent
+  tool_names:
+    - current_time
+  llm_name: oaica_llm
+  verbose: true

@@ -240,6 +240,60 @@ func oaicaLoraRemove(name string) (string, error) {
 	return oaicaLoraToggle("/v1/lora/remove", name)
 }
 
+// oaicaAgentHost is the NeMo Agent Toolkit sidecar's base URL — a local
+// FastAPI service wrapping a react_agent workflow (see /tmp/nat_workflow.yml
+// on the box this was built on; the sidecar is NOT api.sprapp.com, it's a
+// separate local process that itself calls api.sprapp.com as its LLM
+// backend). Override via OAICA_AGENT_HOST for a different sidecar address.
+func oaicaAgentHost() string {
+	if h := strings.TrimSpace(os.Getenv("OAICA_AGENT_HOST")); h != "" {
+		return strings.TrimRight(h, "/")
+	}
+	return "http://127.0.0.1:8600"
+}
+
+type oaicaAgentRequest struct {
+	InputMessage string `json:"input_message"`
+}
+
+type oaicaAgentResponse struct {
+	Value string `json:"value"`
+}
+
+// oaicaAgentRun sends a task to the NeMo Agent Toolkit sidecar's /generate
+// endpoint, which runs a real ReAct tool-use loop (not a plain chat call —
+// the agent decides whether/which tool to invoke, executes it, and folds
+// the result back in) before returning a final answer.
+func oaicaAgentRun(task string) (string, error) {
+	buf, err := json.Marshal(oaicaAgentRequest{InputMessage: task})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, oaicaAgentHost()+"/generate", bytes.NewReader(buf))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("couldn't reach agent sidecar at %s (is it running? see OAICA_AGENT_HOST): %w", oaicaAgentHost(), err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("agent sidecar HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var out oaicaAgentResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("bad response from agent sidecar: %w", err)
+	}
+	return out.Value, nil
+}
+
 // stdinLinesOrArgPrompt splits raw piped stdin into individual lines (so
 // /model and /lora on their own line get parsed, matching how a human
 // typing into the interactive REPL would trigger them). Falls back to
@@ -325,6 +379,17 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 		default:
 			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list", true, nil
 		}
+
+	case strings.HasPrefix(line, "/agent"):
+		task := strings.TrimSpace(strings.TrimPrefix(line, "/agent"))
+		if task == "" {
+			return "Usage:\n  /agent <task>", true, nil
+		}
+		result, err := oaicaAgentRun(task)
+		if err != nil {
+			return "", true, err
+		}
+		return result, true, nil
 	}
 	return "", false, nil
 }

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OAICA — install &amp; usage</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+  max-width: 760px; margin: 0 auto; padding: 3rem 1.25rem; }
+h1 { font-weight: 650; }
+h2 { margin-top: 2.5rem; border-bottom: 1px solid rgba(128,128,128,.25); padding-bottom: .3rem; }
+pre { background: #16181f; color: #e8e9ee; padding: 1rem 1.25rem; border-radius: 10px; overflow-x: auto; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.hint { color: #888; font-size: .9rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(128,128,128,.2); }
+</style>
+</head>
+<body>
+<h1>OAICA</h1>
+<p>A terminal AI CLI (fork of Ollama's client) backed by our own API. No local GPU or model download required — every request goes to <code>api.sprapp.com</code>, which routes to whichever GPU box is currently serving the model you asked for.</p>
+
+<h2>Install</h2>
+<p><strong>macOS / Linux</strong></p>
+<pre><code>curl -fsSL https://oaica.com/install.sh | bash</code></pre>
+<p class="hint">Detects your architecture automatically.</p>
+<p><strong>Windows</strong> (PowerShell)</p>
+<pre><code>irm https://oaica.com/install.ps1 | iex</code></pre>
+<p class="hint">Installs to <code>%LOCALAPPDATA%\Programs\OAICA</code> and adds <code>oaica</code> to your session PATH. Set <code>$env:OAICA_INSTALL_DIR</code> first for a custom location.</p>
+
+<h2>Get an API key</h2>
+<p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>). Set it once:</p>
+<pre><code>export OAICA_API_KEY=&lt;your-key&gt;          # macOS/Linux
+$env:OAICA_API_KEY="&lt;your-key&gt;"          # Windows PowerShell</code></pre>
+<p class="hint">Add the export line to your shell profile (<code>~/.bashrc</code>, <code>~/.zshrc</code>) or Windows profile so it persists across sessions.</p>
+
+<h2>Connecting to a specific box (e.g. bitdeer) directly</h2>
+<p>By default <code>oaica</code> talks to <code>api.sprapp.com</code>, which routes to whichever GPU box is currently live. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
+<pre><code>export OAICA_HOST=http://&lt;bitdeer-host&gt;:&lt;port&gt;   # e.g. the bitdeer tunnel URL for a model's port
+oaica run kat-coder-i-compact</code></pre>
+<p class="hint">Direct-to-box mode usually has no auth of its own (the router is what enforces <code>OAICA_API_KEY</code>) — only point at a box you trust on a network you trust.</p>
+
+<h2>Run a model</h2>
+<pre><code>oaica run flashplan              # recommended — auto-picks fast vs strong-reasoning per prompt
+oaica run kat-coder-i-compact    # fast, general-purpose
+oaica run oaica-v4-flash-i-compact  # stronger reasoning, slower</code></pre>
+
+<h2>Inside the interactive session</h2>
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>/model &lt;name&gt;</code></td><td>Switch the active model for the rest of the session</td></tr>
+<tr><td><code>/model list</code></td><td>List models currently available</td></tr>
+<tr><td><code>/lora add &lt;name&gt;</code></td><td>Activate a LoRA adapter on its backend model</td></tr>
+<tr><td><code>/lora remove &lt;name&gt;</code></td><td>Deactivate it</td></tr>
+<tr><td><code>/lora list</code></td><td>List configured adapters</td></tr>
+</table>
+<p class="hint">A LoRA is shared across everyone calling that model — toggling it affects all concurrent callers, not just your session.</p>
+
+<h2>Calling the API directly (curl, any language)</h2>
+<pre><code>curl -X POST https://api.sprapp.com/v1/chat/completions \
+  -H "Authorization: Bearer $OAICA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"flashplan","messages":[{"role":"user","content":"..."}],"max_tokens":256}'</code></pre>
+<p>Standard OpenAI-compatible shape. <code>GET /v1/models</code> lists what's live right now — always check this instead of hardcoding a name, the backend roster changes as boxes come and go.</p>
+<p class="hint">Full contract + JS example (for browser/PWA use): see <code>API_BACKEND.md</code> in the prism-mobile repo.</p>
+
+<h2>Known limitations</h2>
+<ul>
+<li>Single shared API key today — no per-user rate limiting. Don't ship the key in a public client bundle.</li>
+<li>Each model runs on exactly one GPU box behind a tunnel — if that box goes down, the model 503s until someone notices and relaunches it. No auto-failover yet.</li>
+</ul>
+</body>
+</html>

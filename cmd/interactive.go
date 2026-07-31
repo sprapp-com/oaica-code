@@ -580,6 +580,19 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list")
 			}
 			continue
+		case strings.HasPrefix(line, "/agent"):
+			args := strings.SplitN(line, " ", 2)
+			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+				fmt.Println("Usage:\n  /agent <task>\n\nRuns a tool-using ReAct agent (NeMo Agent Toolkit) instead of a plain\nchat turn — use for tasks that need a real tool call (e.g. current time),\nnot for ordinary conversation.")
+				continue
+			}
+			result, err := oaicaAgentRun(strings.TrimSpace(args[1]))
+			if err != nil {
+				fmt.Printf("error: %v\n", err)
+				continue
+			}
+			fmt.Println(result)
+			continue
 		case strings.HasPrefix(line, "/exit"), strings.HasPrefix(line, "/bye"):
 			return nil
 		case strings.HasPrefix(line, "/"):
