@@ -46,6 +46,9 @@ VER_PARAM="${OAICA_VERSION:+?version=$OAICA_VERSION}"
 ###########################################
 
 if [ "$OS" = "Darwin" ]; then
+    # OAICA is a thin CLI (talks to api.sprapp.com — OAICA_FORK_PLAN.md
+    # option 2), not a GUI desktop app, so unlike upstream Ollama this
+    # ships a plain binary in a zip, not an OAICA.app bundle.
     NEEDS=$(require curl unzip)
     if [ -n "$NEEDS" ]; then
         status "ERROR: The following tools are required but missing:"
@@ -55,37 +58,28 @@ if [ "$OS" = "Darwin" ]; then
         exit 1
     fi
 
-    DOWNLOAD_URL="https://oaica.com/download/OAICA-darwin.zip${VER_PARAM}"
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        arm64|aarch64) DARWIN_ARCH="arm64" ;;
+        x86_64|amd64) DARWIN_ARCH="amd64" ;;
+        *) error "Unsupported macOS architecture: $ARCH" ;;
+    esac
 
-    if pgrep -x OAICA >/dev/null 2>&1; then
-        status "Stopping running OAICA instance..."
-        pkill -x OAICA 2>/dev/null || true
-        sleep 2
-    fi
+    DOWNLOAD_URL="https://oaica.com/download/oaica-darwin-${DARWIN_ARCH}.zip${VER_PARAM}"
+    BINDIR="/usr/local/bin"
 
-    if [ -d "/Applications/OAICA.app" ]; then
-        status "Removing existing OAICA installation..."
-        rm -rf "/Applications/OAICA.app"
-    fi
-
-    status "Downloading OAICA for macOS..."
+    status "Downloading OAICA for macOS ($DARWIN_ARCH)..."
     curl --fail --show-error --location --progress-bar \
-        -o "$TEMP_DIR/OAICA-darwin.zip" "$DOWNLOAD_URL"
+        -o "$TEMP_DIR/oaica-darwin.zip" "$DOWNLOAD_URL"
 
-    status "Installing OAICA to /Applications..."
-    unzip -q "$TEMP_DIR/OAICA-darwin.zip" -d "$TEMP_DIR"
-    mv "$TEMP_DIR/OAICA.app" "/Applications/"
-
-    if [ ! -L "/usr/local/bin/oaica" ] || [ "$(readlink "/usr/local/bin/oaica")" != "/Applications/OAICA.app/Contents/Resources/oaica" ]; then
-        status "Adding 'oaica' command to PATH (may require password)..."
-        mkdir -p "/usr/local/bin" 2>/dev/null || sudo mkdir -p "/usr/local/bin"
-        ln -sf "/Applications/OAICA.app/Contents/Resources/oaica" "/usr/local/bin/oaica" 2>/dev/null || \
-            sudo ln -sf "/Applications/OAICA.app/Contents/Resources/oaica" "/usr/local/bin/oaica"
-    fi
-
-    if [ -z "${OAICA_NO_START:-}" ]; then
-        status "Starting OAICA..."
-        open -a OAICA --args hidden
+    status "Installing OAICA to $BINDIR..."
+    unzip -q "$TEMP_DIR/oaica-darwin.zip" -d "$TEMP_DIR"
+    mkdir -p "$BINDIR" 2>/dev/null || sudo mkdir -p "$BINDIR"
+    if [ -w "$BINDIR" ]; then
+        install -m755 "$TEMP_DIR/bin/oaica" "$BINDIR/oaica"
+    else
+        status "Installing to $BINDIR requires sudo..."
+        sudo install -m755 "$TEMP_DIR/bin/oaica" "$BINDIR/oaica"
     fi
 
     status "Install complete. You can now run 'oaica'."

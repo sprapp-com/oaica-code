@@ -3,17 +3,13 @@ package cmd
 import (
 	"bufio"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,7 +29,6 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/term"
 
@@ -41,7 +36,6 @@ import (
 	"github.com/ollama/ollama/cmd/config"
 	"github.com/ollama/ollama/cmd/launch"
 	"github.com/ollama/ollama/cmd/tui"
-	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/internal/modelref"
@@ -49,13 +43,9 @@ import (
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/readline"
-	"github.com/ollama/ollama/runner"
-	"github.com/ollama/ollama/server"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/types/syncmap"
 	"github.com/ollama/ollama/version"
-	xcreate "github.com/ollama/ollama/x/create"
-	xcreateclient "github.com/ollama/ollama/x/create/client"
 )
 
 func init() {
@@ -174,50 +164,6 @@ func getModelfileName(cmd *cobra.Command) (string, error) {
 	return absName, nil
 }
 
-// isLocalhost returns true if the configured Ollama host is a loopback or unspecified address.
-func isLocalhost() bool {
-	host := envconfig.Host()
-	h, _, _ := net.SplitHostPort(host.Host)
-	if h == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(h)
-	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
-}
-
-func resolveExperimentalLocalModelDir(ref, filename string) string {
-	if ref == "" || filepath.IsAbs(ref) || filename == "" {
-		return ref
-	}
-
-	candidate := filepath.Join(filepath.Dir(filename), ref)
-	if xcreate.IsSafetensorsModelDir(candidate) {
-		return candidate
-	}
-
-	return ref
-}
-
-func resolveExperimentalDraftDir(ref, filename string) (string, error) {
-	if ref == "" {
-		return "", nil
-	}
-	if filepath.IsAbs(ref) {
-		if xcreate.IsSafetensorsModelDir(ref) {
-			return ref, nil
-		}
-		return "", fmt.Errorf("draft %s is not a supported safetensors model directory", ref)
-	}
-	if filename != "" {
-		candidate := filepath.Join(filepath.Dir(filename), ref)
-		if xcreate.IsSafetensorsModelDir(candidate) {
-			return candidate, nil
-		}
-	}
-
-	return "", fmt.Errorf("DRAFT model references are not supported with --experimental yet: %s", ref)
-}
-
 func CreateHandler(cmd *cobra.Command, args []string) error {
 	p := progress.NewProgress(os.Stderr)
 	defer p.Stop()
@@ -229,60 +175,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid model name: %s", modelName)
 	}
 
-	// Check for --experimental flag for safetensors model creation.
-	experimental, _ := cmd.Flags().GetBool("experimental")
+	// OAICA thin-client: dropped the --experimental safetensors-local-dir
+	// creation path (xcreate/xcreateclient) — it required a local Ollama
+	// server anyway (isLocalhost() gate) and pulled in x/mlxrunner/mlx,
+	// which doesn't cross-compile for darwin/windows without a native cgo
+	// toolchain for those targets. Standard Modelfile + API path only.
 	draftQuantize, _ := cmd.Flags().GetString("draft-quantize")
-	if experimental {
-		if !isLocalhost() {
-			return errors.New("remote safetensor model creation not yet supported")
-		}
-
-		// Get Modelfile content - either from -f flag or default to "FROM ."
-		var reader io.Reader
-		filename, err := getModelfileName(cmd)
-		if os.IsNotExist(err) || filename == "" {
-			// No Modelfile specified or found - use default
-			reader = strings.NewReader("FROM .\n")
-		} else if err != nil {
-			return err
-		} else {
-			f, err := os.Open(filename)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			reader = f
-		}
-
-		// Parse the Modelfile
-		modelfile, err := parser.ParseFile(reader)
-		if err != nil {
-			return fmt.Errorf("failed to parse Modelfile: %w", err)
-		}
-
-		modelDir, mfConfig, err := xcreateclient.ConfigFromModelfile(modelfile)
-		if err != nil {
-			return err
-		}
-
-		modelDir = resolveExperimentalLocalModelDir(modelDir, filename)
-		if mfConfig.Draft != "" {
-			draftDir, err := resolveExperimentalDraftDir(mfConfig.Draft, filename)
-			if err != nil {
-				return err
-			}
-			mfConfig.Draft = draftDir
-		}
-
-		quantize, _ := cmd.Flags().GetString("quantize")
-		return xcreateclient.CreateModel(xcreateclient.CreateOptions{
-			ModelName:     modelName,
-			ModelDir:      modelDir,
-			Quantize:      quantize,
-			DraftQuantize: draftQuantize,
-			Modelfile:     mfConfig,
-		}, p)
-	}
 
 	// Standard Modelfile + API path
 	var reader io.Reader
@@ -2038,70 +1936,6 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 	return nil
 }
 
-func RunServer(_ *cobra.Command, _ []string) error {
-	if err := initializeKeypair(); err != nil {
-		return err
-	}
-
-	ln, err := net.Listen("tcp", envconfig.Host().Host)
-	if err != nil {
-		return err
-	}
-
-	err = server.Serve(ln)
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-
-	return err
-}
-
-func initializeKeypair() error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-
-	privKeyPath := filepath.Join(home, ".ollama", "id_ed25519")
-	pubKeyPath := filepath.Join(home, ".ollama", "id_ed25519.pub")
-
-	_, err = os.Stat(privKeyPath)
-	if os.IsNotExist(err) {
-		fmt.Printf("Couldn't find '%s'. Generating new private key.\n", privKeyPath)
-		cryptoPublicKey, cryptoPrivateKey, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return err
-		}
-
-		privateKeyBytes, err := ssh.MarshalPrivateKey(cryptoPrivateKey, "")
-		if err != nil {
-			return err
-		}
-
-		if err := os.MkdirAll(filepath.Dir(privKeyPath), 0o755); err != nil {
-			return fmt.Errorf("could not create directory %w", err)
-		}
-
-		if err := os.WriteFile(privKeyPath, pem.EncodeToMemory(privateKeyBytes), 0o600); err != nil {
-			return err
-		}
-
-		sshPublicKey, err := ssh.NewPublicKey(cryptoPublicKey)
-		if err != nil {
-			return err
-		}
-
-		publicKeyBytes := ssh.MarshalAuthorizedKey(sshPublicKey)
-
-		if err := os.WriteFile(pubKeyPath, publicKeyBytes, 0o644); err != nil {
-			return err
-		}
-
-		fmt.Printf("Your new public key is: \n\n%s\n", publicKeyBytes)
-	}
-	return nil
-}
-
 func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
@@ -2317,23 +2151,16 @@ func NewCLI() *cobra.Command {
 	rootCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 
 	createCmd := &cobra.Command{
-		Use:   "create MODEL",
-		Short: "Create a model",
-		Args:  cobra.ExactArgs(1),
-		PreRunE: func(cmd *cobra.Command, args []string) error {
-			// Skip server check for experimental mode (writes directly to disk)
-			if experimental, _ := cmd.Flags().GetBool("experimental"); experimental {
-				return nil
-			}
-			return checkServerHeartbeat(cmd, args)
-		},
-		RunE: CreateHandler,
+		Use:     "create MODEL",
+		Short:   "Create a model",
+		Args:    cobra.ExactArgs(1),
+		PreRunE: checkServerHeartbeat,
+		RunE:    CreateHandler,
 	}
 
 	createCmd.Flags().StringP("file", "f", "", "Name of the Modelfile (default \"Modelfile\")")
 	createCmd.Flags().StringP("quantize", "q", "", "Quantize model to this level (e.g. q4_K_M)")
 	createCmd.Flags().String("draft-quantize", "", "Quantize draft model to this level")
-	createCmd.Flags().Bool("experimental", false, "Enable experimental safetensors model creation")
 
 	showCmd := &cobra.Command{
 		Use:     "show MODEL",
@@ -2375,14 +2202,6 @@ func NewCLI() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    StopHandler,
-	}
-
-	serveCmd := &cobra.Command{
-		Use:     "serve",
-		Aliases: []string{"start"},
-		Short:   "Start Ollama",
-		Args:    cobra.ExactArgs(0),
-		RunE:    RunServer,
 	}
 
 	pullCmd := &cobra.Command{
@@ -2549,27 +2368,13 @@ func NewCLI() *cobra.Command {
 		RunE:    DeleteHandler,
 	}
 
-	runnerCmd := &cobra.Command{
-		Use:    "runner",
-		Hidden: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runner.Execute(os.Args[1:])
-		},
-		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
-	}
-	runnerCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
-		_ = runner.Execute(args[1:])
-	})
-
-	var gpuDiscoverLibDirs []string
-	gpuDiscoverCmd := &cobra.Command{
-		Use:    "gpu-discover",
-		Hidden: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return discover.RunNativeProbeCommand(cmd.Context(), gpuDiscoverLibDirs, os.Stdout)
-		},
-	}
-	gpuDiscoverCmd.Flags().StringArrayVar(&gpuDiscoverLibDirs, "lib-dir", nil, "Ollama runtime library directory")
+	// OAICA thin-client: "runner" (in-process inference subprocess) and
+	// "gpu-discover" (local hardware probing) both belong to Ollama's local
+	// server, which this fork never runs (OAICA_FORK_PLAN.md option 2) —
+	// dropped, along with the `runner`/`discover` imports, to keep the
+	// cgo-only x/mlxrunner + discover subsystems out of the dependency
+	// graph entirely (they don't cross-compile for darwin/windows without
+	// a native cgo toolchain for those targets).
 
 	envVars := envconfig.AsMap()
 
@@ -2586,42 +2391,16 @@ func NewCLI() *cobra.Command {
 		psCmd,
 		copyCmd,
 		deleteCmd,
-		serveCmd,
 	} {
 		switch cmd {
 		case runCmd:
 			appendEnvDocs(cmd, []envconfig.EnvVar{envVars["OLLAMA_EDITOR"], envVars["OLLAMA_HOST"], envVars["OLLAMA_NOHISTORY"]})
-		case serveCmd:
-			appendEnvDocs(cmd, []envconfig.EnvVar{
-				envVars["OLLAMA_DEBUG"],
-				envVars["OLLAMA_HOST"],
-				envVars["OLLAMA_CONTEXT_LENGTH"],
-				envVars["OLLAMA_KEEP_ALIVE"],
-				envVars["OLLAMA_MAX_LOADED_MODELS"],
-				envVars["OLLAMA_MAX_TRANSFER_STREAMS"],
-				envVars["OLLAMA_MAX_QUEUE"],
-				envVars["OLLAMA_MODELS"],
-				envVars["OLLAMA_NUM_PARALLEL"],
-				envVars["OLLAMA_NO_CLOUD"],
-				envVars["OLLAMA_NOPRUNE"],
-				envVars["OLLAMA_ORIGINS"],
-				envVars["OLLAMA_SCHED_SPREAD"],
-				envVars["OLLAMA_FLASH_ATTENTION"],
-				envVars["OLLAMA_KV_CACHE_TYPE"],
-				envVars["OLLAMA_LLM_LIBRARY"],
-				envVars["OLLAMA_GPU_OVERHEAD"],
-				envVars["OLLAMA_IGPU_ENABLE"],
-				envVars["LLAMA_ARG_FIT"],
-				envVars["LLAMA_ARG_FIT_TARGET"],
-				envVars["OLLAMA_LOAD_TIMEOUT"],
-			})
 		default:
 			appendEnvDocs(cmd, envs)
 		}
 	}
 
 	rootCmd.AddCommand(
-		serveCmd,
 		createCmd,
 		showCmd,
 		runCmd,
@@ -2636,8 +2415,6 @@ func NewCLI() *cobra.Command {
 		psCmd,
 		copyCmd,
 		deleteCmd,
-		runnerCmd,
-		gpuDiscoverCmd,
 		authCmd,
 		launch.LaunchCmd(checkServerHeartbeat, runInteractiveTUI),
 	)

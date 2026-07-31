@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -142,9 +143,19 @@ func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
 	}
 	msg := out.Choices[0].Message
 	if msg.Content == "" && msg.ReasoningContent != "" {
-		return msg.ReasoningContent, nil
+		return stripThinkTags(msg.ReasoningContent), nil
 	}
-	return msg.Content, nil
+	return stripThinkTags(msg.Content), nil
+}
+
+// Some backends (MiniMax M3, notably — enable_thinking/reasoning.enabled are
+// silently IGNORED by its endpoint) inline a literal <think>...</think>
+// block into `content` itself rather than using a separate reasoning_content
+// field. Strip it so the CLI shows only the actual answer.
+var thinkTagRe = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
+
+func stripThinkTags(s string) string {
+	return strings.TrimSpace(thinkTagRe.ReplaceAllString(s, ""))
 }
 
 // oaicaModelExists checks a candidate name against the live /v1/models list.

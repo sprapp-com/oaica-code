@@ -56,7 +56,6 @@ $DebugInstall = [bool]$env:OAICA_DEBUG
 
 # OAICA_DOWNLOAD_URL for developer testing only
 $DownloadBaseURL = if ($env:OAICA_DOWNLOAD_URL) { $env:OAICA_DOWNLOAD_URL.TrimEnd('/') } else { "https://oaica.com/download" }
-$InnoSetupUninstallGuid = "{44E83376-CE68-45EB-8FC1-393500EB558C}_is1"
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -70,43 +69,6 @@ function Write-Status {
 function Write-Step {
     param([string]$Message)
     if ($DebugInstall) { Write-Host ">>> $Message" -ForegroundColor Cyan }
-}
-
-function Test-Signature {
-    param([string]$FilePath)
-
-    $sig = Get-AuthenticodeSignature -FilePath $FilePath
-    if ($sig.Status -ne "Valid") {
-        Write-Status "  Signature status: $($sig.Status)"
-        return $false
-    }
-
-    # TODO: once OAICA has a code-signing cert, pin the organization name
-    # here the same way upstream Ollama pins "O=Ollama Inc." — e.g.
-    #   if ($subject -notmatch "(^|, )O=<Org Name>\.(,|$)") { return $false }
-    # Until then we only verify the binary carries ANY valid Authenticode
-    # signature (tamper/corruption check), not that it's from a specific
-    # signer — this is weaker than upstream's check, not equivalent to it.
-    $subject = $sig.SignerCertificate.Subject
-    Write-Status "  Signature valid: $subject"
-    return $true
-}
-
-function Find-InnoSetupInstall {
-    # Check both HKCU (per-user) and HKLM (per-machine) locations
-    $possibleKeys = @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$InnoSetupUninstallGuid",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$InnoSetupUninstallGuid",
-        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$InnoSetupUninstallGuid"
-    )
-
-    foreach ($key in $possibleKeys) {
-        if (Test-Path $key) {
-            Write-Status "  Found install at: $key"
-            return $key
-        }
-    }
-    return $null
 }
 
 function Update-SessionPath {
@@ -205,37 +167,24 @@ function Invoke-Download {
 function Invoke-Uninstall {
     Write-Step "Uninstalling OAICA"
 
-    $regKey = Find-InnoSetupInstall
-    if (-not $regKey) {
+    # Plain-file install (no Inno Setup registry entry) — remove the
+    # install dir directly and strip it from the persistent user PATH.
+    $oaicaDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "Programs\OAICA" }
+
+    if (-not (Test-Path $oaicaDir)) {
         Write-Host ">>> OAICA is not installed."
         return
     }
 
-    $uninstallString = (Get-ItemProperty -Path $regKey).UninstallString
-    if (-not $uninstallString) {
-        Write-Warning "No uninstall string found in registry"
-        return
+    Remove-Item $oaicaDir -Recurse -Force
+
+    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    $newPath = ($userPath -split ';' | Where-Object { $_ -ne $oaicaDir }) -join ';'
+    if ($newPath -ne $userPath) {
+        [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
     }
 
-    # Strip quotes if present
-    $uninstallExe = $uninstallString -replace '"', ''
-    Write-Status "  Uninstaller: $uninstallExe"
-
-    if (-not (Test-Path $uninstallExe)) {
-        Write-Warning "Uninstaller not found at: $uninstallExe"
-        return
-    }
-
-    Write-Host ">>> Launching uninstaller..."
-    # Run with GUI so user can choose whether to keep models
-    Start-Process -FilePath $uninstallExe -Wait
-
-    # Verify removal
-    if (Find-InnoSetupInstall) {
-        Write-Warning "Uninstall may not have completed"
-    } else {
-        Write-Host ">>> OAICA has been uninstalled."
-    }
+    Write-Host ">>> OAICA has been uninstalled."
 }
 
 # --------------------------------------------------------------------------
@@ -243,66 +192,55 @@ function Invoke-Uninstall {
 # --------------------------------------------------------------------------
 
 function Invoke-Install {
-    # Determine installer URL
-    if ($Version) {
-        $installerUrl = "$DownloadBaseURL/OAICASetup.exe?version=$Version"
-    } else {
-        $installerUrl = "$DownloadBaseURL/OAICASetup.exe"
+    # OAICA is a thin CLI (talks to api.sprapp.com — OAICA_FORK_PLAN.md
+    # option 2), not a GUI desktop app, so unlike upstream Ollama this
+    # ships a plain oaica.exe in a zip, not an Inno Setup installer — no
+    # Authenticode signature to verify either (no code-signing cert yet;
+    # see the TODO in Test-Signature above for when one exists).
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+        throw "No Windows ARM64 build yet — only amd64."
     }
 
-    # Download installer
+    if ($Version) {
+        $zipUrl = "$DownloadBaseURL/oaica-windows-amd64.zip?version=$Version"
+    } else {
+        $zipUrl = "$DownloadBaseURL/oaica-windows-amd64.zip"
+    }
+
     Write-Step "Downloading OAICA"
     if (-not $DebugInstall) {
         Write-Host ">>> Downloading OAICA for Windows..."
     }
 
-    $tempInstaller = Join-Path $env:TEMP "OAICASetup.exe"
-    Invoke-Download -Url $installerUrl -OutFile $tempInstaller
+    $tempZip = Join-Path $env:TEMP "oaica-windows-amd64.zip"
+    Invoke-Download -Url $zipUrl -OutFile $tempZip
 
-    # Verify signature
-    Write-Step "Verifying signature"
-    if (-not (Test-Signature -FilePath $tempInstaller)) {
-        Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
-        throw "Installer signature verification failed"
-    }
+    $oaicaDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "Programs\OAICA" }
 
-    # Build installer arguments
-    $installerArgs = "/VERYSILENT /NORESTART /SUPPRESSMSGBOXES"
-    if ($InstallDir) {
-        $installerArgs += " /DIR=`"$InstallDir`""
-    }
-    Write-Status "  Installer args: $installerArgs"
-
-    # Run installer
-    Write-Step "Installing OAICA"
+    Write-Step "Installing OAICA to $oaicaDir"
     if (-not $DebugInstall) {
         Write-Host ">>> Installing OAICA..."
     }
 
-    # Create upgrade marker so the app starts hidden
-    # The app checks for this file on startup and removes it after
-    $markerDir = Join-Path $env:LOCALAPPDATA "OAICA"
-    $markerFile = Join-Path $markerDir "upgraded"
-    if (-not (Test-Path $markerDir)) {
-        New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
-    }
-    New-Item -ItemType File -Path $markerFile -Force | Out-Null
-    Write-Status "  Created upgrade marker: $markerFile"
+    $tempExtract = Join-Path $env:TEMP "oaica-extract"
+    if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force }
+    Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
 
-    # Start installer and wait for just the installer process (not children)
-    # Using -Wait would wait for OAICA to exit too, which we don't want
-    $proc = Start-Process -FilePath $tempInstaller `
-        -ArgumentList $installerArgs `
-        -PassThru
-    $proc.WaitForExit()
-
-    if ($proc.ExitCode -ne 0) {
-        Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
-        throw "Installation failed with exit code $($proc.ExitCode)"
+    if (-not (Test-Path $oaicaDir)) {
+        New-Item -ItemType Directory -Path $oaicaDir -Force | Out-Null
     }
+    Copy-Item -Path (Join-Path $tempExtract "bin\oaica.exe") -Destination (Join-Path $oaicaDir "oaica.exe") -Force
 
     # Cleanup
-    Remove-Item $tempInstaller -Force -ErrorAction SilentlyContinue
+    Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+    Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Persist PATH for future sessions (user scope, no admin needed)
+    $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if ($userPath -notlike "*$oaicaDir*") {
+        [Environment]::SetEnvironmentVariable("PATH", "$userPath;$oaicaDir", "User")
+        Write-Status "  Added $oaicaDir to persistent user PATH"
+    }
 
     # Update PATH in current session so 'oaica' works immediately
     Write-Step "Updating session PATH"
