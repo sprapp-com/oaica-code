@@ -75,17 +75,23 @@ type oaicaChatMessage struct {
 }
 
 type oaicaChatRequest struct {
-	Model       string              `json:"model"`
-	Messages    []oaicaChatMessage  `json:"messages"`
-	MaxTokens   int                 `json:"max_tokens,omitempty"`
-	Temperature float64             `json:"temperature"`
-	Stream      bool                `json:"stream"`
+	Model             string              `json:"model"`
+	Messages          []oaicaChatMessage  `json:"messages"`
+	MaxTokens         int                 `json:"max_tokens,omitempty"`
+	Temperature       float64             `json:"temperature"`
+	Stream            bool                `json:"stream"`
+	// Some backends (small reasoning-tuned models, e.g. Qwen3.5) default to
+	// emitting a hidden <think> block that can consume the entire max_tokens
+	// budget, leaving `content` empty. Off by default; llama.cpp/vLLM ignore
+	// unknown fields so this is a no-op on backends that don't support it.
+	ChatTemplateKwargs map[string]bool `json:"chat_template_kwargs,omitempty"`
 }
 
 type oaicaChatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
 	Error *struct {
@@ -97,11 +103,12 @@ type oaicaChatResponse struct {
 // the assistant's reply text.
 func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
 	reqBody := oaicaChatRequest{
-		Model:       model,
-		Messages:    messages,
-		MaxTokens:   1024,
-		Temperature: 0.4,
-		Stream:      false,
+		Model:              model,
+		Messages:           messages,
+		MaxTokens:          1024,
+		Temperature:        0.4,
+		Stream:             false,
+		ChatTemplateKwargs: map[string]bool{"enable_thinking": false},
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
@@ -133,7 +140,11 @@ func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
-	return out.Choices[0].Message.Content, nil
+	msg := out.Choices[0].Message
+	if msg.Content == "" && msg.ReasoningContent != "" {
+		return msg.ReasoningContent, nil
+	}
+	return msg.Content, nil
 }
 
 // oaicaModelExists checks a candidate name against the live /v1/models list.
