@@ -65,13 +65,16 @@ func oaicaLiveModels() []string {
 	return names
 }
 
-// oaicaLiveLoraNames fetches /v1/lora — configured (not necessarily
-// active) LoRA adapter names, purely informational in the launch picker
-// today (see this file's doc comment: composing a LoRA into a single
-// `model` string Claude Code sends onward isn't supported by the router
-// yet — that's the real blocker to fully wiring LoRA selection here, not
-// this fetch itself).
-func oaicaLiveLoraNames() []string {
+type oaicaLoraEntry struct {
+	name  string
+	model string
+}
+
+// oaicaLiveLoraEntries fetches /v1/lora — configured (not necessarily
+// active) LoRA adapters, each with the base model it's registered on
+// (needed to build a valid "<model>+<lora>" composite name — the router
+// rejects stacking adapters registered on different backends).
+func oaicaLiveLoraEntries() []oaicaLoraEntry {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/lora", nil)
 	if err != nil {
 		return nil
@@ -88,15 +91,16 @@ func oaicaLiveLoraNames() []string {
 	}
 	var list struct {
 		Data []struct {
-			Name string `json:"name"`
+			Name  string `json:"name"`
+			Model string `json:"model"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil
 	}
-	names := make([]string, 0, len(list.Data))
+	entries := make([]oaicaLoraEntry, 0, len(list.Data))
 	for _, l := range list.Data {
-		names = append(names, l.Name)
+		entries = append(entries, oaicaLoraEntry{name: l.Name, model: l.Model})
 	}
-	return names
+	return entries
 }

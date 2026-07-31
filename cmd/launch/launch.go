@@ -1202,28 +1202,36 @@ func (c *launcherClient) recommendations(ctx context.Context) []ModelItem {
 // ModelRecommendationsExperimental cloud-catalog API — the latter doesn't
 // know about this fork's actual backends and was surfacing Ollama's
 // generic upstream catalog (glm-5.2:cloud, kimi-k2.7-code:cloud, ...) in
-// the picker. LoRA adapters (/v1/lora) are listed for visibility in the
-// description but aren't independently selectable here yet: the picker
-// hands a single `model` string on to the launched tool (e.g. Claude
-// Code), and the router doesn't yet parse a composite model+lora name —
-// that's a real follow-up, not something to fake here.
+// the picker.
+//
+// LoRA adapters (/v1/lora) get their own selectable entries too, using the
+// router's composite "<model>+<lora>" name syntax — the picker hands a
+// single `model` string on to the launched tool (e.g. Claude Code), and
+// the router now parses that syntax and injects the per-request `lora`
+// field itself, so a plain composite name is all any OpenAI-compatible
+// caller needs. One entry per adapter (not every stacking combination —
+// that's combinatorial; use oaica-code's own `/lora stack` for anything
+// beyond a single adapter).
 func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelItem, error) {
 	names := oaicaLiveModels()
 	if len(names) == 0 {
 		return nil, errors.New("no models available from OAICA router")
 	}
-	loraNames := oaicaLiveLoraNames()
-	loraSuffix := ""
-	if len(loraNames) > 0 {
-		loraSuffix = " · LoRA adapters available: " + strings.Join(loraNames, ", ") + " (use `/lora use <name>` inside the model, not selectable here yet)"
-	}
+	loraEntries := oaicaLiveLoraEntries()
 
-	items := make([]ModelItem, 0, len(names))
+	items := make([]ModelItem, 0, len(names)+len(loraEntries))
 	for _, name := range names {
 		items = append(items, ModelItem{
 			Name:        name,
-			Description: "OAICA model (api.sprapp.com)" + loraSuffix,
+			Description: "OAICA model (api.sprapp.com)",
 			Recommended: true,
+		})
+	}
+	for _, entry := range loraEntries {
+		items = append(items, ModelItem{
+			Name:        entry.model + "+" + entry.name,
+			Description: "OAICA model (api.sprapp.com) with LoRA '" + entry.name + "' active — stacked further via oaica-code's /lora stack",
+			Recommended: false,
 		})
 	}
 	return items, nil
