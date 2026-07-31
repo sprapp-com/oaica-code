@@ -2119,23 +2119,7 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 }
 
 func versionHandler(cmd *cobra.Command, _ []string) {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return
-	}
-
-	serverVersion, err := client.Version(cmd.Context())
-	if err != nil {
-		fmt.Println("Warning: could not connect to a running Ollama instance")
-	}
-
-	if serverVersion != "" {
-		fmt.Printf("ollama version is %s\n", serverVersion)
-	}
-
-	if serverVersion != version.Version {
-		fmt.Printf("Warning: client version is %s\n", version.Version)
-	}
+	fmt.Printf("oaica version is %s\n", version.Version)
 }
 
 func appendEnvDocs(cmd *cobra.Command, envs []envconfig.EnvVar) {
