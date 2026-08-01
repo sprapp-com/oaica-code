@@ -306,7 +306,24 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	}
 	noCmoe, _ := cmd.Flags().GetBool("no-cmoe")
 	ncmoe, _ := cmd.Flags().GetInt("ncmoe")
-	threads := runtime.NumCPU()
+	threads, _ := cmd.Flags().GetInt("threads")
+	if threads == 0 {
+		// Default to PHYSICAL cores, not runtime.NumCPU() (logical/SMT
+		// count). Measured on the 6-core/12-thread 4060 laptop: -t 12
+		// (all SMT threads) was WORSE than -t 6 (38.7 vs ~51 tok/s) for
+		// this CPU-offloaded-MoE workload — it's memory-bandwidth-bound,
+		// not compute-bound, so hyperthreads compete for the same cache/
+		// bandwidth without adding real throughput. Go's runtime.NumCPU()
+		// has no portable physical-core query, so approximate with /2 —
+		// wrong on non-SMT hardware (halves real capacity there) but
+		// right on the common consumer laptop/desktop case this command
+		// targets. --threads overrides for anyone who profiles their own
+		// box and finds a different optimum.
+		threads = runtime.NumCPU() / 2
+		if threads < 1 {
+			threads = 1
+		}
+	}
 
 	serveArgs := []string{
 		"-m", modelPath,
