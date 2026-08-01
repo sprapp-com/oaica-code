@@ -47,6 +47,27 @@ func (c *Claude) findPath() (string, error) {
 	return "", fmt.Errorf("claude binary not found")
 }
 
+// RunNative launches the real Claude Code binary with a CLEAN environment
+// — none of the ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN overrides Run()
+// injects to route through OAICA. Lets a user run Claude Code's own
+// native `/login` (Anthropic OAuth device flow) or use a real Claude
+// subscription, completely bypassing the router — a real, deliberate
+// escape hatch from oaica-code's thin-client architecture for anyone who
+// wants genuine upstream Claude Code instead. Exposed as `oaica
+// claude-login` (cmd/claude_native.go).
+func RunNative(args []string) error {
+	claudePath, err := ensureClaudeInstalled()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(claudePath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ() // deliberately untouched — no OAICA env injection at all
+	return cmd.Run()
+}
+
 func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	claudePath, err := ensureClaudeInstalled()
 	if err != nil {

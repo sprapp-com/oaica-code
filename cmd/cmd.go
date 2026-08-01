@@ -2218,6 +2218,19 @@ func NewCLI() *cobra.Command {
 		RunE:   SigninHandler,
 	}
 
+	claudeLoginCmd := &cobra.Command{
+		Use:   "claude-login",
+		Short: "Sign in to real Claude Code (native Anthropic account, bypasses OAICA entirely)",
+		Long: "Launches the real Claude Code binary with a clean environment — none of the\n" +
+			"ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN overrides `oaica launch claude` injects.\n" +
+			"Use this if you want Claude Code's own native `/login` (Anthropic OAuth) or a\n" +
+			"real Claude subscription instead of routing through OAICA's router.",
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.RunNative(args)
+		},
+	}
+
 	signoutCmd := &cobra.Command{
 		Use:   "signout",
 		Short: "Remove your saved OAICA API key",
@@ -2385,6 +2398,7 @@ func NewCLI() *cobra.Command {
 		pushCmd,
 		signinCmd,
 		loginCmd,
+		claudeLoginCmd,
 		signoutCmd,
 		logoutCmd,
 		listCmd,

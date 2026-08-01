@@ -42,6 +42,26 @@ import (
 // — that one authorizes cloud chat calls, this one authorizes downloading
 // raw weights). Distinguishing them matters: a leaked chat API key should
 // never double as a weights-download credential.
+// oaicaHFToken opportunistically finds a HuggingFace token for faster HF
+// pull downloads (public repo, so this is a speed optimization only, never
+// required for correctness) — checks HF_TOKEN first, then the standard
+// location the official `hf`/`huggingface-cli` tools write to, so a user
+// who's already logged in via those tools gets the speedup for free.
+func oaicaHFToken() string {
+	if t := strings.TrimSpace(os.Getenv("HF_TOKEN")); t != "" {
+		return t
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".huggingface", "token"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func oaicaLicenseKeyPath() (string, error) {
 	dir, err := oaicaConfigDir()
 	if err != nil {
@@ -319,6 +339,14 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	req, err := http.NewRequest(http.MethodGet, *manifest.HFURL, nil)
 	if err != nil {
 		return "", err
+	}
+	if hfToken := oaicaHFToken(); hfToken != "" {
+		// The repo is public — a token isn't required for correctness,
+		// only speed. HF explicitly warns unauthenticated requests get
+		// throttled ("Please set a HF_TOKEN to enable higher rate limits
+		// and faster downloads"); opportunistically use one if the user
+		// already has the HF CLI configured locally, but don't require it.
+		req.Header.Set("Authorization", "Bearer "+hfToken)
 	}
 	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(req)
