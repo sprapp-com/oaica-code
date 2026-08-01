@@ -61,7 +61,17 @@ func oaicaLicenseKey() string {
 	return strings.TrimSpace(string(b))
 }
 
+// oaicaModelsDir defaults to ~/.oaica/models but honors OAICA_MODELS_DIR —
+// GGUFs are tens of GB, a home partition is often too small (real report:
+// a user ran out of disk on their home fs). Override to point pulls at a
+// bigger disk without a symlink workaround.
 func oaicaModelsDir() (string, error) {
+	if d := strings.TrimSpace(os.Getenv("OAICA_MODELS_DIR")); d != "" {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return "", err
+		}
+		return d, nil
+	}
 	dir, err := oaicaConfigDir()
 	if err != nil {
 		return "", err
