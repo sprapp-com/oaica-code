@@ -76,8 +76,13 @@ func (c *Claude) envVars(model string) []string {
 	// package's own OAICA client, matching cmd/oaica_client.go's
 	// equivalents) instead — the actual router this whole fork exists to
 	// route through.
+	//
+	// oaicaResolveHostForModel (not oaicaLaunchHost directly) — auto-routes
+	// to a locally running `oaica serve` for this exact model if one exists
+	// (~/.oaica/local_servers.json, health-checked), falling back to the
+	// cloud router otherwise. Explicit OAICA_HOST still overrides both.
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + oaicaLaunchHost(),
+		"ANTHROPIC_BASE_URL=" + oaicaResolveHostForModel(model),
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=" + oaicaLaunchAPIKeyForEnv(),
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",

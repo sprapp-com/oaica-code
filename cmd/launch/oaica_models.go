@@ -28,6 +28,75 @@ func oaicaLaunchHost() string {
 	return "https://api.sprapp.com"
 }
 
+// oaicaLocalServersRegistryEntry mirrors cmd/oaica_pull_serve.go's
+// oaicaLocalServerEntry — `oaica serve` writes this file, this package
+// reads it. Not a shared type (cmd imports launch, not vice versa) — raw
+// JSON shape is the contract between the two files.
+type oaicaLocalServersRegistryEntry struct {
+	Model     string `json:"model"`
+	Origin    string `json:"origin"`
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+}
+
+func oaicaLocalServersRegistryPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica", "local_servers.json"), nil
+}
+
+// oaicaLocalServerEntries reads the registry `oaica serve` maintains and
+// returns only entries whose origin actually responds to /health right
+// now — a stale entry (server crashed without cleanup running, e.g.
+// kill -9) is filtered out here rather than offered as a live option.
+func oaicaLocalServerEntries() []oaicaLocalServersRegistryEntry {
+	path, err := oaicaLocalServersRegistryPath()
+	if err != nil {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var all []oaicaLocalServersRegistryEntry
+	if json.Unmarshal(b, &all) != nil {
+		return nil
+	}
+	live := make([]oaicaLocalServersRegistryEntry, 0, len(all))
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	for _, e := range all {
+		resp, err := client.Get(e.Origin + "/health")
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			live = append(live, e)
+		}
+	}
+	return live
+}
+
+// oaicaResolveHostForModel is what launch integrations (claude.go etc)
+// call instead of oaicaLaunchHost() directly — auto-detects a locally
+// running `oaica serve` for the requested model and routes there, no
+// manual OAICA_HOST needed. Explicit OAICA_HOST still wins if set (that's
+// oaicaLaunchHost()'s own env-var check) — auto-detection only kicks in
+// when the user hasn't overridden anything.
+func oaicaResolveHostForModel(model string) string {
+	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" {
+		return oaicaLaunchHost()
+	}
+	for _, e := range oaicaLocalServerEntries() {
+		if e.Model == model {
+			return e.Origin
+		}
+	}
+	return oaicaLaunchHost()
+}
+
 func oaicaLaunchAuthorize(req *http.Request) {
 	if key := oaicaLaunchAPIKeyForEnv(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -86,7 +155,14 @@ func oaicaLiveModelEntries() []oaicaModelEntry {
 	return entries
 }
 
-func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
+// oaicaFetchCloudModelEntries does the actual GET /v1/models call. Split
+// out from oaicaLiveModelEntriesErr so local-model discovery (below) can
+// proceed independently of cloud reachability/auth — a laptop running
+// `oaica serve` fully offline, or with no OAICA_API_KEY configured at all,
+// must still be able to see and use its own local model. Cloud failure is
+// no longer fatal to the whole function; it only matters if local also
+// comes up empty.
+func oaicaFetchCloudModelEntries() ([]oaicaModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
 	if err != nil {
 		return nil, err
@@ -115,6 +191,53 @@ func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
 		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
+	}
+	return entries, nil
+}
+
+func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
+	entries, cloudErr := oaicaFetchCloudModelEntries()
+
+	// Merge in any locally-served models (`oaica serve`) so the picker
+	// shows BOTH cloud and local in one list — no need to set OAICA_HOST
+	// and re-launch just to see what's running locally. Skipped when
+	// OAICA_HOST is explicitly set: that's the user pinning to ONE host
+	// on purpose, mixing in unrelated local entries would be surprising.
+	// A local entry with the same name as a cloud one REPLACES it in the
+	// list (local takes priority — it's what oaicaResolveHostForModel
+	// would actually route to for that name anyway).
+	//
+	// Runs even when the cloud fetch itself failed (no network, no
+	// OAICA_API_KEY configured, router down) — local discovery must not
+	// depend on cloud reachability, that defeats the point of local
+	// self-host. Only the FINAL error (returned when there are zero
+	// entries from either source) surfaces the cloud failure reason.
+	if strings.TrimSpace(os.Getenv("OAICA_HOST")) == "" {
+		local := oaicaLocalServerEntries()
+		if len(local) > 0 {
+			localNames := make(map[string]bool, len(local))
+			for _, e := range local {
+				localNames[e.Model] = true
+			}
+			deduped := entries[:0]
+			for _, e := range entries {
+				if !localNames[e.ID] {
+					deduped = append(deduped, e)
+				}
+			}
+			entries = deduped
+			for _, e := range local {
+				entries = append(entries, oaicaModelEntry{
+					ID:          e.Model,
+					Description: "⚡ Running locally (" + e.Origin + ") — true self-host, no cloud calls",
+					Stars:       0,
+				})
+			}
+		}
+	}
+
+	if len(entries) == 0 && cloudErr != nil {
+		return nil, cloudErr
 	}
 	return entries, nil
 }

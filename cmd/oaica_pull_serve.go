@@ -20,11 +20,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/ollama/ollama/cmd/launch"
 
 	"github.com/spf13/cobra"
 )
@@ -75,6 +79,84 @@ func oaicaModelPath(model string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, model+".gguf"), nil
+}
+
+// oaicaLocalServersPath is the registry `oaica serve` writes an entry to on
+// startup and removes on clean exit — how `oaica launch`'s picker and
+// per-model host resolution find out a local server exists, without the
+// user having to set OAICA_HOST by hand. See launch/oaica_models.go's
+// oaicaLocalServerEntries/oaicaResolveHostForModel, the readers of this
+// file (cmd package can't import them the other way — this file just
+// writes raw JSON, format is the contract, not a shared Go type).
+func oaicaLocalServersPath() (string, error) {
+	dir, err := oaicaConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "local_servers.json"), nil
+}
+
+type oaicaLocalServerEntry struct {
+	Model     string `json:"model"`
+	Origin    string `json:"origin"`
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+}
+
+func oaicaRegisterLocalServer(model, origin string) error {
+	path, err := oaicaLocalServersPath()
+	if err != nil {
+		return err
+	}
+	entries := oaicaReadLocalServers(path)
+	filtered := entries[:0]
+	for _, e := range entries {
+		if e.Model != model {
+			filtered = append(filtered, e)
+		}
+	}
+	filtered = append(filtered, oaicaLocalServerEntry{
+		Model:     model,
+		Origin:    origin,
+		PID:       os.Getpid(),
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	b, err := json.MarshalIndent(filtered, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+func oaicaUnregisterLocalServer(model string) {
+	path, err := oaicaLocalServersPath()
+	if err != nil {
+		return
+	}
+	entries := oaicaReadLocalServers(path)
+	filtered := entries[:0]
+	for _, e := range entries {
+		if e.Model != model {
+			filtered = append(filtered, e)
+		}
+	}
+	b, err := json.MarshalIndent(filtered, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(path, b, 0o600)
+}
+
+func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var entries []oaicaLocalServerEntry
+	if json.Unmarshal(b, &entries) != nil {
+		return nil
+	}
+	return entries
 }
 
 type oaicaManifest struct {
@@ -325,15 +407,35 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// llama-server binds an INTERNAL port; RunLocalNormalizingProxy sits in
+	// front of it on `port` (the one printed to the user / used as
+	// OAICA_HOST). Two real bugs this fixes vs talking to llama-server
+	// directly:
+	//  1. Claude Code's /v1/messages requests crash llama-server's strict
+	//     Jinja chat template ("System message must be at the beginning")
+	//     — the same bug prism-api-router/src/index.ts's extractModelName
+	//     fixes for cloud requests, ported here since the router isn't in
+	//     the loop for local self-host. See local_proxy.go.
+	//  2. -a <model> sets llama-server's own /v1/models `id` to the
+	//     friendly name instead of the full GGUF file path — without it,
+	//     `oaica launch`'s readiness check (which does GET /v1/models and
+	//     looks for the requested name) reports "model not found" even
+	//     though the server is healthy and serving.
+	internalPort, err := freePort()
+	if err != nil {
+		return err
+	}
+
 	serveArgs := []string{
 		"-m", modelPath,
+		"-a", model,
 		"-ngl", "999",
 		"-c", strconv.Itoa(ctxSize),
 		"-t", strconv.Itoa(threads),
 		"-fa", "on",
 		"-ctk", "q8_0", "-ctv", "q8_0",
 		"--host", "127.0.0.1",
-		"--port", strconv.Itoa(port),
+		"--port", strconv.Itoa(internalPort),
 	}
 	moeMode := "cmoe"
 	switch {
@@ -354,7 +456,57 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	proc.Stderr = os.Stderr
 	proc.Stdin = os.Stdin
 
-	fmt.Fprintf(os.Stderr, "\nOnce healthy, point oaica at it in another shell:\n  export OAICA_HOST=http://127.0.0.1:%d\n  oaica launch claude\n\n", port)
+	proxyErrCh := make(chan error, 1)
+	go func() {
+		proxyErrCh <- launch.RunLocalNormalizingProxy(port, internalPort)
+	}()
 
-	return proc.Run()
+	// Registers this model in ~/.oaica/local_servers.json so `oaica launch`'s
+	// picker and per-model host resolution pick it up automatically — no
+	// manual OAICA_HOST needed. Unregistered on any exit path (signal or
+	// process death) so a stale/dead entry doesn't linger and get offered
+	// as a live option. Health-checked again at read time regardless (see
+	// launch/oaica_models.go) as a second line of defense against staleness.
+	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
+	if err := oaicaRegisterLocalServer(model, origin); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to register local server (picker won't auto-discover it): %v\n", err)
+	}
+	cleanup := func() { oaicaUnregisterLocalServer(model) }
+	defer cleanup()
+
+	// Calling Process.Kill()/Signal() after the process has already
+	// exited/been Wait()'d is a known Go stdlib gotcha that can panic
+	// rather than just return an error (observed here: llama-server OOMing
+	// and exiting near-instantly races with the proxy failing to bind,
+	// both select branches firing close together). Never let a
+	// best-effort cleanup kill crash the process instead of exiting
+	// cleanly.
+	safeKill := func() {
+		defer func() { recover() }()
+		if proc.Process != nil {
+			proc.Process.Kill()
+		}
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cleanup()
+		safeKill()
+		os.Exit(130)
+	}()
+
+	fmt.Fprintf(os.Stderr, "\nAuto-discovered by `oaica launch` — no OAICA_HOST needed. To point manually anyway:\n  export OAICA_HOST=http://127.0.0.1:%d\n  oaica launch claude\n\n", port)
+
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- proc.Run() }()
+
+	select {
+	case err := <-runErrCh:
+		return err
+	case err := <-proxyErrCh:
+		safeKill()
+		return fmt.Errorf("local proxy failed: %w", err)
+	}
 }
