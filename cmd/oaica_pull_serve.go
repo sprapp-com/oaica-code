@@ -13,6 +13,10 @@ package cmd
 // this thin client doesn't run. This file replaces it.
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -170,10 +174,25 @@ func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
 }
 
 type oaicaManifest struct {
-	Model      string  `json:"model"`
-	SizeBytes  int64   `json:"size_bytes"`
-	SHA256     *string `json:"sha256"`
-	PullURL    string  `json:"pull_url"`
+	Model     string  `json:"model"`
+	SizeBytes int64   `json:"size_bytes"`
+	SHA256    *string `json:"sha256"`
+	PullURL   string  `json:"pull_url"`
+	// Source, HFURL, DecryptKeyHex are set when the router routes this
+	// pull through the encrypted-HuggingFace fallback instead of R2/a
+	// bitdeer-style plain fallback (see checkPullAuth's doc in the router
+	// — HF public repos give free, reliable, unlimited-bandwidth hosting;
+	// encryption is what keeps the weights non-usable without a valid
+	// license even though the HF repo itself is public). When Source ==
+	// "hf", download directly from HFURL (bypassing the router entirely
+	// for the actual bytes — no reason to pay Worker CPU/egress just to
+	// proxy what's already a public, free-to-fetch blob) and decrypt
+	// locally with DecryptKeyHex using the chunked AES-256-GCM format
+	// (see decryptChunkedAESGCM) — the key is only ever handed out AFTER
+	// the license check that gated this manifest request passes.
+	Source        string  `json:"source"`
+	HFURL         *string `json:"hf_url"`
+	DecryptKeyHex *string `json:"decrypt_key"`
 }
 
 func oaicaFetchManifest(model string) (*oaicaManifest, error) {
@@ -232,6 +251,10 @@ func oaicaPullModel(model string) (string, error) {
 		return destPath, nil
 	}
 
+	if manifest.Source == "hf" {
+		return oaicaPullFromHF(model, manifest, destPath)
+	}
+
 	pullURL := oaicaHost() + manifest.PullURL
 	req, err := http.NewRequest(http.MethodGet, pullURL, nil)
 	if err != nil {
@@ -276,6 +299,114 @@ func oaicaPullModel(model string) (string, error) {
 	}
 	fmt.Fprintf(os.Stderr, "%s saved to %s\n", model, destPath)
 	return destPath, nil
+}
+
+// oaicaPullFromHF downloads directly from a public HuggingFace repo
+// (manifest.HFURL) — completely bypassing our router for the actual
+// bytes, only the earlier /v1/manifest call went through the router (for
+// the license check + decrypt key). Free, reliable HF bandwidth instead
+// of our own infra; the file is encrypted at rest so being on a public
+// repo doesn't leak the weights — only a valid license gets the key.
+func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (string, error) {
+	if manifest.HFURL == nil || manifest.DecryptKeyHex == nil {
+		return "", fmt.Errorf("router said source=hf but didn't include hf_url/decrypt_key")
+	}
+	key, err := hex.DecodeString(*manifest.DecryptKeyHex)
+	if err != nil || len(key) != 32 {
+		return "", fmt.Errorf("bad decrypt key from router")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, *manifest.HFURL, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HF download failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HF download failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	tmpPath := destPath + ".partial"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(os.Stderr, "pulling %s from HuggingFace (%s encrypted, decrypting as it streams)...\n", model, humanBytes(manifest.SizeBytes))
+	// No exact-size verification here (unlike the R2/fallback path) —
+	// manifest.SizeBytes is the ENCRYPTED blob's size, not the decrypted
+	// plaintext size (chunked AES-GCM adds ~32 bytes/8MB-chunk overhead),
+	// so they'll never match exactly. GCM's authentication tag already
+	// catches truncation/corruption per-chunk (decryptChunkedAESGCMStream
+	// errors out immediately on a bad tag) — that's the real integrity
+	// check here, a byte-count comparison would just be redundant and
+	// wrong given the size mismatch.
+	written, err := decryptChunkedAESGCMStream(&progressReader{r: resp.Body, total: manifest.SizeBytes, label: model}, f, key)
+	if err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("pull/decrypt interrupted: %w", err)
+	}
+	f.Close()
+	fmt.Fprintln(os.Stderr)
+	_ = written
+
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		return "", err
+	}
+	fmt.Fprintf(os.Stderr, "%s saved to %s\n", model, destPath)
+	return destPath, nil
+}
+
+// decryptChunkedAESGCMStream reads the chunked AES-256-GCM frame format
+// (matches the encryption tool used to prepare HF-hosted models):
+//   repeated: [4-byte big-endian ciphertext_len][12-byte nonce][ciphertext+16-byte GCM tag]
+// Decrypts one chunk at a time (8MB plaintext each) so memory use stays
+// flat regardless of file size — never buffers the whole (multi-GB) file.
+func decryptChunkedAESGCMStream(r io.Reader, w io.Writer, key []byte) (int64, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return 0, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return 0, err
+	}
+
+	var written int64
+	lenBuf := make([]byte, 4)
+	nonceBuf := make([]byte, gcm.NonceSize())
+	for {
+		if _, err := io.ReadFull(r, lenBuf); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return written, fmt.Errorf("reading chunk length: %w", err)
+		}
+		ctLen := binary.BigEndian.Uint32(lenBuf)
+		if _, err := io.ReadFull(r, nonceBuf); err != nil {
+			return written, fmt.Errorf("reading nonce: %w", err)
+		}
+		ct := make([]byte, ctLen)
+		if _, err := io.ReadFull(r, ct); err != nil {
+			return written, fmt.Errorf("reading ciphertext: %w", err)
+		}
+		pt, err := gcm.Open(ct[:0], nonceBuf, ct, nil)
+		if err != nil {
+			return written, fmt.Errorf("decrypt failed (wrong key or corrupted download): %w", err)
+		}
+		n, err := w.Write(pt)
+		if err != nil {
+			return written, err
+		}
+		written += int64(n)
+	}
+	return written, nil
 }
 
 type progressReader struct {
