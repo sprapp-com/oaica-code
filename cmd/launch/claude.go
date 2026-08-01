@@ -53,7 +53,13 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 
-	cmd := exec.Command(claudePath, c.args(model, args)...)
+	// The "--model" flag Claude Code itself sees, and the model name it
+	// puts in each API request, must be the bare name — ":local" is a
+	// picker-selection detail (see oaicaLocalTagSuffix's doc), the local
+	// llama-server/cloud router should never see it.
+	bareModel, _ := oaicaStripLocalTag(model)
+
+	cmd := exec.Command(claudePath, c.args(bareModel, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -77,12 +83,18 @@ func (c *Claude) envVars(model string) []string {
 	// equivalents) instead — the actual router this whole fork exists to
 	// route through.
 	//
-	// oaicaResolveHostForModel (not oaicaLaunchHost directly) — auto-routes
-	// to a locally running `oaica serve` for this exact model if one exists
-	// (~/.oaica/local_servers.json, health-checked), falling back to the
-	// cloud router otherwise. Explicit OAICA_HOST still overrides both.
+	// oaicaResolveHostForModel — routes to a locally running `oaica serve`
+	// ONLY when the caller picked the explicit "<model>:local" entry
+	// (bare name always means cloud now, see oaicaLocalTagSuffix's doc).
+	// Explicit OAICA_HOST still overrides both. The bare model name (tag
+	// stripped) is what actually goes to the backend from here on — the
+	// tag is a picker-selection detail, the local llama-server/cloud
+	// router should never see it.
+	host := oaicaResolveHostForModel(model)
+	bareModel, _ := oaicaStripLocalTag(model)
+
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + oaicaResolveHostForModel(model),
+		"ANTHROPIC_BASE_URL=" + host,
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=" + oaicaLaunchAPIKeyForEnv(),
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
@@ -91,7 +103,7 @@ func (c *Claude) envVars(model string) []string {
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
 	}
 
-	env = append(env, c.modelEnvVars(model)...)
+	env = append(env, c.modelEnvVars(bareModel)...)
 	return env
 }
 

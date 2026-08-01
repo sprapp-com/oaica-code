@@ -79,20 +79,44 @@ func oaicaLocalServerEntries() []oaicaLocalServersRegistryEntry {
 	return live
 }
 
+// oaicaLocalTagSuffix marks a picker entry as explicitly local — Ollama's
+// own "name:tag" convention (e.g. "llama3:8b"), reused here so the picker
+// can show "kat-coder-i-compact" (cloud) and "kat-coder-i-compact:local"
+// (this box's own `oaica serve`) as two DISTINCT, both-selectable entries
+// instead of one silently shadowing the other. Deliberate design choice:
+// an earlier version had the bare name auto-prefer local when one was
+// running, which meant picking what LOOKED like the cloud entry could
+// silently route local — selecting from a menu should mean what it says.
+const oaicaLocalTagSuffix = ":local"
+
+func oaicaStripLocalTag(model string) (base string, wasLocal bool) {
+	if strings.HasSuffix(model, oaicaLocalTagSuffix) {
+		return strings.TrimSuffix(model, oaicaLocalTagSuffix), true
+	}
+	return model, false
+}
+
 // oaicaResolveHostForModel is what launch integrations (claude.go etc)
-// call instead of oaicaLaunchHost() directly — auto-detects a locally
-// running `oaica serve` for the requested model and routes there, no
-// manual OAICA_HOST needed. Explicit OAICA_HOST still wins if set (that's
-// oaicaLaunchHost()'s own env-var check) — auto-detection only kicks in
-// when the user hasn't overridden anything.
+// call instead of oaicaLaunchHost() directly. Explicit OAICA_HOST always
+// wins (user pinning beats everything). Otherwise: a "<model>:local" tag
+// forces local (the exact entry the picker shows for a running `oaica
+// serve`); the bare name always means cloud — no silent local preference,
+// see oaicaLocalTagSuffix's doc for why.
 func oaicaResolveHostForModel(model string) string {
 	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" {
 		return oaicaLaunchHost()
 	}
-	for _, e := range oaicaLocalServerEntries() {
-		if e.Model == model {
-			return e.Origin
+	base, wasLocal := oaicaStripLocalTag(model)
+	if wasLocal {
+		for _, e := range oaicaLocalServerEntries() {
+			if e.Model == base {
+				return e.Origin
+			}
 		}
+		// Tagged :local but no matching live server (killed since the
+		// picker was built, e.g.) — fall through to cloud rather than
+		// silently failing; oaicaModelIsReady's own check will have
+		// already caught a genuinely nonexistent model earlier.
 	}
 	return oaicaLaunchHost()
 }
@@ -198,14 +222,14 @@ func oaicaFetchCloudModelEntries() ([]oaicaModelEntry, error) {
 func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	entries, cloudErr := oaicaFetchCloudModelEntries()
 
-	// Merge in any locally-served models (`oaica serve`) so the picker
-	// shows BOTH cloud and local in one list — no need to set OAICA_HOST
-	// and re-launch just to see what's running locally. Skipped when
-	// OAICA_HOST is explicitly set: that's the user pinning to ONE host
-	// on purpose, mixing in unrelated local entries would be surprising.
-	// A local entry with the same name as a cloud one REPLACES it in the
-	// list (local takes priority — it's what oaicaResolveHostForModel
-	// would actually route to for that name anyway).
+	// Merge in any locally-served models (`oaica serve`) as SEPARATE,
+	// distinctly-tagged entries ("<model>:local", Ollama's own name:tag
+	// convention) — not a replacement of the cloud entry. Selecting from a
+	// menu should mean exactly what it says: pick "kat-coder-i-compact"
+	// and you get cloud, pick "kat-coder-i-compact:local" and you get
+	// this box's own server, both visible and choosable in the same list.
+	// Skipped when OAICA_HOST is explicitly set: that's the user pinning
+	// to ONE host on purpose, mixing in local entries would be surprising.
 	//
 	// Runs even when the cloud fetch itself failed (no network, no
 	// OAICA_API_KEY configured, router down) — local discovery must not
@@ -213,26 +237,12 @@ func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	// self-host. Only the FINAL error (returned when there are zero
 	// entries from either source) surfaces the cloud failure reason.
 	if strings.TrimSpace(os.Getenv("OAICA_HOST")) == "" {
-		local := oaicaLocalServerEntries()
-		if len(local) > 0 {
-			localNames := make(map[string]bool, len(local))
-			for _, e := range local {
-				localNames[e.Model] = true
-			}
-			deduped := entries[:0]
-			for _, e := range entries {
-				if !localNames[e.ID] {
-					deduped = append(deduped, e)
-				}
-			}
-			entries = deduped
-			for _, e := range local {
-				entries = append(entries, oaicaModelEntry{
-					ID:          e.Model,
-					Description: "⚡ Running locally (" + e.Origin + ") — true self-host, no cloud calls",
-					Stars:       0,
-				})
-			}
+		for _, e := range oaicaLocalServerEntries() {
+			entries = append(entries, oaicaModelEntry{
+				ID:          e.Model + oaicaLocalTagSuffix,
+				Description: "⚡ Local — running on this machine (" + e.Origin + "), no cloud calls, works offline",
+				Stars:       5,
+			})
 		}
 	}
 
