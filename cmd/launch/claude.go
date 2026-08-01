@@ -59,16 +59,34 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	// llama-server/cloud router should never see it.
 	bareModel, _ := oaicaStripLocalTag(model)
 
+	// Route through a local logging+forwarding proxy instead of pointing
+	// ANTHROPIC_BASE_URL straight at the resolved host — logs
+	// model/message-size/hard-signal features to ~/.oaica/requests.log
+	// (never sent anywhere, no server cost) so we have real labeled data
+	// to eventually evaluate/improve the router's flashplan classifier,
+	// which has never been measured against real traffic. See
+	// request_log.go's doc comment for the full reasoning. Falls back to
+	// talking to the real host directly if the proxy fails to start —
+	// logging must never be able to break a real launch.
+	realHost := oaicaResolveHostForModel(model)
+	anthropicBaseURL := realHost
+	if ln, port, err := ListenLocalLoggingProxy(); err == nil {
+		go func() {
+			_ = RunLocalLoggingProxy(ln, realHost) // best-effort — see request_log.go
+		}()
+		anthropicBaseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	}
+
 	cmd := exec.Command(claudePath, c.args(bareModel, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	cmd.Env = append(os.Environ(), c.envVars(model)...)
+	cmd.Env = append(os.Environ(), c.envVars(model, anthropicBaseURL)...)
 	return cmd.Run()
 }
 
-func (c *Claude) envVars(model string) []string {
+func (c *Claude) envVars(model, anthropicBaseURL string) []string {
 	// THIS WAS THE REAL BUG (found via a live user repro that persisted
 	// through multiple other fixes): envconfig.Host() reads OLLAMA_HOST,
 	// defaulting to 127.0.0.1:11434 — a REAL, unrelated local Ollama
@@ -90,11 +108,10 @@ func (c *Claude) envVars(model string) []string {
 	// stripped) is what actually goes to the backend from here on — the
 	// tag is a picker-selection detail, the local llama-server/cloud
 	// router should never see it.
-	host := oaicaResolveHostForModel(model)
 	bareModel, _ := oaicaStripLocalTag(model)
 
 	env := []string{
-		"ANTHROPIC_BASE_URL=" + host,
+		"ANTHROPIC_BASE_URL=" + anthropicBaseURL,
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=" + oaicaLaunchAPIKeyForEnv(),
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",

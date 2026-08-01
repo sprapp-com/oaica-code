@@ -8,8 +8,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/ollama/ollama/envconfig"
 )
 
 func TestClaudeIntegration(t *testing.T) {
@@ -347,11 +345,20 @@ func TestClaudeEnvVars(t *testing.T) {
 		return m
 	}
 
-	got := envMap(c.envVars("llama3.2"))
+	// envVars takes the resolved ANTHROPIC_BASE_URL as an explicit
+	// parameter now (Run() routes it through a local logging proxy first,
+	// see request_log.go) rather than resolving it internally via
+	// envconfig.Host() — that was the real "flashplan not found" bug
+	// (OLLAMA_HOST default 127.0.0.1:11434, an unrelated real local
+	// Ollama server), fixed in commit 7530c3d5. ANTHROPIC_AUTH_TOKEN
+	// comes from oaicaLaunchAPIKeyForEnv() (OAICA_API_KEY env, falling
+	// back to ~/.oaica/api_key) — no OAICA key configured in this test
+	// environment, so it's expected empty, not the old hardcoded "ollama".
+	got := envMap(c.envVars("llama3.2", "http://127.0.0.1:9999"))
 	for key, want := range map[string]string{
-		"ANTHROPIC_BASE_URL":                  envconfig.Host().String(),
+		"ANTHROPIC_BASE_URL":                  "http://127.0.0.1:9999",
 		"ANTHROPIC_API_KEY":                   "",
-		"ANTHROPIC_AUTH_TOKEN":                "ollama",
+		"ANTHROPIC_AUTH_TOKEN":                oaicaLaunchAPIKeyForEnv(),
 		"CLAUDE_CODE_ATTRIBUTION_HEADER":      "0",
 		"DISABLE_ERROR_REPORTING":             "1",
 		"DISABLE_FEEDBACK_COMMAND":            "1",
