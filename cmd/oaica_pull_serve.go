@@ -264,6 +264,20 @@ func freePort() (int, error) {
 // harmless no-op flag on dense models. Prints the OAICA_HOST export the
 // user needs so `oaica launch`/`oaica run` route to it instead of the
 // cloud router.
+//
+// --ncmoe N overrides -cmoe with llama-server's -ncmoe (keep the MoE
+// experts of only the FIRST N layers on CPU, rest fully on GPU). Measured
+// on an RTX 4060 laptop (8GB VRAM) with kat-coder-i-compact (40 layers,
+// 16.5GB Q4_K_M): the relationship is NOT monotonic — full CPU offload
+// (-cmoe, equivalent to N=40) and near-full (N=34) both beat moderate
+// mixing (N=30, N=36), and N=20 OOM'd. N=34 measured ~25-6x faster than
+// -cmoe depending on prompt-cache warmth. Real cause: every CPU/GPU layer
+// boundary crossing costs a host<->device transfer per token; minimizing
+// the NUMBER of boundary crossings (few GPU-resident layers, all
+// contiguous at the end) beats maximizing GPU-resident layer COUNT once
+// you're VRAM-constrained enough that "mostly GPU" isn't achievable
+// anyway. This is model/hardware-specific — no safe universal default,
+// hence a flag + this note rather than silently overriding -cmoe.
 func ServeHandler(cmd *cobra.Command, args []string) error {
 	model := args[0]
 	modelPath, err := oaicaModelPath(model)
@@ -291,6 +305,7 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		ctxSize = 8192
 	}
 	noCmoe, _ := cmd.Flags().GetBool("no-cmoe")
+	ncmoe, _ := cmd.Flags().GetInt("ncmoe")
 	threads := runtime.NumCPU()
 
 	serveArgs := []string{
@@ -299,14 +314,22 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		"-c", strconv.Itoa(ctxSize),
 		"-t", strconv.Itoa(threads),
 		"-fa", "on",
+		"-ctk", "q8_0", "-ctv", "q8_0",
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(port),
 	}
-	if !noCmoe {
+	moeMode := "cmoe"
+	switch {
+	case ncmoe > 0:
+		serveArgs = append(serveArgs, "-ncmoe", strconv.Itoa(ncmoe))
+		moeMode = fmt.Sprintf("ncmoe=%d", ncmoe)
+	case !noCmoe:
 		serveArgs = append(serveArgs, "-cmoe")
+	default:
+		moeMode = "off"
 	}
 
-	fmt.Fprintf(os.Stderr, "starting %s locally on 127.0.0.1:%d (ctx=%d, threads=%d, cmoe=%v)...\n", model, port, ctxSize, threads, !noCmoe)
+	fmt.Fprintf(os.Stderr, "starting %s locally on 127.0.0.1:%d (ctx=%d, threads=%d, moe=%s)...\n", model, port, ctxSize, threads, moeMode)
 	fmt.Fprintf(os.Stderr, "%s\n", llamaServer+" "+strings.Join(serveArgs, " "))
 
 	proc := exec.Command(llamaServer, serveArgs...)

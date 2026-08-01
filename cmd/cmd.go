@@ -2190,6 +2190,7 @@ func NewCLI() *cobra.Command {
 	serveCmd.Flags().Int("port", 0, "Port to bind (default: auto-pick a free port)")
 	serveCmd.Flags().Int("ctx-size", 8192, "Context size")
 	serveCmd.Flags().Bool("no-cmoe", false, "Disable CPU-RAM MoE expert offload (needs much more VRAM without it)")
+	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU), overrides -cmoe. Tune per model/GPU — see oaica_pull_serve.go's ServeHandler doc for why the fastest N usually isn't 'as many GPU layers as fit'")
 
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
