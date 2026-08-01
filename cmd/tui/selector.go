@@ -61,6 +61,11 @@ type SelectItem struct {
 	Name              string
 	Description       string
 	Recommended       bool
+	// Local marks a model served by this box's own `oaica serve` — see
+	// launch.ModelItem.Local's doc. Renders in its own "Local" section,
+	// always before "Recommended", in the same always-shown (non-
+	// scrolling) region — only the "More" section ever scrolls.
+	Local             bool
 	AvailabilityBadge string
 }
 
@@ -91,6 +96,7 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 			Name:              item.Name,
 			Description:       item.Description,
 			Recommended:       item.Recommended,
+			Local:             item.Local,
 			AvailabilityBadge: item.AvailabilityBadge,
 		}
 	}
@@ -469,14 +475,30 @@ func (m selectorModel) renderContent() string {
 			s.WriteString("\n")
 		}
 	} else {
-		// Split into pinned recommended and scrollable others
-		var recItems, otherItems []int
+		// Split into pinned local, pinned recommended, and scrollable others.
+		// Local and Recommended are BOTH always-shown/non-scrolling (only
+		// "More" scrolls) — Local just gets its own header, rendered
+		// first, so a running `oaica serve` is never ambiguous with a
+		// cloud entry of the same base name.
+		var localItems, recItems, otherItems []int
 		for i, item := range filtered {
-			if item.Recommended {
+			switch {
+			case item.Local:
+				localItems = append(localItems, i)
+			case item.Recommended:
 				recItems = append(recItems, i)
-			} else {
+			default:
 				otherItems = append(otherItems, i)
 			}
+		}
+
+		if len(localItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Local"))
+			s.WriteString("\n")
+			for _, idx := range localItems {
+				m.renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
 		}
 
 		// Always render all recommended items (pinned)
@@ -493,7 +515,7 @@ func (m selectorModel) renderContent() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
@@ -1111,14 +1133,27 @@ func (m multiSelectorModel) View() string {
 			s.WriteString("\n")
 		}
 	} else {
-		// Split into pinned recommended and scrollable others (matches single-select layout)
-		var recItems, otherItems []int
+		// Split into pinned local, pinned recommended, and scrollable
+		// others (matches single-select layout — see the doc comment there).
+		var localItems, recItems, otherItems []int
 		for i, item := range filtered {
-			if item.Recommended {
+			switch {
+			case item.Local:
+				localItems = append(localItems, i)
+			case item.Recommended:
 				recItems = append(recItems, i)
-			} else {
+			default:
 				otherItems = append(otherItems, i)
 			}
+		}
+
+		if len(localItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Local"))
+			s.WriteString("\n")
+			for _, idx := range localItems {
+				renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
 		}
 
 		// Always render all recommended items (pinned)
@@ -1135,7 +1170,7 @@ func (m multiSelectorModel) View() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}

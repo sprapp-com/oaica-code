@@ -251,6 +251,14 @@ type ModelItem struct {
 	Name            string
 	Description     string
 	Recommended     bool
+	// Local marks a model served by this box's own `oaica serve` (the
+	// "<model>:local" tagged entries) — the picker renders these in their
+	// own "Local" section, always before "Recommended", never mixed with
+	// cloud entries. Local implies Recommended (both are always-shown,
+	// non-scrolling groups — see selector.go's render split) but gets its
+	// own header so the choice is visually unambiguous, not just a
+	// description string buried in a shared list.
+	Local           bool
 	VRAMBytes       int64
 	MaxOutputTokens int
 	RequiredPlan    string
@@ -265,6 +273,7 @@ type SelectionItem struct {
 	Name              string
 	Description       string
 	Recommended       bool
+	Local             bool
 	AvailabilityBadge string
 }
 
@@ -1224,17 +1233,19 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 
 	items := make([]ModelItem, 0, len(modelEntries)+len(loraEntries))
 	for _, m := range modelEntries {
+		isLocal := strings.HasSuffix(m.ID, oaicaLocalTagSuffix)
 		desc := m.Description
 		if desc == "" {
 			desc = "OAICA model (api.sprapp.com) — unrated"
 		}
-		if m.Stars > 0 {
+		if m.Stars > 0 && !isLocal {
 			desc = strings.Repeat("★", m.Stars) + strings.Repeat("☆", 5-m.Stars) + "  " + desc
 		}
 		items = append(items, ModelItem{
 			Name:        m.ID,
 			Description: desc,
 			Recommended: m.Stars >= 4,
+			Local:       isLocal,
 		})
 	}
 	for _, entry := range loraEntries {
