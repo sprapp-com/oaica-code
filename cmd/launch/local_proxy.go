@@ -21,6 +21,7 @@ package launch
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -116,8 +117,34 @@ func joinNonEmpty(parts []string, sep string) string {
 // to http://127.0.0.1:backendPort, rewriting the body for POST /v1/messages
 // and POST /v1/chat/completions along the way. Blocks — run in a goroutine.
 func RunLocalNormalizingProxy(listenPort, backendPort int) error {
+	return RunNormalizingProxyOn("127.0.0.1", listenPort, backendPort, "")
+}
+
+// RunNormalizingProxyOn is RunLocalNormalizingProxy with an explicit bind
+// host and optional bearer token.
+//
+// bindHost of "0.0.0.0" exposes the model to the network. apiKey is then
+// the ONLY thing standing between the internet and an unauthenticated
+// inference server, so when a key is set every request must carry
+// `Authorization: Bearer <key>`. An empty key disables the check — fine
+// on loopback, dangerous off it, which is why `oaica serve` refuses that
+// combination unless explicitly forced.
+//
+// Note the BACKEND stays on 127.0.0.1 regardless: llama-server itself is
+// never exposed, only this proxy is, so the auth check cannot be bypassed
+// by hitting the backend port directly from off-box.
+func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey string) error {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", backendPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if apiKey != "" && r.URL.Path != "/health" {
+			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(apiKey)) != 1 {
+				w.Header().Set("content-type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":{"message":"missing or invalid Authorization: Bearer <key>","type":"unauthorized"}}`))
+				return
+			}
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -152,7 +179,7 @@ func RunLocalNormalizingProxy(listenPort, backendPort int) error {
 		io.Copy(w, resp.Body)
 	})
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, listenPort))
 	if err != nil {
 		return err
 	}

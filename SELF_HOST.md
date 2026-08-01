@@ -134,6 +134,48 @@ Headless:
 oaica launch claude --model kat-coder-i-compact:local -- -p "your prompt"
 ```
 
+## 8. Serving it to other machines (OpenAI-compatible API)
+
+By default the API is loopback-only. To expose it on your network:
+
+```bash
+oaica serve kat-coder-i-compact --ncmoe 34 --threads 6 \
+  --host 0.0.0.0 --port 8600 \
+  --api-key "$(openssl rand -hex 24)"
+```
+
+Any OpenAI client then works against it:
+
+```bash
+curl http://<your-ip>:8600/v1/chat/completions \
+  -H "Authorization: Bearer <your-key>" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"kat-coder-i-compact",
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://<your-ip>:8600/v1", api_key="<your-key>")
+```
+
+Endpoints: `/v1/chat/completions`, `/v1/messages` (Anthropic shape, so
+Claude Code works too), `/v1/models`, `/health` (unauthenticated, for
+health checks).
+
+**`--api-key` is mandatory off loopback.** `oaica serve` refuses a
+non-loopback `--host` without one, because that would publish an
+unauthenticated inference server — anyone who can reach the port could use
+your GPU. `--insecure` overrides this, and should only be used on a
+network you genuinely control.
+
+Verified end-to-end over a real LAN address: no key → 401, wrong key →
+401, correct key → real completion.
+
+Note `llama-server` itself stays bound to `127.0.0.1` regardless — only
+OAICA's proxy listens externally, so the auth check cannot be bypassed by
+hitting the backend port from another machine.
+
 ---
 
 ## Troubleshooting

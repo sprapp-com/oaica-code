@@ -531,6 +531,21 @@ func freePort() (int, error) {
 // hence a flag + this note rather than silently overriding -cmoe.
 func ServeHandler(cmd *cobra.Command, args []string) error {
 	model := args[0]
+
+	bindHost, _ := cmd.Flags().GetString("host")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	apiKey, _ := cmd.Flags().GetString("api-key")
+	insecure, _ := cmd.Flags().GetBool("insecure")
+	// Binding off-loopback publishes an inference server. Without a key
+	// anyone who can reach the port can use (and bill) your GPU, so this
+	// is a hard stop rather than a warning — --insecure is the explicit
+	// opt-out for trusted private networks.
+	if bindHost != "127.0.0.1" && bindHost != "localhost" && apiKey == "" && !insecure {
+		return fmt.Errorf("refusing to bind %s without --api-key: that exposes an unauthenticated inference server to the network.\n\nEither set one:\n  oaica serve %s --host %s --api-key \"$(openssl rand -hex 24)\"\n\nor, only on a network you fully trust, pass --insecure", bindHost, model, bindHost)
+	}
+
 	modelPath, err := oaicaModelPath(model)
 	if err != nil {
 		return err
@@ -617,7 +632,13 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		moeMode = "off"
 	}
 
-	fmt.Fprintf(os.Stderr, "starting %s locally on 127.0.0.1:%d (ctx=%d, threads=%d, moe=%s)...\n", model, port, ctxSize, threads, moeMode)
+	auth := "no auth (loopback)"
+	if apiKey != "" {
+		auth = "bearer-token auth"
+	} else if bindHost != "127.0.0.1" && bindHost != "localhost" {
+		auth = "NO AUTH — exposed to the network"
+	}
+	fmt.Fprintf(os.Stderr, "starting %s on %s:%d (ctx=%d, threads=%d, moe=%s, %s)...\n", model, bindHost, port, ctxSize, threads, moeMode, auth)
 	fmt.Fprintf(os.Stderr, "%s\n", llamaServer+" "+strings.Join(serveArgs, " "))
 
 	proc := exec.Command(llamaServer, serveArgs...)
@@ -627,7 +648,7 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 
 	proxyErrCh := make(chan error, 1)
 	go func() {
-		proxyErrCh <- launch.RunLocalNormalizingProxy(port, internalPort)
+		proxyErrCh <- launch.RunNormalizingProxyOn(bindHost, port, internalPort, apiKey)
 	}()
 
 	// Registers this model in ~/.oaica/local_servers.json so `oaica launch`'s
@@ -636,6 +657,9 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	// process death) so a stale/dead entry doesn't linger and get offered
 	// as a live option. Health-checked again at read time regardless (see
 	// launch/oaica_models.go) as a second line of defense against staleness.
+	// Always register loopback for `oaica launch` discovery on this box,
+	// even when also listening on 0.0.0.0 — the local CLI has no reason to
+	// route back in via the external address.
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 	if err := oaicaRegisterLocalServer(model, origin); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to register local server (picker won't auto-discover it): %v\n", err)

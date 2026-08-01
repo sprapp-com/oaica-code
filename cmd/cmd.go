@@ -2191,6 +2191,9 @@ func NewCLI() *cobra.Command {
 	serveCmd.Flags().Int("ctx-size", 8192, "Context size")
 	serveCmd.Flags().Bool("no-cmoe", false, "Disable CPU-RAM MoE expert offload (needs much more VRAM without it)")
 	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU), overrides -cmoe. Tune per model/GPU — see oaica_pull_serve.go's ServeHandler doc for why the fastest N usually isn't 'as many GPU layers as fit'")
+	serveCmd.Flags().String("host", "127.0.0.1", "Address to bind the OpenAI-compatible API to. Use 0.0.0.0 to expose it on the network (requires --api-key)")
+	serveCmd.Flags().String("api-key", "", "Bearer token required on every request. Mandatory when --host is not loopback")
+	serveCmd.Flags().Bool("insecure", false, "Allow a non-loopback --host with no --api-key (trusted private networks only)")
 	serveCmd.Flags().Int("threads", 0, "CPU threads (default: logical CPU count / 2, i.e. physical cores — SMT measured WORSE for CPU-offloaded MoE, see ServeHandler doc)")
 
 	pushCmd := &cobra.Command{
