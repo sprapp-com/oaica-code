@@ -105,6 +105,19 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		}
 	}
 
+	// USER-DEFINED remotes (~/.oaica/remotes.json) -- anyone's own box. These
+	// need no router and no OAICA account; a failure of one is collected, not
+	// propagated, so a sleeping box costs only its own entry.
+	if userModels, uerrs := userRemoteLaunchModels(); len(userModels) > 0 || len(uerrs) > 0 {
+		for _, um := range userModels {
+			if um.Name == "" || seen[um.Name] {
+				continue
+			}
+			seen[um.Name] = true
+			models = append(models, um)
+		}
+	}
+
 	// CLOUD/remote models from the router. A failure here is NOT fatal when we
 	// already have local ones -- it is reported, but the local list still
 	// shows, so `oaica launch` stays usable fully offline.
