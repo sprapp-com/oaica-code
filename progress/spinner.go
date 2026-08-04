@@ -3,25 +3,27 @@ package progress
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type Spinner struct {
-	message      atomic.Value
+	message atomic.Value
+
+	mu           sync.Mutex
 	messageWidth int
 
 	parts []string
 
-	// value and stopped are shared with the goroutine NewSpinner starts: it
-	// advances the frame and observes the stop flag while String renders from
-	// the consumer's goroutine, so plain int/time.Time fields are a data race
-	// the moment a pull renders while the spinner ticks (2026-09-26 audit).
-	value   atomic.Int64
-	stopped atomic.Bool
+	value int
 
-	ticker  *time.Ticker
 	started time.Time
+	stopped time.Time
+
+	stopOnce sync.Once
+	// done is closed to tell the animation loop to exit.
+	done chan struct{}
 }
 
 func NewSpinner(message string) *Spinner {
@@ -30,6 +32,7 @@ func NewSpinner(message string) *Spinner {
 			"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 		},
 		started: time.Now(),
+		done:    make(chan struct{}),
 	}
 	s.SetMessage(message)
 	go s.start()
@@ -41,6 +44,9 @@ func (s *Spinner) SetMessage(message string) {
 }
 
 func (s *Spinner) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var sb strings.Builder
 
 	if message, ok := s.message.Load().(string); ok && len(message) > 0 {
@@ -57,8 +63,8 @@ func (s *Spinner) String() string {
 		sb.WriteString(" ")
 	}
 
-	if !s.stopped.Load() {
-		spinner := s.parts[int(s.value.Load()%int64(len(s.parts)))]
+	if s.stopped.IsZero() {
+		spinner := s.parts[s.value]
 		sb.WriteString(spinner)
 		sb.WriteString(" ")
 	}
@@ -67,15 +73,27 @@ func (s *Spinner) String() string {
 }
 
 func (s *Spinner) start() {
-	s.ticker = time.NewTicker(100 * time.Millisecond)
-	for range s.ticker.C {
-		s.value.Add(1)
-		if s.stopped.Load() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
 			return
+		case <-ticker.C:
+			s.mu.Lock()
+			s.value = (s.value + 1) % len(s.parts)
+			s.mu.Unlock()
 		}
 	}
 }
 
 func (s *Spinner) Stop() {
-	s.stopped.Store(true)
+	s.mu.Lock()
+	if s.stopped.IsZero() {
+		s.stopped = time.Now()
+	}
+	s.mu.Unlock()
+
+	s.stopOnce.Do(func() { close(s.done) })
 }

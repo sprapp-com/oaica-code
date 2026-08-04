@@ -27,46 +27,45 @@ type Progress struct {
 
 	pos int
 
-	ticker *time.Ticker
 	states []State
+
+	stopOnce sync.Once
+	// done is closed to tell the render loop to exit.
+	done chan struct{}
 }
 
 func NewProgress(w io.Writer) *Progress {
-	p := &Progress{w: bufio.NewWriter(w)}
+	p := &Progress{w: bufio.NewWriter(w), done: make(chan struct{})}
 	go p.start()
 	return p
 }
 
-func (p *Progress) stop() bool {
-	p.mu.Lock()
-	states := p.states
-	ticker := p.ticker
-	p.ticker = nil
-	p.mu.Unlock()
+// stop halts the render loop, stopping any spinners first. It reports whether
+// rendering was active and how many lines were last rendered.
+func (p *Progress) stop() (bool, int) {
+	var stopped bool
+	p.stopOnce.Do(func() {
+		close(p.done)
+		stopped = true
+	})
 
-	// stop() races start()'s ticker setup unless both go through p.mu;
-	// render() takes p.mu itself, so it must be called outside the lock.
-	for _, state := range states {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, state := range p.states {
 		if spinner, ok := state.(*Spinner); ok {
 			spinner.Stop()
 		}
 	}
 
-	if ticker != nil {
-		ticker.Stop()
-		p.render()
-		return true
+	if stopped {
+		p.renderLocked()
 	}
-
-	p.mu.Lock()
-	p.pos = len(p.states)
-	p.mu.Unlock()
-
-	return false
+	return stopped, p.pos
 }
 
 func (p *Progress) Stop() bool {
-	stopped := p.stop()
+	stopped, _ := p.stop()
 	if stopped {
 		fmt.Fprint(p.w, "\n")
 		p.w.Flush()
@@ -80,10 +79,10 @@ func (p *Progress) StopAndClear() bool {
 	fmt.Fprint(p.w, "\033[?25l")
 	defer fmt.Fprint(p.w, "\033[?25h")
 
-	stopped := p.stop()
+	stopped, pos := p.stop()
 	if stopped {
 		// clear all progress lines
-		for i := range p.pos {
+		for i := range pos {
 			if i > 0 {
 				fmt.Fprint(p.w, "\033[A")
 			}
@@ -102,13 +101,18 @@ func (p *Progress) Add(key string, state State) {
 }
 
 func (p *Progress) render() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.renderLocked()
+}
+
+// renderLocked renders with p.mu held.
+func (p *Progress) renderLocked() {
 	_, termHeight, err := term.GetSize(int(os.Stderr.Fd()))
 	if err != nil {
 		termHeight = defaultTermHeight
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	defer p.w.Flush()
 
@@ -138,18 +142,15 @@ func (p *Progress) render() {
 }
 
 func (p *Progress) start() {
-	p.mu.Lock()
 	ticker := time.NewTicker(100 * time.Millisecond)
-	if p.ticker != nil {
-		// stop() already ran (or ran concurrently): do not race its nil-out.
-		ticker.Stop()
-		p.mu.Unlock()
-		return
-	}
-	p.ticker = ticker
-	p.mu.Unlock()
+	defer ticker.Stop()
 
-	for range ticker.C {
-		p.render()
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-ticker.C:
+			p.render()
+		}
 	}
 }
