@@ -86,22 +86,49 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		return cloneLaunchModels(i.models), i.err
 	}
 
-	entries, err := oaicaLiveModelEntriesErr()
-	if err != nil {
-		i.models = nil
-		i.err = fmt.Errorf("OAICA router: %w (check OAICA_API_KEY / OAICA_HOST)", err)
-		i.loaded = true
-		return nil, i.err
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		names = append(names, e.ID)
+	// LOCAL models first, and independently of the router. A self-hosted user
+	// may have no router at all; a hosted user's router may be down. Neither
+	// should empty the picker -- previously ANY router error set i.models=nil,
+	// so a dead origin (or a missing key) hid every locally pulled model too.
+	models := make([]LaunchModel, 0, 8)
+	seen := make(map[string]bool)
+	if i.client != nil {
+		if lst, lerr := i.client.List(ctx); lerr == nil && lst != nil {
+			for _, m := range lst.Models {
+				lm := launchModelFromListResponse(m)
+				if lm.Name == "" || seen[lm.Name] {
+					continue
+				}
+				seen[lm.Name] = true
+				models = append(models, lm)
+			}
+		}
 	}
 
-	i.models = make([]LaunchModel, 0, len(names))
-	for _, name := range names {
-		i.models = append(i.models, LaunchModel{Name: name, Remote: true}.WithCloudLimits())
+	// CLOUD/remote models from the router. A failure here is NOT fatal when we
+	// already have local ones -- it is reported, but the local list still
+	// shows, so `oaica launch` stays usable fully offline.
+	entries, err := oaicaLiveModelEntriesErr()
+	if err != nil {
+		i.models = models
+		i.loaded = true
+		if len(models) == 0 {
+			i.err = fmt.Errorf("OAICA router: %w (check OAICA_API_KEY / OAICA_HOST)", err)
+			return nil, i.err
+		}
+		// Degrade to local-only rather than failing outright.
+		i.err = nil
+		return cloneLaunchModels(i.models), nil
 	}
+	for _, e := range entries {
+		if e.ID == "" || seen[e.ID] {
+			continue
+		}
+		seen[e.ID] = true
+		models = append(models, LaunchModel{Name: e.ID, Remote: true}.WithCloudLimits())
+	}
+
+	i.models = models
 	i.err = nil
 	i.loaded = true
 
