@@ -267,6 +267,14 @@ func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string,
 	if oaicaModelIsReady(model) {
 		return nil
 	}
+	// A user-defined remote model (from ~/.oaica/remotes.json, surfaced as
+	// "<remote>/<model>" in the picker) is served live by its own endpoint —
+	// it is never pulled into the local Ollama registry this fork doesn't
+	// run. Without this short-circuit, client.Show() 404s and the flow falls
+	// into pullMissingModel → "pull model manifest: file does not exist".
+	if _, _, ok := findUserRemoteForModel(model); ok {
+		return nil
+	}
 	if _, err := client.Show(ctx, &api.ShowRequest{Model: model}); err == nil {
 		return nil
 	} else {

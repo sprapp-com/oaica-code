@@ -2196,6 +2196,32 @@ func NewCLI() *cobra.Command {
 	serveCmd.Flags().Bool("insecure", false, "Allow a non-loopback --host with no --api-key (trusted private networks only)")
 	serveCmd.Flags().Int("threads", 0, "CPU threads (default: logical CPU count / 2, i.e. physical cores — SMT measured WORSE for CPU-offloaded MoE, see ServeHandler doc)")
 
+	// serve-anthropic-proxy — hidden test harness for the Anthropic↔OpenAI
+	// translation proxy used by `oaica launch claude --model <remote>/<model>`.
+	// Resolves a remote from ~/.oaica/remotes.json, runs the proxy on the
+	// given port (default: auto-pick free), and prints the chosen port to
+	// stdout. Smoke-test standalone against a real remote without launching
+	// Claude Code: `oaica serve-anthropic-proxy --remote deepseek --model
+	// deepseek-v4-flash --port 8799`, then curl
+	// http://127.0.0.1:8799/v1/messages.
+	serveAnthropicProxyCmd := &cobra.Command{
+		Use:    "serve-anthropic-proxy",
+		Short:  "Run a local Anthropic↔OpenAI translation proxy for a user-defined remote (test harness)",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			remoteName, _ := cmd.Flags().GetString("remote")
+			upstreamModel, _ := cmd.Flags().GetString("model")
+			port, _ := cmd.Flags().GetInt("port")
+			if remoteName == "" {
+				return fmt.Errorf("--remote is required (a name from ~/.oaica/remotes.json)")
+			}
+			return launch.ServeAnthropicProxyForRemote(remoteName, upstreamModel, port)
+		},
+	}
+	serveAnthropicProxyCmd.Flags().String("remote", "", "Remote name (as named in ~/.oaica/remotes.json)")
+	serveAnthropicProxyCmd.Flags().String("model", "", "Bare upstream model id to send to the remote (e.g. deepseek-v4-flash)")
+	serveAnthropicProxyCmd.Flags().Int("port", 0, "Port to bind (default: auto-pick a free port)")
+
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
@@ -2398,6 +2424,7 @@ func NewCLI() *cobra.Command {
 		stopCmd,
 		pullCmd,
 		serveCmd,
+		serveAnthropicProxyCmd,
 		pushCmd,
 		signinCmd,
 		loginCmd,

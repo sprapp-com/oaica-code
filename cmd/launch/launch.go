@@ -1456,6 +1456,14 @@ func (c *launcherClient) singleModelUsable(ctx context.Context, name string, inv
 }
 
 func hasLocalModel(inventory []LaunchModel, name string) bool {
+	// A user-defined remote model (namespaced "<remote>/<model>" from
+	// ~/.oaica/remotes.json) is always "usable" for launch purposes — it is
+	// served live by its own endpoint and needs no local pull. Without this
+	// the loop below skips it (model.Remote=true → continue) and
+	// singleModelUsable returns false, blocking launch.
+	if _, _, ok := findUserRemoteForModel(name); ok {
+		return true
+	}
 	for _, model := range inventory {
 		if model.Remote {
 			continue

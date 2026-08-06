@@ -80,6 +80,35 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	// llama-server/cloud router should never see it.
 	bareModel, _ := oaicaStripLocalTag(model)
 
+	// User-defined remote (from ~/.oaica/remotes.json, picked as
+	// "<remote>/<model>"). Claude Code speaks the Anthropic Messages API;
+	// most user-remotes (DeepSeek, vLLM, llama-server, ...) speak OpenAI.
+	// Route through a local Anthropic↔OpenAI translation proxy that points
+	// at the remote's own base_url with the remote's own key — NOT the
+	// OAICA router/key. The bare upstream model id (after the first "/") is
+	// what the remote expects; the namespaced picker name is oaica-only.
+	if remote, bare, ok := findUserRemoteForModel(model); ok {
+		anthropicBaseURL := ""
+		if ln, port, err := ListenAnthropicOpenAIProxy(remote, bare); err == nil {
+			go func() {
+				_ = RunAnthropicOpenAIProxy(ln, remote, bare)
+			}()
+			anthropicBaseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		} else {
+			// Proxy failed to bind — surface the failure rather than
+			// silently falling back to the OAICA router, which would send
+			// the remote's model name to the wrong endpoint with the wrong
+			// key and 404 confusingly.
+			return fmt.Errorf("failed to start translation proxy for remote %q: %w", remote.Name, err)
+		}
+		cmd := exec.Command(claudePath, c.args(bare, args)...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), c.userRemoteEnvVars(remote, bare, anthropicBaseURL)...)
+		return cmd.Run()
+	}
+
 	// Route through a local logging+forwarding proxy instead of pointing
 	// ANTHROPIC_BASE_URL straight at the resolved host — logs
 	// model/message-size/hard-signal features to ~/.oaica/requests.log
@@ -105,6 +134,29 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 
 	cmd.Env = append(os.Environ(), c.envVars(model, anthropicBaseURL)...)
 	return cmd.Run()
+}
+
+// userRemoteEnvVars builds the Claude Code environment for a user-defined
+// remote model. The auth token is the REMOTE's key (not the OAICA key), the
+// model env vars pin to the bare upstream id, and ANTHROPIC_BASE_URL points
+// at the local Anthropic↔OpenAI translation proxy.
+func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, anthropicBaseURL string) []string {
+	env := []string{
+		"ANTHROPIC_BASE_URL=" + anthropicBaseURL,
+		"ANTHROPIC_API_KEY=",
+		"ANTHROPIC_AUTH_TOKEN=" + remote.key(),
+		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
+		"DISABLE_ERROR_REPORTING=1",
+		"DISABLE_FEEDBACK_COMMAND=1",
+		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + bareModel,
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + bareModel,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + bareModel,
+		"CLAUDE_CODE_SUBAGENT_MODEL=" + bareModel,
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
+		"CLAUDE_CODE_AUTO_MODE_MODEL=" + bareModel,
+	}
+	return env
 }
 
 func (c *Claude) envVars(model, anthropicBaseURL string) []string {

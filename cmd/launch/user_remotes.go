@@ -96,10 +96,47 @@ func loadUserRemotes() ([]userRemote, error) {
 	return out, nil
 }
 
+// findUserRemoteForModel splits a "<remote>/<model>" picker name and returns
+// the matching configured userRemote plus the bare upstream model id (the
+// part after the first "/"), or ok=false if the prefix matches no remote.
+// A remote named "deepseek" + model "deepseek/deepseek-v4-flash" →
+// (deepseekRemote, "deepseek-v4-flash", true). The bare id is what the
+// upstream OpenAI-compatible endpoint expects; the namespaced picker name
+// is an oaica-only convention.
+func findUserRemoteForModel(name string) (userRemote, string, bool) {
+	idx := strings.Index(name, "/")
+	if idx <= 0 {
+		return userRemote{}, "", false
+	}
+	prefix := name[:idx]
+	bare := name[idx+1:]
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, "", false
+	}
+	for _, r := range remotes {
+		if r.Name == prefix {
+			return r, bare, true
+		}
+	}
+	return userRemote{}, "", false
+}
+
+// remoteBaseURL normalizes a remote's base_url to a form without a trailing
+// "/" or "/v1" version prefix. Remotes are configured both ways — some include
+// the OpenAI version prefix in base_url ("https://api.deepseek.com/v1"), some
+// don't ("http://192.168.1.50:8080"). Callers append "/v1/<endpoint>" exactly
+// once, so a trailing /v1 here would produce /v1/v1/<endpoint> (404).
+func remoteBaseURL(r userRemote) string {
+	b := strings.TrimRight(strings.TrimSpace(r.BaseURL), "/")
+	b = strings.TrimSuffix(b, "/v1")
+	return b
+}
+
 // fetchRemoteModels lists one remote's /v1/models. Short timeout: a sleeping
 // box must not stall the picker.
 func fetchRemoteModels(r userRemote) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, r.BaseURL+"/v1/models", nil)
+	req, err := http.NewRequest(http.MethodGet, remoteBaseURL(r)+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
