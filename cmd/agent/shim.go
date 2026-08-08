@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
@@ -152,4 +157,115 @@ func imageMediaType(b []byte) string {
 	default:
 		return "image/png"
 	}
+}
+
+// shimTimeout matches the translation proxy's upstream timeout so a hung
+// upstream fails the run instead of stalling it forever.
+const shimTimeout = 5 * time.Minute
+
+// maxSSEFrameSize bounds a single SSE data line (input_json_delta fragments
+// are the only long lines; tool schemas are small).
+const maxSSEFrameSize = 16 * 1024 * 1024
+
+// shimClient implements agent.ChatClient by speaking the Anthropic Messages
+// API to a resolved endpoint: for user remotes the loopback translation proxy,
+// for cloud/local the OAICA router or local server (behind the logging proxy).
+// The endpoint always presents Anthropic-native /v1/messages, so this shim is
+// the one protocol the agent engine sees regardless of upstream.
+type shimClient struct {
+	baseURL    string // loopback proxy or router; shim appends "/v1/messages"
+	token      string // bearer token
+	model      string // bare upstream model id
+	meta       launch.AgentModelMeta
+	httpClient *http.Client
+}
+
+func newShimClient(baseURL, token, model string, meta launch.AgentModelMeta) *shimClient {
+	return &shimClient{
+		baseURL:    baseURL,
+		token:      token,
+		model:      model,
+		meta:       meta,
+		httpClient: &http.Client{Timeout: shimTimeout},
+	}
+}
+
+func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.ChatResponseFunc) error {
+	mreq, err := buildMessagesRequest(req, s.meta)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(mreq)
+	if err != nil {
+		return fmt.Errorf("marshal messages request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+s.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return parseAPIError(resp)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSSEFrameSize)
+	acc := newAnthropicSSEAccumulator()
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "event:") {
+			continue // the event type is also in the JSON payload
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(data), &envelope); err != nil {
+			return fmt.Errorf("parse SSE frame: %w", err)
+		}
+		deltas, done, err := acc.Feed(envelope.Type, []byte(data))
+		if err != nil {
+			return err
+		}
+		for _, d := range deltas {
+			if err := fn(d); err != nil {
+				return err
+			}
+		}
+		if done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read SSE stream: %w", err)
+	}
+	return nil
+}
+
+// parseAPIError extracts an Anthropic-shaped error body from a non-2xx
+// response, falling back to the raw body.
+func parseAPIError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var e anthropic.Error
+	if err := json.Unmarshal(body, &e); err == nil && e.Message != "" {
+		return fmt.Errorf("upstream %s: %s", resp.Status, e.Message)
+	}
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		msg = resp.Status
+	}
+	return fmt.Errorf("upstream error: %s", msg)
 }
