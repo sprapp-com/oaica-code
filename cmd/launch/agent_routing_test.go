@@ -91,6 +91,53 @@ func TestResolveAgentModelLocalTag(t *testing.T) {
 	}
 }
 
+// TestApplyAgentModelMeta covers the pure decision helper. Tool capability is
+// only known for local inventory entries; cloud/router and user-remote entries
+// carry no capability metadata (ToolCapable zero value), so they are treated as
+// tool-capable. No network access needed.
+func TestApplyAgentModelMeta(t *testing.T) {
+	defaults := AgentModelMeta{ToolCapable: true, ContextLength: 128000, MaxOutputTokens: 4096}
+
+	t.Run("not found keeps defaults", func(t *testing.T) {
+		got := applyAgentModelMeta(defaults, LaunchModel{}, false)
+		if got != defaults {
+			t.Errorf("applyAgentModelMeta = %+v, want defaults untouched %+v", got, defaults)
+		}
+	})
+
+	t.Run("local entry with tools stays tool-capable", func(t *testing.T) {
+		got := applyAgentModelMeta(defaults, LaunchModel{ToolCapable: true}, true)
+		if !got.ToolCapable {
+			t.Error("ToolCapable = false, want true")
+		}
+	})
+
+	t.Run("remote entry treated as tool-capable", func(t *testing.T) {
+		got := applyAgentModelMeta(defaults, LaunchModel{Remote: true}, true)
+		if !got.ToolCapable {
+			t.Error("ToolCapable = false for remote entry, want true (regression: router sends no capability metadata)")
+		}
+	})
+
+	t.Run("local entry without tools is not tool-capable", func(t *testing.T) {
+		got := applyAgentModelMeta(defaults, LaunchModel{}, true)
+		if got.ToolCapable {
+			t.Error("ToolCapable = true for local entry without tools, want false")
+		}
+	})
+
+	t.Run("positive limits override, zero values keep defaults", func(t *testing.T) {
+		got := applyAgentModelMeta(defaults, LaunchModel{Remote: true, ContextLength: 32000, MaxOutputTokens: 8000}, true)
+		if got.ContextLength != 32000 || got.MaxOutputTokens != 8000 {
+			t.Errorf("limits not overridden: %+v", got)
+		}
+		got = applyAgentModelMeta(defaults, LaunchModel{Remote: true}, true)
+		if got.ContextLength != defaults.ContextLength || got.MaxOutputTokens != defaults.MaxOutputTokens {
+			t.Errorf("zero limits should keep defaults: %+v", got)
+		}
+	})
+}
+
 // TestResolveAgentModelUnknownModelFallsBackToDefaults: an unknown model
 // yields positive defaults and tool-capable=true.
 func TestResolveAgentModelUnknownModelFallsBackToDefaults(t *testing.T) {

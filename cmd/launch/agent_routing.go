@@ -64,6 +64,25 @@ func ResolveAgentModel(ctx context.Context, model string) (baseURL, token, upstr
 	return baseURL, token, upstreamModel, meta, nil
 }
 
+// applyAgentModelMeta fills ToolCapable and applies positive limit overrides
+// from a matched inventory entry. Tool capability is only known for local
+// entries (client.List carries real capability data); cloud/router and
+// user-remote entries leave ToolCapable at its zero value even though the
+// models are typically tool-capable, so they are treated as tool-capable.
+func applyAgentModelMeta(meta AgentModelMeta, lm LaunchModel, found bool) AgentModelMeta {
+	if !found {
+		return meta
+	}
+	meta.ToolCapable = lm.ToolCapable || lm.Remote
+	if lm.ContextLength > 0 {
+		meta.ContextLength = lm.ContextLength
+	}
+	if lm.MaxOutputTokens > 0 {
+		meta.MaxOutputTokens = lm.MaxOutputTokens
+	}
+	return meta
+}
+
 // agentModelMeta looks the model up in the launch inventory and applies
 // defaults. A model found in the inventory keeps its advertised tool
 // capability (false really means no tools); an unknown or unreachable model
@@ -84,14 +103,7 @@ func agentModelMeta(ctx context.Context, model string) AgentModelMeta {
 		return meta
 	}
 	if lm, ok := findLaunchModel(models, model); ok {
-		meta.ToolCapable = lm.ToolCapable
-		if lm.ContextLength > 0 {
-			meta.ContextLength = lm.ContextLength
-		}
-		if lm.MaxOutputTokens > 0 {
-			meta.MaxOutputTokens = lm.MaxOutputTokens
-		}
-		return meta
+		return applyAgentModelMeta(meta, lm, true)
 	}
 	fb := fallbackLaunchModel(model)
 	if fb.ContextLength > 0 {
