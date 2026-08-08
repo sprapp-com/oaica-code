@@ -32,6 +32,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/ollama/ollama/api"
+	agentcmd "github.com/ollama/ollama/cmd/agent"
 	"github.com/ollama/ollama/cmd/config"
 	"github.com/ollama/ollama/cmd/launch"
 	"github.com/ollama/ollama/cmd/tui"
@@ -2436,6 +2437,7 @@ func NewCLI() *cobra.Command {
 		copyCmd,
 		deleteCmd,
 		authCmd,
+		agentcmd.AgentCmd(oaicaEnsureSignedIn),
 		// oaicaEnsureSignedIn, not checkServerHeartbeat — same dead-local-
 		// server bug as runCmd above; LaunchCmd's PreRunE calls whatever's
 		// passed here before every launch subcommand (barring restore/
