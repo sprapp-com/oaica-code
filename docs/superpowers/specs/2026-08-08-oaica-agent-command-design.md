@@ -125,8 +125,8 @@ Conversion (new, ~150-250 LOC):
 - `api.ChatRequest` → `anthropic.MessagesRequest`: map messages
   (`api.Message` → `anthropic.MessageParam`, tool-call content blocks to
   `tool_use` / `tool_result`), tools (`api.Tool` → `anthropic.Tool`), system
-  prompt, `Think` → `ThinkingConfig`, `MaxTokens` (from `Options` or a default),
-  `Stream = true`.
+  prompt, `Think` → `ThinkingConfig`, `MaxTokens` (from `meta.MaxOutputTokens`
+  when the inventory has it, else 4096), `Stream = true`.
 - POST `baseURL + "/v1/messages"` with `Authorization: Bearer <token>`,
   `Content-Type: application/json`, streaming SSE response.
 - Parse inbound Anthropic SSE events (see `sse.go`) and, for each delta, feed an
@@ -168,26 +168,37 @@ plain-stdout sink is fresh work:
 #### `cmd/agent/tools.go` — registry
 
 Build `*agent.Registry` mirroring `agentToolsRegistry` (`cmd/agent_tui.go:257`)
-but WITHOUT the `client.Show` capability probe: register Bash, Read, Edit,
-Skill, and WebSearch/WebFetch (the latter gated on the same cloud-status env
-vars). Tool capability gating uses `AgentModelMeta.ToolCapable` from the launch
-inventory instead. `OLLAMA_AGENT_DISABLE_SHELL` / `OLLAMA_AGENT_DISABLE_WEBSEARCH`
-env vars respected as today.
+but WITHOUT the `client.Show` capability probe (which needs a live local
+server): register Bash, Read, Edit, Skill, and WebSearch/WebFetch gated on
+`OLLAMA_AGENT_DISABLE_SHELL` / `OLLAMA_AGENT_DISABLE_WEBSEARCH` env vars only
+(the cloud-status check that needs `client` is dropped; env vars are the
+user's explicit control). Tool capability gating uses
+`AgentModelMeta.ToolCapable` from the launch inventory instead.
 
 #### `cmd/agent/agent_cmd.go` — command
 
 ```go
-var agentCmd = &cobra.Command{
-    Use:   "agent [PROMPT]",
-    Short: "Run a streaming coding agent",
-    Args:  cobra.ArbitraryArgs,
-    PreRunE: oaicaEnsureSignedIn,
-    RunE:   runAgent,
-}
+// AgentCmd returns the "oaica agent" cobra command. checkServerHeartbeat is
+// injected (the cmd package's oaicaEnsureSignedIn) to avoid an import cycle:
+// cmd imports cmd/agent to register the command, so cmd/agent cannot import
+// cmd. This mirrors launch.LaunchCmd's dependency-injection pattern
+// (cmd/launch/launch.go:282).
+func AgentCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) error) *cobra.Command
 ```
 
+Command body: `Use: "agent [PROMPT]"`, `Short: "Run a streaming coding agent"`,
+`Args: cobra.ArbitraryArgs`, `PreRunE: checkServerHeartbeat` (the injected
+`oaicaEnsureSignedIn`), `RunE: runAgent`.
+
 Flags: `--model` (picker if unset), `--system`, `--max-turns`, `--yes`,
-`--cwd`. Registered in `NewCLI()` at `cmd/cmd.go:2420-2445` (one added line).
+`--cwd`. Registered in `NewCLI()` at `cmd/cmd.go:2420-2445` (one added line:
+`agentcmd.AgentCmd(oaicaEnsureSignedIn)`).
+
+- `--max-turns` maps to `RunOptions.MaxToolRounds` (the engine's
+  consecutive model/tool-cycle guard; 0 = model-specific default).
+- `--yes` auto-approves all tool calls (no `ApprovalPrompter` prompt).
+  Default: prompt when a tool's approval scope requires it (engine
+  `approval.go` behavior).
 
 `runAgent`:
 1. Resolve model (flag or `launch.ResolveRunModel` picker path).
