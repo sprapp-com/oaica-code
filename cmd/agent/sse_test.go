@@ -100,6 +100,33 @@ func TestFeedThinkingDelta(t *testing.T) {
 	}
 }
 
+// TestFeedEmptyTextDelta: an empty text_delta must not emit a delta frame —
+// the engine's chatRound treats an empty message as a stream-end sentinel, so
+// an empty payload would terminate the round mid-stream. The block must keep
+// streaming a subsequent non-empty delta.
+func TestFeedEmptyTextDelta(t *testing.T) {
+	acc := newAnthropicSSEAccumulator()
+
+	_, _, err := acc.Feed("content_block_start", []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deltas, done, err := acc.Feed("content_block_delta", []byte(textDeltaFrame(0, "")))
+	if err != nil {
+		t.Fatalf("empty delta: %v", err)
+	}
+	if len(deltas) != 0 || done {
+		t.Fatalf("empty delta: deltas=%d done=%v, want 0/not done", len(deltas), done)
+	}
+	deltas, done, err = acc.Feed("content_block_delta", []byte(textDeltaFrame(0, "still here")))
+	if err != nil {
+		t.Fatalf("following delta: %v", err)
+	}
+	if len(deltas) != 1 || done || deltas[0].Message.Content != "still here" {
+		t.Fatalf("following delta: deltas=%d done=%v content=%q", len(deltas), done, deltas[0].Message.Content)
+	}
+}
+
 // TestFeedStreamError surfaces the upstream error from the event payload.
 func TestFeedStreamError(t *testing.T) {
 	acc := newAnthropicSSEAccumulator()

@@ -73,10 +73,16 @@ func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []
 		switch ev.Delta.Type {
 		case "text_delta":
 			b.text.WriteString(ev.Delta.Text)
-			return []api.ChatResponse{{Message: api.Message{Content: ev.Delta.Text}}}, false, nil
+			if ev.Delta.Text != "" {
+				return []api.ChatResponse{{Message: api.Message{Content: ev.Delta.Text}}}, false, nil
+			}
+			return nil, false, nil
 		case "thinking_delta":
 			b.text.WriteString(ev.Delta.Thinking)
-			return []api.ChatResponse{{Message: api.Message{Thinking: ev.Delta.Thinking}}}, false, nil
+			if ev.Delta.Thinking != "" {
+				return []api.ChatResponse{{Message: api.Message{Thinking: ev.Delta.Thinking}}}, false, nil
+			}
+			return nil, false, nil
 		case "input_json_delta", "signature_delta":
 			b.text.WriteString(ev.Delta.PartialJSON + ev.Delta.Signature)
 			return nil, false, nil
