@@ -48,6 +48,10 @@ func AgentCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) error
 }
 
 func runAgent(ctx context.Context, opts *agentOptions, prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf(`no prompt: provide a prompt argument, e.g. oaica agent "what is the capital of France?"`)
+	}
+
 	model := opts.model
 	if model == "" {
 		var err error
@@ -86,6 +90,10 @@ func runAgent(ctx context.Context, opts *agentOptions, prompt string) error {
 		Skills:           skills,
 		ApprovalPrompter: approval,
 		WorkingDir:       cwd,
+		Compactor: &agent.SimpleCompactor{
+			Client:  client,
+			Options: agent.CompactionOptions{ContextWindowTokens: meta.ContextLength},
+		},
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

@@ -149,17 +149,48 @@ func TestShimClientErrorEvent(t *testing.T) {
 	}
 }
 
-// TestShimClientHTTPError: a non-2xx response with an Anthropic-shaped error
-// body yields a descriptive error.
+// TestShimClientHTTPError: a non-2xx response yields a descriptive error for
+// every error body shape the endpoints emit: the nested Anthropic
+// {"type":"error","error":{...}} shape, a flat {"type":...,"message":...}
+// shape, and a raw body in neither shape (e.g. {"error":"model not found"}).
 func TestShimClientHTTPError(t *testing.T) {
-	fake := &fakeAnthropic{status: http.StatusTooManyRequests, errorBody: `{"type":"rate_limit_error","message":"slow down"}`}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
+	cases := []struct {
+		name      string
+		status    int
+		errorBody string
+		want      string
+	}{
+		{
+			name:      "nested anthropic error",
+			status:    http.StatusTooManyRequests,
+			errorBody: `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`,
+			want:      "slow down",
+		},
+		{
+			name:      "flat anthropic error",
+			status:    http.StatusUnauthorized,
+			errorBody: `{"type":"authentication_error","message":"bad key"}`,
+			want:      "bad key",
+		},
+		{
+			name:      "raw body fallback",
+			status:    http.StatusNotFound,
+			errorBody: `{"error":"model not found"}`,
+			want:      `{"error":"model not found"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeAnthropic{status: tc.status, errorBody: tc.errorBody}
+			srv := httptest.NewServer(fake.handler())
+			defer srv.Close()
 
-	shim := newShimClient(srv.URL, "test-token", "m", launch.AgentModelMeta{})
-	err := shim.Chat(context.Background(), &api.ChatRequest{Model: "m"}, func(api.ChatResponse) error { return nil })
-	if err == nil || !strings.Contains(err.Error(), "slow down") {
-		t.Fatalf("err = %v, want rate-limit message", err)
+			shim := newShimClient(srv.URL, "test-token", "m", launch.AgentModelMeta{})
+			err := shim.Chat(context.Background(), &api.ChatRequest{Model: "m"}, func(api.ChatResponse) error { return nil })
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want error containing %q", err, tc.want)
+			}
+		})
 	}
 }
 

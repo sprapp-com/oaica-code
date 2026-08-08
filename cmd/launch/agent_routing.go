@@ -84,10 +84,12 @@ func applyAgentModelMeta(meta AgentModelMeta, lm LaunchModel, found bool) AgentM
 }
 
 // agentModelMeta looks the model up in the launch inventory and applies
-// defaults. A model found in the inventory keeps its advertised tool
-// capability (false really means no tools); an unknown or unreachable model
-// is assumed tool-capable — an agent without tools is useless, and a model
-// that cannot actually call tools fails visibly on the first call instead.
+// defaults. A matched LOCAL inventory entry keeps its advertised tool
+// capability (false really means no tools); remote/cloud entries are treated
+// as tool-capable regardless of their advertised capability. An unknown or
+// unreachable model is assumed tool-capable — an agent without tools is
+// useless, and a model that cannot actually call tools fails visibly on the
+// first call instead.
 func agentModelMeta(ctx context.Context, model string) AgentModelMeta {
 	meta := AgentModelMeta{
 		ToolCapable:     true,

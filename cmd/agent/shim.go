@@ -256,13 +256,23 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 }
 
 // parseAPIError extracts an Anthropic-shaped error body from a non-2xx
-// response, falling back to the raw body.
+// response, falling back to the raw body. Real endpoints return the nested
+// {"type":"error","error":{"type":...,"message":...}} shape; a flat
+// {"type":...,"message":...} shape and plain bodies such as
+// {"error":"model not found"} are also handled.
 func parseAPIError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var e anthropic.Error
-	if err := json.Unmarshal(body, &e); err == nil && e.Message != "" {
-		return fmt.Errorf("upstream %s: %s", resp.Status, e.Message)
+
+	var nested anthropic.ErrorResponse
+	if err := json.Unmarshal(body, &nested); err == nil && nested.Error.Message != "" {
+		return fmt.Errorf("upstream %s: %s", resp.Status, nested.Error.Message)
 	}
+
+	var flat anthropic.Error
+	if err := json.Unmarshal(body, &flat); err == nil && flat.Message != "" {
+		return fmt.Errorf("upstream %s: %s", resp.Status, flat.Message)
+	}
+
 	msg := strings.TrimSpace(string(body))
 	if msg == "" {
 		msg = resp.Status
