@@ -16,3 +16,6 @@ llama/build
 llama/vendor
 /ollama
 integration/testdata/models/
+
+# Claude Code worktrees
+.claude/worktrees/
