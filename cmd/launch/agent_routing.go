@@ -144,13 +144,15 @@ func extractForceTools(args []string) (force bool, rest []string) {
 	return force, rest
 }
 
-// extractSonnetModel pulls a launcher-level "--sonnet-model <bare-id>" (or
-// "--sonnet-model=<bare-id>") out of the passthrough args, for claude.go's
+// extractSonnetModel pulls a launcher-level "--sonnet-model <id>" (or
+// "--sonnet-model=<id>") out of the passthrough args, for claude.go's
 // opusplan-style tier split: the picker-selected model stays pinned to
-// Opus/Haiku, this gives a second bare upstream id (same remote) for
-// Sonnet-tier requests. Not forwarded to the child claude binary — it only
-// controls which ANTHROPIC_DEFAULT_SONNET_MODEL/CLAUDE_CODE_SUBAGENT_MODEL
-// env vars we set.
+// Opus/Haiku, this gives a second model (same remote) for Sonnet-tier
+// requests. Accepts either a bare upstream id ("muse-spark-1.2") or the
+// namespaced picker form ("opencode-go/muse-spark-1.2") — claude.go resolves
+// the latter and verifies it's on the same remote as the primary. Not
+// forwarded to the child claude binary — it only controls which
+// ANTHROPIC_DEFAULT_SONNET_MODEL/CLAUDE_CODE_SUBAGENT_MODEL env vars we set.
 func extractSonnetModel(args []string) (sonnetModel string, rest []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]

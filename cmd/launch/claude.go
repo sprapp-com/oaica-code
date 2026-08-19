@@ -95,18 +95,27 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 			return err
 		}
 
-		// opusplan-style tier split: --sonnet-model gives a second bare model
-		// id on the SAME remote (one proxy = one remote/key) to use for
-		// Sonnet-tier requests, while the picker-selected model stays pinned
-		// to Opus/Haiku/subagent. The proxy (anthropic_openai_proxy.go) reads
-		// whichever model Claude Code puts in each request's "model" field
-		// and forwards that upstream — no per-request routing logic needed
-		// here, just pointing the two ANTHROPIC_DEFAULT_*_MODEL env vars at
-		// different bare ids. Gate the sonnet model too — same remote, same
-		// tool-format risk.
+		// opusplan-style tier split: --sonnet-model gives a second model on
+		// the SAME remote (one proxy = one remote/key) to use for Sonnet-tier
+		// requests, while the picker-selected model stays pinned to
+		// Opus/Haiku/subagent. Accepts either the namespaced picker form
+		// ("<remote>/<model>", stripped to the bare id — must be the SAME
+		// remote as the primary picker selection, since one proxy serves one
+		// remote/key) or an already-bare id. The proxy
+		// (anthropic_openai_proxy.go) reads whichever model Claude Code puts
+		// in each request's "model" field and forwards that upstream — no
+		// per-request routing logic needed here, just pointing the two
+		// ANTHROPIC_DEFAULT_*_MODEL env vars at different bare ids. Gate the
+		// sonnet model too — same remote, same tool-format risk.
 		sonnetBare := bare
 		if sonnetModel != "" {
 			sonnetBare = sonnetModel
+			if sr, sb, ok := findUserRemoteForModel(sonnetModel); ok {
+				if sr.Name != remote.Name {
+					return fmt.Errorf("--sonnet-model %q is on remote %q, but the primary model is on remote %q — both tiers must share one remote/proxy", sonnetModel, sr.Name, remote.Name)
+				}
+				sonnetBare = sb
+			}
 			if err := gateUserRemoteTools(remote, sonnetBare, toolWireAnthropic, forceTools); err != nil {
 				return err
 			}
