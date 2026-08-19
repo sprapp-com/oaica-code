@@ -59,6 +59,16 @@ boxes.** A dropped remote just fails. What exists is:
 The registry + short-lived-token + failover + serverless parts below EXTEND this
 loopback/launch model. Where each new idea lands in code is mapped in §9.
 
+> **Per-model routing (related):** the loopback model above routes **per
+> integration** — every OpenAI integration points at the local daemon, which
+> does not forward user-remotes (they 404), and only claude/agent reach user
+> remotes via the translation proxy. `docs/architecture/PER_MODEL_ROUTING.md`
+> specifies making the wire protocol **per model** (OpenAI-native model →
+> OpenAI integration direct; Anthropic-native → Anthropic integration direct;
+> proxy only on mismatch) plus a capability gate so a free-form-tool model like
+> kat-coder is refused behind a `tool_use` loop instead of silently spiraling.
+> That doc is the spec; this doc is the fleet fabric.
+
 > **v1.0 naming error, corrected:** `integration/` is the Go **test suite**, not
 > the launcher. The launcher is `cmd/launch/`. All `integration/` mentions in
 > this doc's older text were wrong and are replaced below.
