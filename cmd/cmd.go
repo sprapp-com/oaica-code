@@ -2278,8 +2278,10 @@ func NewCLI() *cobra.Command {
 
 	// authCmd — opencode-style provider credential management for the
 	// api.sprapp.com router's hot-reloadable KV provider registry. Distinct
-	// from signinCmd/loginCmd above (those are ollama.com's own unrelated
-	// sign-in flow, kept as-is). Requires OAICA_ADMIN_KEY, NOT OAICA_API_KEY
+	// from signinCmd/loginCmd above (those are OAICA's own OAICA_API_KEY
+	// flow — SigninHandler/SignoutHandler, rewritten from ollama.com's OAuth
+	// sign-in, which this fork never uses). Requires OAICA_ADMIN_KEY, NOT
+	// OAICA_API_KEY
 	// — these commands can add/overwrite ANY model backend for every caller
 	// of the router, so they're gated by a separate operator-only credential
 	// that regular /model and /lora usage never needs.
