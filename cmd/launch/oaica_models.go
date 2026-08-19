@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/envconfig"
 )
 
 func oaicaLaunchHost() string {
@@ -119,6 +121,20 @@ func oaicaResolveHostForModel(model string) string {
 		// already caught a genuinely nonexistent model earlier.
 	}
 	return oaicaLaunchHost()
+}
+
+// openAIBaseURLAndKey returns the base URL, bearer key, and bare model id an
+// OpenAI-speaking integration (opencode, codex, hermes, ...) should talk to for
+// a selected model. For a user-remote model it resolves the direct remote
+// endpoint — base URL includes the /v1 (or /v4) version prefix via
+// resolveRemoteEndpoint, key is the remote's, model id is the bare upstream id.
+// For local/cloud/":local" it falls back to the daemon triple — byte-identical
+// to what integrations hardcoded before, so local launches are unchanged.
+func openAIBaseURLAndKey(primary LaunchModel) (baseURL, apiKey, modelID string) {
+	if ep, ok := resolveRemoteEndpoint(primary.Name); ok {
+		return ep.BaseURL, ep.Token, ep.UpstreamModel
+	}
+	return envconfig.Host().String() + "/v1", "ollama", primary.Name
 }
 
 func oaicaLaunchAuthorize(req *http.Request) {

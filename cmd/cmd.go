@@ -878,6 +878,27 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 // Rewritten from upstream Ollama's ollama.com OAuth-signin flow, which
 // doesn't apply here — this fork never talks to ollama.com.
 func SigninHandler(cmd *cobra.Command, args []string) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("signin requires an interactive terminal — set OAICA_API_KEY directly instead")
+	}
+
+	provider, err := chooseSigninProvider()
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case provider == "":
+		return signinOAICA()
+	case provider == "opencode":
+		return signinOpencode("")
+	default:
+		return signinOpencode(strings.TrimPrefix(provider, "opencode:"))
+	}
+}
+
+// signinOAICA is the pre-existing OAICA router key flow, unchanged.
+func signinOAICA() error {
 	if existing := oaicaSavedAPIKey(); existing != "" {
 		fmt.Printf("Already signed in (key ending ...%s). Run 'oaica signout' first to switch keys.\n", lastN(existing, 4))
 		return nil
@@ -890,6 +911,79 @@ func SigninHandler(cmd *cobra.Command, args []string) error {
 		return errors.New("signin requires an interactive terminal — set OAICA_API_KEY directly instead")
 	}
 	return nil
+}
+
+// chooseSigninProvider offers OAICA plus opencode's known providers (from its
+// existing auth.json) and an "add a new opencode provider" entry, returning
+// "" for OAICA and the chosen provider id for opencode.
+func chooseSigninProvider() (string, error) {
+	items := []launch.SelectionItem{{Name: "OAICA", Description: "api.sprapp.com router key"}}
+	for _, name := range launch.OpencodeKnownProviders() {
+		items = append(items, launch.SelectionItem{Name: "opencode: " + name, Description: "opencode provider credential"})
+	}
+	items = append(items, launch.SelectionItem{Name: "opencode: <new provider>", Description: "add an opencode provider not listed above"})
+
+	if launch.DefaultSingleSelector == nil {
+		return "", nil // no TUI wired (e.g. test binary) — default to OAICA
+	}
+	choice, err := launch.DefaultSingleSelector("Sign in to:", items, "OAICA")
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case choice == "OAICA" || choice == "":
+		return "", nil
+	case choice == "opencode: <new provider>":
+		return "opencode", nil
+	case strings.HasPrefix(choice, "opencode: "):
+		return "opencode:" + strings.TrimPrefix(choice, "opencode: "), nil
+	default:
+		return "", nil
+	}
+}
+
+// signinOpencode prompts for an API key and writes it to opencode's
+// auth.json — the same file/format `opencode auth login` itself writes.
+// provider is the already-chosen provider id, or "" to prompt for a new one.
+func signinOpencode(provider string) error {
+	if provider == "" {
+		p, err := promptProviderName()
+		if err != nil {
+			return err
+		}
+		provider = p
+	}
+
+	fmt.Printf("Enter API key for opencode/%s: ", provider)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	key := strings.TrimSpace(line)
+	if key == "" {
+		return errors.New("no key entered")
+	}
+
+	if err := launch.SaveOpencodeAPIKey(provider, key); err != nil {
+		return fmt.Errorf("failed to save opencode API key: %w", err)
+	}
+	fmt.Printf("Saved API key for opencode provider %q.\n", provider)
+	return nil
+}
+
+func promptProviderName() (string, error) {
+	fmt.Print("Provider name (e.g. deepseek, openrouter): ")
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(line)
+	if name == "" {
+		return "", errors.New("no provider name entered")
+	}
+	return name, nil
 }
 
 // oaicaInteractiveSignin prompts for and saves an OAICA_API_KEY. Returns

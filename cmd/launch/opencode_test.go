@@ -972,6 +972,53 @@ func TestBuildInlineConfig(t *testing.T) {
 			t.Errorf("primary = %v, want ollama/qwen3:32b", cfg["model"])
 		}
 	})
+
+	t.Run("mixed catalog splits providers per remote", func(t *testing.T) {
+		t.Setenv("OAICA_REMOTES_FILE", writeDescriptorRemotesFile(t))
+		t.Setenv("KAT_KEY", "sk-kat")
+		t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+		models := []LaunchModel{
+			{Name: "llama3.2"},
+			{Name: "kat/kat-coder", Remote: true},
+			{Name: "vl/qwen3", Remote: true},
+		}
+		content, err := buildInlineConfig(models[1], models)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]any
+		json.Unmarshal([]byte(content), &cfg)
+
+		if cfg["model"] != "kat/kat-coder" {
+			t.Errorf("primary = %v, want kat/kat-coder (bare remote id)", cfg["model"])
+		}
+
+		providers, _ := cfg["provider"].(map[string]any)
+		for _, want := range []string{"ollama", "kat", "vl"} {
+			if _, ok := providers[want]; !ok {
+				t.Errorf("missing provider %q", want)
+			}
+		}
+		if len(providers) != 3 {
+			t.Errorf("provider count = %d, want 3 (ollama + kat + vl)", len(providers))
+		}
+
+		kat, _ := providers["kat"].(map[string]any)
+		kopts, _ := kat["options"].(map[string]any)
+		if kopts["baseURL"] != "http://192.168.0.50:8080/v1" {
+			t.Errorf("kat baseURL = %v, want remote /v1", kopts["baseURL"])
+		}
+		if kopts["apiKey"] != "sk-kat" {
+			t.Errorf("kat apiKey = %v, want remote token", kopts["apiKey"])
+		}
+
+		oll, _ := providers["ollama"].(map[string]any)
+		oopts, _ := oll["options"].(map[string]any)
+		if _, hasKey := oopts["apiKey"]; hasKey {
+			t.Error("ollama provider should not set apiKey (daemon is unauthenticated)")
+		}
+	})
 }
 
 func TestOpenCodeEdit_PreservesRecentEntries(t *testing.T) {

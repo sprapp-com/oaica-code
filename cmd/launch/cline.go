@@ -21,6 +21,11 @@ type Cline struct{}
 func (c *Cline) String() string { return "Cline" }
 
 func (c *Cline) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	bin, err := ensureClineInstalled()
 	if err != nil {
 		return err
@@ -134,6 +139,24 @@ func clineProviderBaseURL() string {
 	return clineOllamaRootURL() + "/v1"
 }
 
+// clineProviderBaseURLFor is the provider base URL Cline should use: the
+// remote's direct base for a user-remote model, otherwise the daemon's /v1.
+func clineProviderBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/")
+	}
+	return clineProviderBaseURL()
+}
+
+// clineModelIDFor is the model id Cline should use: the bare upstream id for a
+// user-remote model, otherwise the picker name.
+func clineModelIDFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
+	return model
+}
+
 func readClineConfig(configPath string) (map[string]any, error) {
 	config := make(map[string]any)
 	if data, err := os.ReadFile(configPath); err == nil {
@@ -165,15 +188,20 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 		settings = make(map[string]any)
 	}
 
-	baseURL := clineProviderBaseURL()
+	baseURL := clineProviderBaseURLFor(model)
+	modelID := clineModelIDFor(model)
 	previousModel, _ := settings["model"].(string)
 	previousBaseURL, _ := settings["baseUrl"].(string)
 	previousTokenSource, _ := provider["tokenSource"].(string)
 
 	settings["provider"] = clineLaunchProvider
-	settings["model"] = model
+	settings["model"] = modelID
 	settings["baseUrl"] = baseURL
-	delete(settings, "apiKey")
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		settings["apiKey"] = ep.Token
+	} else {
+		delete(settings, "apiKey")
+	}
 	provider["settings"] = settings
 
 	if previousModel != model || previousBaseURL != baseURL || previousTokenSource != "manual" {

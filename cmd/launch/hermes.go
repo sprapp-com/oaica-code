@@ -266,6 +266,12 @@ func (h *Hermes) Paths() []string {
 }
 
 func (h *Hermes) Configure(model string) error {
+	// Hermes' primary model is configured, not passed to Run, so the capability
+	// gate applies here. --force-tools is not threaded through Configure.
+	if err := gateOpenAITools(model, false); err != nil {
+		return err
+	}
+
 	configPath, err := hermesConfigPath()
 	if err != nil {
 		return err
@@ -285,16 +291,16 @@ func (h *Hermes) Configure(model string) error {
 		modelSection = make(map[string]any)
 	}
 	models := h.listModels(model)
-	applyHermesManagedProviders(cfg, hermesBaseURL(), model, models)
+	applyHermesManagedProviders(cfg, hermesBaseURLFor(model), hermesModelIDFor(model), models)
 
 	// launch writes the minimum provider/default-model settings needed to
 	// bootstrap Hermes against Ollama. The active provider stays on a
 	// launch-owned key so /model stays aligned with the launcher-managed entry,
 	// and the Ollama endpoint lives in providers: so the picker shows one row.
 	modelSection["provider"] = hermesProviderKey
-	modelSection["default"] = model
-	modelSection["base_url"] = hermesBaseURL()
-	modelSection["api_key"] = hermesPlaceholderKey
+	modelSection["default"] = hermesModelIDFor(model)
+	modelSection["base_url"] = hermesBaseURLFor(model)
+	modelSection["api_key"] = hermesKeyFor(model)
 	cfg["model"] = modelSection
 
 	// use Hermes' built-in web toolset for now.
@@ -525,6 +531,33 @@ func hermesConfigPath() (string, error) {
 
 func hermesBaseURL() string {
 	return strings.TrimRight(hermesOllamaURL().String(), "/") + "/v1"
+}
+
+// hermesBaseURLFor is the provider endpoint Hermes should talk to: the remote's
+// direct base for a user-remote model, otherwise the daemon's /v1.
+func hermesBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/")
+	}
+	return hermesBaseURL()
+}
+
+// hermesModelIDFor is the default model Hermes should select: the bare upstream
+// id for a user-remote model, otherwise the picker name.
+func hermesModelIDFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
+	return model
+}
+
+// hermesKeyFor is the provider API key: the remote's token for a user-remote
+// model, otherwise the placeholder Hermes uses for the daemon.
+func hermesKeyFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.Token
+	}
+	return hermesPlaceholderKey
 }
 
 func hermesEnvPath() (string, error) {

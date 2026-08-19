@@ -41,6 +41,11 @@ type modelEntry struct {
 func (d *Droid) String() string { return "Droid" }
 
 func (d *Droid) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	if _, err := exec.LookPath("droid"); err != nil {
 		return fmt.Errorf("droid is not installed, install from https://docs.factory.ai/cli/getting-started/quickstart")
 	}
@@ -123,7 +128,7 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 			maxOutput = model.MaxOutputTokens
 		}
 		modelID := fmt.Sprintf("custom:%s-%d", model.Name, i)
-		newModels = append(newModels, modelEntry{
+		entry := modelEntry{
 			Model:           model.Name,
 			DisplayName:     model.Name,
 			BaseURL:         envconfig.Host().String() + "/v1",
@@ -133,7 +138,14 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 			SupportsImages:  model.HasCapability("vision"),
 			ID:              modelID,
 			Index:           i,
-		})
+		}
+		if ep, ok := resolveRemoteEndpoint(model.Name); ok {
+			entry.Model = ep.UpstreamModel
+			entry.DisplayName = ep.UpstreamModel
+			entry.BaseURL = ep.BaseURL
+			entry.APIKey = ep.Token
+		}
+		newModels = append(newModels, entry)
 		if i == 0 {
 			defaultModelID = modelID
 		}

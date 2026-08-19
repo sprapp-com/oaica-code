@@ -49,6 +49,11 @@ func findOpenCode() (string, bool) {
 }
 
 func (o *OpenCode) Run(model string, models []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	opencodePath, err := ensureOpenCodeInstalled()
 	if err != nil {
 		return err
@@ -284,26 +289,82 @@ func (o *OpenCode) Models() []string {
 	return nil
 }
 
+// opencodeModelID is the model id opencode expects for a picker model: the bare
+// upstream id for a user-remote model (the remote's /v1/chat/completions knows
+// it as that, not the namespaced picker name), otherwise the full picker name
+// (local/cloud, which opencode sends to the daemon as-is).
+func opencodeModelID(m LaunchModel) string {
+	if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+		return ep.UpstreamModel
+	}
+	return m.Name
+}
+
 // buildInlineConfig produces the JSON string for OPENCODE_CONFIG_CONTENT.
 // primary is the model to launch with, models is the full list of available models.
+//
+// Models are partitioned by endpoint into one provider block each: a daemon
+// "ollama" provider for local/cloud models (byte-identical to the previous
+// single-provider config), plus one named provider per user remote pointing
+// directly at that remote's /v1 (or /v4) base. This lets an OpenAI-native
+// remote (kat-coder) be reached by opencode directly while local models keep
+// routing through the daemon.
 func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error) {
 	if primary.Name == "" || len(models) == 0 {
 		return "", fmt.Errorf("buildInlineConfig: primary and models are required")
 	}
 
+	type providerGroup struct {
+		id      string
+		name    string
+		baseURL string
+		apiKey  string
+		models  []LaunchModel
+	}
+	var groups []*providerGroup
+	byID := map[string]*providerGroup{}
+	add := func(m LaunchModel, id, name, baseURL, apiKey string) {
+		g := byID[id]
+		if g == nil {
+			g = &providerGroup{id: id, name: name, baseURL: baseURL, apiKey: apiKey}
+			byID[id] = g
+			groups = append(groups, g)
+		}
+		g.models = append(g.models, m)
+	}
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			add(m, ep.Name, ep.Name, ep.BaseURL, ep.Token)
+		} else {
+			add(m, "ollama", "Ollama", envconfig.Host().String()+"/v1", "")
+		}
+	}
+
+	providers := make(map[string]any, len(groups))
+	for _, g := range groups {
+		p := map[string]any{
+			"npm":    "@ai-sdk/openai-compatible",
+			"name":   g.name,
+			"models": buildModelEntries(g.models),
+		}
+		options := map[string]any{"baseURL": g.baseURL}
+		if g.apiKey != "" {
+			options["apiKey"] = g.apiKey
+		}
+		p["options"] = options
+		providers[g.id] = p
+	}
+
+	// Top-level model: "<providerId>/<modelId>".
+	primaryProvider, primaryID := "ollama", opencodeModelID(primary)
+	if ep, ok := resolveRemoteEndpoint(primary.Name); ok {
+		primaryProvider = ep.Name
+	}
+
 	config := map[string]any{
-		"$schema": "https://opencode.ai/config.json",
-		"provider": map[string]any{
-			"ollama": map[string]any{
-				"npm":  "@ai-sdk/openai-compatible",
-				"name": "Ollama",
-				"options": map[string]any{
-					"baseURL": envconfig.Host().String() + "/v1",
-				},
-				"models": buildModelEntries(models),
-			},
-		},
-		"model": "ollama/" + primary.Name,
+		"$schema":  "https://opencode.ai/config.json",
+		"provider": providers,
+		"model":    primaryProvider + "/" + primaryID,
 	}
 	data, err := json.Marshal(config)
 	if err != nil {
@@ -346,8 +407,9 @@ func readModelJSONModels() []string {
 func buildModelEntries(modelList []LaunchModel) map[string]any {
 	models := make(map[string]any)
 	for _, model := range modelList {
+		id := opencodeModelID(model)
 		entry := map[string]any{
-			"name": model.Name,
+			"name": id,
 		}
 		if model.HasCapability("vision") {
 			entry["modalities"] = map[string]any{
@@ -382,7 +444,7 @@ func buildModelEntries(modelList []LaunchModel) map[string]any {
 			limit["output"] = model.MaxOutputTokens
 			entry["limit"] = limit
 		}
-		models[model.Name] = entry
+		models[id] = entry
 	}
 	return models
 }

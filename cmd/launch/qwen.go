@@ -223,6 +223,11 @@ func qwenInstallerCommand(goos string) (string, []string, error) {
 }
 
 func (q *Qwen) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	qwenPath, err := q.findPath()
 	if err != nil {
 		return fmt.Errorf("qwen is not installed: %w", err)
@@ -274,7 +279,7 @@ func (q *Qwen) Configure(model string) error {
 
 func applyQwenOllamaConfig(cfg map[string]any, model string) {
 	envCfg := qwenMap(cfg["env"])
-	envCfg[qwenOllamaEnvKey] = "ollama"
+	envCfg[qwenOllamaEnvKey] = qwenKeyFor(model)
 	cfg["env"] = envCfg
 
 	modelProviders := qwenMap(cfg["modelProviders"])
@@ -284,12 +289,12 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 	security := qwenMap(cfg["security"])
 	auth := qwenMap(security["auth"])
 	auth["selectedType"] = "openai"
-	auth["baseUrl"] = qwenBaseURL()
+	auth["baseUrl"] = qwenBaseURLFor(model)
 	security["auth"] = auth
 	cfg["security"] = security
 
 	modelCfg := qwenMap(cfg["model"])
-	modelCfg["name"] = model
+	modelCfg["name"] = qwenModelIDFor(model)
 	cfg["model"] = modelCfg
 }
 
@@ -407,11 +412,39 @@ func qwenBaseURL() string {
 	return strings.TrimRight(envconfig.Host().String(), "/") + "/v1"
 }
 
+// qwenBaseURLFor is the provider base URL Qwen should use: the remote's direct
+// base for a user-remote model, otherwise the daemon's /v1.
+func qwenBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/")
+	}
+	return qwenBaseURL()
+}
+
+// qwenModelIDFor is the model id Qwen should use: the bare upstream id for a
+// user-remote model, otherwise the picker name.
+func qwenModelIDFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
+	return model
+}
+
+// qwenKeyFor is the API key Qwen should use: the remote's token for a
+// user-remote model, "ollama" for the daemon.
+func qwenKeyFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.Token
+	}
+	return "ollama"
+}
+
 func qwenProvider(model string) map[string]any {
+	id := qwenModelIDFor(model)
 	return map[string]any{
-		"id":      model,
-		"name":    fmt.Sprintf("%s (Ollama)", model),
-		"baseUrl": qwenBaseURL(),
+		"id":      id,
+		"name":    fmt.Sprintf("%s (Ollama)", id),
+		"baseUrl": qwenBaseURLFor(model),
 		"envKey":  qwenOllamaEnvKey,
 	}
 }
@@ -422,17 +455,17 @@ func qwenLaunchArgs(model string, args []string) []string {
 		launchArgs = append([]string{"--auth-type", "openai"}, launchArgs...)
 	}
 	if model != "" && !qwenHasFlag(launchArgs, "--model", "-m") {
-		launchArgs = append([]string{"--model", model}, launchArgs...)
+		launchArgs = append([]string{"--model", qwenModelIDFor(model)}, launchArgs...)
 	}
 	return launchArgs
 }
 
 func qwenLaunchEnv(model string) []string {
 	env := os.Environ()
-	env = qwenUpsertEnv(env, "OPENAI_API_KEY", "ollama")
-	env = qwenUpsertEnv(env, "OPENAI_BASE_URL", qwenBaseURL())
+	env = qwenUpsertEnv(env, "OPENAI_API_KEY", qwenKeyFor(model))
+	env = qwenUpsertEnv(env, "OPENAI_BASE_URL", qwenBaseURLFor(model))
 	if model != "" {
-		env = qwenUpsertEnv(env, "OPENAI_MODEL", model)
+		env = qwenUpsertEnv(env, "OPENAI_MODEL", qwenModelIDFor(model))
 	}
 	return env
 }

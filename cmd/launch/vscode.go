@@ -127,6 +127,13 @@ const (
 )
 
 func (v *VSCode) Run(model string, _ []LaunchModel, args []string) error {
+	// VS Code's Copilot chat uses the Ollama vendor API through the daemon,
+	// which the thin-client fork does not serve for user remotes — refuse early
+	// with a clear message instead of a confusing daemon 404.
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return fmt.Errorf("VS Code Copilot does not yet support user remotes (%q → %q); it relies on the Ollama vendor API, which is not served for user remotes. Use an OpenAI-compatible integration instead: opencode, codex, hermes, cline, droid, or kimi.", model, ep.Name)
+	}
+
 	v.checkVSCodeVersion()
 	v.checkCopilotChatVersion()
 

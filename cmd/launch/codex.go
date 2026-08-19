@@ -38,17 +38,22 @@ func (c *Codex) args(model, modelCatalogPath string, extra []string) ([]string, 
 	}
 
 	args := []string{"--profile", codexProfileName}
-	for _, override := range codexManagedConfigOverrides(modelCatalogPath) {
+	for _, override := range codexManagedConfigOverrides(model, modelCatalogPath) {
 		args = append(args, "-c", override)
 	}
 	if model != "" {
-		args = append(args, "-m", model)
+		args = append(args, "-m", codexModelIDFor(model))
 	}
 	args = append(args, extra...)
 	return args, nil
 }
 
 func (c *Codex) Run(model string, models []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	if err := checkCodexVersion(); err != nil {
 		return err
 	}
@@ -72,7 +77,7 @@ func (c *Codex) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(),
-		"OPENAI_API_KEY=ollama",
+		"OPENAI_API_KEY="+codexAPIKeyFor(model),
 	)
 	return cmd.Run()
 }
@@ -171,12 +176,12 @@ func codexValidateExtraArgs(args []string) error {
 	return nil
 }
 
-func codexManagedConfigOverrides(modelCatalogPath string) []string {
+func codexManagedConfigOverrides(model, modelCatalogPath string) []string {
 	overrides := []string{
 		fmt.Sprintf("%s=%q", codexRootModelProviderKey, codexProfileName),
 		fmt.Sprintf("model_providers.%s.name=%q", codexProfileName, codexProviderName),
-		fmt.Sprintf("model_providers.%s.base_url=%q", codexProfileName, codexBaseURL()),
-		fmt.Sprintf("model_providers.%s.wire_api=%q", codexProfileName, "responses"),
+		fmt.Sprintf("model_providers.%s.base_url=%q", codexProfileName, codexBaseURLFor(model)),
+		fmt.Sprintf("model_providers.%s.wire_api=%q", codexProfileName, codexWireFor(model)),
 	}
 	if modelCatalogPath != "" {
 		overrides = append(overrides, fmt.Sprintf("%s=%q", codexRootModelCatalogJSONKey, modelCatalogPath))
@@ -301,11 +306,12 @@ func writeCodexProfileConfig(profilePath, model, modelCatalogPath string) error 
 }
 
 func writeCodexNamedProfileConfig(profilePath, profileName, model, modelCatalogPath, backupSubdir string) error {
-	baseURL := codexBaseURL()
+	baseURL := codexBaseURLFor(model)
+	modelID := codexModelIDFor(model)
 
 	var lines []string
 	if strings.TrimSpace(model) != "" {
-		lines = append(lines, fmt.Sprintf("%s = %q", codexRootModelKey, model))
+		lines = append(lines, fmt.Sprintf("%s = %q", codexRootModelKey, modelID))
 	}
 	lines = append(lines, fmt.Sprintf("%s = %q", codexRootModelProviderKey, profileName))
 	if strings.TrimSpace(modelCatalogPath) != "" {
@@ -316,7 +322,7 @@ func writeCodexNamedProfileConfig(profilePath, profileName, model, modelCatalogP
 		codexProviderHeaderFor(profileName),
 		fmt.Sprintf("name = %q", codexProviderName),
 		fmt.Sprintf("base_url = %q", baseURL),
-		`wire_api = "responses"`,
+		fmt.Sprintf("wire_api = %q", codexWireFor(model)),
 		"",
 	}, "\n")
 
@@ -324,7 +330,7 @@ func writeCodexNamedProfileConfig(profilePath, profileName, model, modelCatalogP
 	if err != nil {
 		return err
 	}
-	if err := codexValidateProfileConfigText(parsed, profileName, model, modelCatalogPath, baseURL); err != nil {
+	if err := codexValidateProfileConfigText(parsed, profileName, modelID, modelCatalogPath, baseURL); err != nil {
 		return err
 	}
 
@@ -336,6 +342,45 @@ func writeCodexNamedProfileConfig(profilePath, profileName, model, modelCatalogP
 
 func codexBaseURL() string {
 	return strings.TrimRight(envconfig.ConnectableHost().String(), "/") + "/v1/"
+}
+
+// codexModelIDFor is the model id codex should send: the bare upstream id for a
+// user-remote model (the remote knows it as that, not the namespaced picker
+// name), otherwise the picker name (local/cloud, sent to the daemon as-is).
+func codexModelIDFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
+	return model
+}
+
+// codexBaseURLFor is the provider base_url codex should use: the remote's
+// direct base (with a trailing "/") for a user-remote model, otherwise the
+// daemon's /v1 (byte-identical to codexBaseURL()).
+func codexBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/") + "/"
+	}
+	return codexBaseURL()
+}
+
+// codexWireFor picks codex's wire API: "chat" for a user-remote model (most
+// remotes only speak /v1/chat/completions, not /v1/responses), "responses" for
+// the daemon — unchanged from before.
+func codexWireFor(model string) string {
+	if _, ok := resolveRemoteEndpoint(model); ok {
+		return "chat"
+	}
+	return "responses"
+}
+
+// codexAPIKeyFor is the OPENAI_API_KEY codex should use: the remote's token for
+// a user-remote model, "ollama" for the daemon (unchanged).
+func codexAPIKeyFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.Token
+	}
+	return "ollama"
 }
 
 func codexProfileHeader() string {
@@ -681,7 +726,7 @@ func codexRootLineHasKey(line, key string) bool {
 
 func codexCatalogModel(modelName string, models []LaunchModel) LaunchModel {
 	if model, ok := findLaunchModel(models, modelName); ok {
-		model.Name = modelName
+		model.Name = codexModelIDFor(modelName)
 		return model.WithCloudLimits()
 	}
 	return fallbackLaunchModel(modelName)

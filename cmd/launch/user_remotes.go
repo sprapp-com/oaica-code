@@ -6,7 +6,7 @@ package launch
 // gateway) can list it in ~/.oaica/remotes.json and have its models appear in
 // the SAME picker as local and OAICA-hosted ones. Nothing routes through
 // api.sprapp.com, which is a convenience router, not a licence gate — see
-// docs/architecture/SELF_HOSTED_REMOTE.md.
+// docs/architecture/PER_MODEL_ROUTING.md for per-model wire routing.
 //
 //	{
 //	  "remotes": [
@@ -19,6 +19,24 @@ package launch
 // set the env var wins, so a shared/committed config can name a variable each
 // user supplies privately.
 //
+// Protocol descriptor (optional, for per-model wire routing):
+//
+//	{ "name": "kat-a100b", "base_url": "http://192.168.0.50:8080",
+//	  "api_key_env": "KAT_KEY", "tool_format": "freeform" }
+//
+//   wire          "openai" (default) or "anthropic" — which /v1 endpoint the
+//                 box speaks. Drives direct-vs-translation-proxy routing.
+//   tool_format   how the model emits tool calls: "tool_calls" (default for an
+//                 openai wire — real OpenAI tool_calls JSON), "freeform"
+//                 (free-form JSON/XML text, not structured tool_calls — e.g.
+//                 kat-coder), "xml", or "none". Set "freeform" for a model that
+//                 cannot satisfy an integration's structured tool loop so oaica
+//                 can gate it instead of silently spiraling.
+//   tool_reliable whether tool_format reliably satisfies a tool loop. Defaults
+//                 true only for "tool_calls"; false for "freeform"/"xml"/"none"
+//                 unless explicitly set true.
+//
+// Failure of ONE remote never hides the others (or local models): each is
 // Failure of ONE remote never hides the others (or local models): each is
 // queried independently and errors are collected, not propagated. A box that
 // is asleep should cost you its own entry, not the whole menu.
@@ -44,6 +62,20 @@ type userRemote struct {
 	// (https://api.z.ai/api/paas/v4/chat/completions). Leave empty for the
 	// common OpenAI "v1" layout.
 	Version string `json:"version"`
+	// Wire is the request/response protocol the box speaks: "openai"
+	// (/v1/chat/completions, the default) or "anthropic" (/v1/messages). Empty
+	// defaults to "openai". Drives routing: matching wire → direct; mismatch →
+	// the Anthropic↔OpenAI translation proxy.
+	Wire string `json:"wire,omitempty"`
+	// ToolFormat is how the model emits tool calls: "tool_calls", "freeform",
+	// "xml", or "none". Empty is inferred from Wire (openai→"tool_calls",
+	// anthropic→"xml"). Used by the capability gate to refuse pairings that
+	// will spiral (e.g. a freeform model behind a tool_use loop).
+	ToolFormat string `json:"tool_format,omitempty"`
+	// ToolReliable is whether ToolFormat reliably satisfies a structured tool
+	// loop. Defaults to true only for inferred "tool_calls"; false otherwise
+	// unless explicitly set. See Descriptor().
+	ToolReliable *bool `json:"tool_reliable,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -59,6 +91,39 @@ func (r userRemote) key() string {
 		}
 	}
 	return strings.TrimSpace(r.APIKey)
+}
+
+// RemoteDescriptor is the per-remote protocol metadata that decides routing
+// (direct vs translation proxy) and the capability gate. Zero values mean
+// "unknown / default"; consumers use the wire-format defaults.
+type RemoteDescriptor struct {
+	Wire         string // "openai" | "anthropic"
+	ToolFormat   string // "tool_calls" | "freeform" | "xml" | "none"
+	ToolReliable bool
+}
+
+// Descriptor resolves a remote's protocol descriptor with defaults: Wire
+// "openai", ToolFormat inferred from Wire (openai→"tool_calls",
+// anthropic→"xml"), and ToolReliable true only when the tool format is
+// "tool_calls" — unless ToolReliable is explicitly set, which always wins.
+func (r userRemote) Descriptor() RemoteDescriptor {
+	wire := strings.ToLower(strings.TrimSpace(r.Wire))
+	if wire == "" {
+		wire = "openai"
+	}
+	tf := strings.ToLower(strings.TrimSpace(r.ToolFormat))
+	if tf == "" {
+		if wire == "anthropic" {
+			tf = "xml"
+		} else {
+			tf = "tool_calls"
+		}
+	}
+	reliable := tf == "tool_calls"
+	if r.ToolReliable != nil {
+		reliable = *r.ToolReliable
+	}
+	return RemoteDescriptor{Wire: wire, ToolFormat: tf, ToolReliable: reliable}
 }
 
 func userRemotesPath() string {
@@ -153,6 +218,42 @@ func findUserRemoteForModel(name string) (userRemote, string, bool) {
 	return userRemote{}, "", false
 }
 
+// RemoteEndpoint is the resolved, ready-to-hit endpoint for a picker model that
+// lives on a user-defined remote: the direct base URL (including the /v1 or /v4
+// version prefix), the bearer token, the bare upstream model id, and the
+// protocol descriptor used by the capability gate.
+type RemoteEndpoint struct {
+	Name          string // remote.Name — provider id in integration catalogs
+	BaseURL       string // r.openAIBase() — includes the /v1 (or /v4) version prefix
+	Token         string // r.key()
+	UpstreamModel string // bare id the remote expects (part after the first "/")
+	Wire          string
+	ToolFormat    string
+	ToolReliable  bool
+}
+
+// resolveRemoteEndpoint splits a "<remote>/<model>" picker name and resolves the
+// full endpoint the integration should talk to directly. Returns ok=false for
+// anything that is not a user remote (local, cloud, ":local" — those use ":" or
+// no prefix at the split position, so findUserRemoteForModel misses them). The
+// base URL reuses openAIBase() so the /v1 (or /v4) version prefix is respected.
+func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
+	remote, bare, ok := findUserRemoteForModel(model)
+	if !ok {
+		return RemoteEndpoint{}, false
+	}
+	d := remote.Descriptor()
+	return RemoteEndpoint{
+		Name:          remote.Name,
+		BaseURL:       remote.openAIBase(),
+		Token:         remote.key(),
+		UpstreamModel: bare,
+		Wire:          d.Wire,
+		ToolFormat:    d.ToolFormat,
+		ToolReliable:  d.ToolReliable,
+	}, true
+}
+
 // remoteBaseURL normalizes a remote's base_url to a form without a trailing
 // "/" or "/v1" version prefix. Remotes are configured both ways — some include
 // the OpenAI version prefix in base_url ("https://api.deepseek.com/v1"), some
@@ -238,9 +339,13 @@ func userRemoteLaunchModels() ([]LaunchModel, []error) {
 				display = display[i+1:] // llama-server reports a FILE PATH
 			}
 			display = strings.TrimSuffix(display, ".gguf")
+			d := r.Descriptor()
 			models = append(models, LaunchModel{
-				Name:   r.Name + "/" + display,
-				Remote: true,
+				Name:         r.Name + "/" + display,
+				Remote:       true,
+				Wire:         d.Wire,
+				ToolFormat:   d.ToolFormat,
+				ToolReliable: d.ToolReliable,
 			}.WithCloudLimits())
 		}
 	}

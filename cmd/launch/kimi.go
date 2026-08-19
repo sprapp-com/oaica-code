@@ -37,6 +37,11 @@ func (k *Kimi) args(config string, extra []string) []string {
 }
 
 func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	if strings.TrimSpace(model) == "" {
 		return fmt.Errorf("model is required")
 	}
@@ -160,20 +165,47 @@ func validateKimiPassthroughArgs(args []string) error {
 	return nil
 }
 
+// kimiBaseURLFor is the provider base URL Kimi should use: the remote's direct
+// base for a user-remote model, otherwise the daemon's /v1.
+func kimiBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/")
+	}
+	return envconfig.ConnectableHost().String() + "/v1"
+}
+
+// kimiModelIDFor is the model id Kimi should use: the bare upstream id for a
+// user-remote model, otherwise the picker name.
+func kimiModelIDFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
+	return model
+}
+
+// kimiKeyFor is the provider API key: the remote's token for a user-remote
+// model, otherwise "ollama".
+func kimiKeyFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.Token
+	}
+	return "ollama"
+}
+
 func buildKimiInlineConfig(model string, maxContextSize int) (string, error) {
 	cfg := map[string]any{
 		"default_model": kimiDefaultModelAlias,
 		"providers": map[string]any{
 			kimiDefaultModelAlias: map[string]any{
 				"type":     "openai_legacy",
-				"base_url": envconfig.ConnectableHost().String() + "/v1",
-				"api_key":  "ollama",
+				"base_url": kimiBaseURLFor(model),
+				"api_key":  kimiKeyFor(model),
 			},
 		},
 		"models": map[string]any{
 			kimiDefaultModelAlias: map[string]any{
 				"provider":         kimiDefaultModelAlias,
-				"model":            model,
+				"model":            kimiModelIDFor(model),
 				"max_context_size": maxContextSize,
 			},
 		},

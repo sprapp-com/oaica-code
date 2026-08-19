@@ -23,6 +23,11 @@ type LaunchModel struct {
 	EmbeddingLength int
 	Size            int64
 	Details         api.ModelDetails
+	// Protocol descriptor for a user-remote model (see RemoteDescriptor).
+	// Zero values for local/cloud entries — those route through the daemon.
+	Wire         string
+	ToolFormat   string
+	ToolReliable bool
 }
 
 type modelInfo = LaunchModel

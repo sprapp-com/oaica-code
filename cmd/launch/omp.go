@@ -100,6 +100,9 @@ func (o *OMP) args(model string, extra []string) []string {
 }
 
 func ompModelName(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return ep.UpstreamModel
+	}
 	if strings.HasPrefix(model, "ollama/") {
 		return model
 	}
@@ -136,6 +139,11 @@ func ompExecutableNames() []string {
 }
 
 func (o *OMP) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
 	ompPath, err := o.findPath()
 	if err != nil {
 		return fmt.Errorf("omp is not installed, install from https://omp.sh")
@@ -275,7 +283,7 @@ func writeOMPModelsConfig(primary string, models []LaunchModel) error {
 		cfg = existing
 	}
 
-	provider := ensureOMPProvider(cfg)
+	provider := ensureOMPProvider(cfg, primary)
 	existingByID := ompModelEntriesByID(provider)
 	ordered := append([]LaunchModel(nil), models...)
 	if model, ok := findLaunchModel(ordered, primary); ok {
@@ -350,7 +358,7 @@ func writeOMPAgentConfig() error {
 	return fileutil.WriteWithBackup(path, data, ompIntegrationName)
 }
 
-func ensureOMPProvider(cfg map[string]any) map[string]any {
+func ensureOMPProvider(cfg map[string]any, model string) map[string]any {
 	providers, _ := cfg["providers"].(map[string]any)
 	if providers == nil {
 		providers = make(map[string]any)
@@ -362,15 +370,29 @@ func ensureOMPProvider(cfg map[string]any) map[string]any {
 		providers[ompProviderName] = provider
 	}
 
-	provider["baseUrl"] = ompBaseURL()
+	provider["baseUrl"] = ompBaseURLFor(model)
 	provider["api"] = "openai-responses"
+	// Flip to bearer when a user-remote model needs its token; the daemon is
+	// unauthenticated.
 	provider["auth"] = "none"
+	if ep, ok := resolveRemoteEndpoint(model); ok && ep.Token != "" {
+		provider["auth"] = "bearer"
+	}
 	provider["discovery"] = map[string]any{"type": "ollama"}
 	return provider
 }
 
 func ompBaseURL() string {
 	return strings.TrimRight(envconfig.ConnectableHost().String(), "/") + "/v1"
+}
+
+// ompBaseURLFor is the provider base URL OMP should use: the remote's direct
+// base for a user-remote model, otherwise the daemon's /v1.
+func ompBaseURLFor(model string) string {
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return strings.TrimRight(ep.BaseURL, "/")
+	}
+	return ompBaseURL()
 }
 
 func ompProviderHealthy(provider map[string]any) bool {
@@ -423,9 +445,13 @@ func ompModelEntriesByID(provider map[string]any) map[string]map[string]any {
 }
 
 func ompModelConfig(modelInfo LaunchModel) map[string]any {
+	id := modelInfo.Name
+	if ep, ok := resolveRemoteEndpoint(modelInfo.Name); ok {
+		id = ep.UpstreamModel
+	}
 	entry := map[string]any{
-		"id":   modelInfo.Name,
-		"name": modelInfo.Name,
+		"id":   id,
+		"name": id,
 	}
 	input := []string{"text"}
 	if slices.Contains(modelInfo.Capabilities, model.CapabilityVision) {

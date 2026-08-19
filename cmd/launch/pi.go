@@ -535,6 +535,12 @@ func (p *Pi) Edit(models []LaunchModel) error {
 		return nil
 	}
 
+	// Pi's primary model is configured via Edit, not passed to Run, so the
+	// capability gate applies here. --force-tools is not threaded through Edit.
+	if err := gateOpenAITools(models[0].Name, false); err != nil {
+		return err
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -558,9 +564,9 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	ollama, ok := providers["ollama"].(map[string]any)
 	if !ok {
 		ollama = map[string]any{
-			"baseUrl": envconfig.Host().String() + "/v1",
+			"baseUrl": piProviderBaseURL(models),
 			"api":     "openai-completions",
-			"apiKey":  "ollama",
+			"apiKey":  piProviderKey(models),
 		}
 	}
 
@@ -629,7 +635,7 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	}
 
 	settings["defaultProvider"] = "ollama"
-	settings["defaultModel"] = models[0].Name
+	settings["defaultModel"] = piModelIDFor(models[0])
 
 	settingsData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -687,10 +693,41 @@ func hasContextWindow(cfg map[string]any) bool {
 	}
 }
 
+// piModelIDFor is the model id Pi should use: the bare upstream id for a
+// user-remote model, otherwise the picker name.
+func piModelIDFor(model LaunchModel) string {
+	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
+		return ep.UpstreamModel
+	}
+	return model.Name
+}
+
+// piProviderBaseURL is the base URL Pi's single provider should use: the first
+// user-remote model's endpoint, otherwise the daemon's /v1.
+func piProviderBaseURL(models []LaunchModel) string {
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			return strings.TrimRight(ep.BaseURL, "/")
+		}
+	}
+	return envconfig.Host().String() + "/v1"
+}
+
+// piProviderKey is the API key Pi's single provider should use: the first
+// user-remote model's token, otherwise "ollama".
+func piProviderKey(models []LaunchModel) string {
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			return ep.Token
+		}
+	}
+	return "ollama"
+}
+
 // createConfig builds Pi model config with capability detection.
 func createConfig(model LaunchModel) map[string]any {
 	cfg := map[string]any{
-		"id":      model.Name,
+		"id":      piModelIDFor(model),
 		"_launch": true,
 	}
 

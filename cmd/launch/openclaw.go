@@ -28,6 +28,13 @@ type Openclaw struct{}
 func (c *Openclaw) String() string { return "OpenClaw" }
 
 func (c *Openclaw) Run(model string, _ []LaunchModel, args []string) error {
+	// OpenClaw drives the Ollama native API (/api/chat) through the daemon,
+	// which the thin-client fork does not serve for user remotes — refuse early
+	// with a clear message instead of a confusing daemon 404.
+	if ep, ok := resolveRemoteEndpoint(model); ok {
+		return fmt.Errorf("OpenClaw does not yet support user remotes (%q → %q); it relies on the Ollama native API, which is not served for user remotes. Use an OpenAI-compatible integration instead: opencode, codex, hermes, cline, droid, or kimi.", model, ep.Name)
+	}
+
 	bin, err := ensureOpenclawInstalled()
 	if err != nil {
 		return err

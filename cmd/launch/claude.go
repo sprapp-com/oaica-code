@@ -69,6 +69,8 @@ func RunNative(args []string) error {
 }
 
 func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
+	forceTools, args := extractForceTools(args)
+
 	claudePath, err := ensureClaudeInstalled()
 	if err != nil {
 		return err
@@ -88,6 +90,9 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	// OAICA router/key. The bare upstream model id (after the first "/") is
 	// what the remote expects; the namespaced picker name is oaica-only.
 	if remote, bare, ok := findUserRemoteForModel(model); ok {
+		if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, forceTools); err != nil {
+			return err
+		}
 		anthropicBaseURL := ""
 		if ln, port, err := ListenAnthropicOpenAIProxy(remote, bare); err == nil {
 			go func() {
