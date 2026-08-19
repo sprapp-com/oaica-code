@@ -222,3 +222,29 @@ func TestExtractForceTools(t *testing.T) {
 		t.Errorf("rest = %v, want [a]", rest)
 	}
 }
+
+func TestExtractSonnetModel(t *testing.T) {
+	sonnet, rest := extractSonnetModel([]string{"--model", "x", "--sonnet-model", "muse-spark-1.2", "extra"})
+	if sonnet != "muse-spark-1.2" {
+		t.Errorf("sonnet = %q, want muse-spark-1.2", sonnet)
+	}
+	if len(rest) != 3 || rest[0] != "--model" || rest[1] != "x" || rest[2] != "extra" {
+		t.Errorf("rest = %v, want --model/x/extra with --sonnet-model pair removed", rest)
+	}
+
+	sonnet, rest = extractSonnetModel([]string{"--sonnet-model=muse-spark-1.2", "a"})
+	if sonnet != "muse-spark-1.2" {
+		t.Errorf("sonnet = %q for --sonnet-model=..., want muse-spark-1.2", sonnet)
+	}
+	if len(rest) != 1 || rest[0] != "a" {
+		t.Errorf("rest = %v, want [a]", rest)
+	}
+
+	sonnet, rest = extractSonnetModel([]string{"--model", "x"})
+	if sonnet != "" {
+		t.Errorf("sonnet = %q, want empty when flag absent", sonnet)
+	}
+	if len(rest) != 2 {
+		t.Errorf("rest = %v, want unchanged when flag absent", rest)
+	}
+}

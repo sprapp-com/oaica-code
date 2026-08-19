@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/ollama/ollama/api"
 )
@@ -141,6 +142,29 @@ func extractForceTools(args []string) (force bool, rest []string) {
 		rest = append(rest, a)
 	}
 	return force, rest
+}
+
+// extractSonnetModel pulls a launcher-level "--sonnet-model <bare-id>" (or
+// "--sonnet-model=<bare-id>") out of the passthrough args, for claude.go's
+// opusplan-style tier split: the picker-selected model stays pinned to
+// Opus/Haiku, this gives a second bare upstream id (same remote) for
+// Sonnet-tier requests. Not forwarded to the child claude binary — it only
+// controls which ANTHROPIC_DEFAULT_SONNET_MODEL/CLAUDE_CODE_SUBAGENT_MODEL
+// env vars we set.
+func extractSonnetModel(args []string) (sonnetModel string, rest []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--sonnet-model" && i+1 < len(args):
+			sonnetModel = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--sonnet-model="):
+			sonnetModel = strings.TrimPrefix(a, "--sonnet-model=")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return sonnetModel, rest
 }
 
 // ResolveAgentModel resolves a picker model name to the Anthropic-native

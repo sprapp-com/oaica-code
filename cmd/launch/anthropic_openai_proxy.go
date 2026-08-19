@@ -372,7 +372,22 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 			return
 		}
 
-		oaiReq := chatRequestToOpenAI(chatReq, anthReq, upstreamModel)
+		// Tier-aware routing: Claude Code's opusplan mode (and its normal
+		// Opus/Sonnet/Haiku tiering) sends a DIFFERENT model id per request
+		// depending which ANTHROPIC_DEFAULT_*_MODEL env var it's currently
+		// acting under — anthReq.Model carries that id. Honor it when set so
+		// claude.go can pin distinct upstream models per tier (e.g. a
+		// stronger model for planning, a cheaper one for execution) through
+		// this SAME remote/proxy. Falls back to the fixed upstreamModel this
+		// proxy was started with when the request carries none, so a normal
+		// single-model launch (all tiers pinned to the same bare id) is
+		// unaffected — byte-identical to before this existed.
+		reqModel := upstreamModel
+		if anthReq.Model != "" {
+			reqModel = anthReq.Model
+		}
+
+		oaiReq := chatRequestToOpenAI(chatReq, anthReq, reqModel)
 		oaiBody, err := json.Marshal(oaiReq)
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "marshal openai request: "+err.Error())
@@ -404,9 +419,9 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 		}
 
 		if anthReq.Stream {
-			handleStreamResponse(w, resp.Body, upstreamModel)
+			handleStreamResponse(w, resp.Body, reqModel)
 		} else {
-			handleNonStreamResponse(w, resp.Body, upstreamModel)
+			handleNonStreamResponse(w, resp.Body, reqModel)
 		}
 	})
 

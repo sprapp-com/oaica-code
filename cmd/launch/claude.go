@@ -70,6 +70,7 @@ func RunNative(args []string) error {
 
 func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
+	sonnetModel, args := extractSonnetModel(args)
 
 	claudePath, err := ensureClaudeInstalled()
 	if err != nil {
@@ -93,6 +94,24 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, forceTools); err != nil {
 			return err
 		}
+
+		// opusplan-style tier split: --sonnet-model gives a second bare model
+		// id on the SAME remote (one proxy = one remote/key) to use for
+		// Sonnet-tier requests, while the picker-selected model stays pinned
+		// to Opus/Haiku/subagent. The proxy (anthropic_openai_proxy.go) reads
+		// whichever model Claude Code puts in each request's "model" field
+		// and forwards that upstream — no per-request routing logic needed
+		// here, just pointing the two ANTHROPIC_DEFAULT_*_MODEL env vars at
+		// different bare ids. Gate the sonnet model too — same remote, same
+		// tool-format risk.
+		sonnetBare := bare
+		if sonnetModel != "" {
+			sonnetBare = sonnetModel
+			if err := gateUserRemoteTools(remote, sonnetBare, toolWireAnthropic, forceTools); err != nil {
+				return err
+			}
+		}
+
 		anthropicBaseURL := ""
 		if ln, port, err := ListenAnthropicOpenAIProxy(remote, bare); err == nil {
 			go func() {
@@ -110,7 +129,7 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		cmd.Env = append(os.Environ(), c.userRemoteEnvVars(remote, bare, anthropicBaseURL)...)
+		cmd.Env = append(os.Environ(), c.userRemoteEnvVars(remote, bare, sonnetBare, anthropicBaseURL)...)
 		return cmd.Run()
 	}
 
@@ -144,8 +163,15 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 // userRemoteEnvVars builds the Claude Code environment for a user-defined
 // remote model. The auth token is the REMOTE's key (not the OAICA key), the
 // model env vars pin to the bare upstream id, and ANTHROPIC_BASE_URL points
-// at the local Anthropic↔OpenAI translation proxy.
-func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, anthropicBaseURL string) []string {
+// at the local Anthropic↔OpenAI translation proxy. sonnetModel is normally
+// equal to bareModel (single-model launch, byte-identical to before tier
+// splitting existed); when --sonnet-model gives a different bare id,
+// ANTHROPIC_DEFAULT_SONNET_MODEL/CLAUDE_CODE_SUBAGENT_MODEL point at it
+// instead, so Claude Code's opusplan mode (Opus plans, Sonnet executes) and
+// its normal per-tier calls resolve to two different upstream models through
+// the SAME remote/proxy (the proxy honors whichever model each request
+// carries — see anthReq.Model handling in anthropic_openai_proxy.go).
+func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, sonnetModel, anthropicBaseURL string) []string {
 	env := []string{
 		"ANTHROPIC_BASE_URL=" + anthropicBaseURL,
 		"ANTHROPIC_API_KEY=",
@@ -155,9 +181,9 @@ func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, anthropicBaseUR
 		"DISABLE_FEEDBACK_COMMAND=1",
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
 		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + bareModel,
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + bareModel,
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + sonnetModel,
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + bareModel,
-		"CLAUDE_CODE_SUBAGENT_MODEL=" + bareModel,
+		"CLAUDE_CODE_SUBAGENT_MODEL=" + sonnetModel,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
 		"CLAUDE_CODE_AUTO_MODE_MODEL=" + bareModel,
 	}
