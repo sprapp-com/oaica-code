@@ -38,6 +38,12 @@ type userRemote struct {
 	BaseURL   string `json:"base_url"`
 	APIKey    string `json:"api_key"`
 	APIKeyEnv string `json:"api_key_env"`
+	// Version is the OpenAI API version prefix appended to base_url when
+	// building endpoint URLs (e.g. "/v1/chat/completions"). Defaults to "v1".
+	// z.ai is the notable exception: it uses "v4"
+	// (https://api.z.ai/api/paas/v4/chat/completions). Leave empty for the
+	// common OpenAI "v1" layout.
+	Version string `json:"version"`
 }
 
 type userRemotesFile struct {
@@ -66,17 +72,42 @@ func userRemotesPath() string {
 	return filepath.Join(home, ".oaica", "remotes.json")
 }
 
+// Built-in z.ai provider. Exporting Z_AI_API_KEY (e.g. in ~/.bashrc) is enough
+// to make z.ai appear in the picker — no remotes.json edit. Uses the official
+// z.ai platform OpenAI-compatible endpoint under its "v4" API version, so GLM
+// models (e.g. glm-5.3) are discoverable and selectable.
+const (
+	zaiName    = "zai"
+	zaiBaseURL = "https://api.z.ai/api/paas"
+	zaiEnvKey  = "Z_AI_API_KEY"
+)
+
+// builtinRemotes returns remotes that oaica knows about without config, active
+// only while their credential env var is set.
+func builtinRemotes() []userRemote {
+	if os.Getenv(zaiEnvKey) == "" {
+		return nil
+	}
+	return []userRemote{{
+		Name:      zaiName,
+		BaseURL:   zaiBaseURL,
+		APIKeyEnv: zaiEnvKey,
+		Version:   "v4",
+	}}
+}
+
 // loadUserRemotes returns the configured remotes. A missing file is normal and
-// yields no error — most users have none.
+// yields no error — most users have none. Built-in providers (z.ai) are merged
+// in so a key exported in the shell is enough to surface them.
 func loadUserRemotes() ([]userRemote, error) {
 	path := userRemotesPath()
 	if path == "" {
-		return nil, nil
+		return builtinRemotes(), nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return builtinRemotes(), nil
 		}
 		return nil, err
 	}
@@ -93,7 +124,7 @@ func loadUserRemotes() ([]userRemote, error) {
 		}
 		out = append(out, r)
 	}
-	return out, nil
+	return append(out, builtinRemotes()...), nil
 }
 
 // findUserRemoteForModel splits a "<remote>/<model>" picker name and returns
@@ -125,7 +156,7 @@ func findUserRemoteForModel(name string) (userRemote, string, bool) {
 // remoteBaseURL normalizes a remote's base_url to a form without a trailing
 // "/" or "/v1" version prefix. Remotes are configured both ways — some include
 // the OpenAI version prefix in base_url ("https://api.deepseek.com/v1"), some
-// don't ("http://192.168.1.50:8080"). Callers append "/v1/<endpoint>" exactly
+// don't ("http://192.168.1.50:8080"). openAIBase appends "/<version>" exactly
 // once, so a trailing /v1 here would produce /v1/v1/<endpoint> (404).
 func remoteBaseURL(r userRemote) string {
 	b := strings.TrimRight(strings.TrimSpace(r.BaseURL), "/")
@@ -133,10 +164,23 @@ func remoteBaseURL(r userRemote) string {
 	return b
 }
 
-// fetchRemoteModels lists one remote's /v1/models. Short timeout: a sleeping
-// box must not stall the picker.
+// openAIBase returns the remote's full OpenAI base including its API version
+// prefix, the value endpoint URLs are appended to. Almost all OpenAI-compatible
+// endpoints version under "v1" ("https://api.deepseek.com/v1/chat/completions");
+// z.ai versions under "v4" ("https://api.z.ai/api/paas/v4/chat/completions").
+// The version defaults to "v1"; set userRemote.Version to override.
+func (r userRemote) openAIBase() string {
+	v := strings.Trim(strings.TrimSpace(r.Version), "/")
+	if v == "" {
+		v = "v1"
+	}
+	return remoteBaseURL(r) + "/" + v
+}
+
+// fetchRemoteModels lists one remote's models endpoint (e.g. /v1/models).
+// Short timeout: a sleeping box must not stall the picker.
 func fetchRemoteModels(r userRemote) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, remoteBaseURL(r)+"/v1/models", nil)
+	req, err := http.NewRequest(http.MethodGet, r.openAIBase()+"/models", nil)
 	if err != nil {
 		return nil, err
 	}

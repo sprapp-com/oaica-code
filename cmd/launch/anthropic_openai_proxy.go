@@ -325,19 +325,21 @@ func ListenAnthropicOpenAIProxy(remote userRemote, upstreamModel string) (net.Li
 // listener closes.
 func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel string) error {
 	// Normalize the base URL (shared with fetchRemoteModels so the picker
-	// and the proxy agree): strip a trailing "/" and "/v1" so we append
-	// /v1/<endpoint> exactly once — otherwise a base_url that already
-	// includes /v1 (e.g. https://api.deepseek.com/v1) would produce
+	// and the proxy agree): openAIBase strips a trailing "/v1" from base_url
+	// and re-appends the remote's API version (default "v1", "v4" for z.ai),
+	// so the upstream endpoint is hit exactly once — otherwise a base_url that
+	// already includes /v1 (e.g. https://api.deepseek.com/v1) would produce
 	// /v1/v1/chat/completions and 404.
-	baseURL := remoteBaseURL(remote)
+	baseURL := remote.openAIBase()
 	key := remote.key()
 
 	mux := http.NewServeMux()
 
-	// GET /v1/models — proxy straight to the remote's /v1/models so Claude
-	// Code's model probes resolve. The remote already speaks OpenAI /v1/models.
+	// GET /v1/models — proxy straight to the remote's /models endpoint so
+	// Claude Code's model probes resolve. The remote already speaks OpenAI
+	// /models (z.ai serves it under /v4).
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		proxyPassThrough(w, r, baseURL+"/v1/models", key)
+		proxyPassThrough(w, r, baseURL+"/models", key)
 	})
 
 	// /health — a trivial liveness probe so callers can confirm the proxy is up.
@@ -377,7 +379,7 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 			return
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(oaiBody))
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
 			return
