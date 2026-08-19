@@ -95,7 +95,12 @@ func gateRemoteToolsEndpoint(ep RemoteEndpoint, wants ToolWire, force bool) erro
 	if ok {
 		return nil
 	}
-	if force {
+	// A remote can opt itself into always-warn (remotes.json "force_tools":
+	// true) so a model you've deliberately decided to use despite an
+	// unreliable tool format — e.g. kat-coder driven only through an
+	// OpenAI-wire integration — doesn't need --force-tools typed every
+	// launch. Still visible: same stderr warning either way.
+	if force || ep.ForceTools {
 		fmt.Fprintf(os.Stderr, "%sWarning: %s%s\n", ansiYellow, reason, ansiReset)
 		return nil
 	}
@@ -115,6 +120,7 @@ func gateUserRemoteTools(remote userRemote, bare string, wants ToolWire, force b
 		Wire:          d.Wire,
 		ToolFormat:    d.ToolFormat,
 		ToolReliable:  d.ToolReliable,
+		ForceTools:    remote.ForceTools,
 	}
 	return gateRemoteToolsEndpoint(ep, wants, force)
 }

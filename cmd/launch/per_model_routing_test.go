@@ -18,7 +18,8 @@ func writeDescriptorRemotesFile(t *testing.T) string {
     { "name": "kat", "base_url": "http://192.168.0.50:8080", "api_key_env": "KAT_KEY", "tool_format": "freeform" },
     { "name": "vl",  "base_url": "http://10.0.0.9:8000",      "api_key": "sk-vl", "tool_format": "tool_calls" },
     { "name": "ds",  "base_url": "https://api.deepseek.com",  "api_key": "sk-ds" },
-    { "name": "zai", "base_url": "https://api.z.ai/api/paas", "api_key": "sk-zai", "version": "v4" }
+    { "name": "zai", "base_url": "https://api.z.ai/api/paas", "api_key": "sk-zai", "version": "v4" },
+    { "name": "katforced", "base_url": "http://192.168.0.50:30099", "api_key": "", "tool_format": "freeform", "force_tools": true }
   ]
 }`
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -187,6 +188,12 @@ func TestGateOpenAITools(t *testing.T) {
 			t.Errorf("gateOpenAITools(local) error: %v", err)
 		}
 	})
+
+	t.Run("remote-level force_tools warns-and-proceeds without the flag", func(t *testing.T) {
+		if err := gateOpenAITools("katforced/kat-coder", false); err != nil {
+			t.Errorf("gateOpenAITools(force_tools remote, force=false) error: %v, want warn-and-proceed via remote's own force_tools", err)
+		}
+	})
 }
 
 func TestGateUserRemoteTools(t *testing.T) {
@@ -202,6 +209,14 @@ func TestGateUserRemoteTools(t *testing.T) {
 	}
 	if err := gateUserRemoteTools(kat, bare, toolWireAnthropic, true); err != nil {
 		t.Errorf("gateUserRemoteTools(force=true) error: %v, want warn-and-proceed", err)
+	}
+
+	katforced, bare2, ok := findUserRemoteForModel("katforced/kat-coder")
+	if !ok {
+		t.Fatal("findUserRemoteForModel(katforced/kat-coder) not ok")
+	}
+	if err := gateUserRemoteTools(katforced, bare2, toolWireAnthropic, false); err != nil {
+		t.Errorf("gateUserRemoteTools(remote.ForceTools, force=false) error: %v, want warn-and-proceed via remote's own force_tools", err)
 	}
 }
 

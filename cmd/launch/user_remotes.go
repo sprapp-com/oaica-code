@@ -35,6 +35,13 @@ package launch
 //   tool_reliable whether tool_format reliably satisfies a tool loop. Defaults
 //                 true only for "tool_calls"; false for "freeform"/"xml"/"none"
 //                 unless explicitly set true.
+//   force_tools   set true to always warn-and-proceed past the capability
+//                 gate for this remote instead of refusing, equivalent to
+//                 passing --force-tools on every launch. Use once you've
+//                 deliberately decided to drive an unreliable-tool-format
+//                 model (e.g. kat-coder) only through an OpenAI-wire
+//                 integration (opencode, codex, ...) so you don't retype the
+//                 flag each time. Still prints the warning.
 //
 // Failure of ONE remote never hides the others (or local models): each is
 // Failure of ONE remote never hides the others (or local models): each is
@@ -76,6 +83,15 @@ type userRemote struct {
 	// loop. Defaults to true only for inferred "tool_calls"; false otherwise
 	// unless explicitly set. See Descriptor().
 	ToolReliable *bool `json:"tool_reliable,omitempty"`
+	// ForceTools makes the capability gate (agent_routing.go) always
+	// warn-and-proceed for this remote instead of refusing, equivalent to
+	// passing --force-tools on every launch. Set this on a remote you've
+	// deliberately decided to use despite an unreliable tool format (e.g. a
+	// freeform-tool-calling coder model you only ever drive through an
+	// OpenAI-wire integration) so you don't have to remember the flag each
+	// time. Still prints the same stderr warning — this only skips the
+	// refusal, not the visibility.
+	ForceTools bool `json:"force_tools,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -230,6 +246,7 @@ type RemoteEndpoint struct {
 	Wire          string
 	ToolFormat    string
 	ToolReliable  bool
+	ForceTools    bool // remote.ForceTools — skip the capability gate's refusal for this remote
 }
 
 // resolveRemoteEndpoint splits a "<remote>/<model>" picker name and resolves the
@@ -251,6 +268,7 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		Wire:          d.Wire,
 		ToolFormat:    d.ToolFormat,
 		ToolReliable:  d.ToolReliable,
+		ForceTools:    remote.ForceTools,
 	}, true
 }
 
