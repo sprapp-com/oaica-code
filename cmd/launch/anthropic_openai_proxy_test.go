@@ -7,8 +7,45 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 )
+
+// TestNormalizeSystemFirst verifies the proxy folds every system message into a
+// SINGLE leading system message. Some Anthropic→OpenAI translations place a
+// second system message AFTER a user turn (e.g. Claude Code: [system, user,
+// system]); strict chat templates (KAT-Coder's apex GGUF) raise
+// "System message must be at the beginning" on that. Non-system messages keep
+// their relative order.
+func TestNormalizeSystemFirst(t *testing.T) {
+	in := []openAIMessage{
+		{Role: "system", Content: "sys-a"},
+		{Role: "user", Content: "hello"},
+		{Role: "system", Content: "sys-b"},
+		{Role: "user", Content: "again"},
+	}
+	got := normalizeSystemFirst(in)
+	want := []openAIMessage{
+		{Role: "system", Content: "sys-a\n\nsys-b"},
+		{Role: "user", Content: "hello"},
+		{Role: "user", Content: "again"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("normalizeSystemFirst = %+v, want %+v", got, want)
+	}
+
+	// No system messages → unchanged.
+	single := []openAIMessage{{Role: "user", Content: "x"}}
+	if out := normalizeSystemFirst(single); !reflect.DeepEqual(out, single) {
+		t.Errorf("normalizeSystemFirst(single) changed it: %+v", out)
+	}
+
+	// Empty system content is dropped, not emitted as a blank first message.
+	blank := []openAIMessage{{Role: "system", Content: "  "}, {Role: "user", Content: "y"}}
+	if out := normalizeSystemFirst(blank); len(out) != 1 || out[0].Role != "user" {
+		t.Errorf("normalizeSystemFirst(blank system) = %+v, want just the user msg", out)
+	}
+}
 
 // TestProxyHonorsPerRequestModel verifies the opusplan tier-split mechanism:
 // the proxy forwards WHICHEVER model each Anthropic request carries

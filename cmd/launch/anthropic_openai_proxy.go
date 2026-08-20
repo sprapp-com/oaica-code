@@ -213,7 +213,40 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 		}
 		oai.Messages = append(oai.Messages, om)
 	}
+	oai.Messages = normalizeSystemFirst(oai.Messages)
 	return oai
+}
+
+// normalizeSystemFirst makes every system message contiguous at the start of
+// the conversation. The Anthropic→OpenAI translation (and some clients) can
+// place a system message AFTER a user turn — e.g. Claude Code's request arrives
+// as [system, user, system]. Strict chat templates raise on that (KAT-Coder's
+// apex GGUF: "System message must be at the beginning"), 500ing every request.
+// Concatenate all system content into ONE leading system message and keep the
+// non-system messages in their original order.
+func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
+	var system []string
+	var rest []openAIMessage
+	sawSystem := false
+	for _, m := range msgs {
+		if m.Role == "system" {
+			sawSystem = true
+			if strings.TrimSpace(m.Content) != "" {
+				system = append(system, m.Content)
+			}
+			continue
+		}
+		rest = append(rest, m)
+	}
+	if !sawSystem {
+		return msgs
+	}
+	if len(system) == 0 {
+		return rest // all system messages were blank — drop them
+	}
+	out := make([]openAIMessage, 0, len(msgs))
+	out = append(out, openAIMessage{Role: "system", Content: strings.Join(system, "\n\n")})
+	return append(out, rest...)
 }
 
 // toFloat64 coerces numeric-ish values from the Options map.
