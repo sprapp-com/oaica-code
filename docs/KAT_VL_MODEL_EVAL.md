@@ -99,4 +99,22 @@ Unrelated to the AWQ blocker above — pure vLLM serving-flag test on the existi
 
 **Real gotcha hit:** FP8 KV-cache changes the required attention block size for this hybrid Mamba/attention architecture (2096 tokens vs. 1056 at default), which exceeded the default `--max-num-batched-tokens` (2048) and crashed with `AssertionError: In Mamba cache align mode, block_size (2096) must be <= max_num_batched_tokens`. Fixed by passing `--max-num-batched-tokens 4096`. Worth knowing if anyone else tries FP8 KV-cache on this model family.
 
-**Conclusion:** not worth deploying to production — no throughput benefit measured, and it requires a non-default flag to avoid a startup crash. FP8 *activation* quantization (a different, potentially more impactful lever) was not tested — it would need offline requantization via `llm-compressor`, which hits the same MoE blocker documented above for the vision+MTP model; it was not separately tested against the plain production `kat-awq` checkpoint in this session.
+**Conclusion:** not worth deploying to production — no throughput benefit measured, and it requires a non-default flag to avoid a startup crash. FP8 *activation* quantization (a different, potentially more impactful lever) was not tested — it needs offline requantization via `llm-compressor`, which hits the same MoE blocker documented above for the vision+MTP model; it was not separately tested against the plain production `kat-awq` checkpoint in this session.
+
+## Update 2026-08-21/22 part 4: MTP/speculative-decode throughput — real A/B, net-negative
+
+Earlier I measured a strong 86.4% draft-token acceptance rate on this model. That alone doesn't prove a wall-clock speedup, so I benchmarked it properly: two identical vision+MTP BF16 instances (spec-decode ON with the MTP draft vs OFF), same GPU tier (GPU2/GPU3), same config (`--enforce-eager`, `--max-model-len 8192`, N=64, robust concurrency bench).
+
+| | tok/s | errors |
+|---|---|---|
+| Spec-decode ON (`num_speculative_tokens=2`) | 613.1 | 0 |
+| Spec-decode OFF (no draft) | 724.3 | 0 |
+
+**Result: speculative decoding is ~15% SLOWER, not faster, in this config.** The 86.4% acceptance rate (draft quality is genuinely good — the draft shares the target's embeddings/lm_head) does not translate into wall-clock throughput here.
+
+**Why (real, not speculative):**
+- This config uses `--enforce-eager` (required to fit the unquantized BF16 model in 80GB). Eager mode disables CUDA graphs, which is the mechanism speculative decoding leans on to overlap draft+verify compute. Without graphs, each of the 2 draft steps + verification is pure serialized overhead that exceeds the accepted-token savings.
+- At single-digit concurrency, the draft model's own forward pass is a real, non-trivial cost (256-expert MoE) that only pays off when batched enough.
+- The reasoning-heavy output path (`reasoning_content`) generates draft tokens with heterogeneous acceptance, so the 86% average overstates how much compute is saved per step.
+
+**Honest conclusion:** MTP/speculative decoding is **not a free throughput win** on this hardware/config. To measure its true potential I'd need CUDA-graph mode (non-eager), which the unquantized model can't fit on one A100 at viable context — another reason the AWQ quantization blocker (above) is the real gating issue for this model. Corrects the earlier optimistic "1.5-2x per-GPU" estimate I gave before measuring — the real measured answer is that this config loses ~15%. The MTP capability itself still works (verified, 86.4% acceptance, vision intact); it just doesn't currently buy throughput on single-GPU serving.
