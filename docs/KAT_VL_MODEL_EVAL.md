@@ -85,3 +85,18 @@ Both hit the identical crash at the identical line (`llmcompressor/modeling/moe/
 3. Deploy the vision+MTP variant at BF16 as-is if the capability is wanted before quantization tooling catches up — real constraint: needs `--enforce-eager` and a small context window to fit on a single A100 today (confirmed in the section above), not production-viable as a drop-in `kat-awq` replacement without either more VRAM per GPU or the quantization gap closing.
 
 No fabricated numbers, no forced "success" — this is the honest state of the AWQ quantization attempt.
+
+## Update 2026-08-21/22 part 3: FP8 KV-cache test on production kat-awq
+
+Unrelated to the AWQ blocker above — pure vLLM serving-flag test on the existing, already-quantized production model, `--kv-cache-dtype fp8`. Real, isolated A/B on GPU2, N=128, `single_port_bench.py`.
+
+| | tok/s | errors |
+|---|---|---|
+| Baseline (no FP8 KV) | 3231.0 | 0 |
+| `--kv-cache-dtype fp8` | 3204.2 | 0 |
+
+**Result: no measurable gain — 0.8% difference, within noise.** Consistent with this session's earlier finding that the fleet is compute-bound, not memory-bound: extra KV-cache headroom doesn't help when the GPU's compute is already the bottleneck. Real quality check (`tool_calls` pwd-tool test) passed on the FP8 variant, no regression observed.
+
+**Real gotcha hit:** FP8 KV-cache changes the required attention block size for this hybrid Mamba/attention architecture (2096 tokens vs. 1056 at default), which exceeded the default `--max-num-batched-tokens` (2048) and crashed with `AssertionError: In Mamba cache align mode, block_size (2096) must be <= max_num_batched_tokens`. Fixed by passing `--max-num-batched-tokens 4096`. Worth knowing if anyone else tries FP8 KV-cache on this model family.
+
+**Conclusion:** not worth deploying to production — no throughput benefit measured, and it requires a non-default flag to avoid a startup crash. FP8 *activation* quantization (a different, potentially more impactful lever) was not tested — it would need offline requantization via `llm-compressor`, which hits the same MoE blocker documented above for the vision+MTP model; it was not separately tested against the plain production `kat-awq` checkpoint in this session.
