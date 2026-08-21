@@ -36,18 +36,31 @@ GOOS=linux GOARCH=amd64 go build -o katlb-linux-amd64 main.go
 ## Real deployment (a100b, 2026-08-21)
 
 Config at `/root/katlb-kat-awq.json` on a100b, pointing at the 6 kat-awq
-vLLM replicas (ports 30099, 30101-30105). Kept alive by
-`/root/katlb_watchdog.sh` (no systemd in the container — plain poll loop,
-same pattern as the SSH tunnel watchdogs).
+vLLM replicas. Kept alive by `/root/katlb_watchdog.sh` (no systemd in the
+container — plain poll loop, same pattern as the SSH tunnel watchdogs).
+
+**`leastconn_addr` is `:30099`, not `:8090`** — deliberately took over the
+port GPU0's vLLM instance used to own. GPU0 itself was moved to `:30199`
+(now just another backend in the pool) so that every existing
+`~/.oaica/remotes.json` `kat-awq` entry, and every ALREADY-RUNNING Claude
+Code session's translation proxy, keeps working with zero relaunch and zero
+config change — they were always addressing "port 30099," it just silently
+became load-balanced with failover instead of being one fixed GPU. This is
+the answer to "does a live session need to restart to get failover": no,
+because the LB sits exactly where the single instance used to sit, not on
+a new port next to it.
+
+`session_hash_addr` stays on `:8091` (still unused in production — see
+above). `status_addr` `:8092`.
 
 `~/.oaica/remotes.json`'s `kat-awq` entry on all 3 machines (this laptop,
-lenovo.samwong.com, 192.168.0.46) points at the leastconn listener through
-an SSH tunnel — local port 8890 (not 8090; that's already taken by an
-unrelated service on two of the three boxes) mapped to a100b's real 8090.
-The separate `kat-awq1`-`kat-awq5` picker entries were removed — `kat-awq`
-alone now load-balances across all 6 replicas.
+lenovo.samwong.com, 192.168.0.46) is just `http://127.0.0.1:30099/v1` —
+the same address it always was. The separate `kat-awq1`-`kat-awq5` picker
+entries were removed — `kat-awq` alone now load-balances across all 6
+replicas.
 
 Verified: even distribution under both sequential (4/4/4/4/4/4 over 24
 requests) and concurrent (10/10/10/10/10/10 over 60 concurrent requests)
-load, real end-to-end `oaica launch claude --model kat-awq` on all 3
-machines.
+load; real end-to-end `oaica launch claude --model kat-awq` on all 3
+machines; a request to the fixed `:30099` address transparently routed to
+a different backend after GPU0 was moved, with no client-side change.
