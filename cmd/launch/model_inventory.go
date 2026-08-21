@@ -159,6 +159,19 @@ func (i *modelInventory) Resolve(ctx context.Context, names []string) []LaunchMo
 		return nil
 	}
 
+	// Fast path: every requested name is already an explicit "<remote>/<model>"
+	// user-remote picker name. Load() probes ALL configured remotes (plus local
+	// ollama and the cloud router) to build the full inventory — with many
+	// remotes configured and some slow/unreachable, that adds several seconds
+	// of dead-weight latency to every launch for a name we can already resolve
+	// with zero network calls (findUserRemoteForModel does a config lookup
+	// only; it never validates reachability, so Load() wouldn't have told us
+	// anything more here anyway). Falls back to the full inventory the moment
+	// any name ISN'T a user-remote picker name (local/cloud mixed in, etc.).
+	if resolved, ok := resolveUserRemoteModelsDirect(names); ok {
+		return resolved
+	}
+
 	models, err := i.Load(ctx)
 	if err != nil {
 		models = nil
@@ -171,6 +184,32 @@ func (i *modelInventory) Resolve(ctx context.Context, names []string) []LaunchMo
 		}
 	}
 	return resolved
+}
+
+// resolveUserRemoteModelsDirect resolves every name directly against
+// ~/.oaica/remotes.json, with no network calls — mirrors exactly what
+// userRemoteLaunchModels() (used inside Load()) would produce for a
+// user-remote entry (same Descriptor()-derived fields, same WithCloudLimits()
+// call), just without fetching every configured remote's /v1/models first.
+// ok=false the instant one name isn't a user-remote picker name, so the
+// caller falls back to the real (slower, complete) inventory.
+func resolveUserRemoteModelsDirect(names []string) ([]LaunchModel, bool) {
+	out := make([]LaunchModel, 0, len(names))
+	for _, name := range names {
+		remote, _, ok := findUserRemoteForModel(name)
+		if !ok {
+			return nil, false
+		}
+		d := remote.Descriptor()
+		out = append(out, LaunchModel{
+			Name:         name,
+			Remote:       true,
+			Wire:         d.Wire,
+			ToolFormat:   d.ToolFormat,
+			ToolReliable: d.ToolReliable,
+		}.WithCloudLimits())
+	}
+	return out, true
 }
 
 func resolveLaunchModels(names []string, models []LaunchModel) ([]LaunchModel, bool) {

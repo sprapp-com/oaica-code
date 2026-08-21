@@ -92,6 +92,13 @@ type userRemote struct {
 	// time. Still prints the same stderr warning — this only skips the
 	// refusal, not the visibility.
 	ForceTools bool `json:"force_tools,omitempty"`
+	// PriceInputPerM / PriceOutputPerM are informational USD-per-million-token
+	// rates for this remote (see docs/PRICING.md). oaica-code has no billing
+	// enforcement — these are surfaced in the launch banner only, so a human
+	// driving the picker sees the rate before racking up usage. Zero means
+	// "not priced" (e.g. a personal/free box) and prints nothing.
+	PriceInputPerM  float64 `json:"price_input_per_m,omitempty"`
+	PriceOutputPerM float64 `json:"price_output_per_m,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -247,6 +254,8 @@ type RemoteEndpoint struct {
 	ToolFormat    string
 	ToolReliable  bool
 	ForceTools    bool // remote.ForceTools — skip the capability gate's refusal for this remote
+	PriceInputPerM  float64
+	PriceOutputPerM float64
 }
 
 // resolveRemoteEndpoint splits a "<remote>/<model>" picker name and resolves the
@@ -269,6 +278,8 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		ToolFormat:    d.ToolFormat,
 		ToolReliable:  d.ToolReliable,
 		ForceTools:    remote.ForceTools,
+		PriceInputPerM:  remote.PriceInputPerM,
+		PriceOutputPerM: remote.PriceOutputPerM,
 	}, true
 }
 

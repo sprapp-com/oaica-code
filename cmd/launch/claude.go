@@ -71,6 +71,13 @@ func RunNative(args []string) error {
 func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
+	briefMode, args := extractBriefMode(args)
+	if briefMode {
+		// Claude Code's own flag, not a bespoke mechanism — see
+		// briefModeSystemPrompt's doc for why this exact wording and why
+		// not "--compact".
+		args = append(args, "--append-system-prompt", briefModeSystemPrompt)
+	}
 
 	claudePath, err := ensureClaudeInstalled()
 	if err != nil {

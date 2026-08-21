@@ -88,9 +88,23 @@ type ResolveOpts struct {
 	ForceTools bool
 }
 
+// printPriceBanner surfaces a remote's configured rate (remotes.json
+// price_input_per_m / price_output_per_m, see docs/PRICING.md) once per
+// launch. oaica-code has no billing enforcement of its own — this is purely
+// informational so a human driving the picker sees the rate before racking
+// up usage. Silent when a remote isn't priced (the common case).
+func printPriceBanner(ep RemoteEndpoint) {
+	if ep.PriceInputPerM <= 0 && ep.PriceOutputPerM <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s%s: $%.2f/M in, $%.2f/M out%s\n",
+		ansiYellow, ep.Name, ep.PriceInputPerM, ep.PriceOutputPerM, ansiReset)
+}
+
 // gateRemoteToolsEndpoint applies the capability gate to a resolved remote
 // endpoint, warning-and-proceeding under --force-tools.
 func gateRemoteToolsEndpoint(ep RemoteEndpoint, wants ToolWire, force bool) error {
+	printPriceBanner(ep)
 	ok, reason := toolGateDecision(wants, ep)
 	if ok {
 		return nil
@@ -113,14 +127,16 @@ func gateRemoteToolsEndpoint(ep RemoteEndpoint, wants ToolWire, force bool) erro
 func gateUserRemoteTools(remote userRemote, bare string, wants ToolWire, force bool) error {
 	d := remote.Descriptor()
 	ep := RemoteEndpoint{
-		Name:          remote.Name,
-		BaseURL:       remote.openAIBase(),
-		Token:         remote.key(),
-		UpstreamModel: bare,
-		Wire:          d.Wire,
-		ToolFormat:    d.ToolFormat,
-		ToolReliable:  d.ToolReliable,
-		ForceTools:    remote.ForceTools,
+		Name:            remote.Name,
+		BaseURL:         remote.openAIBase(),
+		Token:           remote.key(),
+		UpstreamModel:   bare,
+		Wire:            d.Wire,
+		ToolFormat:      d.ToolFormat,
+		ToolReliable:    d.ToolReliable,
+		ForceTools:      remote.ForceTools,
+		PriceInputPerM:  remote.PriceInputPerM,
+		PriceOutputPerM: remote.PriceOutputPerM,
 	}
 	return gateRemoteToolsEndpoint(ep, wants, force)
 }
@@ -148,6 +164,37 @@ func extractForceTools(args []string) (force bool, rest []string) {
 		rest = append(rest, a)
 	}
 	return force, rest
+}
+
+// briefModeSystemPrompt is appended via Claude Code's own --append-system-
+// prompt flag when --brief-mode is passed. Empirically tuned (2026-08-20,
+// real A/B token-count sweep against kat-awq): compressed bullet-fragment
+// framing gave the most reliable savings of every style tested — 100%
+// natural completion (never truncated) and the lowest avg output tokens
+// among fully-completed variants. More aggressive "MAXIMUM compression,
+// drop ALL X/Y/Z" instructions measured WORSE — they make the model reason
+// at length about the compression rule itself before answering, which is
+// the opposite of the goal. Keep this instruction simple; do not "strengthen"
+// it without re-running the sweep.
+const briefModeSystemPrompt = "Answer in compressed bullet fragments only. No prose sentences. One fact per line. Preserve all code/numbers exactly."
+
+// extractBriefMode pulls a launcher-level "--brief-mode" flag out of the
+// passthrough args, same convention as extractForceTools. Not forwarded to
+// the child claude binary as-is — claude.go turns it into a real
+// "--append-system-prompt" flag Claude Code already supports natively,
+// rather than inventing a new mechanism. Named "brief-mode" (not "compact")
+// deliberately: Claude Code already has a built-in "/compact" command for
+// context-window compaction, an unrelated concept — reusing that word for
+// output-style compression would collide in the user's mental model.
+func extractBriefMode(args []string) (brief bool, rest []string) {
+	for _, a := range args {
+		if a == "--brief-mode" || a == "--brief-mode=true" {
+			brief = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return brief, rest
 }
 
 // extractSonnetModel pulls a launcher-level "--sonnet-model <id>" (or
