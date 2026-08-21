@@ -55,6 +55,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -345,38 +346,68 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 // userRemoteLaunchModels queries every configured remote and returns picker
 // entries named "<remote>/<model>". Errors are returned alongside the models,
 // never instead of them.
+//
+// Remotes are fetched CONCURRENTLY, not one at a time: fetchRemoteModels has a
+// 6s timeout per remote, and a real config can easily list a dozen-plus boxes
+// (LAN, external, cloud). Sequentially that's minutes in the worst case for
+// one sleeping/slow box to cost the whole picker; in parallel the wall-clock
+// cost is bounded by the single slowest remote, ~6s worst case. Results are
+// reassembled in the original remotes.json order so the picker stays
+// deterministic across runs regardless of which goroutine finishes first.
 func userRemoteLaunchModels() ([]LaunchModel, []error) {
 	remotes, err := loadUserRemotes()
 	if err != nil {
 		return nil, []error{err}
 	}
+
+	type result struct {
+		models []LaunchModel
+		err    error
+	}
+	results := make([]result, len(remotes))
+	var wg sync.WaitGroup
+	for i, r := range remotes {
+		wg.Add(1)
+		go func(i int, r userRemote) {
+			defer wg.Done()
+			ids, ferr := fetchRemoteModels(r)
+			if ferr != nil {
+				results[i] = result{err: ferr}
+				return
+			}
+			d := r.Descriptor()
+			rm := make([]LaunchModel, 0, len(ids))
+			for _, id := range ids {
+				// Namespaced so two boxes serving the same model stay distinct,
+				// and so the picker shows WHERE a model runs.
+				display := id
+				if idx := strings.LastIndex(id, "/"); idx >= 0 {
+					display = id[idx+1:] // llama-server reports a FILE PATH
+				}
+				display = strings.TrimSuffix(display, ".gguf")
+				rm = append(rm, LaunchModel{
+					Name:         r.Name + "/" + display,
+					Remote:       true,
+					Wire:         d.Wire,
+					ToolFormat:   d.ToolFormat,
+					ToolReliable: d.ToolReliable,
+				}.WithCloudLimits())
+			}
+			results[i] = result{models: rm}
+		}(i, r)
+	}
+	wg.Wait()
+
 	var (
 		models []LaunchModel
 		errs   []error
 	)
-	for _, r := range remotes {
-		ids, ferr := fetchRemoteModels(r)
-		if ferr != nil {
-			errs = append(errs, ferr)
+	for _, res := range results {
+		if res.err != nil {
+			errs = append(errs, res.err)
 			continue
 		}
-		for _, id := range ids {
-			// Namespaced so two boxes serving the same model stay distinct,
-			// and so the picker shows WHERE a model runs.
-			display := id
-			if i := strings.LastIndex(display, "/"); i >= 0 {
-				display = display[i+1:] // llama-server reports a FILE PATH
-			}
-			display = strings.TrimSuffix(display, ".gguf")
-			d := r.Descriptor()
-			models = append(models, LaunchModel{
-				Name:         r.Name + "/" + display,
-				Remote:       true,
-				Wire:         d.Wire,
-				ToolFormat:   d.ToolFormat,
-				ToolReliable: d.ToolReliable,
-			}.WithCloudLimits())
-		}
+		models = append(models, res.models...)
 	}
 	return models, errs
 }
