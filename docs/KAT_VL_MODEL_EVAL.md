@@ -118,3 +118,15 @@ Earlier I measured a strong 86.4% draft-token acceptance rate on this model. Tha
 - The reasoning-heavy output path (`reasoning_content`) generates draft tokens with heterogeneous acceptance, so the 86% average overstates how much compute is saved per step.
 
 **Honest conclusion:** MTP/speculative decoding is **not a free throughput win** on this hardware/config. To measure its true potential I'd need CUDA-graph mode (non-eager), which the unquantized model can't fit on one A100 at viable context — another reason the AWQ quantization blocker (above) is the real gating issue for this model. Corrects the earlier optimistic "1.5-2x per-GPU" estimate I gave before measuring — the real measured answer is that this config loses ~15%. The MTP capability itself still works (verified, 86.4% acceptance, vision intact); it just doesn't currently buy throughput on single-GPU serving.
+
+## Update 2026-08-21/22 part 5: quantization monkeypatch — mechanism unblocked, but partial only
+
+Earlier documented that `llm-compressor`'s `oneshot()` unconditionally calls `linearize_moe()` on MoE models, OOMing for `qwen3_5_moe`. Found the real bypass:
+
+**Monkeypatch bug + fix:** `import llmcompressor.entrypoints.oneshot as oneshot_mod` returns the **function**, not the module — the package's `__init__` shadows the submodule name with the `oneshot()` function. Patching an attribute on the function object is silently ineffective (functions accept arbitrary attributes, but `apply_recipe_modifiers` reads from the module globals). Fix: `importlib.import_module('llmcompressor.entrypoints.oneshot')` returns the real module object; patching its `get_non_linearized_moes` (→ `[]`) and `linearize_moe` (→ no-op) globals correctly routes around the entire linearize block.
+
+**Verified working:** with the patch, `QuantizationModifier(scheme='W4A16_ASYM', targets=['Linear'])` applied W4A16 quantization to 350 non-MoE modules (attention/embedding projections) with no linearize crash and no OOM — the quantization mechanism itself works on this architecture once linearize is skipped.
+
+**But — real limitation:** the output was ~56GB vs ~67GB BF16 source, only ~17% smaller. The 256-expert MoE FFN weights (the dominant weight mass) stayed BF16 because quantizing them is exactly what requires the linearize path (which OOMs). Partial (attention-only) quantization does not make the model production-viable at full context on one A100.
+
+**Honest conclusion:** the monkeypatch proves the quantization path is mechanically viable for this architecture, but full production-viability (expert quantization) remains gated on the same linearize-memory issue. Real options: (1) wait for `llm-compressor` `qwen3_5_moe` support; (2) custom 3D-expert weight quantization (deep surgery, unverified against vLLM's load format); (3) deploy the vision+MTP variant at BF16 with constrained context if the capability is wanted before that lands.
