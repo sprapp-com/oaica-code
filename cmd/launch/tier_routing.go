@@ -1027,6 +1027,12 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 		"ANTHROPIC_API_KEY=",
 		"ANTHROPIC_AUTH_TOKEN=" + token,
 		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
+		// Claude Code appends a "tokens left" system message after every tool
+		// result. Our translators hoist system messages to the front of the
+		// prompt, so that message lands ahead of everything cached and the
+		// prefix cache misses on every single request. Off keeps the prefix
+		// stable across a turn (upstream add1f92bd, #17918).
+		"CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off",
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_FEEDBACK_COMMAND=1",
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",

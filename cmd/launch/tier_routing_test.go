@@ -231,6 +231,24 @@ func TestBuildTierPlan_CrossSourceTiers(t *testing.T) {
 	}
 }
 
+// Regression (upstream add1f92bd, #17918): Claude Code appends a "tokens left"
+// system message after every tool result, and our translators hoist system
+// messages to the front of the prompt — so a reminder left on inserts fresh
+// text ahead of everything cached and the prefix cache misses on every request
+// of the turn. The child environment must disable it.
+func TestTierPlanEnvDisablesClaudeCodeTokenReminder(t *testing.T) {
+	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "deepseek-v4-flash:0731-cloud", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range plan.envVars("http://127.0.0.1:1", "tok") {
+		if kv == "CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off" {
+			return
+		}
+	}
+	t.Fatal("tierPlan.envVars must set CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off, or Claude Code's per-tool-result system message invalidates the prompt prefix cache on every request")
+}
+
 // Regression (audit, high): an un-namespaced secondary that the LOCAL DAEMON
 // serves under an id containing "/" was forwarded to the primary's remote
 // instead. `oaica pull hf.co/Qwen/Qwen3-8B` records the publisher's id
