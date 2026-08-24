@@ -85,6 +85,34 @@ func TestExtractFileDataRemovesQuotedFilepath(t *testing.T) {
 	assert.Equal(t, cleaned, "before  after")
 }
 
+func TestResolveEditorCommandNeverReturnsEmpty(t *testing.T) {
+	// A whitespace-only VISUAL or EDITOR is non-empty, so it bypasses an
+	// `editor == ""` fallback, but strings.Fields collapses it to no words —
+	// and editInExternalEditor indexes the result at [0]. resolveEditorCommand
+	// therefore judges every source by what it SPLITS into and falls through
+	// to the platform default, so the index can never panic. (Upstream #17067
+	// guarded the same hazard with a `len(args) == 0` check that is unreachable
+	// once the slice can never be empty; this is the stronger contract.)
+	for _, ws := range []string{"\t ", "\n", "   "} {
+		t.Setenv("OLLAMA_EDITOR", ws)
+		t.Setenv("VISUAL", ws)
+		t.Setenv("EDITOR", ws)
+		if got := resolveEditorCommand(); len(got) == 0 {
+			t.Fatalf("resolveEditorCommand() with %q configured = empty slice, but the caller indexes [0]", ws)
+		}
+	}
+}
+
+func TestEditInExternalEditorParsesEditorWithArgs(t *testing.T) {
+	// A well-formed editor command with arguments must still be parsed so
+	// its binary is looked up (guards the normal path from regressing).
+	t.Setenv("OLLAMA_EDITOR", "definitely-not-a-real-editor arg1")
+	t.Setenv("VISUAL", "")
+	t.Setenv("EDITOR", "")
+	_, err := editInExternalEditor("content")
+	assert.ErrorContains(t, err, "definitely-not-a-real-editor")
+}
+
 func TestExtractFileDataWAV(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "sample.wav")
