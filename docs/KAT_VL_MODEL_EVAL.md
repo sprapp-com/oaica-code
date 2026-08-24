@@ -130,3 +130,82 @@ Earlier documented that `llm-compressor`'s `oneshot()` unconditionally calls `li
 **But — real limitation:** the output was ~56GB vs ~67GB BF16 source, only ~17% smaller. The 256-expert MoE FFN weights (the dominant weight mass) stayed BF16 because quantizing them is exactly what requires the linearize path (which OOMs). Partial (attention-only) quantization does not make the model production-viable at full context on one A100.
 
 **Honest conclusion:** the monkeypatch proves the quantization path is mechanically viable for this architecture, but full production-viability (expert quantization) remains gated on the same linearize-memory issue. Real options: (1) wait for `llm-compressor` `qwen3_5_moe` support; (2) custom 3D-expert weight quantization (deep surgery, unverified against vLLM's load format); (3) deploy the vision+MTP variant at BF16 with constrained context if the capability is wanted before that lands.
+
+## Update 2026-08-23/24 part 6: model composition + deployment attempt
+
+**What's actually spliced together** (`/dev/shm/kat_coder_vl_mtp`, a100b, ~67GB BF16):
+- Text backbone: `Kwaipilot/KAT-Coder-V2.5-Dev` (`qwen3_5_moe`, 40 layers, 256 experts, 8 active/tok, hybrid Mamba/full-attention every 4th layer) — untouched, symlinked from `/dev/shm/kat_coder_bf16`.
+- Vision tower: spliced in from `Qwen/Qwen3.6-35B-A3B`. SigLIP-style ViT, 27 layers, hidden 1152, intermediate 4304, 16 heads, patch 16, `gelu_pytorch_tanh`, `out_hidden_size 2048` (matches text backbone hidden size for the projection). **BF16, no quantization config at all** — never in scope for the AWQ blocker work (deliberately `ignore`d in the quantization recipe), so it's simply full-precision, untouched.
+- MTP draft: 1 dedicated hidden layer (`mtp_num_hidden_layers: 1`), shares target's embeddings/lm_head, spliced from the same Qwen3.6-35B-A3B source. Standalone copy at `/dev/shm/kat_mtp_draft` for `--speculative-config`.
+- Real verified behavior: correct image understanding, `tool_calls` intact, 86.4% real MTP draft-token acceptance (part 4 above shows this doesn't translate to wall-clock win under `--enforce-eager`).
+
+**Deployment status: attempted, blocked by capacity contention, not by the model.**
+- 16K context confirmed viable on one A100 (`--enforce-eager`, `gpu-memory-utilization 0.97`): "GPU KV cache size: 214,958 tokens", "Maximum concurrency for 16,384 tokens per request: 13.12x".
+- a100b is an 8-GPU box shared with other users' active jobs (production kat-awq fleet on GPU0/6, malay35b on GPU7, judge/gen jobs on GPU1-3/4 rotating) — free capacity is transient, not stable. Two real launch attempts this session raced against other jobs claiming VRAM between the free-check and the actual launch (once against the kat-awq watchdog auto-restoring a replica I'd stopped, once against a GPU2 job that finished right before launch, GPU2 stayed clear).
+- Not yet wired into `~/.oaica/remotes.json` on the 3 client machines, no dedicated port/watchdog set up (would use `:30140`, matching earlier test port) — deployment is not persistent, exists only per test-launch.
+
+**Honest bottom line:** the vision+MTP splice is a real, working capability — correct multimodal understanding, correct tool-calling, functioning speculative decoding mechanism — proven at BF16/16K-context/single-A100. It is not currently a persistent, production-grade service: no stable GPU allocation on this shared box, MTP is a net throughput loss under the required `--enforce-eager` mode, and full quantization (needed for both smaller footprint and to unlock non-eager/CUDA-graph mode where MTP could actually pay off) remains blocked on `llm-compressor`'s MoE expert linearization OOM. Treat this as a verified prototype, not a deployed product.
+
+## Update 2026-08-24 part 7: live deployment + quantization blocker re-scoped
+
+**Deployment status changed — now live and persistent (supersedes part 6's "not persistent"):**
+- Running on a100b **GPU2, port 30140**, served-model-name `kat-vl-mtp`, `--enforce-eager`, `--max-model-len 16384`, MTP spec-decode ON (draft `/dev/shm/kat_mtp_draft`, 2 tokens, qwen3_5_mtp method).
+- Watchdog `/root/vllm_vlmtp_watchdog.sh` (same pattern as kat-awq's) relaunches it on death.
+- Wired into `~/.oaica/remotes.json` on all 3 machines (this laptop, lenovo.samwong.com, 192.168.0.46); port 30140 added to each tunnel loop. Verified end-to-end on all 3: real vision test (correctly identified red square + blue circle on a generated test image), tool_calls test (`pwd` tool called with proper `finish_reason: tool_calls`).
+- Real throughput on GPU2 (N=48, shared-box load): 144-183 tok/s run-to-run (contention varies it). Still ~16x slower than kat-awq (2983 tok/s) — expected: BF16 vs W4A16, and `--enforce-eager` forced.
+
+### Quantization blocker — RE-SCOPED: OOM solved, now disk-bound (was "llm-compressor linearize OOM")
+
+**Breakthrough:** GPTQModel 7.2.0 has **native `qwen3_5_moe` support** (dedicated definition file, `dynamic_expert_index`, MoE lifecycle hooks, and `out_of_model_tensors={"prefixes":["mtp"]}` so MTP tensors auto-excluded from quantization). Its disk-offload (`offload_to_disk=True`) **avoids the exact OOM that crashed `llm-compressor`'s `linearize_moe()`**. Real attempts quantized hundreds of MoE expert sublayers with no OOM — mechanism genuinely works on this architecture.
+
+New blocker is now **disk, not memory**: all 3 real GPTQ runs died on `/dev/shm` filling to 100% — caused by the shared box's concurrent churn from other users (lost 5-10GB in under a minute repeatedly), not by this job's own ~1GB writes. Also confirmed GPTQModel can do AWQ W4A16-ASYM (`METHOD.AWQ` + `FORMAT.GEMM`) — same recipe, matching prod kat-awq's quant — once disk headroom exists.
+
+**Hard constraint (not code):** this box's writable disk is uniquely hostile — root overlay 16G (100% full), `/dev/shm` is `noexec` tmpfs (can hold data, can't run binaries), `/workspace` only 3.5G free (owns other users' venvs). A multi-hour full-model quantization can't survive here. Needs a quieter disk window or a box with normal storage.
+
+### FreeToken (edge MoE serving) — identified, blocked on install disk
+`FlashML-org/FreeToken` (Apache-2.0, ~3k stars) is a bandwidth-adaptive CPU-GPU MoE serving engine that explicitly supports `Qwen3.6-35B-A3B` (our `qwen3_5_moe` family). Its LRU expert caching + bandwidth-adaptive co-execution could serve kat-vl-mtp WITHOUT full-VRAM residency or pre-quantization — potentially sidestepping the entire quant blocker. **But untestable here:** install (6.6GB venv) needs an exec-capable disk; root full, `/dev/shm` noexec, `/workspace` too small. Needs a normal-disk box to evaluate.
+
+**Honest bottom line (updated):** vision+MTP is now a live, persistent, verified service (vision + tool_calls + spec-decode working, all 3 machines wired). The remaining path to kat-awq-class speed is quantization (GPTQModel mechanism solved; disk-blocked on this box) → drop `--enforce-eager` → re-test MTP throughput (unproven whether it wins outside eager). Treat as live prototype + a real, near-unblocked quant path, not yet a fast production model.
+
+## Update 2026-08-24 part 8: FreeToken tested — format incompatibility with standard HF MoE layout
+
+Tested `FlashML-org/FreeToken` 0.1.2 (edge MoE serving engine, bandwidth-adaptive CPU-GPU co-execution, Apache-2.0) as a path to serve kat-vl-mtp WITHOUT quantization. Installed successfully in `/workspace/freetoken_venv` (exec-capable — the freed `escha_venv` space made it fit).
+
+**Result: real format incompatibility — FreeToken cannot load a standard HF `qwen3_5_moe` checkpoint in this build.**
+
+FreeToken's MoE expert loader (`loader.py` `_packed_expert_source_info` / fused path) requires expert weights as **per-layer fused tensors**:
+- `model.layers.N.mlp.experts.gate_up_proj` (shape `[num_experts, ...]`, gate+up fused)
+- `model.layers.N.mlp.experts.down_proj`
+
+Our splice (standard HF safetensors) stores **per-expert** weights:
+- `model.language_model.layers.N.mlp.experts.E.gate_proj` / `.up_proj` / `.down_proj`
+
+**All 3 serve modes fail identically:**
+| `--moe-backend` | Error |
+|---|---|
+| `offload` | `Missing MoE expert source layers: {gate_up: [0..39], down: [0..39]}` (bank builder) |
+| `fused` | `KeyError: 'model.layers.0.mlp.experts.gate_up_proj'` (wants per-layer fused) |
+| `ft checkpoint` (converter) | same `Missing MoE expert source layers` — its own converter also can't fuse our raw HF layout |
+
+Root cause: FreeToken expects experts pre-fused into per-layer `gate_up_proj`/`down_proj`, but standard HF qwen3_5_moe (KAT-Coder/Qwen3.6) stores per-expert `gate_proj/up_proj/down_proj`. FreeToken's qwen3_5_moe adapter has the raw-key regex + prefix normalization, but the actual expert loader (and converter) never perform the fusion for the bf16 path. Dense (attention/norm/embed) weights load fine (14 shards, 67GB in ~3s); only the MoE expert mapping fails.
+
+**To use FreeToken would require a custom converter** that fuses `gate_proj`+`up_proj` → `gate_up_proj` per layer and strips `model.language_model.` → `model.` (a 67GB read+write), and even then FreeToken's vision-tower support for the multimodal splice is unproven. Not done — parked as a known gap, pending whether that custom work is worth it vs. continuing with the vLLM (working, BF16-slow) deployment.
+
+**Net after this thread:** kat-vl-mtp back on GPU2 vLLM (restored), port 30140, serving, all 3 machines wired. FreeToken is installed but cannot load our checkpoint without custom expert-fusion work.
+
+### FreeToken resolution (2026-08-24) — built the converter; verdict: NOT faster
+
+Built a custom converter to bridge the format gap above (fuse per-expert `gate_proj`+`up_proj` → per-layer `[E,2I,H]` `gate_up_proj`, stack `down_proj` → `[E,H,I]`, strip `model.language_model.` → `model.`, drop vision+MTP for a text-only test). This produced a flat ~67GB model at `model.layers.N.mlp.experts.{gate_up_proj,down_proj}`. **FreeToken then loaded and served it** after two env fixes:
+
+1. `FREETOKEN_ALLOW_CUDA_MISMATCH=1` — the venv's torch is CUDA 13.0 but system nvcc is 12.8; FreeToken's JIT kernel build refuses without the override.
+2. `FREETOKEN_KERNEL_CACHE_DIR=/workspace/ft_kernel_cache` — FreeToken JIT-caches kernels to `~/.cache/tvm-ffi` on the full 16G root overlay; must redirect to an exec-capable disk.
+
+**Real measured throughput (text-only flat model, MoE `--moe-backend offload`, GPU2):**
+
+| | tok/s | errors |
+|---|---|---|
+| FreeToken N=16 | 50.1 | 0 |
+| FreeToken N=48 | 45.4 | **10** |
+| vLLM BF16 (deployed kat-vl-mtp, N=48) | 183.3 | 0 |
+
+**Verdict: FreeToken MoE-offload is ~4x SLOWER than vLLM and error-prone at concurrency** (50 vs 183 tok/s, 10/48 errors). The premise — bypass quantization AND be fast — is disproven: streaming 256-expert weights from CPU/RAM per token is far slower than vLLM's dense GPU execution on A100s. FreeToken's MoE-offload trades throughput for low-VRAM residency, which this hardware (A100 80GB with room) doesn't need. Reverted to the vLLM deployment; FreeToken parked as a non-viable path for this model/hardware. `/dev/shm` flat test model cleaned up (reclaimed 67GB).
