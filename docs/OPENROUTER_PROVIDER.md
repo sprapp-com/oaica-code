@@ -75,7 +75,31 @@ internal machines that share katlb.
 
 Build: `cd tools/gateway && go build -o oaica-gateway main.go`.
 
-## Public URL (one manual step)
+## Moving to api.oaica.com (blocked on a token)
+
+`oaica.com` is the product domain and `api.oaica.com` is unclaimed, but the
+zone lives in a DIFFERENT Cloudflare account (`Cloudflare.com@unisqu.com`,
+account `125f3856…`) from the one the `.91` tunnel runs under (samwong,
+`3c04198c…`). Every API token available so far is read-only on oaica.com
+(a DNS-create probe returns "Authentication error"), so the cutover cannot
+be automated until a write token exists.
+
+Two scripts make it a one-shot once the token is in place:
+
+1. `tools/a100b/cutover-api-oaica-com.sh` -- needs `CF_API_TOKEN` in
+   `~/.secrets/cloudflare_oaica.env` with **Zone:DNS:Edit (oaica.com)** and
+   **Account:Cloudflare Tunnel:Edit**. Creates/reuses the `oaica-api`
+   tunnel, sets ingress `api.oaica.com -> localhost:8081`, CNAMEs the host,
+   runs cloudflared ON a100b (dropping the .91 hop), verifies every public
+   route plus a metered stream. Refuses to do anything if the token cannot
+   write (proven: exits 2 on the read-only tokens).
+2. `tools/a100b/rebrand-api-oaica-com.sh` -- rewrites the hostname in the
+   legal pages/docs/form, rebuilds and redeploys the gateway, verifies,
+   commits.
+
+Until then the live public URL is `https://oaica.samwong.com` (below).
+
+## Public URL (current: oaica.samwong.com)
 
 DNS CNAME and the SSH tunnel are set up. The remaining step is **only doable
 in the Cloudflare dashboard** (the tunnel is token-based; it reads ingress

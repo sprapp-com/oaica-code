@@ -1,5 +1,11 @@
 # OpenRouter provider application — final answers (2026-08-26)
 
+> **Domain:** the URLs below are `oaica.samwong.com` because that is what is
+> live. The intended domain is `api.oaica.com`; the cutover is scripted
+> (`tools/a100b/cutover-api-oaica-com.sh`) and blocked only on a
+> write-capable Cloudflare token for the unisqu account that owns oaica.com.
+> Run the cutover BEFORE submitting so the form carries the final hostname.
+
 Everything below is verified live at time of writing. Anything marked
 **you** needs a human to type it into the form.
 
