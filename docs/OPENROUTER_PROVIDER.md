@@ -1,8 +1,9 @@
-# OpenRouter provider — self-hosted kat-awq + Cog fallback
+# OpenRouter provider — self-hosted kat-awq
 
-How we publish kat-awq as an OpenRouter inference provider: a self-hosted
-primary (near-zero marginal cost on the already-rented a100b) with a
-Replicate/Cog fallback for managed uptime/scale.
+How we publish kat-awq as an OpenRouter inference provider: self-hosted on
+the already-rented a100b (near-zero marginal cost). There is NO failover
+region today -- see "Cog fallback (not built)" below before claiming one
+anywhere.
 
 ## Architecture
 
@@ -10,11 +11,10 @@ Replicate/Cog fallback for managed uptime/scale.
 OpenRouter
    │
    ├─ [PRIMARY]  https://oaica.samwong.com/v1   (cloudflared tunnel)
-   │              └─ oaica-gateway (:8081, Bearer key auth)
-   │                   ├─ GET  /models               -> standardized OpenAI list (from config)
-   │                   └─ POST /v1/chat/completions   -> katlb (:30099) -> kat-awq fleet
-   │
-   └─ [FALLBACK] Replicate (Cog-packaged kat-awq)   — paid only on failover
+                  └─ oaica-gateway (:8081, sha256 Bearer key, metering ledger)
+                       ├─ GET  /health /privacy /terms /status  (public, no key)
+                       ├─ GET  /models                            -> from config (pricing, context)
+                       └─ POST /v1/chat/completions               -> gatekeeper (:30098) -> katlb (:30099) -> 2x kat-awq
 ```
 
 ## Components
@@ -26,7 +26,7 @@ OpenRouter
 | Gateway tunnel | .91 systemd user service `oaica-gateway-tunnel.service` (8081->a100b:8081) | Running |
 | Cloudflare DNS | `oaica.samwong.com` CNAME -> tunnel `bbd1217e` | Created |
 | Cloudflare ingress | tunnel public hostname `oaica.samwong.com -> http://localhost:8081` | **Manual (dashboard)** |
-| Cog fallback (`tools/cog-kat-awq/`) | Replicate | Project written, not pushed |
+| Legal pages | embedded in the gateway binary from `tools/gateway/legal/*.md`, served at `/privacy` `/terms` `/status` | Live |
 
 ## The gateway
 
@@ -87,13 +87,15 @@ from Cloudflare, not a local file):
 Then `https://oaica.samwong.com/models` and
 `https://oaica.samwong.com/v1/chat/completions` are live.
 
-## Cog fallback
+## Cog fallback (not built -- do not list it)
 
-`tools/cog-kat-awq/` — a Cog project wrapping the same AWQ weights via vLLM.
-Deploy: `cog login && cog push r8.im/<you>/kat-awq`. It's the failover route;
-Replicate charges only when traffic actually goes there, so it's cheap
-insurance. Replicate models can be exposed to OpenRouter via Replicate's own
-OpenAI-compatible integration (a second route behind the self-host primary).
+A `tools/cog-kat-awq/` sketch exists (cog.yaml + a raw-text `predict.py`,
+8192 ctx, never pushed, `cog` not installed). It is NOT a usable failover:
+it speaks Cog's predict API, not OpenAI; it has no tool calling; and
+Replicate runs in the US, which would change the inference-location answer
+on the OpenRouter form. Until it is actually built, tested end-to-end and
+its region documented, the provider is single-region (JP) with no failover.
+Keeping the sketch out of git so nobody mistakes it for capacity.
 
 ## Pricing decision (see OpenRouter form)
 

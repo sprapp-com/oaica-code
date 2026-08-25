@@ -78,6 +78,9 @@ func newTestGateway(t *testing.T, upstream string) (*gateway, string) {
 func mux(g *gateway) http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("/health", g.healthHandler)
+	m.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
+	m.HandleFunc("/terms", legalHandler("TERMS.md"))
+	m.HandleFunc("/status", legalHandler("STATUS.md"))
 	m.HandleFunc("/models", g.authed(g.modelsHandler))
 	m.HandleFunc("/v1/models", g.authed(g.modelsHandler))
 	m.HandleFunc("/v1/chat/completions", g.completionHandler)
@@ -336,5 +339,65 @@ func TestHealth_DownWhenUpstreamDead(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 503 {
 		t.Errorf("health with dead upstream: got %d want 503", resp.StatusCode)
+	}
+}
+
+// OpenRouter's provider form requires public Privacy/Terms URLs. They must
+// serve WITHOUT a key and must not be a placeholder.
+func TestLegalPages_PublicAndComplete(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	for path, must := range map[string]string{
+		"/privacy": "We do not use your prompts",
+		"/terms":   "NO SLA",
+		"/status":  "/health",
+	} {
+		resp, err := http.Get(srv.URL + path) // no Authorization header
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("%s: got %d without auth, want 200 (must be public)", path, resp.StatusCode)
+		}
+		if !strings.Contains(string(body), must) {
+			t.Errorf("%s: missing expected text %q", path, must)
+		}
+		if strings.Contains(string(body), "[LEGAL ENTITY NAME]") || strings.Contains(string(body), " DOMAIN]") {
+			t.Errorf("%s: still contains a placeholder", path)
+		}
+	}
+}
+
+func TestModels_CreatedIsStableAcrossPolls(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	poll := func() float64 {
+		req, _ := http.NewRequest("GET", srv.URL+"/models", nil)
+		req.Header.Set("Authorization", "Bearer sk-new")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var doc struct {
+			Data []map[string]any `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&doc)
+		return doc.Data[0]["created"].(float64)
+	}
+	a := poll()
+	time.Sleep(1100 * time.Millisecond)
+	if b := poll(); a != b {
+		t.Fatalf("created changed between polls (%v -> %v); OpenRouter would see a new model each time", a, b)
 	}
 }

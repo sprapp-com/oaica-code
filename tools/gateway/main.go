@@ -54,6 +54,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,27 @@ import (
 	"syscall"
 	"time"
 )
+
+// Legal/status pages are embedded so they ship with the binary and are
+// served unauthenticated at /privacy, /terms, /status -- OpenRouter's
+// provider form needs public URLs for them. Content lives in legal/*.md and
+// is rendered as text/markdown; edit the files and rebuild to change them.
+//
+//go:embed legal/PRIVACY.md legal/TERMS.md legal/STATUS.md
+var legalFS embed.FS
+
+func legalHandler(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b, err := legalFS.ReadFile("legal/" + name)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "not_found", "page unavailable")
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(b)
+	}
+}
 
 // maxBodyBytes caps a completion request body. A 262k-token context of text
 // is ~1 MB; 16 MB leaves ample headroom for tool schemas and base64 images
@@ -287,7 +309,10 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		created := m.Created
 		if created == 0 {
-			created = time.Now().Unix()
+			// OpenRouter polls /models; a "created" that changes on every
+			// poll looks like a new model each time. Pin it to process
+			// start when the config does not set one.
+			created = processStart
 		}
 		entry := map[string]any{
 			"id":       m.ID,
@@ -463,6 +488,9 @@ func newRequestID() string {
 
 var randReader = mustRand()
 
+// processStart is the fallback "created" timestamp for /models entries.
+var processStart = time.Now().Unix()
+
 func mustRand() io.Reader {
 	f, err := os.Open("/dev/urandom")
 	if err != nil {
@@ -597,6 +625,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", g.healthHandler)
+	mux.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
+	mux.HandleFunc("/terms", legalHandler("TERMS.md"))
+	mux.HandleFunc("/status", legalHandler("STATUS.md"))
 	mux.HandleFunc("/models", g.authed(g.modelsHandler))
 	mux.HandleFunc("/v1/models", g.authed(g.modelsHandler))
 	mux.HandleFunc("/v1/chat/completions", g.completionHandler)
