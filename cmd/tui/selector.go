@@ -58,9 +58,9 @@ const maxSelectorItems = 10
 var ErrCancelled = launch.ErrCancelled
 
 type SelectItem struct {
-	Name              string
-	Description       string
-	Recommended       bool
+	Name        string
+	Description string
+	Recommended bool
 	// Local marks a model served by this box's own `oaica serve` — see
 	// launch.ModelItem.Local's doc. Renders in its own "Local" section,
 	// always before "Recommended", in the same always-shown (non-
@@ -138,6 +138,14 @@ func selectorModelWithCurrent(title string, items []SelectItem, current string) 
 		title:  title,
 		items:  items,
 		cursor: cursorForCurrent(items, current),
+		// Ranked filtering (exact > prefix > substring > description) is on
+		// for every selector, not just the chat modal. With OpenRouter's
+		// ~400 models in the launch picker, plain substring order is list
+		// order: typing "deepseek" surfaced "openrouter/deepseek/deepseek-
+		// chat-v2.5" above "deepseek/deepseek-chat" purely by position.
+		// Ranking puts the closest name first, which is what type-to-filter
+		// is for.
+		rankFiltered: true,
 	}
 	m.updateScroll(m.otherStart())
 	return m

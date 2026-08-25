@@ -171,18 +171,41 @@ const (
 	zaiEnvKey  = "Z_AI_API_KEY"
 )
 
+// Built-in OpenRouter provider. Exporting OPENROUTER_API_KEY is enough to put
+// every OpenRouter model (~400) in the picker as "openrouter/<vendor>/<id>",
+// searchable with type-to-filter. Ids keep their "vendor/" prefix -- see
+// remoteDisplayID; OpenRouter rejects the stripped form as ambiguous.
+//
+// This replaces the per-model pattern ("openrouter-ox-alpha" pinned to one
+// id) that needed a remotes.json edit for every model tried.
+const (
+	openrouterName    = "openrouter"
+	openrouterBaseURL = "https://openrouter.ai/api"
+	openrouterEnvKey  = "OPENROUTER_API_KEY"
+)
+
 // builtinRemotes returns remotes that oaica knows about without config, active
-// only while their credential env var is set.
+// only while their credential env var is set. A user-defined remote of the
+// same name in remotes.json wins (see loadUserRemotes).
 func builtinRemotes() []userRemote {
-	if os.Getenv(zaiEnvKey) == "" {
-		return nil
+	var out []userRemote
+	if os.Getenv(zaiEnvKey) != "" {
+		out = append(out, userRemote{
+			Name:      zaiName,
+			BaseURL:   zaiBaseURL,
+			APIKeyEnv: zaiEnvKey,
+			Version:   "v4",
+		})
 	}
-	return []userRemote{{
-		Name:      zaiName,
-		BaseURL:   zaiBaseURL,
-		APIKeyEnv: zaiEnvKey,
-		Version:   "v4",
-	}}
+	if os.Getenv(openrouterEnvKey) != "" {
+		out = append(out, userRemote{
+			Name:       openrouterName,
+			BaseURL:    openrouterBaseURL,
+			APIKeyEnv:  openrouterEnvKey,
+			ToolFormat: "tool_calls",
+		})
+	}
+	return out
 }
 
 // loadUserRemotes returns the configured remotes. A missing file is normal and
@@ -213,7 +236,16 @@ func loadUserRemotes() ([]userRemote, error) {
 		}
 		out = append(out, r)
 	}
-	return append(out, builtinRemotes()...), nil
+	seen := make(map[string]bool, len(out))
+	for _, r := range out {
+		seen[r.Name] = true
+	}
+	for _, b := range builtinRemotes() {
+		if !seen[b.Name] {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 // findUserRemoteForModel splits a "<remote>/<model>" picker name and returns
@@ -226,10 +258,59 @@ func loadUserRemotes() ([]userRemote, error) {
 func findUserRemoteForModel(name string) (userRemote, string, bool) {
 	idx := strings.Index(name, "/")
 	if idx <= 0 {
-		return userRemote{}, "", false
+		return resolveBareRemoteModel(name)
 	}
 	prefix := name[:idx]
 	bare := name[idx+1:]
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, "", false
+	}
+	for _, r := range remotes {
+		if r.Name == prefix {
+			return r, bare, true
+		}
+	}
+	return userRemote{}, "", false
+}
+
+// bareRemoteModelIndex lists every "<remote>/<id>" the configured remotes
+// serve, keyed by the bare id. Populated once per process by
+// resolveBareRemoteModel; the picker already fetches the same lists, so
+// this is the same network cost, not an extra one. Overridable in tests.
+var bareRemoteModelIndex = func() map[string][]string {
+	models, _ := userRemoteLaunchModels()
+	idx := make(map[string][]string, len(models))
+	for _, m := range models {
+		if i := strings.Index(m.Name, "/"); i > 0 {
+			bare := m.Name[i+1:]
+			idx[bare] = append(idx[bare], m.Name)
+		}
+	}
+	return idx
+}
+
+// resolveBareRemoteModel maps a bare model name (no "/") to the ONE remote
+// that serves it. This is the fix for the "Download <model>?" trap: a user
+// typing `--model kat-awq` -- the exact id shown by their own kat-awq box --
+// was routed to the Ollama-registry pull path because only "<remote>/<id>"
+// was recognised as remote. Now, if exactly one configured remote serves
+// that bare id, it resolves as if the user had typed the full form.
+//
+// Ambiguity is deliberately NOT resolved: if two remotes both serve
+// "deepseek-chat", picking one silently would send traffic to the wrong
+// box. The caller then falls through to the old behaviour and the user is
+// told to disambiguate with "<remote>/<id>".
+func resolveBareRemoteModel(bare string) (userRemote, string, bool) {
+	bare = strings.TrimSpace(bare)
+	if bare == "" || strings.Contains(bare, "/") {
+		return userRemote{}, "", false
+	}
+	full := bareRemoteModelIndex()[bare]
+	if len(full) != 1 {
+		return userRemote{}, "", false
+	}
+	prefix := full[0][:strings.Index(full[0], "/")]
 	remotes, err := loadUserRemotes()
 	if err != nil {
 		return userRemote{}, "", false
@@ -247,14 +328,14 @@ func findUserRemoteForModel(name string) (userRemote, string, bool) {
 // version prefix), the bearer token, the bare upstream model id, and the
 // protocol descriptor used by the capability gate.
 type RemoteEndpoint struct {
-	Name          string // remote.Name — provider id in integration catalogs
-	BaseURL       string // r.openAIBase() — includes the /v1 (or /v4) version prefix
-	Token         string // r.key()
-	UpstreamModel string // bare id the remote expects (part after the first "/")
-	Wire          string
-	ToolFormat    string
-	ToolReliable  bool
-	ForceTools    bool // remote.ForceTools — skip the capability gate's refusal for this remote
+	Name            string // remote.Name — provider id in integration catalogs
+	BaseURL         string // r.openAIBase() — includes the /v1 (or /v4) version prefix
+	Token           string // r.key()
+	UpstreamModel   string // bare id the remote expects (part after the first "/")
+	Wire            string
+	ToolFormat      string
+	ToolReliable    bool
+	ForceTools      bool // remote.ForceTools — skip the capability gate's refusal for this remote
 	PriceInputPerM  float64
 	PriceOutputPerM float64
 }
@@ -271,14 +352,14 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 	}
 	d := remote.Descriptor()
 	return RemoteEndpoint{
-		Name:          remote.Name,
-		BaseURL:       remote.openAIBase(),
-		Token:         remote.key(),
-		UpstreamModel: bare,
-		Wire:          d.Wire,
-		ToolFormat:    d.ToolFormat,
-		ToolReliable:  d.ToolReliable,
-		ForceTools:    remote.ForceTools,
+		Name:            remote.Name,
+		BaseURL:         remote.openAIBase(),
+		Token:           remote.key(),
+		UpstreamModel:   bare,
+		Wire:            d.Wire,
+		ToolFormat:      d.ToolFormat,
+		ToolReliable:    d.ToolReliable,
+		ForceTools:      remote.ForceTools,
 		PriceInputPerM:  remote.PriceInputPerM,
 		PriceOutputPerM: remote.PriceOutputPerM,
 	}, true
