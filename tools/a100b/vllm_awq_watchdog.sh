@@ -86,15 +86,22 @@ launch() {
 
 # per-port backoff state: last launch epoch + current delay
 declare -A LAST DELAY
-for r in ${REPLICAS:-0:30199}; do p=${r##*:}; LAST[$p]=0; DELAY[$p]=15; done
+for r in ${REPLICAS:-0:30199 2:30105}; do p=${r##*:}; LAST[$p]=0; DELAY[$p]=15; done
 
 listening() { ss -ltn 2>/dev/null | grep -q ":$1 "; }
+# booting: an api_server for this port exists but is not listening yet.
+# vLLM takes ~100 s to load 21 GB of AWQ weights and warm up; during that
+# window the port is closed but the launch is healthy. Without this check
+# the watchdog launched a SECOND api_server on the same port every backoff
+# tick (seen 2026-08-25: 3 launches in 90 s, one left as a 3 MB zombie).
+booting() { pgrep -f "api_server.*--port $1 " >/dev/null 2>&1; }
 
 tick() {
   local gpu=$1 port=$2 logfile=$3 now
   now=$(date +%s)
   listening "$port" && { DELAY[$port]=15; return; }
-  # not listening: respect backoff
+  booting "$port" && return
+  # not listening and no process: respect backoff
   if (( now - LAST[$port] < DELAY[$port] )); then return; fi
   if ! preflight; then
     alert "preflight failed for :${port}; backing off ${DELAY[$port]}s"
@@ -110,12 +117,12 @@ tick() {
   launch "$gpu" "$port" "$logfile"
 }
 
-# REPLICAS: "gpu:port" pairs. GPU5 is deliberately NOT here as of 2026-08-26:
-# it is fully occupied by the malay35b-offload prism_server (22 GB) plus
-# another session's 52 GB job, so a kat-awq launch there OOMs on startup
-# (5.9/79 GiB free vs the 72.9 GiB vLLM wants). Re-add "5:30105" once GPU5
-# is actually free -- the watchdog will pick it up on the next tick.
-REPLICAS="${REPLICAS:-0:30199}"
+# REPLICAS: "gpu:port" pairs. GPU2 was reclaimed from kat-vl-mtp on
+# 2026-08-25 for replica 2 (kat-awq is the product; the vision prototype can
+# be relaunched when a GPU frees up). GPU5 is NOT usable: another session's
+# 52 GB job plus the malay35b-offload server leave 5.9/79 GiB, and vLLM
+# refuses to start below gpu_memory_utilization * total (~73 GiB).
+REPLICAS="${REPLICAS:-0:30199 2:30105}"
 
 log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS"
 while true; do

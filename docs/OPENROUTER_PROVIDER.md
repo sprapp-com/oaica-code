@@ -21,7 +21,7 @@ OpenRouter
 
 | Piece | Where | Status |
 |---|---|---|
-| kat-awq fleet | a100b, vLLM, GPU0 :30199 (+ GPU5 :30105 via watchdog `/root/vllm_awq_watchdog.sh`) | Running |
+| kat-awq fleet | a100b, vLLM, **2 replicas**: GPU0 :30199 + GPU2 :30105, hardened watchdog `/workspace/vllm_awq_watchdog.sh` (see `tools/a100b/`) | Running, load-balanced by katlb (chat-aware probe) |
 | Gateway (`tools/gateway/oaica-gateway`) | a100b:8081, binary+config+ledger under `/workspace/` (root overlay is full), launched by `/workspace/gw-swap.sh` | Running (v2: hashed keys, metering, gatekeeper upstream) |
 | Gateway tunnel | .91 systemd user service `oaica-gateway-tunnel.service` (8081->a100b:8081) | Running |
 | Cloudflare DNS | `oaica.samwong.com` CNAME -> tunnel `bbd1217e` | Created |

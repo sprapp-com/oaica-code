@@ -209,3 +209,25 @@ Built a custom converter to bridge the format gap above (fuse per-expert `gate_p
 | vLLM BF16 (deployed kat-vl-mtp, N=48) | 183.3 | 0 |
 
 **Verdict: FreeToken MoE-offload is ~4x SLOWER than vLLM and error-prone at concurrency** (50 vs 183 tok/s, 10/48 errors). The premise — bypass quantization AND be fast — is disproven: streaming 256-expert weights from CPU/RAM per token is far slower than vLLM's dense GPU execution on A100s. FreeToken's MoE-offload trades throughput for low-VRAM residency, which this hardware (A100 80GB with room) doesn't need. Reverted to the vLLM deployment; FreeToken parked as a non-viable path for this model/hardware. `/dev/shm` flat test model cleaned up (reclaimed 67GB).
+
+## Update 2026-08-25: kat-vl-mtp retired from GPU2 (reversible)
+
+GPU2 was handed to the kat-awq fleet as **replica 2** so the OpenRouter
+product has real failover (until then it was single-replica on GPU0; GPU5
+cannot host it -- another session's 52 GB job leaves 5.9/79 GiB and vLLM
+refuses to start below ~73 GiB). kat-awq is what is being sold; the
+vision+MTP build is a verified prototype at 183 tok/s, so it lost the
+tie-break.
+
+Nothing was deleted: `/dev/shm/kat_coder_vl_mtp` (67 GB BF16 splice),
+`/dev/shm/kat_mtp_draft`, and the launch command in `vllm_vlmtp_watchdog.sh`
+are intact. To bring it back on any free A100:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> nohup /root/vllm_vlmtp_watchdog.sh > /workspace/vllm_vlmtp_watchdog.out 2>&1 &
+```
+
+The `kat-vl-mtp` entries in `~/.oaica/remotes.json` on the 3 client
+machines and the :30140 tunnels are left in place (they just 502 until the
+model is relaunched), so re-enabling is a one-line launch, not a re-wire.
+
