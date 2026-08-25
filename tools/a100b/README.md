@@ -59,12 +59,17 @@ OAICA_GATEWAY_UPSTREAM_KEY=<gatekeeper openrouter key> \
 ## Request path
 
 ```
-Cloudflare (oaica.samwong.com) -> .91 cloudflared -> ssh tunnel -> a100b
+Cloudflare (api.oaica.com) -> cloudflared ON a100b (/workspace/cf/run.sh) -> :8081
   :8081 oaica-gateway   auth (sha256 key), model rewrite, usage injection, ledger
   :30098 gatekeeper     per-key concurrency ("openrouter" tier = 32)
   :30099 katlb          leastconn across replicas, chat-aware health probe
-  :30199 vLLM kat-awq   GPU0
+  :30199 vLLM kat-awq   GPU0        :30105 vLLM kat-awq   GPU2
 ```
+
+The tunnel is the `oaica-api` tunnel in the Cloudflare account that owns
+oaica.com (unisqu, `125f3856…`), run directly on the box with a tunnel token
+(`/workspace/cf/token`, 0600) -- no .91 hop. `oaica.samwong.com` (samwong
+account, via .91) still resolves but is no longer the published URL.
 
 ## Health semantics (why the probe is a chat call)
 
@@ -73,7 +78,7 @@ the tokenizer had no `chat_template`). katlb's probe is therefore a real
 1-token `POST /v1/chat/completions` for the served model (`probe_model` in
 `katlb.json`). A replica is UP only if a customer request would succeed.
 The gateway's `/health` in turn asks gatekeeper, so an external monitor on
-`https://oaica.samwong.com/health` sees the whole chain.
+`https://api.oaica.com/health` sees the whole chain.
 
 ## Watchdog behaviour
 
@@ -88,9 +93,33 @@ The gateway's `/health` in turn asks gatekeeper, so an external monitor on
 Poll the ALERT file from a monitor; a restore or a backoff is the signal
 that something on the box changed under us.
 
-`REPLICAS` defaults to `0:30199` only. GPU5 is held by the malay35b-offload
-`prism_server` plus another session's 52 GB job, so a second kat-awq replica
-OOMs at startup there. Add `5:30105` back once GPU5 is actually free.
+`REPLICAS` defaults to `0:30199 2:30105` (GPU0 + GPU2). GPU5 is held by the
+malay35b-offload `prism_server` plus another session's 52 GB job, so a
+kat-awq replica OOMs at startup there. A `booting()` guard skips a port whose
+api_server exists but is not yet listening (vLLM takes ~100 s to load), so a
+slow start is not treated as a crash.
+
+## Control-plane supervisor + reboot
+
+`stack_watchdog.sh` keeps katlb (:30099), gatekeeper (:30098) and the
+gateway (:8081) alive, detecting each by LISTENING PORT (never `pgrep -f`).
+The gateway's upstream credential is read from `/workspace/gateway_upstream.key`
+(0600). This replaced the legacy `/root/*_watchdog.sh` loops, which
+relaunched the OLD binaries from `/root` and fought the v2 processes
+("bind: address already in use" in /tmp/katlb.log).
+
+There is no systemd in the container and `/etc/rc.local` is empty, so a
+box reboot starts NOTHING. After a reboot, run in order:
+
+```bash
+nohup /workspace/vllm_awq_watchdog.sh > /workspace/vllm_awq_watchdog.out 2>&1 &
+nohup /workspace/stack_watchdog.sh    > /workspace/stack_watchdog.out    2>&1 &
+nohup /workspace/cf/run.sh            > /workspace/cf/cloudflared.log    2>&1 &
+```
+
+Reboots of a rented vast.ai instance also wipe /dev/shm (the weights); the
+vLLM watchdog's preflight re-downloads them from the pinned revision, or
+restore faster from the lenovo mirror.
 
 ## Gotchas (each cost real time)
 

@@ -6,7 +6,7 @@ Operator: BizTransit Sdn Bhd, Malaysia ("oaica", "we").
 Contact: biztransit@bcz.com
 
 ## What this covers
-The OpenAI-compatible inference API at https://oaica.samwong.com (the "Service"),
+The OpenAI-compatible inference API at https://api.oaica.com (the "Service"),
 including access via OpenRouter and any other reseller that forwards requests to us.
 
 ## What we receive

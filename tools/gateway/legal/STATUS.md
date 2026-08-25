@@ -1,6 +1,6 @@
 # oaica Inference API — Service Status & Availability Statement
 
-Live health: GET https://oaica.samwong.com/health (200 = at least one backend serving; 503 = down)
+Live health: GET https://api.oaica.com/health (200 = at least one backend serving; 503 = down)
 
 What we run
 - One inference cluster on a single rented GPU server in Japan (JP);
@@ -18,7 +18,7 @@ What to expect
   above and notify OpenRouter for outages longer than 30 minutes.
 
 Health endpoint (unauthenticated, for monitors)
-- GET https://oaica.samwong.com/health -> 200 when the upstream answers a
+- GET https://api.oaica.com/health -> 200 when the upstream answers a
   real request, 503 otherwise. Body: {"status":"ok"} or {"status":"down","reason":...}.
 
 Incident contact: biztransit@bcz.com

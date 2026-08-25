@@ -10,7 +10,7 @@ anywhere.
 ```
 OpenRouter
    │
-   ├─ [PRIMARY]  https://oaica.samwong.com/v1   (cloudflared tunnel)
+   ├─ [PRIMARY]  https://api.oaica.com/v1   (cloudflared tunnel)
                   └─ oaica-gateway (:8081, sha256 Bearer key, metering ledger)
                        ├─ GET  /health /privacy /terms /status  (public, no key)
                        ├─ GET  /models                            -> from config (pricing, context)
@@ -24,8 +24,8 @@ OpenRouter
 | kat-awq fleet | a100b, vLLM, **2 replicas**: GPU0 :30199 + GPU2 :30105, hardened watchdog `/workspace/vllm_awq_watchdog.sh` (see `tools/a100b/`) | Running, load-balanced by katlb (chat-aware probe) |
 | Gateway (`tools/gateway/oaica-gateway`) | a100b:8081, binary+config+ledger under `/workspace/` (root overlay is full), launched by `/workspace/gw-swap.sh` | Running (v2: hashed keys, metering, gatekeeper upstream) |
 | Gateway tunnel | .91 systemd user service `oaica-gateway-tunnel.service` (8081->a100b:8081) | Running |
-| Cloudflare DNS | `oaica.samwong.com` CNAME -> tunnel `bbd1217e` | Created |
-| Cloudflare ingress | tunnel public hostname `oaica.samwong.com -> http://localhost:8081` | **Manual (dashboard)** |
+| Cloudflare DNS | `api.oaica.com` CNAME -> tunnel `bbd1217e` | Created |
+| Cloudflare ingress | tunnel public hostname `api.oaica.com -> http://localhost:8081` | **Manual (dashboard)** |
 | Legal pages | embedded in the gateway binary from `tools/gateway/legal/*.md`, served at `/privacy` `/terms` `/status` | Live |
 
 ## The gateway
@@ -97,19 +97,19 @@ Two scripts make it a one-shot once the token is in place:
    legal pages/docs/form, rebuilds and redeploys the gateway, verifies,
    commits.
 
-Until then the live public URL is `https://oaica.samwong.com` (below).
+Until then the live public URL is `https://api.oaica.com` (below).
 
-## Public URL (current: oaica.samwong.com)
+## Public URL (current: api.oaica.com)
 
 DNS CNAME and the SSH tunnel are set up. The remaining step is **only doable
 in the Cloudflare dashboard** (the tunnel is token-based; it reads ingress
 from Cloudflare, not a local file):
 
 > Cloudflare dashboard -> tunnel `bbd1217e-...` -> Public Hostnames -> add
-> `oaica.samwong.com` -> service `http://localhost:8081`.
+> `api.oaica.com` -> service `http://localhost:8081`.
 
-Then `https://oaica.samwong.com/models` and
-`https://oaica.samwong.com/v1/chat/completions` are live.
+Then `https://api.oaica.com/models` and
+`https://api.oaica.com/v1/chat/completions` are live.
 
 ## Cog fallback (not built -- do not list it)
 
