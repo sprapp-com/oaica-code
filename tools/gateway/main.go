@@ -118,7 +118,44 @@ type gwModel struct {
 	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"`
 	Pricing             gwPricing `json:"pricing"`
 	SupportedParameters []string  `json:"supported_parameters,omitempty"`
-	Created             int64     `json:"created,omitempty"`
+	// InputModalities is what the model can actually consume: "text" and
+	// optionally "image". Empty means text only. kat-awq's config claims a
+	// vision tower, but under AWQ an image request produces garbage
+	// ("!!!!!!!!" in the reasoning field, verified live 2026-08-26); the
+	// gateway must refuse images for such a model rather than bill a
+	// customer for noise.
+	InputModalities []string `json:"input_modalities,omitempty"`
+	Created         int64    `json:"created,omitempty"`
+}
+
+func (m gwModel) acceptsImages() bool {
+	for _, x := range m.InputModalities {
+		if x == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasImageContent reports whether any message carries an image part in the
+// OpenAI chat schema ({"type":"image_url"} or {"type":"input_image"}).
+func hasImageContent(req map[string]any) bool {
+	msgs, _ := req["messages"].([]any)
+	for _, mi := range msgs {
+		m, _ := mi.(map[string]any)
+		parts, ok := m["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, pi := range parts {
+			p, _ := pi.(map[string]any)
+			switch p["type"] {
+			case "image_url", "input_image", "image":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m gwModel) upstreamID() string {
@@ -382,6 +419,14 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 		if len(m.SupportedParameters) > 0 {
 			entry["supported_parameters"] = m.SupportedParameters
 		}
+		in := m.InputModalities
+		if len(in) == 0 {
+			in = []string{"text"}
+		}
+		entry["architecture"] = map[string]any{
+			"input_modalities":  in,
+			"output_modalities": []string{"text"},
+		}
 		data = append(data, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -598,6 +643,11 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	g.mu.RUnlock()
 	if !ok {
 		writeErr(w, http.StatusNotFound, "model_not_found", "unknown model "+fmt.Sprintf("%q", modelID))
+		return
+	}
+	if hasImageContent(req) && !m.acceptsImages() {
+		writeErr(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("model %q does not accept image input (text only)", m.ID))
 		return
 	}
 	req["model"] = m.upstreamID()

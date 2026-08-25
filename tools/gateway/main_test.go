@@ -584,3 +584,96 @@ func TestCompletion_ClampsMaxTokens(t *testing.T) {
 		t.Errorf("within-limit 500 must pass through unchanged, got %v", v)
 	}
 }
+
+// kat-awq's AWQ quant emits garbage for image input ("!!!!!!!!", verified
+// live). A text-only model must refuse images with a 400 BEFORE the request
+// reaches vLLM, and /models must advertise input_modalities honestly.
+func TestCompletion_RejectsImagesForTextOnlyModel(t *testing.T) {
+	var got map[string]any
+	reached := false
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(200)
+		io.WriteString(w, `{"choices":[{"message":{"content":"!!!!"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+	g, ledger := newTestGateway(t, up.URL) // model has no input_modalities -> text only
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	body := `{"model":"kat-awq","messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("image to text-only model: got %d want 400", resp.StatusCode)
+	}
+	if reached {
+		t.Fatal("request must be refused at the gateway, never forwarded to vLLM")
+	}
+	var doc struct {
+		Error map[string]any `json:"error"`
+	}
+	json.NewDecoder(resp.Body).Decode(&doc)
+	if doc.Error == nil || doc.Error["code"] != "invalid_request_error" {
+		t.Errorf("not OpenAI-shaped: %v", doc)
+	}
+	if rows := readLedger(t, ledger); len(rows) != 0 {
+		t.Errorf("a refused request must not be billed, got %d ledger rows", len(rows))
+	}
+	_ = got
+}
+
+func TestCompletion_AllowsImagesForVisionModel(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	// promote the test model to vision-capable
+	cfg := g.cfg
+	cfg.Models[0].InputModalities = []string{"text", "image"}
+	if err := g.apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	body := `{"model":"kat-awq","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("image to vision model: got %d want 200", resp.StatusCode)
+	}
+}
+
+func TestModels_AdvertisesInputModalities(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	req, _ := http.NewRequest("GET", srv.URL+"/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var doc struct {
+		Data []map[string]any `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&doc)
+	arch, _ := doc.Data[0]["architecture"].(map[string]any)
+	in, _ := arch["input_modalities"].([]any)
+	if len(in) != 1 || in[0] != "text" {
+		t.Fatalf("text-only model must advertise input_modalities [text], got %v", arch)
+	}
+}

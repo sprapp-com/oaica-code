@@ -23,6 +23,7 @@ Everything below is verified live at time of writing. Anything marked
 | Privacy Policy URL | https://api.oaica.com/privacy |
 | Terms of Service URL | https://api.oaica.com/terms |
 | Data policy | We do not train on, sell, or persist prompts or completions. Gateway, load balancer and auth layer are pass-through reverse proxies with no request-body logging (verified: a marker prompt sent through the live stack appears in no log). Request content lives only in RAM/GPU memory while served. Metadata (timestamp, status, key label, backend, token counts, latency, request id) is retained in an append-only billing ledger for payout reconciliation; no request content or end-user identity. |
+| Supported input modalities | Text only. The AWQ quant of kat-awq carries a vision config but produces garbage on image input; the gateway refuses images with a 400 and advertises `input_modalities: [text]`. |
 | Supported output modalities | Text |
 | Inference location | **JP** (the GPU host is in Kanazawa, Japan per its public IP; Cloudflare edge transits traffic but does not run inference). Do NOT put MY here -- MY is HQ, not compute. |
 | HQ location | MY (Malaysia) |
