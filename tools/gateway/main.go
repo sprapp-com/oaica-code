@@ -204,6 +204,53 @@ func newProxy(upstream string) (*httputil.ReverseProxy, error) {
 		MaxIdleConnsPerHost:   64,
 	}
 	p.FlushInterval = -1 // flush every write: required for SSE streaming
+	p.ModifyResponse = func(resp *http.Response) error {
+		// Internal topology must not leak to the public.
+		resp.Header.Del("X-Katlb-Backend")
+		resp.Header.Del("X-Gatekeeper-Tier")
+		resp.Header.Del("X-Gatekeeper-Limit")
+		// gatekeeper (429/401) and katlb (503) answer with text/plain or a
+		// non-OpenAI JSON; normalize so clients see {"error":{...}} and keep
+		// Retry-After. Streaming bodies are never rewritten (status 200).
+		if resp.StatusCode >= 400 && !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			msg := strings.TrimSpace(string(raw))
+			var probe struct {
+				Error any `json:"error"`
+			}
+			if json.Unmarshal(raw, &probe) == nil {
+				if em, ok := probe.Error.(map[string]any); ok {
+					if s, ok := em["message"].(string); ok {
+						msg = s
+					}
+				} else if s, ok := probe.Error.(string); ok {
+					msg = s
+				}
+			}
+			code := "upstream_error"
+			switch resp.StatusCode {
+			case http.StatusTooManyRequests:
+				code = "rate_limit_exceeded"
+				if resp.Header.Get("Retry-After") == "" {
+					resp.Header.Set("Retry-After", "1")
+				}
+			case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+				code = "server_error"
+				if resp.Header.Get("Retry-After") == "" {
+					resp.Header.Set("Retry-After", "2")
+				}
+			case http.StatusBadRequest:
+				code = "invalid_request_error"
+			}
+			b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": code, "code": code}})
+			resp.Body = io.NopCloser(bytes.NewReader(b))
+			resp.ContentLength = int64(len(b))
+			resp.Header.Set("Content-Type", "application/json")
+			resp.Header.Set("Content-Length", fmt.Sprint(len(b)))
+		}
+		return nil
+	}
 	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		status := http.StatusBadGateway
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timeout") {
@@ -342,27 +389,41 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 	g.mu.RLock()
 	up := g.cfg.UpstreamAddr
+	models := g.cfg.Models
 	g.mu.RUnlock()
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(up, "/")+"/v1/models", nil)
-	resp, err := http.DefaultClient.Do(req)
 	w.Header().Set("Content-Type", "application/json")
-	// gatekeeper returns 401 to an unauthenticated probe; that still proves
-	// the hop is alive. Anything but a transport error / 5xx is "up".
-	if err != nil || resp.StatusCode >= 500 {
+	w.Header().Set("Cache-Control", "no-store")
+	if len(models) == 0 {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		msg := "upstream unreachable"
-		if err != nil {
-			msg = err.Error()
-		} else {
-			resp.Body.Close()
-			msg = fmt.Sprintf("upstream HTTP %d", resp.StatusCode)
-		}
-		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": msg})
+		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": "no models configured"})
 		return
 	}
+	// A real 1-token chat completion, authenticated with the gateway's own
+	// upstream credential, through gatekeeper -> katlb -> a replica. This is
+	// the only probe that proves a customer request would succeed. The old
+	// unauthenticated GET /v1/models got a 401 from gatekeeper and reported
+	// "ok" with every replica dead (audit 2026-08-25).
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	body := `{"model":` + fmt.Sprintf("%q", models[0].upstreamID()) + `,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}`
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(up, "/")+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if k := os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY"); k != "" {
+		req.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": err.Error()})
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode)})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 }
 
@@ -381,6 +442,7 @@ type ledgerEntry struct {
 	CompletionTokens int    `json:"completion_tokens"`
 	LatencyMS        int64  `json:"latency_ms"`
 	UsageSeen        bool   `json:"usage_seen"` // false = upstream sent no usage; do not trust zeros
+	Aborted          bool   `json:"aborted"`    // client disconnected / upstream died mid-response
 }
 
 func (g *gateway) writeLedger(e ledgerEntry) {
@@ -540,9 +602,10 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		if so == nil {
 			so = map[string]any{}
 		}
-		if _, set := so["include_usage"]; !set {
-			so["include_usage"] = true
-		}
+		// Always on. A client sending include_usage:false produced a 200 with
+		// zero metered tokens -- a billing bypass. OpenAI clients tolerate the
+		// trailing usage-only chunk.
+		so["include_usage"] = true
 		req["stream_options"] = so
 	}
 	nb, err := json.Marshal(req)
@@ -566,28 +629,42 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", rid)
 	rec := &usageRecorder{ResponseWriter: w, status: http.StatusOK, stream: stream}
 	start := time.Now()
+	// The ledger write is DEFERRED so it runs on every exit path: normal
+	// completion, a client that disconnects mid-stream (ReverseProxy panics
+	// with http.ErrAbortHandler), or an upstream failure. Before this, an
+	// aborted stream burned GPU time and left no row (audit 2026-08-25).
+	// The panic is re-raised after logging so net/http still handles it.
+	aborted := false
+	defer func() {
+		if p := recover(); p != nil {
+			aborted = true
+			rec.finish()
+			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted))
+			panic(p)
+		}
+	}()
 	proxy.ServeHTTP(rec, r)
-	// Meter BEFORE the handler returns. ServeHTTP has already streamed the
-	// full body to the client, so the client can observe "done" and read the
-	// ledger before this line runs -- a real race hit by the non-stream test.
-	// writeLedger is synchronous and the ledger fd is opened O_APPEND, so
-	// once this call returns the entry is durably in the file. Nothing here
-	// may be deferred or spun onto a goroutine.
 	rec.finish()
-	g.writeLedger(ledgerEntry{
+	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted))
+}
+
+// entry builds the ledger row for one completion.
+func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool) ledgerEntry {
+	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,
 		KeyLabel:         label,
 		Model:            m.ID,
 		UpstreamModel:    m.upstreamID(),
-		Path:             r.URL.Path,
+		Path:             path,
 		Stream:           stream,
 		Status:           rec.status,
 		PromptTokens:     rec.usage.PromptTokens,
 		CompletionTokens: rec.usage.CompletionTokens,
 		LatencyMS:        time.Since(start).Milliseconds(),
 		UsageSeen:        rec.seen,
-	})
+		Aborted:          aborted,
+	}
 }
 
 func (g *gateway) authed(h http.HandlerFunc) http.HandlerFunc {

@@ -342,6 +342,157 @@ func TestHealth_DownWhenUpstreamDead(t *testing.T) {
 	}
 }
 
+// The 2026-08-25 audit's #1 blocker: the old probe was an unauthenticated
+// GET that gatekeeper answered 401, which the gateway treated as "ok" even
+// with every replica dead. The probe must be a real authenticated chat
+// completion and must report DOWN when that chat returns anything but 200.
+func TestHealth_IsAuthenticatedChatProbe(t *testing.T) {
+	t.Setenv("OAICA_GATEWAY_UPSTREAM_KEY", "up-key")
+	var sawAuth, sawChat bool
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/completions" && r.Method == "POST" {
+			sawChat = true
+			sawAuth = r.Header.Get("Authorization") == "Bearer up-key"
+			if !sawAuth {
+				w.WriteHeader(401) // gatekeeper's real behaviour
+				return
+			}
+			w.WriteHeader(200)
+			io.WriteString(w, `{"choices":[{"message":{"content":"x"}}]}`)
+			return
+		}
+		w.WriteHeader(200) // GET /v1/models is 200 even when chat is broken -- must NOT be trusted
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/health")
+	resp.Body.Close()
+	if !sawChat || !sawAuth {
+		t.Fatalf("health must POST an authenticated chat probe (chat=%v auth=%v)", sawChat, sawAuth)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("healthy upstream: got %d want 200", resp.StatusCode)
+	}
+	// Now the "every replica dead but proxies alive" case: chat 503, GET 200.
+	t.Setenv("OAICA_GATEWAY_UPSTREAM_KEY", "wrong-key")
+	resp, _ = http.Get(srv.URL + "/health")
+	resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("chat probe rejected -> health must be 503, got %d", resp.StatusCode)
+	}
+}
+
+// include_usage:false from the client was a metering bypass (200, 0 tokens).
+func TestCompletion_Streaming_ClientCannotDisableUsage(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, ledger := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	body := `{"model":"kat-awq","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"x"}]}`
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	so, _ := got["stream_options"].(map[string]any)
+	if inc, _ := so["include_usage"].(bool); !inc {
+		t.Fatalf("client include_usage:false must be overridden to true upstream, got %v", got["stream_options"])
+	}
+	e := waitLedger(t, ledger, 1)[0]
+	if !e.UsageSeen || e.CompletionTokens == 0 {
+		t.Fatalf("stream with client-disabled usage must still meter: %+v", e)
+	}
+}
+
+// Upstream 429/503 (gatekeeper / katlb) must reach the client as OpenAI
+// error objects with Retry-After, and internal topology headers must be
+// stripped.
+func TestProxy_NormalizesUpstreamErrors_StripsTopology(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Katlb-Backend", "http://127.0.0.1:30105")
+		w.Header().Set("X-Gatekeeper-Tier", "openrouter")
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(429)
+		io.WriteString(w, `{"error":"concurrency limit reached for your tier","tier":"openrouter","limit":32}`)
+	}))
+	defer up.Close()
+	g, ledger := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 429 {
+		t.Fatalf("status %d want 429", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Katlb-Backend") != "" || resp.Header.Get("X-Gatekeeper-Tier") != "" {
+		t.Errorf("topology headers leaked: %v", resp.Header)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("429 must carry Retry-After")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type %q want application/json", ct)
+	}
+	var doc struct {
+		Error map[string]any `json:"error"`
+	}
+	json.NewDecoder(resp.Body).Decode(&doc)
+	if doc.Error == nil || doc.Error["code"] != "rate_limit_exceeded" || doc.Error["message"] == nil {
+		t.Errorf("not OpenAI-shaped: %v", doc)
+	}
+	e := waitLedger(t, ledger, 1)[0]
+	if e.Status != 429 {
+		t.Errorf("429 must be ledgered for reconciliation, got status %d", e.Status)
+	}
+}
+
+// A client that disconnects mid-stream still produces a ledger row (marked
+// aborted) -- previously the GPU work was unmetered.
+func TestCompletion_ClientAbortIsLedgered(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+		f.Flush()
+		<-release // hold the stream open until the client is gone
+	}))
+	defer up.Close()
+	g, ledger := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	body := `{"model":"kat-awq","stream":true,"messages":[{"role":"user","content":"x"}]}`
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	resp.Body.Read(buf) // got first chunk
+	resp.Body.Close()   // client aborts
+	close(release)
+	e := waitLedger(t, ledger, 1)
+	if len(e) != 1 {
+		t.Fatalf("aborted stream must still be ledgered, got %d rows", len(e))
+	}
+	if !e[0].Aborted {
+		t.Errorf("row must be flagged aborted: %+v", e[0])
+	}
+}
+
 // OpenRouter's provider form requires public Privacy/Terms URLs. They must
 // serve WITHOUT a key and must not be a placeholder.
 func TestLegalPages_PublicAndComplete(t *testing.T) {

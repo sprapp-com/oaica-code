@@ -17,15 +17,11 @@ including access via OpenRouter and any other reseller that forwards requests to
 - We do not receive end-user identity from OpenRouter; we see OpenRouter's
   key and IP, not yours.
 
-## What we store
-- Prompts and completions: NOT written to disk by our gateway, load balancer
-  or auth layer. They exist only in memory (host RAM and GPU memory,
-  including the inference engine's prefix cache) for the duration needed to
-  serve the request and are then evicted. We do not keep copies.
-- Metadata (timestamps, status codes, key id, backend, token counts,
-  latency): kept in process logs for up to 30 days for debugging,
-  abuse detection and billing reconciliation, then deleted.
-- We do not build user profiles and we do not sell any data.
+- Metadata (timestamp, status code, key label, model, token counts,
+  latency, request id): kept in an append-only billing ledger for as long
+  as needed to reconcile reseller payouts (currently retained
+  indefinitely; no automated deletion is in place). It contains no
+  request content and no end-user identity.
 
 ## Training
 We do not use your prompts, completions or any request content to train,
