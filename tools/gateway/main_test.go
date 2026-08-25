@@ -552,3 +552,35 @@ func TestModels_CreatedIsStableAcrossPolls(t *testing.T) {
 		t.Fatalf("created changed between polls (%v -> %v); OpenRouter would see a new model each time", a, b)
 	}
 }
+
+// max_tokens is clamped to the published max_completion_tokens, and further
+// to nonStreamMaxTokens for non-streaming requests (Cloudflare 100 s TTFB).
+func TestCompletion_ClampsMaxTokens(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL) // model has max_completion_tokens 32768
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	send := func(body string) float64 {
+		req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer sk-new")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.ReadAll(resp.Body)
+		resp.Body.Close()
+		v, _ := got["max_tokens"].(float64)
+		return v
+	}
+	if v := send(`{"model":"kat-awq","max_tokens":200000,"messages":[]}`); v != 8192 {
+		t.Errorf("non-stream 200000 -> upstream %v, want 8192 (nonStreamMaxTokens)", v)
+	}
+	if v := send(`{"model":"kat-awq","stream":true,"max_tokens":200000,"messages":[]}`); v != 32768 {
+		t.Errorf("stream 200000 -> upstream %v, want 32768 (published max_completion_tokens)", v)
+	}
+	if v := send(`{"model":"kat-awq","max_tokens":500,"messages":[]}`); v != 500 {
+		t.Errorf("within-limit 500 must pass through unchanged, got %v", v)
+	}
+}

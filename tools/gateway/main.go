@@ -100,6 +100,11 @@ func legalHandler(name string) http.HandlerFunc {
 // while refusing the 512 MB the previous version would have buffered.
 const maxBodyBytes = 16 << 20
 
+// nonStreamMaxTokens bounds max_tokens on NON-streaming completions so the
+// response can complete inside Cloudflare's 100 s TTFB limit. Streaming is
+// not bounded by this (only by the model's max_completion_tokens).
+const nonStreamMaxTokens = 8192
+
 type gwPricing struct {
 	Prompt     string `json:"prompt"`     // USD per token, decimal string (OpenRouter shape)
 	Completion string `json:"completion"` // USD per token, decimal string
@@ -597,6 +602,24 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	req["model"] = m.upstreamID()
 	stream, _ := req["stream"].(bool)
+	// Clamp the output budget to what is published in /models. Two reasons:
+	// max_tokens above max_completion_tokens was accepted verbatim (audit),
+	// and a NON-streaming reply must finish before Cloudflare's 100 s edge
+	// timeout -- at ~80 tok/s per stream that is ~8k tokens. Above that the
+	// client got a Cloudflare-branded text/plain 504 after the GPU had
+	// already done the work. Streaming has no such ceiling (headers go out
+	// immediately), so it keeps the full published limit.
+	limit := m.MaxCompletionTokens
+	if !stream && limit > nonStreamMaxTokens {
+		limit = nonStreamMaxTokens
+	}
+	if limit > 0 {
+		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+			if v, ok := req[k].(float64); ok && int(v) > limit {
+				req[k] = limit
+			}
+		}
+	}
 	if stream {
 		so, _ := req["stream_options"].(map[string]any)
 		if so == nil {

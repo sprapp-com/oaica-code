@@ -26,9 +26,10 @@ Everything below is verified live at time of writing. Anything marked
 | Supported output modalities | Text |
 | Inference location | **JP** (the GPU host is in Kanazawa, Japan per its public IP; Cloudflare edge transits traffic but does not run inference). Do NOT put MY here -- MY is HQ, not compute. |
 | HQ location | MY (Malaysia) |
+| Output limits | `max_completion_tokens` 32768 on streaming. Non-streaming requests are clamped to 8192 output tokens so the reply completes inside Cloudflare's 100 s edge timeout; use `stream:true` for longer outputs. Reasoning is always on (vLLM `--reasoning-parser qwen3`): thinking tokens count toward `max_tokens` and are billed as completion tokens; with very small `max_tokens` the visible `content` can be empty while `reasoning` is populated. |
 | Model | `kat-awq` = Ar4ikov/KAT-Coder-V2.5-Dev-AWQ-W4A16-ASYM @ 446ea8c6 (int4 AWQ of Kwaipilot/KAT-Coder-V2.5-Dev). Licence: Apache-2.0 on both the base and the quant (verified on HF) -- commercial hosted serving permitted. |
 | Pricing | $0.05 / M input, $0.12 / M output (published in `/models` as per-token decimals) |
-| Capacity | 2 replicas, ~3-5k tok/s each, 32 concurrent for the OpenRouter key (gatekeeper tier). Not the historical 6-replica number. |
+| Capacity | 2 replicas (GPU0 + GPU2). Measured through the public path at the 32-concurrency cap: ~2.5k tok/s aggregate, ~80 tok/s per stream. 32 is a request-admission cap; at the full 262k context about 19 requests fit in KV cache fleet-wide, beyond that requests queue. |
 | Status / health | https://api.oaica.com/status (statement) and https://api.oaica.com/health (200/503, for monitors) |
 
 ## Before you click submit
