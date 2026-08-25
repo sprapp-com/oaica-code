@@ -1,0 +1,16 @@
+{
+  "backends": [
+    "http://127.0.0.1:30199",
+    "http://127.0.0.1:30101",
+    "http://127.0.0.1:30102",
+    "http://127.0.0.1:30103",
+    "http://127.0.0.1:30104",
+    "http://127.0.0.1:30105"
+  ],
+  "health_path": "/v1/models",
+  "leastconn_addr": ":30099",
+  "session_hash_addr": ":8091",
+  "status_addr": ":8092",
+  "probe_model": "kat-awq",
+  "probe_timeout_sec": 10
+}

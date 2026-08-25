@@ -1,0 +1,35 @@
+{
+  "upstream_addr": "http://127.0.0.1:30098",
+  "listen_addr": ":8081",
+  "ledger_path": "/workspace/oaica-gateway-ledger.jsonl",
+  "api_keys": [
+    {
+      "sha256": "<sha256 hex of key>",
+      "label": "openrouter"
+    }
+  ],
+  "models": [
+    {
+      "id": "kat-awq",
+      "upstream_id": "kat-awq",
+      "owned_by": "oaica",
+      "context_length": 262144,
+      "max_completion_tokens": 32768,
+      "pricing": {
+        "prompt": "0.00000005",
+        "completion": "0.00000012"
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "stream",
+        "tools",
+        "tool_choice",
+        "stop",
+        "seed",
+        "response_format"
+      ]
+    }
+  ]
+}

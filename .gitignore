@@ -20,3 +20,4 @@ integration/testdata/models/
 # Claude Code worktrees
 .claude/worktrees/
 tools/gateway/oaica-gateway
+tools/katlb/katlb-linux-amd64

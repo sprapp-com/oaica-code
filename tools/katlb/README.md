@@ -22,9 +22,20 @@ Two listeners, same backends:
   `X-Session-Id`. Listener is up and correct, just unused until that's
   added.
 
-Active health checks: `GET <health_path>` (default `/v1/models`) every 3s,
-2 consecutive failures marks a backend down, 2 consecutive successes marks
-it back up.
+Active health checks every 3s; 2 consecutive failures marks a backend down,
+2 consecutive successes marks it back up. Two probe modes:
+
+- default: `GET <health_path>` (`/v1/models`). Cheap, but only proves the
+  HTTP server is up.
+- `"probe_model": "<served-model-name>"`: a real 1-token
+  `POST /v1/chat/completions`. Use this in production. vLLM answers
+  `GET /v1/models` 200 while every chat request 400s (e.g. tokenizer with no
+  `chat_template` -- the 2026-08-25 outage), so the GET probe kept every
+  backend UP while all traffic failed. `probe_timeout_sec` (default 10)
+  bounds one probe so a replica still loading weights is not marked DOWN.
+
+A malformed config is returned as an error at startup instead of
+`log.Fatalf`, so a future reload path cannot kill the LB.
 
 ## Build
 

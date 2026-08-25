@@ -1,0 +1,19 @@
+{
+  "tiers": {
+    "free": 2,
+    "pro": 10,
+    "team": 50,
+    "internal": 200,
+    "openrouter": 32
+  },
+  "keys": {
+    "<sha-or-key-0>": "internal",
+    "<sha-or-key-1>": "internal",
+    "<sha-or-key-2>": "internal",
+    "<sha-or-key-3>": "free",
+    "<sha-or-key-4>": "pro",
+    "<sha-or-key-5>": "openrouter"
+  },
+  "upstream_addr": "http://127.0.0.1:30099",
+  "listen_addr": ":30098"
+}

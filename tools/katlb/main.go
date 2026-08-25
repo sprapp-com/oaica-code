@@ -5,9 +5,10 @@
 // cold-cache replica, reprocessing the whole prefix from scratch).
 //
 // Two listeners, same 6 backends:
-//   :8090  leastconn (baseline — today's effective behavior)
-//   :8091  consistent-hash on X-Session-Id header, leastconn fallback if the
-//          hashed backend is marked unhealthy
+//
+//	:8090  leastconn (baseline — today's effective behavior)
+//	:8091  consistent-hash on X-Session-Id header, leastconn fallback if the
+//	       hashed backend is marked unhealthy
 //
 // Health checks: GET /v1/models every 3s, 2 consecutive failures marks a
 // backend down, 2 consecutive successes marks it back up.
@@ -16,12 +17,16 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,14 +39,27 @@ import (
 // session-hash load balancing by running a second katlb with its own
 // -config, not by touching this code.
 type lbConfig struct {
-	Backends       []string `json:"backends"`
-	HealthPath     string   `json:"health_path"`      // default "/v1/models"
-	LeastConnAddr  string   `json:"leastconn_addr"`    // default ":8090"
-	SessionAddr    string   `json:"session_hash_addr"` // default ":8091"
-	StatusAddr     string   `json:"status_addr"`       // default ":8092"
+	Backends      []string `json:"backends"`
+	HealthPath    string   `json:"health_path"`       // default "/v1/models"
+	LeastConnAddr string   `json:"leastconn_addr"`    // default ":8090"
+	SessionAddr   string   `json:"session_hash_addr"` // default ":8091"
+	StatusAddr    string   `json:"status_addr"`       // default ":8092"
+
+	// ProbeModel turns the health check into a real 1-token
+	// POST /v1/chat/completions for this served model name. GET /v1/models
+	// only proves the HTTP server is up: vLLM answers it 200 while every
+	// chat request 400s (e.g. tokenizer missing a chat_template -- the exact
+	// outage hit on 2026-08-25), so katlb kept routing into errors with all
+	// backends "UP". A chat probe fails the way a customer request fails.
+	// Empty keeps the cheap GET probe.
+	ProbeModel string `json:"probe_model"`
+	// ProbeTimeoutSec bounds one chat probe (default 10s; a 1-token reply on
+	// a healthy A100 replica is well under 1s, but a replica mid-startup can
+	// stall while loading weights and must not be marked DOWN for that).
+	ProbeTimeoutSec int `json:"probe_timeout_sec"`
 }
 
-func loadConfig(path string) lbConfig {
+func loadConfig(path string) (lbConfig, error) {
 	cfg := lbConfig{
 		Backends: []string{
 			"http://127.0.0.1:30099",
@@ -57,17 +75,20 @@ func loadConfig(path string) lbConfig {
 		StatusAddr:    ":8092",
 	}
 	if path == "" {
-		return cfg
+		return cfg, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("katlb: no config at %s (%v), using kat-awq defaults", path, err)
-		return cfg
+		return cfg, nil
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		log.Fatalf("katlb: bad config %s: %v", path, err)
+		return cfg, fmt.Errorf("katlb: bad config %s: %w", path, err)
 	}
-	return cfg
+	if cfg.ProbeTimeoutSec <= 0 {
+		cfg.ProbeTimeoutSec = 10
+	}
+	return cfg, nil
 }
 
 type backend struct {
@@ -90,14 +111,31 @@ func newBackend(raw string) *backend {
 	return b
 }
 
-func (b *backend) healthCheck(healthPath string) {
-	client := http.Client{Timeout: 2 * time.Second}
-	for {
+// probeOnce runs ONE health probe against b. With probeModel set it is a
+// real 1-token chat completion (see lbConfig.ProbeModel); otherwise a GET on
+// healthPath. A backend is healthy only when the probe returns 200 -- a 400
+// from a chat probe is the signal GET /v1/models can never give.
+func (b *backend) probeOnce(client *http.Client, healthPath, probeModel string) bool {
+	if probeModel == "" {
 		resp, err := client.Get(b.url.String() + healthPath)
-		ok := err == nil && resp != nil && resp.StatusCode == 200
 		if resp != nil {
 			resp.Body.Close()
 		}
+		return err == nil && resp != nil && resp.StatusCode == 200
+	}
+	body := `{"model":` + strconv.Quote(probeModel) + `,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}`
+	resp, err := client.Post(b.url.String()+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if resp != nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+	}
+	return err == nil && resp != nil && resp.StatusCode == 200
+}
+
+func (b *backend) healthCheck(healthPath, probeModel string, timeout time.Duration) {
+	client := &http.Client{Timeout: timeout}
+	for {
+		ok := b.probeOnce(client, healthPath, probeModel)
 		b.mu.Lock()
 		if ok {
 			b.okCount++
@@ -180,12 +218,18 @@ func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
 func main() {
 	configPath := flag.String("config", "", "path to a JSON config (backends, health_path, listen addrs) -- see lbConfig. Empty uses the kat-awq 6-replica default.")
 	flag.Parse()
-	cfg := loadConfig(*configPath)
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if cfg.ProbeModel != "" {
+		log.Printf("katlb: health probe = 1-token chat on %q (timeout %ds)", cfg.ProbeModel, cfg.ProbeTimeoutSec)
+	}
 
 	bs := make([]*backend, 0, len(cfg.Backends))
 	for _, raw := range cfg.Backends {
 		b := newBackend(raw)
-		go b.healthCheck(cfg.HealthPath)
+		go b.healthCheck(cfg.HealthPath, cfg.ProbeModel, time.Duration(cfg.ProbeTimeoutSec)*time.Second)
 		bs = append(bs, b)
 	}
 	time.Sleep(1 * time.Second) // let first health check land before serving
