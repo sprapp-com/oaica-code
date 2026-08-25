@@ -19,3 +19,4 @@ integration/testdata/models/
 
 # Claude Code worktrees
 .claude/worktrees/
+tools/gateway/oaica-gateway

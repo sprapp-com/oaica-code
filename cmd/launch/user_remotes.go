@@ -343,6 +343,33 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 	return ids, nil
 }
 
+// remoteDisplayID turns a remote's raw model id into the bare id the picker
+// shows after "<remote>/" and, crucially, the id that gets sent BACK to the
+// remote as the upstream model. Two remote families disagree about what an
+// id looks like:
+//
+//   - llama-server reports the GGUF FILE PATH as the id
+//     ("/dev/shm/oaica_malay35b_plain_q4km.gguf"). Only the basename is a
+//     usable name, so the directory prefix and .gguf suffix are dropped.
+//   - Aggregators (OpenRouter, OpenCode Zen) use "vendor/model" ids
+//     ("deepseek/deepseek-chat"). The vendor prefix is part of the id:
+//     OpenRouter rejects the stripped form as ambiguous ("'deepseek-chat'
+//     matches multiple models ... use the full model ID"), confirmed
+//     empirically 2026-08-26. Stripping it here silently broke every
+//     aggregator model in the picker.
+//
+// The two are told apart by the leading "/": an absolute path is a file
+// (strip to basename), anything else is an opaque id (keep it whole).
+func remoteDisplayID(id string) string {
+	display := id
+	if strings.HasPrefix(id, "/") {
+		if idx := strings.LastIndex(id, "/"); idx >= 0 {
+			display = id[idx+1:]
+		}
+	}
+	return strings.TrimSuffix(display, ".gguf")
+}
+
 // userRemoteLaunchModels queries every configured remote and returns picker
 // entries named "<remote>/<model>". Errors are returned alongside the models,
 // never instead of them.
@@ -380,11 +407,7 @@ func userRemoteLaunchModels() ([]LaunchModel, []error) {
 			for _, id := range ids {
 				// Namespaced so two boxes serving the same model stay distinct,
 				// and so the picker shows WHERE a model runs.
-				display := id
-				if idx := strings.LastIndex(id, "/"); idx >= 0 {
-					display = id[idx+1:] // llama-server reports a FILE PATH
-				}
-				display = strings.TrimSuffix(display, ".gguf")
+				display := remoteDisplayID(id)
 				rm = append(rm, LaunchModel{
 					Name:         r.Name + "/" + display,
 					Remote:       true,
