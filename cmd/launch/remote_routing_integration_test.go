@@ -16,6 +16,10 @@ func TestRemoteRoutingHelpers(t *testing.T) {
 	t.Setenv("OAICA_REMOTES_FILE", writeDescriptorRemotesFile(t))
 	t.Setenv("KAT_KEY", "sk-kat")
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+	// The "local" cases resolve a bare name, which sweeps every configured
+	// remote's /v1/models (unroutable hosts above → 6s timeout per helper
+	// call). The explicit "<remote>/<id>" cases never consult the index.
+	stubBareIndex(t, map[string][]string{})
 
 	const remoteModel = "kat/kat-coder"
 

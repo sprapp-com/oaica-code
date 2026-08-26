@@ -275,9 +275,13 @@ func findUserRemoteForModel(name string) (userRemote, string, bool) {
 }
 
 // bareRemoteModelIndex lists every "<remote>/<id>" the configured remotes
-// serve, keyed by the bare id. Populated once per process by
-// resolveBareRemoteModel; the picker already fetches the same lists, so
-// this is the same network cost, not an extra one. Overridable in tests.
+// serve, keyed by the bare id. Built from userRemoteLaunchModels on EVERY
+// call (there is no per-process cache), so each bare-name lookup through
+// resolveBareRemoteModel is a full remote sweep — up to fetchRemoteModels'
+// 6s timeout per unreachable remote. Tests that resolve bare names must
+// stub this (stubBareIndex) or userRemoteLaunchModels; the picker already
+// fetches the same lists, so in production this is the same network cost,
+// not an extra one. Overridable in tests.
 var bareRemoteModelIndex = func() map[string][]string {
 	models, _ := userRemoteLaunchModels()
 	idx := make(map[string][]string, len(models))
@@ -455,6 +459,16 @@ func remoteDisplayID(id string) string {
 // entries named "<remote>/<model>". Errors are returned alongside the models,
 // never instead of them.
 //
+// Package var so tests can replace the remote sweep: it is the single network
+// call behind both the picker inventory (modelInventory.load) and the bare-id
+// index (bareRemoteModelIndex), and every configured remote costs up to
+// fetchRemoteModels' 6s timeout when it is unreachable. The default is the
+// live sweep.
+var userRemoteLaunchModels = userRemoteLaunchModelsLive
+
+// userRemoteLaunchModelsLive is the real remote sweep behind
+// userRemoteLaunchModels.
+//
 // Remotes are fetched CONCURRENTLY, not one at a time: fetchRemoteModels has a
 // 6s timeout per remote, and a real config can easily list a dozen-plus boxes
 // (LAN, external, cloud). Sequentially that's minutes in the worst case for
@@ -462,7 +476,7 @@ func remoteDisplayID(id string) string {
 // cost is bounded by the single slowest remote, ~6s worst case. Results are
 // reassembled in the original remotes.json order so the picker stays
 // deterministic across runs regardless of which goroutine finishes first.
-func userRemoteLaunchModels() ([]LaunchModel, []error) {
+func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 	remotes, err := loadUserRemotes()
 	if err != nil {
 		return nil, []error{err}

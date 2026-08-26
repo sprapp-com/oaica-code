@@ -24,10 +24,25 @@ func writeRemotesFile(t *testing.T) string {
 	return path
 }
 
+// stubAgentRoutingNetwork keeps ResolveAgentModel off every network path it
+// would otherwise touch: the bare-id remote sweep (a bare model name goes
+// through resolveBareRemoteModel), the inventory's own remote sweep
+// (agentModelMeta → modelInventory.load → userRemoteLaunchModels; writeRemotesFile's
+// "lan" host is unroutable, so each sweep costs fetchRemoteModels' full 6s
+// timeout), the router catalog, and the local Ollama daemon.
+func stubAgentRoutingNetwork(t *testing.T) {
+	t.Helper()
+	stubBareIndex(t, map[string][]string{})
+	stubUserRemoteModels(t, nil, nil)
+	stubCloudFetch(t, nil, nil)
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+}
+
 // TestResolveAgentModelRemote routes "<remote>/<model>" through a loopback
 // translation proxy with the remote's own key, and returns the bare upstream
 // model id.
 func TestResolveAgentModelRemote(t *testing.T) {
+	stubAgentRoutingNetwork(t)
 	t.Setenv("OAICA_REMOTES_FILE", writeRemotesFile(t))
 	t.Setenv("OAICA_API_KEY", "unused-oaica-key")
 
@@ -54,6 +69,7 @@ func TestResolveAgentModelRemote(t *testing.T) {
 
 // TestResolveAgentModelKeyPrecedence: api_key_env wins over api_key.
 func TestResolveAgentModelKeyPrecedence(t *testing.T) {
+	stubAgentRoutingNetwork(t)
 	t.Setenv("OAICA_REMOTES_FILE", writeRemotesFile(t))
 	t.Setenv("LAN_KEY", "sk-from-env")
 
@@ -72,6 +88,7 @@ func TestResolveAgentModelKeyPrecedence(t *testing.T) {
 // TestResolveAgentModelLocalTag: ":local" is stripped and the result uses the
 // OAICA key, never the remote key.
 func TestResolveAgentModelLocalTag(t *testing.T) {
+	stubAgentRoutingNetwork(t)
 	t.Setenv("OAICA_REMOTES_FILE", writeRemotesFile(t))
 	t.Setenv("OAICA_API_KEY", "oaica-key")
 	t.Setenv("OAICA_HOST", "https://router.example.test")
@@ -141,6 +158,7 @@ func TestApplyAgentModelMeta(t *testing.T) {
 // TestResolveAgentModelUnknownModelFallsBackToDefaults: an unknown model
 // yields positive defaults and tool-capable=true.
 func TestResolveAgentModelUnknownModelFallsBackToDefaults(t *testing.T) {
+	stubAgentRoutingNetwork(t)
 	t.Setenv("OAICA_REMOTES_FILE", writeRemotesFile(t))
 	t.Setenv("OAICA_API_KEY", "oaica-key")
 	t.Setenv("OAICA_HOST", "https://router.example.test")
