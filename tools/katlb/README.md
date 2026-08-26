@@ -33,6 +33,19 @@ Active health checks every 3s; 2 consecutive failures marks a backend down,
   `chat_template` -- the 2026-08-25 outage), so the GET probe kept every
   backend UP while all traffic failed. `probe_timeout_sec` (default 10)
   bounds one probe so a replica still loading weights is not marked DOWN.
+  A 200 whose body is not a completion (empty, truncated, no `choices`)
+  counts as a failure.
+
+Hung-replica detection (`stall_sec`, default 120; `-1` disables): katlb
+tracks every in-flight request per backend. If at least
+`stall_min_inflight` (default 1) of them are older than `stall_sec` AND the
+latest probe failed or timed out, the backend is marked DOWN on that single
+failure instead of waiting for two in a row -- this is the only thing that
+catches a replica whose probe flaps (ok, timeout, ok, ...) while every real
+request on it hangs. It is re-admitted by the normal 2-consecutive-successes
+rule. Old requests alone never mark a backend DOWN (a long legitimate
+generation with a passing probe is fine). `/status` on `status_addr` adds
+`oldest_inflight_sec=` and `probe=ok|fail` per backend.
 
 A malformed config is returned as an error at startup instead of
 `log.Fatalf`, so a future reload path cannot kill the LB.
