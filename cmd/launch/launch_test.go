@@ -1106,7 +1106,10 @@ func TestLaunchIntegration_ManagedSingleIntegrationCanConfigureWithModelList(t *
 		t.Fatalf("LaunchIntegration returned error: %v", err)
 	}
 
-	if diff := compareStringSlices(runner.configuredModelLists, [][]string{{"gemma4", "kimi-k2.6:cloud", "qwen3.5:cloud", "glm-5.1:cloud", "minimax-m2.7:cloud", "qwen3.5", "qwen3:8b"}}); diff != "" {
+	// Fork: with no router models, no user remotes and no keys, the managed
+	// integration's model list is seeded from the local daemon only — never
+	// from upstream Ollama's built-in catalog (ollamaCloudAliasCatalog).
+	if diff := compareStringSlices(runner.configuredModelLists, [][]string{{"gemma4", "qwen3:8b"}}); diff != "" {
 		t.Fatalf("configured model list mismatch (-want +got):\n%s", diff)
 	}
 	if diff := compareStrings(runner.configured, []string{"gemma4"}); diff != "" {
@@ -2002,6 +2005,9 @@ func TestResolveRunModel_ForcePicker_DoesNotReorderByLastModel(t *testing.T) {
 }
 
 func TestResolveRunModel_UsesSignInHookForCloudModel(t *testing.T) {
+	// Empty daemon + Ollama cloud sign-in: only reachable when the picker is
+	// padded with upstream's built-in catalog, which this fork never does.
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -2053,6 +2059,9 @@ func TestResolveRunModel_UsesSignInHookForCloudModel(t *testing.T) {
 }
 
 func TestResolveRunModel_MetadataSignedOutUsesSignInHook(t *testing.T) {
+	// Relies on Ollama's model-recommendations API + cloud sign-in; the fork
+	// sources the picker from the OAICA router instead.
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -2249,6 +2258,9 @@ func TestResolveRunModel_UpgradeCancelledReturnsToModelSelector(t *testing.T) {
 }
 
 func TestResolveRunModel_SubscriptionModelUnavailableWhoamiAllowsSelection(t *testing.T) {
+	// Relies on Ollama's model-recommendations API (required_plan) to pad an
+	// empty daemon's picker; the fork sources the picker from the OAICA router.
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -2494,9 +2506,13 @@ func TestLaunchIntegration_EditorForceConfigure_FloatsCheckedModelsInPicker(t *t
 	if len(gotItems) == 0 {
 		t.Fatal("expected multi selector to receive items")
 	}
-	wantItems := recommendedNames()
+	// Fork: the router returned nothing (setLaunchTestHome seam), so the
+	// picker holds only the daemon's two models — upstream's built-in
+	// catalog (recommendedNames()) is never padded in. The saved default
+	// still sorts first among checked items.
+	wantItems := []string{"qwen3.5:cloud", "qwen3.5"}
 	if diff := cmp.Diff(wantItems, gotItems); diff != "" {
-		t.Fatalf("expected fixed recommended order in selector items (-want +got):\n%s", diff)
+		t.Fatalf("expected daemon models only, saved default first (-want +got):\n%s", diff)
 	}
 	if len(gotPreChecked) < 2 {
 		t.Fatalf("expected prechecked models to be preserved, got %v", gotPreChecked)
@@ -2962,7 +2978,9 @@ func TestLaunchIntegration_EditorConfigureMultiAllFailuresKeepsExistingAndSkipsL
 		case "/api/experimental/model-recommendations":
 			fmt.Fprint(w, `{"recommendations":[]}`)
 		case "/api/tags":
-			fmt.Fprint(w, `{"models":[]}`)
+			// Fork: the picker is no longer padded with upstream's built-in
+			// catalog, so the daemon must hold something for it to open at all.
+			fmt.Fprint(w, `{"models":[{"name":"sample-model"}]}`)
 		case "/api/show":
 			var req apiShowRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)

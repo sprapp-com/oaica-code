@@ -248,9 +248,9 @@ type SupportedIntegration interface {
 
 // ModelItem represents model metadata before selector-only UI state is derived.
 type ModelItem struct {
-	Name            string
-	Description     string
-	Recommended     bool
+	Name        string
+	Description string
+	Recommended bool
 	// Local marks a model served by this box's own `oaica serve` (the
 	// "<model>:local" tagged entries) — the picker renders these in their
 	// own "Local" section, always before "Recommended", never mixed with
@@ -426,10 +426,13 @@ type launcherClient struct {
 	inventory             *modelInventory
 	recommendationsLoaded bool
 	recommendationItems   []ModelItem
-	accountState          *AccountState
-	accountStateProvider  func() *AccountState
-	accountStateUpdates   func(context.Context) <-chan *AccountState
-	policy                LaunchPolicy
+	// recommendationsErr is why recommendationItems is empty (router
+	// unreachable, key rejected, zero models); nil when the router answered.
+	recommendationsErr   error
+	accountState         *AccountState
+	accountStateProvider func() *AccountState
+	accountStateUpdates  func(context.Context) <-chan *AccountState
+	policy               LaunchPolicy
 }
 
 func newLauncherClient(policy LaunchPolicy) (*launcherClient, error) {
@@ -1180,6 +1183,11 @@ func (c *launcherClient) loadSelectableModels(ctx context.Context, preChecked []
 		orderedChecked = c.filterDisabledCloudModels(ctx, orderedChecked)
 	}
 	if len(items) == 0 {
+		if c.recommendationsErr != nil {
+			// Nothing local, no user remotes, and the router gave us nothing:
+			// name the router problem instead of a bare "no models available".
+			return nil, nil, fmt.Errorf("%s: %w", emptyMessage, c.recommendationsErr)
+		}
 		return nil, nil, errors.New(emptyMessage)
 	}
 	return items, orderedChecked, nil
@@ -1191,17 +1199,26 @@ func (c *launcherClient) recommendations(ctx context.Context) []ModelItem {
 	}
 
 	recommendations, err := c.requestRecommendations(ctx)
-	if err != nil || len(recommendations) == 0 {
+	if err == nil && len(recommendations) == 0 {
+		err = errors.New("OAICA router returned zero models")
+	}
+	if err != nil {
 		// Fail open: recommendation issues should not block launch flows.
-		// Fall back to built-in recommendations until server data is available.
-		fallback := append([]ModelItem(nil), recommendedModels...)
-		setDynamicCloudModelLimits(cloudModelLimitsFromRecommendations(fallback))
-		c.recommendationItems = fallback
+		// The picker degrades to what the inventory already holds (local
+		// daemon models, user remotes) — it must NOT fall back to upstream
+		// Ollama's built-in catalog (ollamaCloudAliasCatalog): this fork does
+		// not serve those models, so offering them would list rows that can
+		// never launch as if they were OAICA offerings. The reason is kept so
+		// an empty picker can say why (see loadSelectableModels).
+		setDynamicCloudModelLimits(nil)
+		c.recommendationItems = nil
+		c.recommendationsErr = err
 		c.recommendationsLoaded = true
-		return append([]ModelItem(nil), fallback...)
+		return nil
 	}
 	setDynamicCloudModelLimits(cloudModelLimitsFromRecommendations(recommendations))
 	c.recommendationItems = recommendations
+	c.recommendationsErr = nil
 	c.recommendationsLoaded = true
 	return append([]ModelItem(nil), recommendations...)
 }

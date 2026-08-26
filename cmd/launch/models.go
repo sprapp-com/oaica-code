@@ -23,7 +23,17 @@ import (
 	"github.com/ollama/ollama/progress"
 )
 
-var recommendedModels = []ModelItem{
+// ollamaCloudAliasCatalog is upstream Ollama's built-in launch catalog: the
+// ":cloud" aliases Ollama sells on its own hosted service, plus two local
+// pulls. This fork does NOT sell Ollama cloud — the picker is sourced live
+// from the OAICA router (/v1/models), user remotes (~/.oaica/remotes.json),
+// OpenRouter and the local daemon (see launcherClient.requestRecommendations
+// and modelInventory.load). These entries are therefore NEVER offered as
+// recommendations or picker rows. The slice is kept only to seed
+// cloudModelLimits, so a genuine Ollama ":cloud" alias that a user has on
+// their own local daemon still resolves its context/output limits
+// (WithCloudLimits, CLAUDE_CODE_AUTO_COMPACT_WINDOW in tierPlan.envVars).
+var ollamaCloudAliasCatalog = []ModelItem{
 	{Name: "kimi-k2.6:cloud", Description: "State-of-the-art coding, long-horizon execution, and multimodal agent swarm capability", Recommended: true, Details: api.ModelDetails{ContextLength: 262_144}, MaxOutputTokens: 262_144},
 	{Name: "qwen3.5:cloud", Description: "Reasoning, coding, and agentic tool use with vision", Recommended: true, Details: api.ModelDetails{ContextLength: 262_144}, MaxOutputTokens: 32_768},
 	{Name: "glm-5.1:cloud", Description: "Reasoning and code generation", Recommended: true, Details: api.ModelDetails{ContextLength: 202_752}, MaxOutputTokens: 131_072},
@@ -49,8 +59,8 @@ type cloudModelLimit struct {
 	Output  int
 }
 
-// extraCloudModelLimits maps cloud model base names to token limits for models
-// that are not already covered by recommendedModels fallback entries.
+// extraCloudModelLimits maps Ollama cloud alias base names to token limits for
+// aliases that are not already covered by ollamaCloudAliasCatalog.
 // TODO(parthsareen): grab context/output limits from model info instead of hardcoding
 var extraCloudModelLimits = map[string]cloudModelLimit{
 	"cogito-2.1:671b":     {Context: 163_840, Output: 65_536},
@@ -74,7 +84,12 @@ var extraCloudModelLimits = map[string]cloudModelLimit{
 	"qwen3.5":             {Context: 262_144, Output: 32_768},
 }
 
-var cloudModelLimits = mergeCloudModelLimits(cloudModelLimitsFromRecommendations(recommendedModels), extraCloudModelLimits)
+// cloudModelLimits holds the Ollama cloud alias limits: context/output token
+// limits keyed by the base name of an Ollama ":cloud" alias. It is a lookup
+// table only — nothing here is a recommendation, and lookupCloudModelLimit
+// only consults it for names carrying an explicit cloud source tag, so OAICA
+// router / user-remote model ids never match it.
+var cloudModelLimits = mergeCloudModelLimits(cloudModelLimitsFromRecommendations(ollamaCloudAliasCatalog), extraCloudModelLimits)
 
 var (
 	dynamicCloudModelLimitsMu sync.RWMutex
@@ -374,9 +389,16 @@ func prepareManagedAutodiscoveryIntegration(name string, autodiscovery ManagedAu
 	return nil
 }
 
-// buildModelList merges existing models with recommendations for selection UIs.
+// buildModelList merges existing models with upstream Ollama's built-in
+// catalog for selection UIs.
+//
+// Not used by any launch flow in this fork: the picker goes through
+// buildModelListWithRecommendations with the live OAICA/user-remote list from
+// launcherClient.recommendations, which never falls back to
+// ollamaCloudAliasCatalog. Kept so the upstream merge/sort tests keep
+// exercising buildModelListWithRecommendations against a fixed fixture.
 func buildModelList(existing []modelInfo, preChecked []string, current string) (items []ModelItem, orderedChecked []string, existingModels, cloudModels map[string]bool) {
-	return buildModelListWithRecommendations(existing, recommendedModels, preChecked, current)
+	return buildModelListWithRecommendations(existing, ollamaCloudAliasCatalog, preChecked, current)
 }
 
 func buildModelListWithRecommendations(existing []modelInfo, recommendations []ModelItem, preChecked []string, current string) (items []ModelItem, orderedChecked []string, existingModels, cloudModels map[string]bool) {
