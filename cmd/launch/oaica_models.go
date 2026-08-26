@@ -202,7 +202,15 @@ func oaicaLiveModelEntries() []oaicaModelEntry {
 // must still be able to see and use its own local model. Cloud failure is
 // no longer fatal to the whole function; it only matters if local also
 // comes up empty.
-func oaicaFetchCloudModelEntries() ([]oaicaModelEntry, error) {
+// oaicaFetchCloudModelEntries is a package var so tests can replace the
+// network call. Every launch-path test previously reached the REAL router
+// (api.sprapp.com, or whatever OAICA_HOST pointed at) and either polluted
+// the picker with live production models or failed outright when the host
+// was unreachable -- 9 tests were red for exactly this reason. Tests that
+// want a router stub set this; the default hits the network.
+var oaicaFetchCloudModelEntries = oaicaFetchCloudModelEntriesLive
+
+func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
 	if err != nil {
 		return nil, err

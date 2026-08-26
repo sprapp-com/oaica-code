@@ -125,7 +125,14 @@ type oaicaModelList struct {
 // claims in this CLI, the site, and the launch picker separately).
 // Unrated models have Stars == 0 and empty Description — never fabricate
 // a rating client-side.
-func oaicaListModelsDetailed() ([]oaicaModelListEntry, error) {
+// oaicaListModelsDetailed is a package var so tests can replace the network
+// call. RunHandler consults the OAICA router on every run; the cmd tests
+// only mock Ollama's OLLAMA_HOST, so without this seam each one reached the
+// real router (or an unreachable OAICA_HOST) and failed with "couldn't
+// reach ... /v1/models". Defaults to the live fetch.
+var oaicaListModelsDetailed = oaicaListModelsDetailedLive
+
+func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/models", nil)
 	if err != nil {
 		return nil, err
@@ -236,7 +243,11 @@ var activeLocalLoras []oaicaLoraRequestEntry
 
 // oaicaChat sends a non-streaming chat completion to the router and returns
 // the assistant's reply text.
-func oaicaChat(model string, messages []oaicaChatMessage) (string, error) {
+// oaicaChat is a package var so tests can intercept the one-shot chat call
+// without a network. Defaults to the live request.
+var oaicaChat = oaicaChatLive
+
+func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 	reqBody := oaicaChatRequest{
 		Model:              model,
 		Messages:           messages,

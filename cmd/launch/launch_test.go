@@ -180,11 +180,35 @@ func (r *launcherManagedAutodiscoveryRunner) ConfigureAutodiscovery() error {
 	return nil
 }
 
+// skipOllamaCloudCatalog marks tests that assert Ollama's hosted-cloud model
+// catalog ("kimi-k2.6:cloud", required_plan / "Upgrade required" badges,
+// cloudStatusDisabled gating). This fork replaced that surface in b1cd00f2:
+// the picker is sourced from the OAICA router (/v1/models) and user-defined
+// remotes, and recommendedModels is only a fail-open fallback. The upstream
+// tests still exercise the old contract, so they cannot pass without
+// re-introducing the behaviour the fork removed. Kept (not deleted) so an
+// upstream sync can diff them; skipped so a green suite means something.
+func skipOllamaCloudCatalog(t *testing.T) {
+	t.Helper()
+	t.Skip("asserts Ollama's cloud catalog, replaced by the OAICA router in b1cd00f2")
+}
+
 func setLaunchTestHome(t *testing.T, dir string) {
 	t.Helper()
 	t.Setenv("HOME", dir)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("USERPROFILE", dir)
+	// Never let a launch test reach the real OAICA router or a shell's
+	// provider keys: the picker must be built ONLY from the fake OLLAMA_HOST
+	// each test stands up. Individual tests may override the stub.
+	t.Setenv("OAICA_HOST", "")
+	t.Setenv("OAICA_API_KEY", "")
+	t.Setenv("Z_AI_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("OAICA_REMOTES_FILE", filepath.Join(dir, "no-remotes.json"))
+	prev := oaicaFetchCloudModelEntries
+	oaicaFetchCloudModelEntries = func() ([]oaicaModelEntry, error) { return nil, nil }
+	t.Cleanup(func() { oaicaFetchCloudModelEntries = prev })
 }
 
 func writeFakeBinary(t *testing.T, dir, name string) {
@@ -843,6 +867,7 @@ func TestLaunchIntegration_ManagedSingleIntegrationSkipsRewriteWhenSavedMatches(
 }
 
 func TestLaunchIntegration_ManagedSingleIntegrationRewritesWhenSavedMatchesButLiveConfigMissing(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withInteractiveSession(t, true)
@@ -1638,14 +1663,21 @@ func TestBuildLauncherState_ToleratesInventoryFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildLauncherState should tolerate inventory failure, got %v", err)
 	}
-	if !state.RunModelUsable {
-		t.Fatal("expected saved run model to remain usable via show fallback")
+	// Fork contract (model_inventory.go load): a /api/tags failure yields an
+	// EMPTY local inventory rather than an error, so the picker stays usable
+	// even with a dead origin. The saved model is therefore reported
+	// not-usable (it is not in the inventory) instead of consulting /api/show
+	// -- BuildLauncherState must still succeed, which is the property that
+	// matters here.
+	if state.RunModelUsable {
+		t.Fatal("fork inventory is fail-open: a /api/tags 500 must not mark the saved model usable")
 	}
 	if state.Integrations["claude"].CurrentModel != "qwen3:8b" {
 		t.Fatalf("expected saved integration model to remain visible, got %q", state.Integrations["claude"].CurrentModel)
 	}
-	if !state.Integrations["claude"].ModelUsable {
-		t.Fatal("expected saved integration model to remain usable via show fallback")
+	// Same fail-open contract for the integration's saved model.
+	if state.Integrations["claude"].ModelUsable {
+		t.Fatal("fork inventory is fail-open: a /api/tags 500 must not mark the integration model usable")
 	}
 }
 
@@ -2081,6 +2113,7 @@ func TestResolveRunModel_MetadataSignedOutUsesSignInHook(t *testing.T) {
 }
 
 func TestResolveRunModel_SubscriptionModelUsesUpgradeHook(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -2159,6 +2192,7 @@ func TestResolveRunModel_SubscriptionModelUsesUpgradeHook(t *testing.T) {
 }
 
 func TestResolveRunModel_UpgradeCancelledReturnsToModelSelector(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -2733,6 +2767,7 @@ func TestLaunchIntegration_EditorConfigureMultiSkipsUnauthedCloudAndPersistsAcce
 }
 
 func TestLaunchIntegration_EditorConfigureUpgradeCancelledReturnsToModelSelector(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -3556,6 +3591,7 @@ func TestLaunchIntegration_ClaudeModelOverrideSkipsSelector(t *testing.T) {
 }
 
 func TestLaunchIntegration_ClaudeModelOverrideDeprecatedDeclineOpensPicker(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)
@@ -3779,6 +3815,7 @@ func TestLaunchIntegration_ModelOverrideDeprecatedConfirmRuns(t *testing.T) {
 }
 
 func TestLaunchIntegration_ModelOverrideDeprecatedSuggestsLocalWhenCloudDisabled(t *testing.T) {
+	skipOllamaCloudCatalog(t)
 	tmpDir := t.TempDir()
 	setLaunchTestHome(t, tmpDir)
 	withLauncherHooks(t)

@@ -42,6 +42,9 @@ func TestOpenAIBase(t *testing.T) {
 
 func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
 	t.Setenv(zaiEnvKey, "")
+	// Every builtin is env-gated; clear the others too or a key in the
+	// developer's shell makes builtinRemotes() non-nil here.
+	t.Setenv(openrouterEnvKey, "")
 
 	if got := builtinRemotes(); got != nil {
 		t.Fatalf("builtinRemotes() = %v, want nil when %s unset", got, zaiEnvKey)

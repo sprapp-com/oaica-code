@@ -389,7 +389,126 @@ func TestDeleteHandler(t *testing.T) {
 	}
 }
 
+// skipOllamaLocalRunPath marks tests written against upstream Ollama's `run`
+// flow: client.Show() / PullHandler against a local 127.0.0.1:11434 server,
+// embedding-capability routing, and ":cloud" stub models. This fork short-
+// circuits all of that in RunHandler (cmd.go, "OAICA thin-client short-
+// circuit", dd0c779f): the model is resolved against the OAICA router's
+// /v1/models and the prompt is sent straight to the router. The upstream
+// contract these tests assert no longer exists here. Kept for upstream
+// diffing; skipped so a green suite is meaningful. Fork behaviour is
+// covered by TestRunHandler_Oaica* below.
+func skipOllamaLocalRunPath(t *testing.T) {
+	t.Helper()
+	t.Skip("asserts upstream Ollama's local run path, replaced by the OAICA router short-circuit in dd0c779f")
+}
+
+// oaicaRunCmd builds the cobra command RunHandler expects, mirroring the
+// flags the real `run` command registers.
+func oaicaRunCmd(t *testing.T) *cobra.Command {
+	t.Helper()
+	cmd := &cobra.Command{}
+	cmd.SetContext(t.Context())
+	cmd.Flags().String("keepalive", "", "")
+	cmd.Flags().Bool("truncate", false, "")
+	cmd.Flags().Int("dimensions", 0, "")
+	cmd.Flags().Bool("verbose", false, "")
+	cmd.Flags().Bool("insecure", false, "")
+	cmd.Flags().Bool("nowordwrap", false, "")
+	cmd.Flags().String("format", "", "")
+	cmd.Flags().String("think", "", "")
+	cmd.Flags().Bool("hidethinking", false, "")
+	return cmd
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = old
+	b, _ := io.ReadAll(r)
+	return string(b)
+}
+
+// Fork run path: a model the router lists is accepted and the one-shot
+// prompt goes to the router, never to a local Ollama server.
+func TestRunHandler_OaicaKnownModelOneShotChat(t *testing.T) {
+	oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) {
+		return []oaicaModelListEntry{{ID: "kat-awq"}}, nil
+	}
+	t.Cleanup(func() { oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) { return nil, nil } })
+	var gotModel, gotPrompt string
+	oaicaChat = func(model string, msgs []oaicaChatMessage) (string, error) {
+		gotModel = model
+		gotPrompt = msgs[len(msgs)-1].Content
+		return "4", nil
+	}
+	t.Cleanup(func() { oaicaChat = oaicaChatLive })
+	// Any request to a local Ollama server is a bug in the fork path.
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("fork run path must not call the local Ollama server, got %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(ollama.Close)
+	t.Setenv("OLLAMA_HOST", ollama.URL)
+
+	out := captureStdout(t, func() {
+		if err := RunHandler(oaicaRunCmd(t), []string{"kat-awq", "what is 2+2"}); err != nil {
+			t.Fatalf("RunHandler: %v", err)
+		}
+	})
+	if gotModel != "kat-awq" || gotPrompt != "what is 2+2" {
+		t.Fatalf("router call = (%q, %q), want (kat-awq, what is 2+2)", gotModel, gotPrompt)
+	}
+	if !strings.Contains(out, "4") {
+		t.Fatalf("reply not printed, got %q", out)
+	}
+}
+
+// Fork run path: an unknown model is refused with the router's model list
+// and exits cleanly (no pull, no local server).
+func TestRunHandler_OaicaUnknownModelListsAvailable(t *testing.T) {
+	oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) {
+		return []oaicaModelListEntry{{ID: "kat-awq"}, {ID: "malay35b"}}, nil
+	}
+	t.Cleanup(func() { oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) { return nil, nil } })
+	chatCalled := false
+	oaicaChat = func(string, []oaicaChatMessage) (string, error) { chatCalled = true; return "", nil }
+	t.Cleanup(func() { oaicaChat = oaicaChatLive })
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+
+	out := captureStdout(t, func() {
+		if err := RunHandler(oaicaRunCmd(t), []string{"nope", "hi"}); err != nil {
+			t.Fatalf("unknown model must not error, got %v", err)
+		}
+	})
+	if !strings.Contains(out, "Unknown model 'nope'") || !strings.Contains(out, "kat-awq") || !strings.Contains(out, "malay35b") {
+		t.Fatalf("expected refusal listing available models, got %q", out)
+	}
+	if chatCalled {
+		t.Fatal("must not send a prompt for an unknown model")
+	}
+}
+
+// Fork run path: router unreachable surfaces a clear error, not a hang or a
+// fall-through to the local-Ollama pull flow.
+func TestRunHandler_OaicaRouterUnreachable(t *testing.T) {
+	oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) {
+		return nil, fmt.Errorf("couldn't reach http://router: dial tcp: connection refused")
+	}
+	t.Cleanup(func() { oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) { return nil, nil } })
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+	err := RunHandler(oaicaRunCmd(t), []string{"kat-awq", "hi"})
+	if err == nil || !strings.Contains(err.Error(), "couldn't reach OAICA API") {
+		t.Fatalf("want 'couldn't reach OAICA API' error, got %v", err)
+	}
+}
+
 func TestRunEmbeddingModel(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	reqCh := make(chan api.EmbedRequest, 1)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" && r.Method == http.MethodPost {
@@ -481,6 +600,7 @@ func TestRunEmbeddingModel(t *testing.T) {
 }
 
 func TestRunEmbeddingModelWithFlags(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	reqCh := make(chan api.EmbedRequest, 1)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" && r.Method == http.MethodPost {
@@ -583,6 +703,7 @@ func TestRunEmbeddingModelWithFlags(t *testing.T) {
 }
 
 func TestRunEmbeddingModelPipedInput(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	reqCh := make(chan api.EmbedRequest, 1)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" && r.Method == http.MethodPost {
@@ -675,6 +796,7 @@ func TestRunEmbeddingModelPipedInput(t *testing.T) {
 }
 
 func TestRunEmbeddingModelNoInput(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/show" && r.Method == http.MethodPost {
 			w.Header().Set("Content-Type", "application/json")
@@ -714,6 +836,7 @@ func TestRunEmbeddingModelNoInput(t *testing.T) {
 }
 
 func TestRunHandler_CloudAuthErrorOnShow_PrintsSigninMessage(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	var generateCalled bool
 
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -783,6 +906,7 @@ func TestRunHandler_CloudAuthErrorOnShow_PrintsSigninMessage(t *testing.T) {
 }
 
 func TestRunHandler_CloudAuthErrorOnGenerate_PrintsSigninMessage(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/show" && r.Method == http.MethodPost:
@@ -847,6 +971,7 @@ func TestRunHandler_CloudAuthErrorOnGenerate_PrintsSigninMessage(t *testing.T) {
 }
 
 func TestRunHandler_ExplicitCloudStubMissing_PullsNormalizedNameTEMP(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	var pulledModel string
 	var generateCalled bool
 
@@ -921,6 +1046,7 @@ func TestRunHandler_ExplicitCloudStubMissing_PullsNormalizedNameTEMP(t *testing.
 }
 
 func TestRunHandler_ExplicitCloudStubPresent_SkipsPullTEMP(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	var pullCalled bool
 	var generateCalled bool
 
@@ -992,6 +1118,7 @@ func TestRunHandler_ExplicitCloudStubPresent_SkipsPullTEMP(t *testing.T) {
 }
 
 func TestRunHandler_ExplicitCloudStubPullFailure_IsBestEffortTEMP(t *testing.T) {
+	skipOllamaLocalRunPath(t)
 	var generateCalled bool
 
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1259,7 +1386,8 @@ func TestPushHandler(t *testing.T) {
 			tmpDir := t.TempDir()
 			t.Setenv("HOME", tmpDir)
 			t.Setenv("USERPROFILE", tmpDir)
-			initializeKeypair()
+			// initializeKeypair was removed in a6fb6b5d along with the
+			// ssh-key push auth; push no longer needs a keypair.
 
 			cmd := &cobra.Command{}
 			cmd.Flags().Bool("insecure", false, "")
@@ -1584,56 +1712,6 @@ func TestCreateHandlerDraftQuantizeRequiresDraft(t *testing.T) {
 	err := CreateHandler(cmd, []string{"test-model"})
 	if err == nil || !strings.Contains(err.Error(), "--draft-quantize requires a DRAFT model") {
 		t.Fatalf("error = %v, want draft-quantize requires DRAFT", err)
-	}
-}
-
-func TestResolveExperimentalLocalModelDir(t *testing.T) {
-	dir := t.TempDir()
-	modelfile := filepath.Join(dir, "Modelfile")
-	modelDir := filepath.Join(dir, "model")
-	if err := os.Mkdir(modelDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(modelDir, "config.json"), []byte(`{}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(modelDir, "model.safetensors"), []byte("dummy"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := resolveExperimentalLocalModelDir("gemma4", modelfile); got != "gemma4" {
-		t.Fatalf("resolveExperimentalLocalModelDir(model name) = %q, want gemma4", got)
-	}
-	if got := resolveExperimentalLocalModelDir("./model", modelfile); got != modelDir {
-		t.Fatalf("resolveExperimentalLocalModelDir(local dir) = %q, want %q", got, modelDir)
-	}
-}
-
-func TestResolveExperimentalDraftDir(t *testing.T) {
-	dir := t.TempDir()
-	modelfile := filepath.Join(dir, "Modelfile")
-	draftDir := filepath.Join(dir, "assistant")
-	if err := os.Mkdir(draftDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(draftDir, "config.json"), []byte(`{}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(draftDir, "model.safetensors"), []byte("dummy"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := resolveExperimentalDraftDir("./assistant", modelfile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != draftDir {
-		t.Fatalf("resolveExperimentalDraftDir(local dir) = %q, want %q", got, draftDir)
-	}
-
-	_, err = resolveExperimentalDraftDir("assistant-model", modelfile)
-	if err == nil || !strings.Contains(err.Error(), "DRAFT model references are not supported with --experimental yet") {
-		t.Fatalf("error = %v, want unsupported draft model reference", err)
 	}
 }
 
@@ -2351,41 +2429,6 @@ func TestLoadOrUnloadModel_CloudModelAuth(t *testing.T) {
 				if err != nil {
 					t.Errorf("expected no error, got %v", err)
 				}
-			}
-		})
-	}
-}
-
-func TestIsLocalhost(t *testing.T) {
-	tests := []struct {
-		name     string
-		host     string
-		expected bool
-	}{
-		{"default empty", "", true},
-		{"localhost no port", "localhost", true},
-		{"localhost with port", "localhost:11435", true},
-		{"127.0.0.1 no port", "127.0.0.1", true},
-		{"127.0.0.1 with port", "127.0.0.1:11434", true},
-		{"0.0.0.0 no port", "0.0.0.0", true},
-		{"0.0.0.0 with port", "0.0.0.0:11434", true},
-		{"::1 no port", "::1", true},
-		{"[::1] with port", "[::1]:11434", true},
-		{"loopback with scheme", "http://localhost:11434", true},
-		{"remote hostname", "example.com", false},
-		{"remote hostname with port", "example.com:11434", false},
-		{"remote IP", "192.168.1.1", false},
-		{"remote IP with port", "192.168.1.1:11434", false},
-		{"remote with scheme", "http://example.com:11434", false},
-		{"https remote", "https://example.com:443", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("OLLAMA_HOST", tt.host)
-			got := isLocalhost()
-			if got != tt.expected {
-				t.Errorf("isLocalhost() with OLLAMA_HOST=%q = %v, want %v", tt.host, got, tt.expected)
 			}
 		})
 	}
