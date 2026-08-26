@@ -80,9 +80,11 @@ oaica run kat-coder-i-compact</code></pre>
 <p class="hint">Direct-to-box mode usually has no auth of its own (the router is what enforces <code>OAICA_API_KEY</code>) — only point at a box you trust on a network you trust.</p>
 
 <h2>Run a model</h2>
-<pre><code>oaica run flashplan              # recommended — auto-picks fast vs strong-reasoning per prompt
-oaica run kat-coder-i-compact    # fast, general-purpose
-oaica run oaica-v4-flash-i-compact  # stronger reasoning, slower</code></pre>
+<pre><code>oaica run kat-awq                          # chat with the coding model (262k context, tool calling)
+oaica run kat-awq "explain this error: ..."  # one-shot
+oaica launch claude --model kat-awq        # run Claude Code / opencode / codex on it
+oaica launch claude                        # or pick from a searchable menu (add OPENROUTER_API_KEY for 400+ more)</code></pre>
+<p class="hint">The model list is live: <code>oaica run</code> with an unknown name prints what your key can use.</p>
 
 <h2>Inside the interactive session</h2>
 <table>
@@ -116,6 +118,13 @@ Stacked LoRA(s) [nutrition_en] for this session only (per-request — doesn't af
 &gt; /lora off
 Per-request LoRA disabled for this session.</code></pre>
 <p class="hint"><strong>Stacked LoRA</strong> composes multiple adapters in one request (e.g. a fitness adapter + a nutrition adapter together) — real weighted composition, verified to produce a blended response distinct from either adapter alone. All stacked adapters must share the same backend model (they need to already be loaded together on one server via multiple <code>--lora</code> flags at launch — this is a private/local-deployment feature, not something the CLI provisions on the fly). Adapters can be toggled/scaled/stacked freely at runtime; loading a brand-new adapter file not already on the server requires a restart — that's a real llama.cpp limitation, not ours.</p>
+
+<h2>Build a website from a sentence</h2>
+<pre><code>oaica site new ./clinic --prompt "Landing page for a family dental clinic in Johor Bahru: same-day appointments, kids' dentistry, prices in MYR"
+oaica site edit ./clinic --prompt "hero should mention we open 7 days"
+oaica site preview ./clinic                       # sandboxed local preview
+oaica site deploy ./clinic --project my-clinic     # publish to Cloudflare Pages (needs wrangler)</code></pre>
+<p class="hint">Plans the page, writes each section separately, sanitizes everything (no scripts, no inline styles), assembles one <code>index.html</code>. About 10 seconds for a 5-section site on <code>kat-awq</code>. Edits regenerate only the section you name. Static output — host it anywhere.</p>
 
 <h2>Calling the API directly (curl, any language)</h2>
 <pre><code>curl -X POST https://api.oaica.com/v1/chat/completions \
