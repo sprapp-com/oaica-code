@@ -7,8 +7,11 @@ Linux box. Two things ship per release and they must stay in sync:
    `oaica-v<semver>` tag is pushed.
 2. **oaica.com** — the landing page plus `oaica.com/download/*` and
    `oaica.com/install.sh`, served from the `site/` directory of this repo via
-   Cloudflare Pages (project `oaica-com`). `install.sh` downloads from there,
-   not from GitHub.
+   Cloudflare Pages: project **`oaica-install`** in the unisqu account
+   (`125f3856…`), with `oaica.com` CNAMEd to `oaica-install.pages.dev`.
+   (There is no `oaica-com` project; `/mnt/ext9/cloudflare-pages/oaica-com`
+   on the laptop is a stale copy of the landing page only.) `install.sh`
+   downloads from oaica.com, not from GitHub.
 
 Why this exists: the binary at `oaica.com/download` had been hand-built on
 2026-08-04 from `329de0bf` with a dirty tree (`vcs.modified=true`), then left
@@ -44,10 +47,21 @@ git commit -m "release: oaica 0.3.0"
 git tag oaica-v0.3.0
 git push origin main oaica-v0.3.0     # tag push triggers the GitHub release
 
-# 3. publish oaica.com (needs a Cloudflare token with Pages:Edit on the
-#    account that owns oaica.com — the tunnel/DNS token in
-#    ~/.secrets/cloudflare_oaica.env does NOT have it)
-wrangler pages deploy site --project-name oaica-com
+# 3. publish oaica.com (wrangler must be logged into the unisqu account;
+#    on the laptop CLOUDFLARE_API_TOKEN in the shell env is. The tunnel/DNS
+#    token in ~/.secrets/cloudflare_oaica.env has no Pages permission.)
+wrangler pages deploy site --project-name oaica-install --commit-dirty=true
+
+# 3b. GitHub release. The tag push should run release.yaml, but this repo is
+#     a FORK of ollama/ollama and GitHub does not run workflows on forks
+#     until someone clicks "enable workflows" once in the repo's Actions tab
+#     (the REST permissions endpoint already says enabled=true; that is not
+#     the same gate). Until that is done, or if the run does not appear,
+#     create the release by hand from the same archives — this is how
+#     oaica-v0.3.0 was published:
+gh release create oaica-v0.3.0 --title "oaica 0.3.0" --notes "<changes>" \
+  site/download/oaica-* site/download/SHA256SUMS site/download/VERSION.txt \
+  scripts/install.sh scripts/install.ps1
 
 # 4. verify what a new user gets
 curl -fsSL https://oaica.com/install.sh | bash
