@@ -17,9 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test download verification and retry against a local server
         run: bash scripts/tests/install_checksum_test.sh
-      - name: Run install script
+      - name: Run the real installer against oaica.com
         run: sh ./scripts/install.sh
-        env:
-          OLLAMA_NO_START: 1 # do not start app
-      - name: Verify ollama is available
-        run: ollama --version
+      - name: Verify oaica is available
+        run: oaica --version

@@ -80,17 +80,21 @@ the tokenizer had no `chat_template`). katlb's probe is therefore a real
 The gateway's `/health` in turn asks gatekeeper, so an external monitor on
 `https://api.oaica.com/health` sees the whole chain.
 
-A replica that is listening but hung (accepts the connection and never
-answers, or passes the 1-token probe while real generations sit forever)
-is caught by `stall_sec` (default 120): katlb tracks every in-flight request
-per backend, and if at least `stall_min_inflight` (default 1) of them are
-older than `stall_sec` AND the latest probe failed or timed out, the replica
-is marked DOWN on that single failure -- not the usual two in a row -- and
-gets no new requests until the probe passes twice again. A 200 probe with an
-empty or non-completion body also counts as a failure. Old requests alone
-(a long legitimate generation with a passing probe) never mark a replica
-DOWN; `stall_sec: -1` disables the check. `:8092/status` shows
-`oldest_inflight_sec=` and `probe=ok|fail` per backend.
+Stall detection (`stall_sec`, deployed as 300 with `stall_min_inflight` 2):
+katlb tracks every in-flight request per backend. If at least
+`stall_min_inflight` of them are older than `stall_sec` AND the latest probe
+failed or timed out, the replica is marked DOWN on that single failure --
+not the usual two in a row -- and gets no new requests until the probe
+passes twice again. A 200 probe with an empty or non-completion body also
+counts as a failure. What this does NOT catch: a replica whose 1-token probe
+keeps passing while real generations sit forever is never marked DOWN by
+this rule -- the probe remains the gate; stall only lowers the trip count
+from two failures to one when old requests are also piling up. Old requests
+alone (a long legitimate generation with a passing probe) never mark a
+replica DOWN. The deployed 300 s / 2 defaults are deliberately conservative:
+under saturation, streams > 120 s are routine and a single 10 s probe timeout
+must not shrink capacity at peak. `stall_sec: -1` disables the check.
+`:8092/status` shows `oldest_inflight_sec=` and `probe=ok|fail` per backend.
 
 ## Watchdog behaviour
 

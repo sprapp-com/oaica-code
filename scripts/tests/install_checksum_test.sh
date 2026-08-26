@@ -11,6 +11,9 @@
 #
 #   bash scripts/tests/install_checksum_test.sh
 set -euo pipefail
+# Portable digest for the test's own fixtures: GitHub's macOS runners ship
+# shasum, not sha256sum (the installer under test has the same fallback).
+sum256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALL_SH="$ROOT/scripts/install.sh"
@@ -115,12 +118,12 @@ cp "$DL/oaica-linux-amd64.tgz" "$DL/nosums/oaica-linux-amd64.tgz"
     cd "$DL"
     listed=(oaica-*.tgz oaica-*.zip short-once.tgz corrupt-once.tgz corrupt-always.tgz)
     if [ "$HAVE_ZSTD" -eq 1 ]; then listed+=(oaica-*.tar.zst); fi
-    sha256sum "${listed[@]}" > SHA256SUMS
+    sum256 "${listed[@]}" > SHA256SUMS
 )
 head -c 4096 "$DL/oaica-linux-amd64.tgz" > "$DL/corrupt-always.tgz.trunc"
 mv "$DL/corrupt-always.tgz.trunc" "$DL/corrupt-always.tgz"
 [ "$(wc -c < "$DL/corrupt-always.tgz")" -lt "$(wc -c < "$DL/oaica-linux-amd64.tgz")" ] || { echo "test setup: corrupt-always.tgz was not truncated" >&2; exit 1; }
-GOOD_SUM="$(sha256sum "$DL/oaica-linux-amd64.tgz" | cut -d ' ' -f1)"
+GOOD_SUM="$(sum256 "$DL/oaica-linux-amd64.tgz" | cut -d ' ' -f1)"
 
 ###########################################
 # 4. Local server: python http.server that can break the first response
