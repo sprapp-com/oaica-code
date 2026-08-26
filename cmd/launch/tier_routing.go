@@ -95,7 +95,7 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		for _, e := range oaicaLocalServerEntries() {
 			if e.Model == base {
 				return launchEndpoint{Source: sourceLocalServe, RemoteEndpoint: RemoteEndpoint{
-					Name: "local", BaseURL: strings.TrimRight(e.Origin, "/") + "/v1", Token: "",
+					Name: "local", BaseURL: strings.TrimRight(e.Origin, "/") + "/v1", Token: e.APIKey,
 					UpstreamModel: base, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
 				}}, nil
 			}
@@ -103,27 +103,55 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		return launchEndpoint{}, fmt.Errorf("%q: no running `oaica serve` for %q (start it, or drop the :local tag)", model, base)
 	}
 
+	// Explicit source prefixes, for when a bare id is ambiguous or the user
+	// wants to pin a tier to the router / daemon regardless of what else
+	// serves that id. A user remote literally named "router" or "ollama"
+	// still wins above (resolveRemoteEndpoint ran first).
+	wantRouter, wantDaemon := false, false
+	switch {
+	case strings.HasPrefix(base, "router/"), strings.HasPrefix(base, "oaica/"):
+		wantRouter, base = true, base[strings.Index(base, "/")+1:]
+	case strings.HasPrefix(base, "ollama/"), strings.HasPrefix(base, "daemon/"):
+		wantDaemon, base = true, base[strings.Index(base, "/")+1:]
+	}
+
+	// A bare id served by SEVERAL remotes: say so instead of silently
+	// falling through to the router with a different credential.
+	if !wantRouter && !wantDaemon && !strings.Contains(base, "/") {
+		if owners := bareRemoteModelIndex()[base]; len(owners) > 1 {
+			return launchEndpoint{}, fmt.Errorf("model %q is served by several remotes (%s): pick one as <remote>/<id>", base, strings.Join(owners, ", "))
+		}
+	}
+
 	var tried []string
-	// Router: the model list is the readiness check; OAICA_HOST override is
-	// honoured by oaicaLaunchHost(). "<model>+<lora>" composites are router
-	// syntax and resolve through the same list (see oaicaModelIsReady).
-	routerModels, routerErr := oaicaFetchCloudModelEntries()
-	if routerErr == nil {
-		routerBase := base
-		if i := strings.Index(base, "+"); i >= 0 {
-			routerBase = base[:i]
-		}
-		for _, m := range routerModels {
-			if m.ID == routerBase {
-				return launchEndpoint{Source: sourceRouter, RemoteEndpoint: RemoteEndpoint{
-					Name: "oaica", BaseURL: oaicaLaunchHost() + "/v1", Token: oaicaLaunchAPIKeyForEnv(),
-					UpstreamModel: base, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
-				}}, nil
+	if !wantDaemon {
+		// Router: the model list is the readiness check; OAICA_HOST override
+		// is honoured by oaicaLaunchHost(). "<model>+<lora>" composites are
+		// router syntax and resolve through the same list by base id (see
+		// oaicaModelIsReady); the full composite goes upstream.
+		routerModels, routerErr := oaicaFetchCloudModelEntries()
+		if routerErr == nil {
+			routerBase := base
+			if i := strings.Index(base, "+"); i >= 0 {
+				routerBase = base[:i]
 			}
+			for _, m := range routerModels {
+				if m.ID == routerBase {
+					return launchEndpoint{Source: sourceRouter, RemoteEndpoint: RemoteEndpoint{
+						Name: "oaica", BaseURL: oaicaLaunchHost() + "/v1", Token: oaicaLaunchAPIKeyForEnv(),
+						UpstreamModel: base, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
+					}}, nil
+				}
+			}
+			tried = append(tried, fmt.Sprintf("not on %s", oaicaLaunchHost()))
+		} else if isOaicaRouterAuthErr(routerErr) {
+			tried = append(tried, fmt.Sprintf("%s rejected the API key — set OAICA_API_KEY or run `oaica signin`", oaicaLaunchHost()))
+		} else {
+			tried = append(tried, fmt.Sprintf("%s unavailable (%v)", oaicaLaunchHost(), routerErr))
 		}
-		tried = append(tried, fmt.Sprintf("not on %s", oaicaLaunchHost()))
-	} else {
-		tried = append(tried, fmt.Sprintf("%s unavailable (%v)", oaicaLaunchHost(), routerErr))
+		if wantRouter {
+			return launchEndpoint{}, fmt.Errorf("model %q: %s", model, strings.Join(tried, "; "))
+		}
 	}
 
 	found, reachable := daemonHasModel(base)
@@ -137,6 +165,9 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		tried = append(tried, fmt.Sprintf("not pulled on the local daemon at %s", envconfig.Host()))
 	} else {
 		tried = append(tried, fmt.Sprintf("no local daemon at %s", envconfig.Host()))
+	}
+	if wantDaemon {
+		return launchEndpoint{}, fmt.Errorf("model %q: %s", model, strings.Join(tried, "; "))
 	}
 	return launchEndpoint{}, fmt.Errorf("model %q not found: not a user remote (~/.oaica/remotes.json); %s", model, strings.Join(tried, "; "))
 }
@@ -154,6 +185,54 @@ type tierPlan struct {
 
 func routeFor(ep launchEndpoint) proxyRoute {
 	return proxyRoute{BaseURL: ep.BaseURL, Key: ep.Token, UpstreamModel: ep.UpstreamModel, Label: string(ep.Source) + ":" + ep.Name}
+}
+
+// resolveSecondaryEndpoint resolves --sonnet-model relative to the primary.
+//
+// When the primary is a user remote, an un-namespaced secondary means "on
+// that same remote" -- the contract --sonnet-model always had ("muse-spark-1.2"
+// on opencode-go, or an OpenRouter "vendor/id" the remote's /models did not
+// enumerate). The 2026-08-26 review caught the first version of this file
+// breaking that: an unlisted bare id failed with "not found", and an
+// ambiguous one silently moved to the OAICA router with the OAICA key.
+// Cross-source secondaries are still reachable, explicitly: "<remote>/<id>",
+// "<model>:local", "router/<id>", "ollama/<id>".
+//
+// When the primary is not a user remote, the generic resolver applies.
+func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launchEndpoint, error) {
+	if primary.Source != sourceUserRemote {
+		return resolveLaunchEndpoint(sonnetModel)
+	}
+	explicit := strings.HasSuffix(sonnetModel, oaicaLocalTagSuffix) ||
+		strings.HasPrefix(sonnetModel, "router/") || strings.HasPrefix(sonnetModel, "oaica/") ||
+		strings.HasPrefix(sonnetModel, "ollama/") || strings.HasPrefix(sonnetModel, "daemon/")
+	if ep, ok := resolveRemoteEndpoint(sonnetModel); ok {
+		// "<remote>/<id>" -- possibly a different remote; or a bare id that
+		// exactly one remote serves, which must be the primary's remote to
+		// count as "same remote" semantics... unless it IS the primary's.
+		if !strings.Contains(sonnetModel, "/") && ep.Name != primary.Name {
+			// bare id owned by another remote: ambiguous intent; keep the old
+			// contract (primary's remote) unless the user namespaces it.
+			return sameRemote(primary, sonnetModel), nil
+		}
+		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
+	}
+	if explicit {
+		return resolveLaunchEndpoint(sonnetModel)
+	}
+	// Prefix with the primary's remote name in case the id is enumerated
+	// there under the namespaced form; otherwise pass it through unchanged.
+	if ep, ok := resolveRemoteEndpoint(primary.Name + "/" + sonnetModel); ok {
+		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
+	}
+	return sameRemote(primary, sonnetModel), nil
+}
+
+// sameRemote is the primary's endpoint with a different upstream model id.
+func sameRemote(primary launchEndpoint, upstreamModel string) launchEndpoint {
+	ep := primary
+	ep.UpstreamModel = upstreamModel
+	return ep
 }
 
 // buildTierPlan resolves primary and optional secondary models and gates
@@ -178,7 +257,7 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 		plan.Routes.ByModel[primary.UpstreamModel] = routeFor(primary)
 	}
 	if sonnetModel != "" && sonnetModel != model {
-		secondary, err := resolveLaunchEndpoint(sonnetModel)
+		secondary, err := resolveSecondaryEndpoint(primary, sonnetModel)
 		if err != nil {
 			return tierPlan{}, fmt.Errorf("--sonnet-model: %w", err)
 		}
@@ -196,10 +275,11 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 }
 
 // envVars is the Claude Code environment for a plan. ANTHROPIC_AUTH_TOKEN is
-// only what Claude Code presents to OUR proxy; the proxy attaches each
-// route's real key upstream, so it can be any non-empty string.
-func (p tierPlan) envVars(anthropicBaseURL string) []string {
-	token := p.Primary.Token
+// the per-launch proxy token (see proxyRouteTable.ClientToken): the proxy
+// attaches each route's real key upstream, so no real key enters the child
+// environment (where Claude Code's Bash tool could print it).
+func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
+	token := clientToken
 	if token == "" {
 		token = "oaica-local"
 	}
@@ -250,6 +330,11 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	if err != nil {
 		return err
 	}
+	clientToken, err := newProxyClientToken()
+	if err != nil {
+		return fmt.Errorf("proxy token: %w", err)
+	}
+	plan.Routes.ClientToken = clientToken
 
 	ln, port, err := ListenAnthropicOpenAIProxy(userRemote{}, "")
 	if err != nil {
@@ -269,6 +354,6 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), plan.envVars(anthropicBaseURL)...)
+	cmd.Env = append(os.Environ(), plan.envVars(anthropicBaseURL, clientToken)...)
 	return cmd.Run()
 }

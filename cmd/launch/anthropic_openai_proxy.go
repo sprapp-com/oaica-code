@@ -28,11 +28,15 @@ package launch
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -385,7 +389,58 @@ type proxyRoute struct {
 type proxyRouteTable struct {
 	Default proxyRoute
 	ByModel map[string]proxyRoute
+	// ClientToken, when set, is the only credential the proxy accepts from
+	// its caller (Authorization: Bearer <t> or x-api-key: <t>). The proxy
+	// listens on loopback but loopback is shared with every other process
+	// and user on the box; without this, anyone local could spend the
+	// launcher's real upstream keys. Claude.Run generates one per launch
+	// and hands it to Claude Code as ANTHROPIC_AUTH_TOKEN, so the real keys
+	// never enter the child environment. Empty = no check (the standalone
+	// serve-anthropic-proxy subcommand and older callers).
+	ClientToken string
 }
+
+// authorized reports whether r presents the table's client token.
+func (t proxyRouteTable) authorized(r *http.Request) bool {
+	if t.ClientToken == "" {
+		return true
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
+	if got == "" {
+		got = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(t.ClientToken)) == 1
+}
+
+// newProxyClientToken makes the per-launch credential (32 random bytes, hex).
+func newProxyClientToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "oaica-proxy-" + hex.EncodeToString(b), nil
+}
+
+// redactURL strips userinfo from a URL for logs.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
+
+// proxyUpstreamClient bounds connection setup, never the response: a slow
+// local model may legitimately stream for longer than any fixed timeout,
+// and the request already carries the caller's context, which cancels
+// when Claude Code disconnects. (A 5-minute Client.Timeout here truncated
+// long streams -- review of 2026-08-26.)
+var proxyUpstreamClient = &http.Client{Transport: &http.Transport{
+	DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	MaxIdleConnsPerHost: 8,
+	IdleConnTimeout:     90 * time.Second,
+}}
 
 func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 	if requested == "" {
@@ -409,6 +464,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	// Claude Code's model probes resolve. The remote already speaks OpenAI
 	// /models (z.ai serves it under /v4).
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if !table.authorized(r) {
+			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
+			return
+		}
 		proxyPassThrough(w, r, baseURL+"/models", key)
 	})
 
@@ -422,6 +481,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !table.authorized(r) {
+			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
 			return
 		}
 		body, err := io.ReadAll(r.Body)
@@ -474,8 +537,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			upstreamReq.Header.Set("Authorization", "Bearer "+route.Key)
 		}
 
-		client := &http.Client{Timeout: 5 * time.Minute}
-		resp, err := client.Do(upstreamReq)
+		resp, err := proxyUpstreamClient.Do(upstreamReq)
 		if err != nil {
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 			return
@@ -489,7 +551,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			Timestamp:        time.Now().UTC().Format(time.RFC3339),
 			Model:            anthReq.Model,
 			Path:             r.URL.Path,
-			Backend:          route.Label + " " + route.BaseURL,
+			Backend:          route.Label + " " + redactURL(route.BaseURL),
 			LastMessageLen:   lastLen,
 			TotalMessagesLen: totalLen,
 			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),

@@ -5,10 +5,19 @@ an env var the launcher sets:
 
 | Request | Tier | Env var |
 |---|---|---|
-| Plan mode (`/model opusplan`, `--model opus`) | Opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` |
-| Normal turns, execution, `--model sonnet` | Sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` |
-| Subagents | — | `CLAUDE_CODE_SUBAGENT_MODEL` |
-| Quick background calls (titles, summaries) | Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
+| Plan mode under `/model opusplan`; `/model opus`; `--model opus` | Opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` |
+| Execution under `/model opusplan`; `/model sonnet`; `--model sonnet` | Sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` |
+| Subagents | — | `CLAUDE_CODE_SUBAGENT_MODEL` (= the Sonnet model) |
+| Quick background calls (titles, summaries) | Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` (= the primary) |
+
+The launcher always passes `--model <primary>` to Claude Code, so **with a
+plain launch every main-conversation request goes to the primary**. The
+`--sonnet-model` backend is reached three ways: `/model opusplan` (plans on
+the primary, executes on the secondary), `/model sonnet` / `--model sonnet`
+(main conversation on the secondary), and subagents (always the secondary).
+Haiku-tier background calls stay on the primary in every mode. `--model
+opus` / `--model sonnet` pin the *main conversation* only; subagents and
+Haiku calls keep their env-var tiers.
 
 Every request carries the resolved model id. The launcher runs ONE local
 Anthropic→OpenAI translation proxy with a **routing table keyed by that id**,
@@ -23,24 +32,31 @@ oaica launch claude --model deepseek-v4-flash:0731-cloud -- --sonnet-model kat-a
 oaica launch claude --model openrouter/anthropic/claude-sonnet-4 -- --sonnet-model bonsai:local
 ```
 
-Then inside Claude Code: `/model opusplan` → plans on the primary, executes
-on the `--sonnet-model`. `--model opus` / `--model sonnet` on the command
-line force one tier for the whole session.
-
 ## Where a model name can come from
 
-Resolution order (first match wins), `cmd/launch/tier_routing.go`:
+Resolution order for the **primary** (first match wins), `cmd/launch/tier_routing.go`:
 
 | Name | Source | Endpoint used |
 |---|---|---|
 | `<remote>/<id>`, or a bare id exactly one remote serves | `~/.oaica/remotes.json` | the remote's `base_url` + key |
-| `<model>:local` | a running `oaica serve` | its origin, no key |
-| id listed by the OAICA router (`OAICA_HOST`, default api.oaica.com) | router | `<host>/v1` + `OAICA_API_KEY` |
-| anything the local Ollama daemon answers `/api/show` for (pulled or `:cloud`) | daemon (`OLLAMA_HOST`) | `<daemon>/v1` |
+| `<model>:local` | a running `oaica serve` | its origin (+ its `--api-key` if it has one) |
+| `router/<id>` or `oaica/<id>` — or a bare id the OAICA router lists (`OAICA_HOST`, default api.oaica.com); `<id>+<lora>[+…]` composites resolve by `<id>` and are sent upstream whole | router | `<host>/v1` + `OAICA_API_KEY` |
+| `ollama/<id>` or `daemon/<id>` — or anything the local Ollama daemon answers `POST /api/show` for (pulled models **and** `:cloud` aliases) | daemon (`OLLAMA_HOST`) | `<daemon>/v1` |
 
-Primary and `--sonnet-model` resolve independently, so cross-source splits
-are fine. A name found nowhere fails before anything starts, naming every
-place that was tried.
+A bare id that several remotes serve is refused with a hint to write
+`<remote>/<id>`. A name found nowhere fails before anything starts, naming
+every place that was tried (and the fix when the router rejected the key).
+
+## `--sonnet-model` resolution
+
+- Primary on a **user remote**: an un-namespaced secondary means *on that
+  same remote* — the id is passed through even if the remote's `/models`
+  does not enumerate it (`muse-spark-1.2` on opencode-go, `openai/gpt-5` on
+  an OpenRouter remote). A bare id that other remotes or the router also
+  serve is never silently rerouted. To leave the primary's remote, be
+  explicit: `<remote>/<id>`, `<model>:local`, `router/<id>`, `ollama/<id>`.
+- Primary on the router / daemon / `oaica serve`: the secondary resolves
+  with the primary table above.
 
 ## Why this exists
 
@@ -52,14 +68,19 @@ place that was tried.
   `launch claude --model kat-awq` died with `unrecognized_model`. Now every
   source goes through the proxy.
 
-## Notes
+## Security notes
 
+- The proxy listens on 127.0.0.1 but loopback is shared with every process
+  and user on the machine, so it requires a **per-launch random token**
+  (`Authorization: Bearer` / `x-api-key`). Claude Code receives that token
+  as `ANTHROPIC_AUTH_TOKEN`; the real upstream keys live only inside the
+  proxy and never enter the child environment.
+- The proxy writes a local-only request log (`~/.oaica/requests.log`:
+  model, backend label + redacted URL, sizes, status — never content).
+  Backend labels: `daemon:ollama …`, `remote:<name> …`, `router:oaica …`,
+  `local-serve:local …`.
 - Tool calling is gated per endpoint (`--force-tools` downgrades refusal to
   a warning).
-- The proxy writes a local-only request log (`~/.oaica/requests.log`:
-  model, backend label, sizes, status — never content). The backend column
-  shows which route each request took: `daemon:ollama …`, `remote:kat-awq …`,
-  `router:oaica …`, `local-serve:local …`.
-- `ANTHROPIC_AUTH_TOKEN` is only what Claude Code presents to the local
-  proxy; each route's real key is attached upstream by the proxy.
+- Upstream streaming is bounded only by connection setup and by Claude Code
+  disconnecting — a slow local model may stream as long as it needs.
 - Ollama cloud models (`…:cloud`) need `ollama signin` on the daemon.

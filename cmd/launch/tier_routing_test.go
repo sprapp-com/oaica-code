@@ -101,9 +101,21 @@ func TestResolveLaunchEndpoint_UserRemoteWins(t *testing.T) {
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "kat-awq"}}, nil) // router also has it; remote must win
 	stubDaemon(t, "kat-awq")
 
-	ep, err := resolveLaunchEndpoint("box/kat-awq")
+	// the BARE id: every source claims it; the unique user remote must win
+	ep, err := resolveLaunchEndpoint("kat-awq")
 	if err != nil || ep.Source != sourceUserRemote || ep.BaseURL != "http://box:8080/v1" || ep.Token != "k" || ep.UpstreamModel != "kat-awq" {
-		t.Fatalf("remote = %+v, %v", ep, err)
+		t.Fatalf("bare remote = %+v, %v", ep, err)
+	}
+	ep, err = resolveLaunchEndpoint("box/kat-awq")
+	if err != nil || ep.Source != sourceUserRemote || ep.UpstreamModel != "kat-awq" {
+		t.Fatalf("namespaced remote = %+v, %v", ep, err)
+	}
+	// explicit prefixes override the remote for the same bare id
+	if ep, err := resolveLaunchEndpoint("router/kat-awq"); err != nil || ep.Source != sourceRouter {
+		t.Fatalf("router/ prefix = %+v, %v", ep, err)
+	}
+	if ep, err := resolveLaunchEndpoint("ollama/kat-awq"); err != nil || ep.Source != sourceDaemon {
+		t.Fatalf("ollama/ prefix = %+v, %v", ep, err)
 	}
 }
 
@@ -154,7 +166,7 @@ func TestBuildTierPlan_CrossSourceTiers(t *testing.T) {
 		t.Fatalf("bare secondary id route = %+v", r)
 	}
 	env := map[string]string{}
-	for _, kv := range plan.envVars("http://127.0.0.1:1") {
+	for _, kv := range plan.envVars("http://127.0.0.1:1", "tok") {
 		k, v, _ := strings.Cut(kv, "=")
 		env[k] = v
 	}
@@ -183,7 +195,7 @@ func TestBuildTierPlan_SingleModelPinsEveryTier(t *testing.T) {
 	if plan.SecondaryName != "kat-awq" || plan.Routes.Default.BaseURL != "https://api.example.test/v1" {
 		t.Fatalf("plan = %+v", plan)
 	}
-	for _, kv := range plan.envVars("http://x") {
+	for _, kv := range plan.envVars("http://x", "tok") {
 		if strings.HasPrefix(kv, "ANTHROPIC_DEFAULT_") && !strings.HasSuffix(kv, "=kat-awq") {
 			t.Fatalf("tier not pinned: %s", kv)
 		}

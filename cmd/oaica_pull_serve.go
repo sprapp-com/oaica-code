@@ -135,9 +135,13 @@ type oaicaLocalServerEntry struct {
 	Origin    string `json:"origin"`
 	PID       int    `json:"pid"`
 	StartedAt string `json:"started_at"`
+	// APIKey is the --api-key the server's normalizing proxy requires (empty
+	// for loopback-only servers). The launcher's translation proxy sends it
+	// as the bearer for "<model>:local" launches; the registry file is 0600.
+	APIKey string `json:"api_key,omitempty"`
 }
 
-func oaicaRegisterLocalServer(model, origin string) error {
+func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	path, err := oaicaLocalServersPath()
 	if err != nil {
 		return err
@@ -154,6 +158,7 @@ func oaicaRegisterLocalServer(model, origin string) error {
 		Origin:    origin,
 		PID:       os.Getpid(),
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		APIKey:    apiKey,
 	})
 	b, err := json.MarshalIndent(filtered, "", "  ")
 	if err != nil {
@@ -661,7 +666,7 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	// even when also listening on 0.0.0.0 — the local CLI has no reason to
 	// route back in via the external address.
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
-	if err := oaicaRegisterLocalServer(model, origin); err != nil {
+	if err := oaicaRegisterLocalServer(model, origin, apiKey); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to register local server (picker won't auto-discover it): %v\n", err)
 	}
 	cleanup := func() { oaicaUnregisterLocalServer(model) }

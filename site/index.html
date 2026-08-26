@@ -83,7 +83,7 @@ oaica launch claude                        # or pick from a searchable menu (add
 <p><strong>Plan with one model, execute with another.</strong> Claude Code's tiers (Opus for plan mode, Sonnet for execution) can point at different backends — a cloud model and a local one, two different remotes, anything:</p>
 <pre><code>oaica launch claude --model deepseek-v4-flash:0731-cloud -- --sonnet-model kat-awq
 # inside Claude Code:  /model opusplan   → plans on deepseek, executes on kat-awq</code></pre>
-<p class="hint">Any name works for either side: a remote from <code>~/.oaica/remotes.json</code>, a model on api.oaica.com, a running <code>oaica serve</code> (<code>name:local</code>), or anything your local Ollama daemon has pulled.</p>
+<p class="hint">Any name works for either side: a remote from <code>~/.oaica/remotes.json</code>, a model on api.oaica.com, a running <code>oaica serve</code> (<code>name:local</code>), or anything your local Ollama daemon answers for (pulled models or <code>:cloud</code> aliases). Plain launches send every main-conversation turn to the primary; the second model is used by <code>/model opusplan</code>, <code>/model sonnet</code> and subagents. Details: <code>docs/CLAUDE_TIERS.md</code> in the repo.</p>
 
 <h2>Inside the interactive session</h2>
 <table>

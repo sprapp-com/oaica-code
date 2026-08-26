@@ -40,6 +40,7 @@ type oaicaLocalServersRegistryEntry struct {
 	Origin    string `json:"origin"`
 	PID       int    `json:"pid"`
 	StartedAt string `json:"started_at"`
+	APIKey    string `json:"api_key,omitempty"` // --api-key the server requires, if any
 }
 
 func oaicaLocalServersRegistryPath() (string, error) {
