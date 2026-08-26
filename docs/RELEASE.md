@@ -55,15 +55,15 @@ git push origin main oaica-v<semver>  # tag push triggers the GitHub release
 #    token in ~/.secrets/cloudflare_oaica.env has no Pages permission.)
 wrangler pages deploy site --project-name oaica-install --commit-dirty=true
 
-# 3b. GitHub release. The tag push should run release.yaml, but this repo is
-#     a FORK of ollama/ollama and GitHub does not run workflows on forks
-#     until someone clicks "enable workflows" once in the repo's Actions tab
-#     (the REST permissions endpoint already says enabled=true; that is not
-#     the same gate). Until that is done, or if the run does not appear,
-#     create the release by hand from the same archives — this is how
-#     both oaica-v0.3.0 and oaica-v0.4.0 were published (no green Actions
-#     run yet either time):
-gh release create oaica-v<semver> --title "oaica <semver>" --notes "<changes>" \
+# 3b. GitHub release: the tag push runs release.yaml, which builds the same
+#     archives on a runner and creates the release (or, if one already
+#     exists, replaces its assets). Actions is live on this fork since
+#     2026-08-26 (0.3.0-0.4.1 were created by hand before that; the runner
+#     build proved green on the 0.4.1 tag). Watch it:
+gh run list --workflow release.yaml -L 3
+#     To ship release notes better than --generate-notes, create the release
+#     by hand BEFORE pushing the tag (the workflow then only refreshes assets):
+gh release create oaica-v<semver> --title "oaica <semver>" --notes-file notes.md \
   site/download/oaica-* site/download/SHA256SUMS site/download/VERSION.txt \
   scripts/install.sh scripts/install.ps1
 

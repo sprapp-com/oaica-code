@@ -1,22 +1,22 @@
-# TODO — oaica (as of 2026-08-26)
+# TODO — oaica (as of 2026-08-26, evening)
 
-Status: core CLI 0.4.0 live at oaica.com; public API api.oaica.com live and
-verified; site builder shipped; OpenRouter form answers verified
-(`docs/OPENROUTER_FORM_ANSWERS.md`). What remains is split by who can do it.
+Status: CLI 0.4.1 live at oaica.com (laptop upgraded); api.oaica.com live and
+re-verified after today's control-plane window; site builder shipped;
+cross-source Claude Code tiers shipped; OpenRouter form answers verified
+(`docs/OPENROUTER_FORM_ANSWERS.md`). GitHub Actions now runs on the fork.
 
 ## You (human) — before submitting the OpenRouter form
 
 - [ ] Confirm `oaica@sprapp.com` exists and is read. OpenRouter emails it and
       invites it to a Slack Connect channel; `/privacy` and `/terms` tell
       customers to write to it.
-- [x] `/models` auth — decided + done 2026-08-26: `/models` and `/v1/models`
-      are public (200 without a key); completions stay key-protected.
-      Nothing to note in the form.
+- [x] `/models` auth — public since 2026-08-26 (200 without a key);
+      completions stay key-protected. Nothing to note in the form.
 - [ ] Uptime monitor: UptimeRobot / Better Stack (free) on
       `https://api.oaica.com/health`, interval >= 60 s. Paste its public
       status URL into the form if asked, and send it to me for `/status`.
 - [ ] Fill the form from `docs/OPENROUTER_FORM_ANSWERS.md`, row by row.
-      Key for the `/models` field: `~/.secrets/oaica_openrouter_key` (laptop).
+      Key for the API credential: `~/.secrets/oaica_openrouter_key` (laptop).
 - [ ] Same OpenRouter account: toggle the privacy/data-policy setting only
       if you also want to *consume* stealth/free models (unrelated to listing).
 
@@ -26,59 +26,49 @@ verified; site builder shipped; OpenRouter form answers verified
       for a rotation (runbook: "Rotating the OpenRouter key" in
       `docs/OPENROUTER_PROVIDER.md`, zero downtime).
 
-## You — housekeeping (1 min each, any time)
+## Housekeeping — done
 
-- [ ] GitHub -> repo -> Actions tab -> "enable workflows". Repo is a fork;
-      until this is clicked releases stay manual (`docs/RELEASE.md` §3b).
-- [ ] Laptop upgrade: `curl -fsSL https://oaica.com/install.sh | bash`
-      (sudo) -> 0.4.0 with `oaica site`.
-- [ ] `wrangler pages project delete oaica-site-demo` when done with the demo.
+- [x] GitHub Actions on the fork: live. The release workflow built and
+      verified 0.4.1 on a runner (it only failed at "create release" because
+      the release already existed; the step is idempotent now). Upstream's
+      `latest.yaml` disabled.
+- [x] Laptop: 0.4.1 installed to `~/.local/bin/oaica` (precedes the stale
+      0.0.0 dev build in /usr/local/bin on your PATH).
+- [x] Demo Pages project `oaica-site-demo` deleted.
 
 ## Releases
 
 - [x] 0.4.1 shipped 2026-08-26 (oaica.com + GitHub): fixes the fresh-install
       `launch claude --model kat-awq` failure; adds cross-source
       `--sonnet-model` tiers (docs/CLAUDE_TIERS.md). All four combos verified
-      live with the downloaded binary: remote→remote, local→local,
-      remote→local, local→remote.
-- [ ] Versioning decision (2026-08-26): stay on 0.x; cut **1.0.0** as the
-      official-launch marker when you announce (e.g. OpenRouter listing live).
-- [ ] install.sh: verify the archive against `download/SHA256SUMS` before
-      installing. One of three test downloads from oaica.com came back
-      truncated (HTTP 200, 1.6 MB of 4.9 MB) during a Cloudflare cache fill;
-      today that surfaces as a zstd/tar error and a tgz fallback, not a
-      clear "checksum mismatch, retrying".
+      live with the downloaded binary.
+- [ ] Versioning: stay on 0.x; cut **1.0.0** as the official-launch marker
+      when you announce. (Ollama itself has stayed 0.x for years; our
+      `oaica-v*` tags are independent of upstream's.)
 
-## Me (Claude) — on request, each needs a short 503 window
+## a100b control plane — done 2026-08-26
 
-- [ ] Rotate the gatekeeper upstream key on a100b (it sat in a
-      group-readable script until today; other accounts on the box are
-      yours, low risk). Touches `/root/gatekeeper.json`,
-      `/workspace/gateway_upstream.key`, restarts gatekeeper + gateway.
-- [ ] Move gatekeeper under `stack_watchdog.sh` (still launched by the
-      legacy `/root/gatekeeper_watchdog.sh` x2); binary + config to
-      `/workspace`.
-- [ ] Ledger monthly rotation (`ledger.YYYY-MM` + SIGHUP); backup pull to
-      the laptop already runs every 30 min.
+- [x] Gateway upstream key (gatekeeper `openrouter` tier) rotated; old key
+      retired. Procedure in `tools/a100b/README.md`.
+- [x] gatekeeper moved under `/workspace` + `stack_watchdog.sh`; legacy
+      `/root/gatekeeper_watchdog.sh` loops stopped, script disabled.
+- [x] katlb config pruned to the two live replicas (30199, 30105).
+- [x] Monthly ledger rotation (`/workspace/ledger-rotate.sh`, cron
+      `5 0 1 * *`); laptop pull covers rotated files.
+- [x] `/dev/shm/gpus.md` section updated (GPU0/GPU2 kat-awq, GPU5
+      malay35b-offload, kat-vl-mtp retired).
 
-## Me — low priority (not blocking sale)
+## Code items — in flight (worktree agents, see this file's next revision)
 
-- [ ] Dead katlb backends 30101-30104 still in `katlb-kat-awq.json`
-      (marked down by the probe; remove for clarity).
-- [ ] Hung-but-listening replica detection (probe timeout is the only guard).
-- [ ] Stale hardcoded `recommendedModels` in `cmd/launch/models.go`.
-- [ ] Cloudflare Browser Integrity Check on the oaica.com zone may 403
-      non-browser clients on the landing page (api.oaica.com verified fine).
-- [ ] Slow tests: `TestRemoteRoutingHelpers` 78 s + several 12 s (pre-existing).
-- [ ] Relaunch kat-vl-mtp when a GPU frees (`/root/vllm_vlmtp_watchdog.sh`).
-- [ ] Second region / failover — none today; `/status` says so.
+- [ ] `install.sh`: verify `SHA256SUMS` + retry (one truncated CDN download
+      in three seen).
+- [ ] katlb: hung-but-listening replica detection (`stall_sec`).
+- [ ] Slow `cmd/launch` tests (78 s / 12 s ones) — stub the network.
+- [ ] Stale upstream `recommendedModels` catalog out of the picker.
 
-## Done today (for the record)
+## Blocked
 
-- 0.3.0 + 0.4.0 released (oaica.com + GitHub); default router api.oaica.com;
-  auth-guard errors; reproducible builds; `oaica site` v1.
-- Gateway: non-stream clamp 8192 -> 4096 (real 504s), cached `/health`,
-  PRIVACY wording, contact email, Website https://oaica.com/.
-- Box: swap scripts 0700 without key literals, v1 config deleted,
-  cloudflared supervised, `@reboot` cron, ledger backup cron on laptop.
-- Verified live: tools, `response_format`, `stop`, image refusal, licences.
+- [ ] kat-vl-mtp relaunch: no GPU on a100b has >= 75 GB free (all 52-75 GB
+      used by other sessions' jobs). Relaunch with
+      `/root/vllm_vlmtp_watchdog.sh` when one frees.
+- [ ] Second region / failover: none; `/status` says so. Needs a second box.
