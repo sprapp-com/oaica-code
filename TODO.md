@@ -58,13 +58,20 @@ cross-source Claude Code tiers shipped; OpenRouter form answers verified
 - [x] `/dev/shm/gpus.md` section updated (GPU0/GPU2 kat-awq, GPU5
       malay35b-offload, kat-vl-mtp retired).
 
-## Code items — in flight (worktree agents, see this file's next revision)
+## Code items — done 2026-08-26 (4 worktree agents + verifiers, merged)
 
-- [ ] `install.sh`: verify `SHA256SUMS` + retry (one truncated CDN download
-      in three seen).
-- [ ] katlb: hung-but-listening replica detection (`stall_sec`).
-- [ ] Slow `cmd/launch` tests (78 s / 12 s ones) — stub the network.
-- [ ] Stale upstream `recommendedModels` catalog out of the picker.
+- [x] `install.sh` verifies every archive against `download/SHA256SUMS`
+      and retries (3x) on short body / mismatch; darwin zip and tgz
+      fallback included; 51-case shell test; live on oaica.com.
+- [x] katlb stall detection deployed (`stall_sec` 300, `stall_min_inflight`
+      2): a replica with old in-flight requests AND a failing probe is
+      drained on one failure instead of two. Honest limit: a replica whose
+      1-token probe keeps passing while generations hang is still not
+      caught — the probe remains the gate.
+- [x] `cmd/launch` suite 308 s → 1.3 s (bare-name lookups swept every
+      remote's /models with a 6 s timeout; the "cache" did not exist).
+- [x] Upstream `recommendedModels` no longer shown as oaica offerings; the
+      Ollama `:cloud` alias limits map is kept for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
 
 ## Blocked
 
