@@ -949,6 +949,11 @@ func TestOpenCodeResolveContent(t *testing.T) {
 }
 
 func TestBuildInlineConfig(t *testing.T) {
+	// buildInlineConfig resolves every catalog entry through
+	// resolveRemoteEndpoint; each bare local name sweeps every configured
+	// remote's /v1/models (6s per unreachable host) unless the index is stubbed.
+	stubBareIndex(t, map[string][]string{})
+
 	t.Run("returns error for empty primary", func(t *testing.T) {
 		if _, err := buildInlineConfig(LaunchModel{}, testLaunchModels("llama3.2")); err == nil {
 			t.Error("expected error for empty primary")

@@ -94,6 +94,7 @@ func TestResolveRemoteEndpointInferToolCalls(t *testing.T) {
 
 func TestResolveRemoteEndpointLocalAndCloud(t *testing.T) {
 	t.Setenv("OAICA_REMOTES_FILE", writeDescriptorRemotesFile(t))
+	stubBareIndex(t, map[string][]string{}) // bare names sweep the (unroutable) remotes otherwise
 
 	for _, name := range []string{"llama3.2", "qwen3:32b:local"} {
 		if _, ok := resolveRemoteEndpoint(name); ok {
@@ -106,6 +107,7 @@ func TestOpenAIBaseURLAndKey(t *testing.T) {
 	t.Setenv("OAICA_REMOTES_FILE", writeDescriptorRemotesFile(t))
 	t.Setenv("KAT_KEY", "sk-kat")
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+	stubBareIndex(t, map[string][]string{}) // "llama3.2" sweeps the (unroutable) remotes otherwise
 
 	t.Run("remote primary uses remote triple", func(t *testing.T) {
 		base, key, id := openAIBaseURLAndKey(LaunchModel{Name: "kat/kat-coder"})
@@ -170,6 +172,7 @@ func TestToolGateDecision(t *testing.T) {
 func TestGateOpenAITools(t *testing.T) {
 	t.Setenv("OAICA_REMOTES_FILE", writeDescriptorRemotesFile(t))
 	t.Setenv("KAT_KEY", "sk-kat")
+	stubBareIndex(t, map[string][]string{}) // "llama3.2" sweeps the (unroutable) remotes otherwise
 
 	t.Run("freeform refuses unless forced", func(t *testing.T) {
 		if err := gateOpenAITools("kat/kat-coder", false); err == nil {

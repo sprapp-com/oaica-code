@@ -20,6 +20,7 @@ func TestMain(m *testing.M) {
 		runOMPTestHelper()
 		return
 	}
+	hermeticTestEnv()
 	os.Exit(m.Run())
 }
 

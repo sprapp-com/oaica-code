@@ -1,6 +1,8 @@
 package launch
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +15,56 @@ func stubBareIndex(t *testing.T, idx map[string][]string) {
 	old := bareRemoteModelIndex
 	bareRemoteModelIndex = func() map[string][]string { return idx }
 	t.Cleanup(func() { bareRemoteModelIndex = old })
+}
+
+// stubUserRemoteModels replaces the per-remote /v1/models sweep for a test and
+// restores it on cleanup. This is the seam BELOW stubBareIndex: it also feeds
+// modelInventory.load, so a test that exercises the inventory (ResolveAgentModel,
+// showOrPull, ...) against a remotes.json with unreachable hosts must stub it
+// or pay fetchRemoteModels' 6s timeout per call.
+func stubUserRemoteModels(t *testing.T, models []LaunchModel, errs []error) {
+	t.Helper()
+	old := userRemoteLaunchModels
+	userRemoteLaunchModels = func() ([]LaunchModel, []error) { return models, errs }
+	t.Cleanup(func() { userRemoteLaunchModels = old })
+}
+
+// The default bare-id index is built from userRemoteLaunchModels, so stubbing
+// the sweep is enough to keep resolveBareRemoteModel off the network.
+func TestBareRemoteModelIndex_BuiltFromUserRemoteSweep(t *testing.T) {
+	stubUserRemoteModels(t, []LaunchModel{
+		{Name: "box/kat-awq", Remote: true},
+		{Name: "other/deepseek-chat", Remote: true},
+		{Name: "box/deepseek-chat", Remote: true},
+		{Name: "llama3.2"}, // no "/" — never a bare-remote candidate
+	}, nil)
+
+	idx := bareRemoteModelIndex()
+	if got := idx["kat-awq"]; len(got) != 1 || got[0] != "box/kat-awq" {
+		t.Fatalf("idx[kat-awq] = %v, want [box/kat-awq]", got)
+	}
+	if got := idx["deepseek-chat"]; len(got) != 2 {
+		t.Fatalf("idx[deepseek-chat] = %v, want both owners", got)
+	}
+	if _, ok := idx["llama3.2"]; ok {
+		t.Fatal("un-namespaced entry must not appear in the bare index")
+	}
+}
+
+// modelInventory.load reads user remotes through the same seam, so an
+// inventory test never needs a reachable remote to see remote entries.
+func TestModelInventoryLoad_UsesUserRemoteSweepSeam(t *testing.T) {
+	t.Setenv("OAICA_HOST", "https://api.example.test") // skip local_servers.json discovery
+	stubUserRemoteModels(t, []LaunchModel{{Name: "box/kat-awq", Remote: true}}, nil)
+	stubCloudFetch(t, nil, errors.New("router down"))
+
+	models, err := newModelInventory(nil).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load() error = %v, want remote entry to keep the inventory usable", err)
+	}
+	if len(models) != 1 || models[0].Name != "box/kat-awq" || !models[0].Remote {
+		t.Fatalf("Load() = %+v, want just the stubbed remote entry", models)
+	}
 }
 
 func writeRemotes(t *testing.T, body string) {
