@@ -34,14 +34,20 @@ verified; site builder shipped; OpenRouter form answers verified
       (sudo) -> 0.4.0 with `oaica site`.
 - [ ] `wrangler pages project delete oaica-site-demo` when done with the demo.
 
-## Release 0.4.1 (needs your "go")
+## Releases
 
-- [ ] The 0.4.0 binary's `oaica launch claude --model kat-awq` (router model,
-      fresh install) fails with `unrecognized_model`: Claude Code was pointed
-      at the gateway directly, which has no `/v1/messages`. Fixed on main
-      2026-08-26 (every source now goes through the translation proxy;
-      cross-source `--sonnet-model` tiers — see docs/CLAUDE_TIERS.md). Ship
-      as 0.4.1 with `docs/RELEASE.md`.
+- [x] 0.4.1 shipped 2026-08-26 (oaica.com + GitHub): fixes the fresh-install
+      `launch claude --model kat-awq` failure; adds cross-source
+      `--sonnet-model` tiers (docs/CLAUDE_TIERS.md). All four combos verified
+      live with the downloaded binary: remote→remote, local→local,
+      remote→local, local→remote.
+- [ ] Versioning decision (2026-08-26): stay on 0.x; cut **1.0.0** as the
+      official-launch marker when you announce (e.g. OpenRouter listing live).
+- [ ] install.sh: verify the archive against `download/SHA256SUMS` before
+      installing. One of three test downloads from oaica.com came back
+      truncated (HTTP 200, 1.6 MB of 4.9 MB) during a Cloudflare cache fill;
+      today that surfaces as a zstd/tar error and a tgz fallback, not a
+      clear "checksum mismatch, retrying".
 
 ## Me (Claude) — on request, each needs a short 503 window
 
