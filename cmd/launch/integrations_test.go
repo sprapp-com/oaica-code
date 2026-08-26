@@ -370,8 +370,8 @@ func names(items []ModelItem) []string {
 }
 
 func recommendedNames(extra ...string) []string {
-	out := make([]string, 0, len(recommendedModels)+len(extra))
-	for _, item := range recommendedModels {
+	out := make([]string, 0, len(ollamaCloudAliasCatalog)+len(extra))
+	for _, item := range ollamaCloudAliasCatalog {
 		out = append(out, item.Name)
 	}
 	return append(out, extra...)
@@ -1588,8 +1588,8 @@ func TestSelectionItemsWithAccountState_UsesPrefetchedStateForRecommendedCloudIt
 }
 
 func TestRecommendedModelsDoNotIncludeRequiredPlanStubs(t *testing.T) {
-	byName := make(map[string]ModelItem, len(recommendedModels))
-	for _, item := range recommendedModels {
+	byName := make(map[string]ModelItem, len(ollamaCloudAliasCatalog))
+	for _, item := range ollamaCloudAliasCatalog {
 		byName[item.Name] = item
 	}
 
