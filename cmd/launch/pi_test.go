@@ -1095,6 +1095,12 @@ func TestPiEdit(t *testing.T) {
 		providers := cfg["providers"].(map[string]any)
 		ollama := providers["ollama"].(map[string]any)
 
+		// A slot with a foreign api value is the user's endpoint, their key,
+		// their choice, and is left exactly as they wrote it: Pi's own
+		// "openai-completions" is what every OpenAI-compatible provider carries,
+		// so the api value alone cannot show a slot was ours (round 21). Only a
+		// slot oaica can show it wrote — this api value AND one of oaica's own
+		// base URLs — is repointed (piEndpointWasOurs).
 		if ollama["baseUrl"] != "http://custom:8080/v1" {
 			t.Errorf("Custom baseUrl not preserved, got %v", ollama["baseUrl"])
 		}
@@ -1638,6 +1644,120 @@ func TestPiModels(t *testing.T) {
 		models := pi.Models()
 		if models != nil {
 			t.Errorf("Models() = %v, want nil for corrupt config", models)
+		}
+	})
+
+	t.Run("returns nil when a daemon-shaped baseUrl is stale", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		t.Setenv("OLLAMA_HOST", srv.URL)
+
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+
+		configDir := filepath.Join(tmpDir, ".pi", "agent")
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// One of the addresses oaica writes by default, left behind after
+		// OLLAMA_HOST moved this machine's daemon: Pi would keep talking to the
+		// old host, so Models() reports none and the launcher calls Edit, which
+		// repoints the slot.
+		config := `{
+			"providers": {
+				"ollama": {
+					"baseUrl": "http://127.0.0.1:11434/v1",
+					"models": [
+						{"id": "llama3.2"},
+						{"id": "qwen3:8b"}
+					]
+				}
+			}
+		}`
+		configPath := filepath.Join(configDir, "models.json")
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if models := pi.Models(); models != nil {
+			t.Errorf("Models() = %v, want nil when a daemon-shaped baseUrl is stale", models)
+		}
+	})
+
+	t.Run("does not treat a custom-host baseUrl as stale", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		t.Setenv("OLLAMA_HOST", srv.URL)
+
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+
+		configDir := filepath.Join(tmpDir, ".pi", "agent")
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// An address oaica cannot derive from anything it holds is the user's,
+		// not a stale daemon one: taking it as stale on a suffix alone would
+		// rewrite the user's own provider on that host (round 22).
+		config := `{
+			"providers": {
+				"ollama": {
+					"baseUrl": "http://custom-host:9999/v1",
+					"models": [
+						{"id": "llama3.2"},
+						{"id": "qwen3:8b"}
+					]
+				}
+			}
+		}`
+		configPath := filepath.Join(configDir, "models.json")
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if models := pi.Models(); len(models) != 2 {
+			t.Errorf("Models() = %v, want the 2 models of a custom-host slot", models)
+		}
+	})
+
+	t.Run("returns models when baseUrl matches OLLAMA_HOST", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		t.Setenv("OLLAMA_HOST", srv.URL)
+
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+
+		configDir := filepath.Join(tmpDir, ".pi", "agent")
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		expectedBaseURL := strings.TrimRight(srv.URL, "/") + "/v1"
+		config := fmt.Sprintf(`{
+			"providers": {
+				"ollama": {
+					"baseUrl": "%s",
+					"models": [
+						{"id": "llama3.2"},
+						{"id": "qwen3:8b"}
+					]
+				}
+			}
+		}`, expectedBaseURL)
+		configPath := filepath.Join(configDir, "models.json")
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		models := pi.Models()
+		if len(models) != 2 {
+			t.Errorf("Models() returned %d models, want 2", len(models))
 		}
 	})
 }

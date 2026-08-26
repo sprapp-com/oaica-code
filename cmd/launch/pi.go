@@ -861,6 +861,22 @@ func (p *Pi) Models() []string {
 
 	providers, _ := config["providers"].(map[string]any)
 	ollama, _ := providers["ollama"].(map[string]any)
+
+	// Returning nil on host drift forces launchEditorIntegration to call Edit.
+	// Judged only for a DAEMON-shaped slot — one naming an address oaica writes
+	// by default, at a moment when OLLAMA_HOST points this machine's daemon
+	// somewhere else (upstream #18039). Such an entry is stale: Pi would keep
+	// talking to the old host. A slot naming any OTHER address is left alone
+	// here, because a user remote oaica wrote is that provider's real address
+	// rather than a stale daemon one, and whether it serves THIS launch's models
+	// is decided in Edit, which holds the launch — not by a comparison Models()
+	// has no context to make (round 22's ownership rule).
+	if configured, _ := ollama["baseUrl"].(string); configured != "" &&
+		piIsDaemonDefaultBaseURL(configured) &&
+		strings.TrimRight(configured, "/") != strings.TrimRight(piDaemonProviderBaseURL(), "/") {
+		return nil
+	}
+
 	models, _ := ollama["models"].([]any)
 	baseURL, _ := ollama["baseUrl"].(string)
 
@@ -1070,6 +1086,24 @@ func piPickerNameFor(id, providerBaseURL string) string {
 // local daemon's OpenAI-compatible endpoint.
 func piDaemonProviderBaseURL() string { return envconfig.ConnectableHost().String() + "/v1" }
 
+// piDaemonDefaultBaseURLs are the daemon addresses oaica writes by DEFAULT,
+// whatever OLLAMA_HOST points this machine's daemon at today.
+func piDaemonDefaultBaseURLs() []string {
+	return []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"}
+}
+
+// piIsDaemonDefaultBaseURL reports whether baseURL is one of those defaults,
+// with or without the /v1 suffix.
+func piIsDaemonDefaultBaseURL(baseURL string) bool {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	for _, host := range piDaemonDefaultBaseURLs() {
+		if base == host || base == host+"/v1" {
+			return true
+		}
+	}
+	return false
+}
+
 // isPiOllamaModel reports whether a model config entry is managed by oaica launch
 func isPiOllamaModel(cfg map[string]any) bool {
 	if v, ok := cfg["_launch"].(bool); ok && v {
@@ -1156,10 +1190,8 @@ func piEndpointWasOurs(baseURL string) bool {
 	// ours on a suffix alone would rewrite the user's own provider on that host.
 	// Such a value is treated as the user's: the warning below says so and
 	// leaves the endpoint and key alone (2026-09-27 audit, round 22).
-	for _, host := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
-		if base == host || base == host+"/v1" {
-			return true
-		}
+	if piIsDaemonDefaultBaseURL(base) {
+		return true
 	}
 	remotes, err := loadUserRemotes()
 	if err != nil {
