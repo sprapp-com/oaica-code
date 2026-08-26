@@ -291,6 +291,16 @@ func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string,
 	if _, _, ok := findUserRemoteForModel(model); ok {
 		return nil
 	}
+	// Explicit source prefixes ("router/<id>", "ollama/<id>", ...) are
+	// resolved by tier_routing.go; they are never local models to pull.
+	// Caught on .91 2026-08-27: `--model router/kat-awq` reached the pull
+	// path ("pull model manifest: file does not exist").
+	if hasSourcePrefix(model) {
+		if _, err := resolveLaunchEndpoint(model); err != nil {
+			return err
+		}
+		return nil
+	}
 	if _, err := client.Show(ctx, &api.ShowRequest{Model: model}); err == nil {
 		return nil
 	} else {

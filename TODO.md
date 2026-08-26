@@ -36,6 +36,17 @@ cross-source Claude Code tiers shipped; OpenRouter form answers verified
       0.0.0 dev build in /usr/local/bin on your PATH).
 - [x] Demo Pages project `oaica-site-demo` deleted.
 
+## .91 — verified 2026-08-27
+
+- [x] Upgraded (0.4.1 → then a stamped 0.4.2-dev with the `router/` fix);
+      stale remotes pruned (kat-vl-mtp, kat-a100b, malay35b), dead tunnel
+      services disabled (kat-vl-mtp, mach1); own gateway key `internal-91`
+      (ledger label distinct from OpenRouter traffic) saved as
+      `~/.oaica/api_key`. Live: router `oaica run kat-awq`, remote launch,
+      `router/kat-awq`, cross-source opus→kat-awq / sonnet→deepseek all pong.
+- [ ] **0.4.2** — main has a fix released users don't: `--model router/<id>`
+      / `ollama/<id>` hit the pull path in 0.4.1. Say "release 0.4.2".
+
 ## Releases
 
 - [x] 0.4.1 shipped 2026-08-26 (oaica.com + GitHub): fixes the fresh-install

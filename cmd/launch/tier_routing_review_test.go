@@ -3,6 +3,7 @@ package launch
 // Cases from the 2026-08-26 adversarial review of tier routing.
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -240,6 +241,27 @@ func TestPlanEnv_NoRealKeyInChildEnvironment(t *testing.T) {
 		if strings.HasPrefix(kv, "ANTHROPIC_AUTH_TOKEN=") && !strings.HasSuffix(kv, "=oaica-proxy-abc") {
 			t.Fatalf("auth token must be the proxy token: %s", kv)
 		}
+	}
+}
+
+// Caught on .91 2026-08-27: `--model router/kat-awq` passed --sonnet-model
+// resolution but the launch pre-flight (showOrPullWithPolicy) treated the
+// prefixed name as a local model and tried to pull it.
+func TestShowOrPull_SourcePrefixedModelNeverPulls(t *testing.T) {
+	noRemotes(t)
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "kat-awq"}}, nil)
+	stubDaemon(t, "qwen2.5:7b")
+
+	for _, m := range []string{"router/kat-awq", "oaica/kat-awq", "ollama/qwen2.5:7b"} {
+		if err := showOrPullWithPolicy(context.Background(), deadClient(t), m, missingModelFail, false); err != nil {
+			t.Fatalf("%s: %v", m, err)
+		}
+	}
+	err := showOrPullWithPolicy(context.Background(), deadClient(t), "router/nope", missingModelFail, false)
+	if err == nil || strings.Contains(err.Error(), "pull") || !strings.Contains(err.Error(), "api.example.test") {
+		t.Fatalf("unknown prefixed model must fail without a pull attempt: %v", err)
 	}
 }
 

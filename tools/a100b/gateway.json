@@ -6,6 +6,10 @@
     {
       "sha256": "<sha256 hex of key>",
       "label": "openrouter"
+    },
+    {
+      "sha256": "<sha256 hex of key>",
+      "label": "internal-91"
     }
   ],
   "models": [

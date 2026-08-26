@@ -77,6 +77,19 @@ func daemonHasModelLive(model string) (bool, bool) {
 	return resp.StatusCode == http.StatusOK, true
 }
 
+// hasSourcePrefix reports whether model carries one of the explicit source
+// prefixes resolveLaunchEndpoint understands ("router/", "oaica/",
+// "ollama/", "daemon/"). Callers outside this file use it to skip the
+// local-pull path for such names.
+func hasSourcePrefix(model string) bool {
+	for _, p := range []string{"router/", "oaica/", "ollama/", "daemon/"} {
+		if strings.HasPrefix(model, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveLaunchEndpoint maps a picker model name to the endpoint that serves
 // it. Order: user remote ("<remote>/<id>" or a bare id exactly one remote
 // serves) -> "<model>:local" (a running `oaica serve`) -> OAICA router ->
