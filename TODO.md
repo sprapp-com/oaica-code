@@ -44,8 +44,9 @@ cross-source Claude Code tiers shipped; OpenRouter form answers verified
       (ledger label distinct from OpenRouter traffic) saved as
       `~/.oaica/api_key`. Live: router `oaica run kat-awq`, remote launch,
       `router/kat-awq`, cross-source opus→kat-awq / sonnet→deepseek all pong.
-- [ ] **0.4.2** — main has a fix released users don't: `--model router/<id>`
-      / `ollama/<id>` hit the pull path in 0.4.1. Say "release 0.4.2".
+- [x] **0.4.2** shipped 2026-08-27 (`router/`·`ollama/` prefix fix,
+      checksum-verifying installer, no upstream catalog in the picker).
+      Laptop and .91 run it.
 
 ## Releases
 

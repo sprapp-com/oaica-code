@@ -62,7 +62,11 @@ wrangler pages deploy site --project-name oaica-install --commit-dirty=true
 #     build proved green on the 0.4.1 tag). Watch it:
 gh run list --workflow release.yaml -L 3
 #     To ship release notes better than --generate-notes, create the release
-#     by hand BEFORE pushing the tag (the workflow then only refreshes assets):
+#     by hand with the tag ALREADY PUSHED (or pass --target <sha>): if the
+#     tag does not exist on GitHub, `gh release create` makes one at the
+#     remote default branch's HEAD, and your local tag on the archives
+#     commit will then be rejected as conflicting (0.4.2, harmless but
+#     confusing). The workflow then only refreshes assets:
 gh release create oaica-v<semver> --title "oaica <semver>" --notes-file notes.md \
   site/download/oaica-* site/download/SHA256SUMS site/download/VERSION.txt \
   scripts/install.sh scripts/install.ps1
