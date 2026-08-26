@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -342,6 +343,43 @@ func TestHealth_DownWhenUpstreamDead(t *testing.T) {
 	}
 }
 
+// /health is unauthenticated and its probe runs on the customer concurrency
+// tier: without a cache, a burst of GETs would occupy customer slots for
+// free. Repeated calls inside healthCacheTTL must hit upstream once.
+func TestHealth_ProbeIsCached(t *testing.T) {
+	var probes int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&probes, 1)
+		w.Write([]byte(`{"choices":[{"message":{"content":"x"}}]}`))
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	for i := 0; i < 20; i++ {
+		resp, err := http.Get(srv.URL + "/health")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("call %d: %d", i, resp.StatusCode)
+		}
+	}
+	if n := atomic.LoadInt32(&probes); n != 1 {
+		t.Fatalf("20 /health calls within %v hit upstream %d times, want 1", healthCacheTTL, n)
+	}
+	// expiry re-probes
+	g.healthMu.Lock()
+	g.healthAt = time.Now().Add(-2 * healthCacheTTL)
+	g.healthMu.Unlock()
+	resp, _ := http.Get(srv.URL + "/health")
+	resp.Body.Close()
+	if n := atomic.LoadInt32(&probes); n != 2 {
+		t.Fatalf("after TTL expiry upstream hit %d times, want 2", n)
+	}
+}
+
 // The 2026-08-25 audit's #1 blocker: the old probe was an unauthenticated
 // GET that gatekeeper answered 401, which the gateway treated as "ok" even
 // with every replica dead. The probe must be a real authenticated chat
@@ -377,6 +415,9 @@ func TestHealth_IsAuthenticatedChatProbe(t *testing.T) {
 	}
 	// Now the "every replica dead but proxies alive" case: chat 503, GET 200.
 	t.Setenv("OAICA_GATEWAY_UPSTREAM_KEY", "wrong-key")
+	g.healthMu.Lock()
+	g.healthAt = time.Time{} // expire the probe cache (see TestHealth_ProbeIsCached)
+	g.healthMu.Unlock()
 	resp, _ = http.Get(srv.URL + "/health")
 	resp.Body.Close()
 	if resp.StatusCode != 503 {
@@ -574,8 +615,13 @@ func TestCompletion_ClampsMaxTokens(t *testing.T) {
 		v, _ := got["max_tokens"].(float64)
 		return v
 	}
-	if v := send(`{"model":"kat-awq","max_tokens":200000,"messages":[]}`); v != 8192 {
-		t.Errorf("non-stream 200000 -> upstream %v, want 8192 (nonStreamMaxTokens)", v)
+	if v := send(`{"model":"kat-awq","max_tokens":200000,"messages":[]}`); v != float64(nonStreamMaxTokens) {
+		t.Errorf("non-stream 200000 -> upstream %v, want %d (nonStreamMaxTokens)", v, nonStreamMaxTokens)
+	}
+	if nonStreamMaxTokens > 4096 {
+		// ~80 tok/s per stream under the 32-way cap; the proxy's
+		// ResponseHeaderTimeout is 90 s. 8192 produced real 504s.
+		t.Errorf("nonStreamMaxTokens = %d cannot finish inside the 90 s upstream timeout", nonStreamMaxTokens)
 	}
 	if v := send(`{"model":"kat-awq","stream":true,"max_tokens":200000,"messages":[]}`); v != 32768 {
 		t.Errorf("stream 200000 -> upstream %v, want 32768 (published max_completion_tokens)", v)

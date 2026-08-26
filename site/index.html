@@ -27,7 +27,7 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(1
 </head>
 <body>
 <h1>OAICA</h1>
-<p>A terminal AI CLI (fork of Ollama's client) backed by our own API. No local GPU or model download required — every request goes to <code>api.oaica.com</code>, which routes to whichever GPU box is currently serving the model you asked for.</p>
+<p>A terminal AI CLI (fork of Ollama's client) backed by our own API. No local GPU or model download required — every request goes to <code>api.oaica.com</code>, which fronts the a100b GPU fleet serving the model you asked for.</p>
 
 <h2>Install</h2>
 <p><strong>macOS / Linux</strong></p>
@@ -48,7 +48,7 @@ $env:OAICA_UNINSTALL=1; irm https://oaica.com/install.ps1 | iex           # Wind
 <p class="hint">Removes the binary and its lib directory. Doesn't touch <code>OAICA_API_KEY</code> or any shell profile export you added yourself.</p>
 
 <h2>Get an API key</h2>
-<p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>).</p>
+<p>There's no self-serve signup yet — email <a href="mailto:biztransit@bcz.com">biztransit@bcz.com</a> for a key.</p>
 <p><strong>Recommended: sign in once, it's saved for you</strong> — no need to export anything every session:</p>
 <pre><code>oaica signin
 Enter your OAICA API key (from api.oaica.com): &lt;paste your key&gt;
@@ -59,22 +59,17 @@ Signed in. Key saved — future sessions won't need OAICA_API_KEY set.</code></p
 <pre><code>export OAICA_API_KEY=&lt;your-key&gt;          # macOS/Linux
 $env:OAICA_API_KEY="&lt;your-key&gt;"          # Windows PowerShell</code></pre>
 <p class="hint">Add the export line to your shell profile (<code>~/.bashrc</code>, <code>~/.zshrc</code>) or Windows profile so it persists across sessions.</p>
-<p>Once set, list what's live right now — the roster changes as boxes come and go, so check this instead of hardcoding a name:</p>
-<pre><code>oaica run kat-coder-i-compact
+<p>Once set, list what's live right now — check this instead of hardcoding a name:</p>
+<pre><code>oaica run kat-awq
 &gt; /model list
 Available models:
-  flashplan
-  kat-coder-i-compact
-  oaica-v4-flash-i-compact
-  oaica-v4-flash-mm
-  openrouter-gpt4o-mini
-  sfc6-i-compact
-&gt; /model flashplan
-Switched to model 'flashplan'</code></pre>
-<p class="hint">Same list from the shell without opening a session: <code>curl -s https://api.oaica.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-coder-i-compact</code>.</p>
+  kat-awq
+&gt; /model kat-awq
+Switched to model 'kat-awq'</code></pre>
+<p class="hint"><code>kat-awq</code> is currently the only model on the public gateway: 262,144 context, up to 32,768 output tokens on streaming requests. Non-streaming requests are clamped to 4,096 output tokens and return HTTP 504 if they haven't finished within 90s — use <code>stream:true</code> for longer replies. Text-only input (image content returns 400). $0.05/M input, $0.12/M output. Same list from the shell without opening a session: <code>curl -s https://api.oaica.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-awq</code>.</p>
 
 <h2>Connecting to a specific box (e.g. bitdeer) directly</h2>
-<p>By default <code>oaica</code> talks to <code>api.oaica.com</code>, which routes to whichever GPU box is currently live. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
+<p>By default <code>oaica</code> talks to <code>api.oaica.com</code>, which fronts the a100b GPU fleet. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
 <pre><code>export OAICA_HOST=http://&lt;bitdeer-host&gt;:&lt;port&gt;   # e.g. the bitdeer tunnel URL for a model's port
 oaica run kat-coder-i-compact</code></pre>
 <p class="hint">Direct-to-box mode usually has no auth of its own (the router is what enforces <code>OAICA_API_KEY</code>) — only point at a box you trust on a network you trust.</p>
@@ -130,14 +125,14 @@ oaica site deploy ./clinic --project my-clinic     # publish to Cloudflare Pages
 <pre><code>curl -X POST https://api.oaica.com/v1/chat/completions \
   -H "Authorization: Bearer $OAICA_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"flashplan","messages":[{"role":"user","content":"..."}],"max_tokens":256}'</code></pre>
+  -d '{"model":"kat-awq","messages":[{"role":"user","content":"..."}],"max_tokens":256}'</code></pre>
 <p>Standard OpenAI-compatible shape. <code>GET /v1/models</code> lists what's live right now — always check this instead of hardcoding a name, the backend roster changes as boxes come and go.</p>
 <p class="hint">Full contract + JS example (for browser/PWA use): see <code>API_BACKEND.md</code> in the prism-mobile repo.</p>
 
 <h2>Known limitations</h2>
 <ul>
-<li>Single shared API key today — no per-user rate limiting. Don't ship the key in a public client bundle.</li>
-<li>Each model runs on exactly one GPU box behind a tunnel — if that box goes down, the model 503s until someone notices and relaunches it. No auto-failover yet.</li>
+<li>Keys are per-customer with a per-key concurrency cap (tiers range from 2 concurrent requests up to 32+, depending on plan). Don't ship your key in a public client bundle.</li>
+<li>kat-awq runs 2 replicas on one host, load-balanced with automatic failover between those replicas — but there's no cross-host/region failover: if the host itself goes down, the model 503s until it's restored. Check <a href="https://api.oaica.com/status">api.oaica.com/status</a>.</li>
 </ul>
 <script>
 document.querySelectorAll('pre').forEach(function (pre) {

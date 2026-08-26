@@ -41,10 +41,24 @@ start_gateway() {
     nohup /workspace/oaica-gateway --config /workspace/oaica-gateway.json >> /workspace/oaica-gateway.log 2>&1 < /dev/null &
 }
 
+# The public path itself: the token-based `oaica-api` tunnel. cloudflared
+# has no listening port, so detect it by its exact argv (-x: whole process
+# name, then the --token flag that only OUR tunnel uses; other sessions run
+# `cloudflared tunnel --url ...` quick tunnels on this box and must not be
+# matched). Before 2026-08-26 nothing restarted it -- a crash silently took
+# api.oaica.com down while every internal port stayed green.
+tunnel_running() { pgrep -x cloudflared -a 2>/dev/null | grep -q -- '--token'; }
+start_tunnel() {
+  [ -x /workspace/cf/run.sh ] || { log "ALERT: /workspace/cf/run.sh missing -- public API is DOWN"; return; }
+  log "starting cloudflared (oaica-api tunnel)"
+  nohup /workspace/cf/run.sh >> /workspace/cf/cloudflared.log 2>&1 < /dev/null &
+}
+
 log "stack watchdog start"
 while true; do
   listening 30099 || start_katlb
   listening 30098 || start_gatekeeper
   listening 8081  || start_gateway
+  tunnel_running  || start_tunnel
   sleep 10
 done

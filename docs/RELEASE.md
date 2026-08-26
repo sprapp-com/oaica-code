@@ -19,6 +19,9 @@ for three weeks / ~100 commits while `main` moved on. No tag, no GitHub
 release, no way to tell from the binary what it contained. Linux arm64 —
 which `install.sh` requests on aarch64 — had never been built at all.
 
+**Current: 0.4.0** — see https://oaica.com/download/VERSION.txt for the live
+pointer.
+
 ## Version stamping
 
 `version/version.go` defaults to `0.0.0`. A build only reports a real
@@ -39,13 +42,13 @@ go test ./cmd/... ./tools/...
 
 # 1. build every archive into site/download/ (stamps VERSION, verifies the
 #    Linux binary reports it, writes SHA256SUMS)
-VERSION=0.3.0 scripts/build_oaica.sh
+VERSION=<semver> scripts/build_oaica.sh
 
 # 2. commit the archives + tag
 git add site/download
-git commit -m "release: oaica 0.3.0"
-git tag oaica-v0.3.0
-git push origin main oaica-v0.3.0     # tag push triggers the GitHub release
+git commit -m "release: oaica <semver>"
+git tag oaica-v<semver>
+git push origin main oaica-v<semver>  # tag push triggers the GitHub release
 
 # 3. publish oaica.com (wrangler must be logged into the unisqu account;
 #    on the laptop CLOUDFLARE_API_TOKEN in the shell env is. The tunnel/DNS
@@ -58,14 +61,15 @@ wrangler pages deploy site --project-name oaica-install --commit-dirty=true
 #     (the REST permissions endpoint already says enabled=true; that is not
 #     the same gate). Until that is done, or if the run does not appear,
 #     create the release by hand from the same archives — this is how
-#     oaica-v0.3.0 was published:
-gh release create oaica-v0.3.0 --title "oaica 0.3.0" --notes "<changes>" \
+#     both oaica-v0.3.0 and oaica-v0.4.0 were published (no green Actions
+#     run yet either time):
+gh release create oaica-v<semver> --title "oaica <semver>" --notes "<changes>" \
   site/download/oaica-* site/download/SHA256SUMS site/download/VERSION.txt \
   scripts/install.sh scripts/install.ps1
 
 # 4. verify what a new user gets
 curl -fsSL https://oaica.com/install.sh | bash
-oaica --version                        # must print 0.3.0
+oaica --version                        # must print <semver>
 OAICA_API_KEY=<key> oaica run kat-awq 'reply with exactly: pong'
 ```
 

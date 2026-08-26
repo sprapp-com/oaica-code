@@ -23,9 +23,8 @@ OpenRouter
 |---|---|---|
 | kat-awq fleet | a100b, vLLM, **2 replicas**: GPU0 :30199 + GPU2 :30105, hardened watchdog `/workspace/vllm_awq_watchdog.sh` (see `tools/a100b/`) | Running, load-balanced by katlb (chat-aware probe) |
 | Gateway (`tools/gateway/oaica-gateway`) | a100b:8081, binary+config+ledger under `/workspace/` (root overlay is full), launched by `/workspace/gw-swap.sh` | Running (v2: hashed keys, metering, gatekeeper upstream) |
-| Gateway tunnel | .91 systemd user service `oaica-gateway-tunnel.service` (8081->a100b:8081) | Running |
-| Cloudflare DNS | `api.oaica.com` CNAME -> tunnel `bbd1217e` | Created |
-| Cloudflare ingress | tunnel public hostname `api.oaica.com -> http://localhost:8081` | **Manual (dashboard)** |
+| Cloudflare tunnel | `oaica-api` tunnel (unisqu account, `125f3856…`); cloudflared runs ON a100b (`/workspace/cf/run.sh`, token at `/workspace/cf/token`) -> `localhost:8081`. No `.91` hop, no SSH tunnel. | Running |
+| Cloudflare DNS + ingress | `api.oaica.com` CNAME -> tunnel `oaica-api`, ingress `api.oaica.com -> http://localhost:8081` | Live |
 | Legal pages | embedded in the gateway binary from `tools/gateway/legal/*.md`, served at `/privacy` `/terms` `/status` | Live |
 
 ## The gateway
@@ -64,6 +63,9 @@ laptop only -- it must never appear in this repo.
   `stream_options.include_usage=true` injected so vLLM emits a final usage
   chunk. Every completion is appended to the JSONL ledger (request id, key
   label, model, prompt/completion tokens, status, latency, `usage_seen`).
+- Non-streaming requests are clamped to **4096** output tokens (down from
+  8192) and get an HTTP 504 if they haven't finished within 90s — use
+  `stream:true` for longer replies.
 - Everything else is 404 before touching the proxy (vLLM's /metrics,
   /tokenize, dev endpoints are unreachable from the public key).
 - SIGHUP reloads config and rebuilds the upstream proxy; a bad file is
@@ -75,40 +77,29 @@ internal machines that share katlb.
 
 Build: `cd tools/gateway && go build -o oaica-gateway main.go`.
 
-## Moving to api.oaica.com (blocked on a token)
+## Rotating the OpenRouter key (zero downtime)
 
-`oaica.com` is the product domain and `api.oaica.com` is unclaimed, but the
-zone lives in a DIFFERENT Cloudflare account (`Cloudflare.com@unisqu.com`,
-account `125f3856…`) from the one the `.91` tunnel runs under (samwong,
-`3c04198c…`). Every API token available so far is read-only on oaica.com
-(a DNS-create probe returns "Authentication error"), so the cutover cannot
-be automated until a write token exists.
+1. Generate a new key.
+2. Append its sha256 as a second `api_keys` entry in
+   `/workspace/oaica-gateway.json` with a dated label (both keys are valid
+   while both entries exist).
+3. Reload without dropping connections:
+   `kill -HUP $(ss -ltnp | grep ':8081' | grep -oE 'pid=[0-9]+' | cut -d= -f2)`
+   — the gateway reloads config on SIGHUP.
+4. Hand the new key to OpenRouter.
+5. Once the ledger shows requests under the new label, remove the old
+   `api_keys` entry and HUP again.
 
-Two scripts make it a one-shot once the token is in place:
+## Public URL: api.oaica.com
 
-1. `tools/a100b/cutover-api-oaica-com.sh` -- needs `CF_API_TOKEN` in
-   `~/.secrets/cloudflare_oaica.env` with **Zone:DNS:Edit (oaica.com)** and
-   **Account:Cloudflare Tunnel:Edit**. Creates/reuses the `oaica-api`
-   tunnel, sets ingress `api.oaica.com -> localhost:8081`, CNAMEs the host,
-   runs cloudflared ON a100b (dropping the .91 hop), verifies every public
-   route plus a metered stream. Refuses to do anything if the token cannot
-   write (proven: exits 2 on the read-only tokens).
-2. `tools/a100b/rebrand-api-oaica-com.sh` -- rewrites the hostname in the
-   legal pages/docs/form, rebuilds and redeploys the gateway, verifies,
-   commits.
-
-Until then the live public URL is `https://api.oaica.com` (below).
-
-## Public URL (current: api.oaica.com)
-
-DNS CNAME and the SSH tunnel are set up. The remaining step is **only doable
-in the Cloudflare dashboard** (the tunnel is token-based; it reads ingress
-from Cloudflare, not a local file):
-
-> Cloudflare dashboard -> tunnel `bbd1217e-...` -> Public Hostnames -> add
-> `api.oaica.com` -> service `http://localhost:8081`.
-
-Then `https://api.oaica.com/models` and
+Cut over from the interim `oaica.samwong.com` path on 2026-08-26 07:30 +08
+(2026-08-25 23:30 UTC), commit `b8c3ed9e`. `api.oaica.com` lives in the
+unisqu Cloudflare account (`125f3856…`) that owns `oaica.com`; the
+`oaica-api` tunnel runs cloudflared directly ON the a100b box
+(`/workspace/cf/run.sh`, token at `/workspace/cf/token`), so there is no
+`.91` hop and no SSH tunnel anywhere in the public path any more.
+`oaica.samwong.com` (samwong account, via `.91`) still resolves but is no
+longer the published URL. `https://api.oaica.com/models` and
 `https://api.oaica.com/v1/chat/completions` are live.
 
 ## Cog fallback (not built -- do not list it)

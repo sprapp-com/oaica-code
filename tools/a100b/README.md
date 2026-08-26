@@ -101,21 +101,35 @@ slow start is not treated as a crash.
 
 ## Control-plane supervisor + reboot
 
-`stack_watchdog.sh` keeps katlb (:30099), gatekeeper (:30098) and the
-gateway (:8081) alive, detecting each by LISTENING PORT (never `pgrep -f`).
-The gateway's upstream credential is read from `/workspace/gateway_upstream.key`
-(0600). This replaced the legacy `/root/*_watchdog.sh` loops, which
-relaunched the OLD binaries from `/root` and fought the v2 processes
+`stack_watchdog.sh` keeps katlb (:30099) and the gateway (:8081) alive,
+detecting each by LISTENING PORT (never `pgrep -f`). The gateway's upstream
+credential is read from `/workspace/gateway_upstream.key` (0600). This
+replaced the legacy `/root/katlb_watchdog.sh` loop for katlb, which
+relaunched the OLD binary from `/root` and fought the v2 process
 ("bind: address already in use" in /tmp/katlb.log).
 
-There is no systemd in the container and `/etc/rc.local` is empty, so a
-box reboot starts NOTHING. After a reboot, run in order:
+gatekeeper (:30098) is **not yet** migrated onto `stack_watchdog.sh` — it's
+still launched by the legacy `/root/gatekeeper_watchdog.sh` (two instances
+currently running); moving it over is pending. `cloudflared` (the
+`oaica-api` tunnel, `/workspace/cf/run.sh`) IS supervised since
+2026-08-26: `stack_watchdog.sh` detects it by `pgrep -x cloudflared -a |
+grep -- --token` (other sessions' `--url` quick tunnels are deliberately
+not matched) and relaunches `run.sh` when absent.
+
+There is no systemd in the container and `/etc/rc.local` is empty. Root's
+crontab now carries two `@reboot` lines (added 2026-08-26) that start
+`vllm_awq_watchdog.sh` and `stack_watchdog.sh` after a 30 s delay; the
+stack watchdog then brings up katlb, the gateway and cloudflared. Verify
+with `crontab -l | grep @reboot`. If they are missing, run by hand in order:
 
 ```bash
 nohup /workspace/vllm_awq_watchdog.sh > /workspace/vllm_awq_watchdog.out 2>&1 &
 nohup /workspace/stack_watchdog.sh    > /workspace/stack_watchdog.out    2>&1 &
-nohup /workspace/cf/run.sh            > /workspace/cf/cloudflared.log    2>&1 &
 ```
+
+The ledger is pulled to the laptop every 30 min by cron
+(`~/.oaica/ledger-backup/pull.sh`, dated daily copies); the box is the only
+other copy.
 
 Reboots of a rented vast.ai instance also wipe /dev/shm (the weights); the
 vLLM watchdog's preflight re-downloads them from the pinned revision, or

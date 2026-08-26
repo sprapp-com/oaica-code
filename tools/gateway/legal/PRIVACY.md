@@ -17,11 +17,14 @@ including access via OpenRouter and any other reseller that forwards requests to
 - We do not receive end-user identity from OpenRouter; we see OpenRouter's
   key and IP, not yours.
 
-- Metadata (timestamp, status code, key label, model, token counts,
-  latency, request id): kept in an append-only billing ledger for as long
-  as needed to reconcile reseller payouts (currently retained
-  indefinitely; no automated deletion is in place). It contains no
-  request content and no end-user identity.
+- Metadata (timestamp, request id, key label, model id and upstream model
+  id, endpoint path, stream flag, HTTP status, prompt/completion token
+  counts, latency, and two bookkeeping flags — whether upstream reported
+  usage and whether the client aborted): kept in an append-only,
+  owner-only billing ledger for as long as needed to reconcile reseller
+  payouts (currently retained indefinitely; no automated deletion is in
+  place). It contains no request content, no client IP and no end-user
+  identity.
 
 ## Training
 We do not use your prompts, completions or any request content to train,
@@ -36,8 +39,9 @@ model as published; we do not modify it with customer data.
   principle access memory on that machine; we mitigate by not persisting
   request content, but you should not send data whose exposure to the
   hardware host would be unacceptable.
-- Network transit: requests pass through Cloudflare (tunnel/edge) and an
-  encrypted SSH tunnel operated by us. Cloudflare may process connection
+- Network transit: requests pass through Cloudflare's edge and a Cloudflare
+  Tunnel (cloudflared) that terminates on the inference host itself; there
+  is no intermediate hop operated by us. Cloudflare may process connection
   metadata at whichever edge location is nearest to the sender.
 - Failover: we do not currently route to any other region. If a managed
   failover (e.g. Replicate, United States) is enabled in future, this policy

@@ -101,9 +101,14 @@ func legalHandler(name string) http.HandlerFunc {
 const maxBodyBytes = 16 << 20
 
 // nonStreamMaxTokens bounds max_tokens on NON-streaming completions so the
-// response can complete inside Cloudflare's 100 s TTFB limit. Streaming is
-// not bounded by this (only by the model's max_completion_tokens).
-const nonStreamMaxTokens = 8192
+// response can complete inside the proxy's 90 s ResponseHeaderTimeout (and
+// Cloudflare's 100 s TTFB limit behind it). Streaming is not bounded by
+// this (only by the model's max_completion_tokens).
+//
+// 8192 was wrong: at the ~80 tok/s a stream gets under the 32-way cap that
+// is ~102 s, and the ledger showed eight real 504s, every one non-stream at
+// latency_ms 90000-90012 (2026-08-25). 4096 completes in ~51 s worst case.
+const nonStreamMaxTokens = 4096
 
 type gwPricing struct {
 	Prompt     string `json:"prompt"`     // USD per token, decimal string (OpenRouter shape)
@@ -314,6 +319,11 @@ type gateway struct {
 
 	ledgerMu sync.Mutex
 	ledger   *os.File
+
+	// /health probe cache; see healthCacheTTL.
+	healthMu   sync.Mutex
+	healthAt   time.Time
+	healthLast healthResult
 }
 
 func (g *gateway) apply(cfg gwConfig) error {
@@ -436,17 +446,40 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 // healthHandler is unauthenticated so uptime monitors and OpenRouter can
 // probe it. 200 only when the upstream actually answers; otherwise 503, so a
 // down fleet is visible instead of hidden behind a static /models.
+// healthCacheTTL bounds how often /health performs a real upstream chat
+// probe. The probe is unauthenticated and runs on the customer ("openrouter")
+// concurrency tier, so without a cache 32 parallel GETs could occupy every
+// customer slot for a second at zero cost to the caller. Monitors poll at
+// >= 30 s; a 10 s cache changes nothing for them.
+const healthCacheTTL = 10 * time.Second
+
+type healthResult struct {
+	code int
+	body map[string]any
+}
+
 func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	g.healthMu.Lock()
+	if g.healthAt.IsZero() || time.Since(g.healthAt) >= healthCacheTTL {
+		g.healthLast = g.probeHealth(r)
+		g.healthAt = time.Now()
+	}
+	res := g.healthLast
+	g.healthMu.Unlock()
+	w.WriteHeader(res.code)
+	json.NewEncoder(w).Encode(res.body)
+}
+
+// probeHealth does the real check; healthHandler caches its result.
+func (g *gateway) probeHealth(r *http.Request) healthResult {
 	g.mu.RLock()
 	up := g.cfg.UpstreamAddr
 	models := g.cfg.Models
 	g.mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
 	if len(models) == 0 {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": "no models configured"})
-		return
+		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": "no models configured"}}
 	}
 	// A real 1-token chat completion, authenticated with the gateway's own
 	// upstream credential, through gatekeeper -> katlb -> a replica. This is
@@ -463,18 +496,14 @@ func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": err.Error()})
-		return
+		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": err.Error()}}
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]any{"status": "down", "reason": fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode)})
-		return
+		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode)}}
 	}
-	json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	return healthResult{http.StatusOK, map[string]any{"status": "ok"}}
 }
 
 // ledgerEntry is one metered completion. Appended as a JSON line so it can

@@ -1,5 +1,13 @@
 # kat-awq Pricing (2026-08-21)
 
+> **Note (2026-08-26):** the cost basis below was measured against a
+> 6-replica sweep on 2026-08-21. The public fleet behind `api.oaica.com`
+> has run **2 replicas** since 2026-08-25 — the rates themselves are
+> unchanged, but treat the $/hr fleet cost and throughput ceiling as
+> historical context, not the current deployed capacity. The rates in
+> force are deployed in `tools/a100b/gateway.json`, served live at
+> `GET /models`.
+
 ## Cost basis (real, measured)
 
 - Fleet: 6x kat-awq vLLM replicas, A100 SXM4 80GB, a100b (vast.ai), $1.056/hr median/GPU → **$6.34/hr fleet**.
@@ -29,4 +37,8 @@
 
 ## Deploy
 
-No live billing config found in this repo (`oaica-code`) — this file is the rate card of record. Propagate to whatever service reads pricing (api.sprapp.com billing, if separate repo) manually; ping when that location is known so this doc can link to it directly.
+This file is the rate card of record; the deployed pricing lives in
+`tools/a100b/gateway.json` (the `oaica-gateway` config), served live at
+`GET /models` on `api.oaica.com`. Any rate change here must be propagated
+to that file by hand and reloaded (see "Rotating the OpenRouter key" in
+`docs/OPENROUTER_PROVIDER.md` for the SIGHUP reload mechanism).

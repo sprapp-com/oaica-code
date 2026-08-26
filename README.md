@@ -1,3 +1,32 @@
+# oaica
+
+A thin, CGO-free terminal AI CLI (fork of Ollama's client) backed by our
+own hosted API — no local GPU or model download required. It also ships an
+optional static site builder (`oaica site new|edit|preview|deploy`).
+
+**Install**
+
+```shell
+curl -fsSL https://oaica.com/install.sh | bash    # macOS/Linux
+irm https://oaica.com/install.ps1 | iex           # Windows
+```
+
+**Current release:** 0.4.0 — see https://oaica.com/download/VERSION.txt for
+the live pointer.
+
+**API base URL:** `https://api.oaica.com` (`OAICA_HOST` defaults here;
+OpenAI-compatible).
+
+**Docs:** [docs/RELEASE.md](docs/RELEASE.md) (cutting a release),
+[docs/SITE_BUILDER.md](docs/SITE_BUILDER.md) (the static site builder),
+[docs/OPENROUTER_PROVIDER.md](docs/OPENROUTER_PROVIDER.md) (how the API is
+served).
+
+Everything below this section is upstream Ollama's README, kept as-is since
+oaica is a fork of the Ollama client.
+
+---
+
 <p align="center">
   <a href="https://ollama.com">
     <img src="https://github.com/ollama/ollama/assets/3325447/0d0b44e2-8f4a-4e99-9b52-a5c1c741c8f7" alt="ollama" width="200"/>
