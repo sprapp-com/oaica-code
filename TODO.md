@@ -9,10 +9,9 @@ verified; site builder shipped; OpenRouter form answers verified
 - [ ] Confirm `oaica@sprapp.com` exists and is read. OpenRouter emails it and
       invites it to a Slack Connect channel; `/privacy` and `/terms` tell
       customers to write to it.
-- [ ] Decide `/models` auth. Today it needs the key (401 without). Either
-      write "poll /models with the provided key" in the form notes, or say
-      "make /models public" (one line + SIGHUP; listing is public data —
-      recommended).
+- [x] `/models` auth — decided + done 2026-08-26: `/models` and `/v1/models`
+      are public (200 without a key); completions stay key-protected.
+      Nothing to note in the form.
 - [ ] Uptime monitor: UptimeRobot / Better Stack (free) on
       `https://api.oaica.com/health`, interval >= 60 s. Paste its public
       status URL into the form if asked, and send it to me for `/status`.

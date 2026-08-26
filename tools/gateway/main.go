@@ -807,8 +807,14 @@ func main() {
 	mux.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
 	mux.HandleFunc("/terms", legalHandler("TERMS.md"))
 	mux.HandleFunc("/status", legalHandler("STATUS.md"))
-	mux.HandleFunc("/models", g.authed(g.modelsHandler))
-	mux.HandleFunc("/v1/models", g.authed(g.modelsHandler))
+	// /models is public (2026-08-26): it is served from in-memory config
+	// (no upstream call) and contains only what the OpenRouter listing and
+	// oaica.com already publish -- ids, context, limits, pricing, modalities.
+	// Keeping it behind the key only risked OpenRouter's model poller not
+	// sending one and the listing silently never appearing. Completions
+	// stay authenticated; nothing about metering changes.
+	mux.HandleFunc("/models", g.modelsHandler)
+	mux.HandleFunc("/v1/models", g.modelsHandler)
 	mux.HandleFunc("/v1/chat/completions", g.completionHandler)
 	mux.HandleFunc("/v1/completions", g.completionHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

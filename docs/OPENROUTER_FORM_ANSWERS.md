@@ -19,7 +19,7 @@ into the form.
 | Slug | oaica |
 | Distinguishing features | Unique Models, Unique Infrastructure, Low Pricing |
 | Extra details | Self-hosted vLLM fleet (2x A100 80GB replicas, least-conn LB with chat-aware health probes, automatic failover between replicas). Serves KAT-Coder-V2.5-Dev (35B MoE, int4 AWQ) with 262k context and tool calling. No cloud markup. Per-key concurrency limits; per-request token ledger. Single host, no cross-region failover yet (see /status). |
-| URL to /models API | https://api.oaica.com/models — **requires** `Authorization: Bearer <key>` (401 without it); **you** paste the key from `~/.secrets/oaica_openrouter_key` (laptop) into the same form and state in the notes that the model poll must use it. If OpenRouter's poller turns out not to authenticate, the listing is public data (pricing, context, modalities) and `/models` can be made unauthenticated with a one-line change + SIGHUP — decide before submitting. |
+| URL to /models API | https://api.oaica.com/models — **public**, no key needed (also at `/v1/models`); served from config, so it stays up even if a backend is down. Completions still require `Authorization: Bearer <key>`; **you** paste the key from `~/.secrets/oaica_openrouter_key` (laptop) wherever the form asks for the API credential. |
 | API base URL | https://api.oaica.com/v1 |
 | Privacy Policy URL | https://api.oaica.com/privacy |
 | Terms of Service URL | https://api.oaica.com/terms |
@@ -53,7 +53,7 @@ into the form.
 Independent re-check of every row above (15 agents, read-only, adversarial
 re-check of each discrepancy), then fixes applied and re-verified:
 
-- `GET /models` without key -> 401 `{"error":{"code":"invalid_api_key",…}}`; with key -> 200, one entry `kat-awq`: `pricing {prompt:"0.00000005", completion:"0.00000012"}`, `context_length 262144`, `max_completion_tokens 32768`, `architecture.input_modalities ["text"]`, `supported_parameters [max_tokens, temperature, top_p, stream, tools, tool_choice, stop, seed, response_format]`, `created` stable across calls. `/v1/models` identical.
+- `GET /models` -> 200 with or without a key (made public 2026-08-26 after the decision matrix; `POST /v1/chat/completions` without a key -> 401 `{"error":{"code":"invalid_api_key",…}}`); one entry `kat-awq`: `pricing {prompt:"0.00000005", completion:"0.00000012"}`, `context_length 262144`, `max_completion_tokens 32768`, `architecture.input_modalities ["text"]`, `supported_parameters [max_tokens, temperature, top_p, stream, tools, tool_choice, stop, seed, response_format]`, `created` stable across calls. `/v1/models` identical.
 - `/privacy` `/terms` `/status` `/health` -> 200; legal pages name BizTransit Sdn Bhd / oaica@sprapp.com / JP inference / ledger retention; `/status` states single host, no cross-region failover.
 - No `X-Katlb-Backend` / `X-Gatekeeper-*` headers on `/models` or on a chat completion.
 - Image `image_url` part -> 400, OpenAI error shape, not forwarded.

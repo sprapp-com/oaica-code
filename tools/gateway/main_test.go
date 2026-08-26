@@ -82,8 +82,8 @@ func mux(g *gateway) http.Handler {
 	m.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
 	m.HandleFunc("/terms", legalHandler("TERMS.md"))
 	m.HandleFunc("/status", legalHandler("STATUS.md"))
-	m.HandleFunc("/models", g.authed(g.modelsHandler))
-	m.HandleFunc("/v1/models", g.authed(g.modelsHandler))
+	m.HandleFunc("/models", g.modelsHandler)
+	m.HandleFunc("/v1/models", g.modelsHandler)
 	m.HandleFunc("/v1/chat/completions", g.completionHandler)
 	m.HandleFunc("/v1/completions", g.completionHandler)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { writeErr(w, 404, "not_found", "unknown route") })
@@ -141,7 +141,9 @@ func TestAuth_OldKeyRejected_NewKeyAccepted_ConstantTime(t *testing.T) {
 		{"", 401},
 		{"sk-new", 200},
 	} {
-		req, _ := http.NewRequest("GET", srv.URL+"/models", nil)
+		// completions are the authenticated surface (/models is public)
+		req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Content-Type", "application/json")
 		if tc.key != "" {
 			req.Header.Set("Authorization", "Bearer "+tc.key)
 		}
@@ -149,10 +151,40 @@ func TestAuth_OldKeyRejected_NewKeyAccepted_ConstantTime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != tc.want {
 			t.Errorf("key %q: got %d want %d", tc.key, resp.StatusCode, tc.want)
 		}
+	}
+}
+
+// /models is intentionally public: served from config, no upstream call,
+// nothing in it that the OpenRouter listing does not already publish. A
+// poller that sends no key must still get the roster.
+func TestModels_PublicWithoutKey(t *testing.T) {
+	var got map[string]any
+	up := fakeUpstream(t, &got)
+	defer up.Close()
+	g, _ := newTestGateway(t, up.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+	for _, p := range []string{"/models", "/v1/models"} {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Data []map[string]any `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&doc)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || len(doc.Data) != 1 || doc.Data[0]["id"] != "kat-awq" {
+			t.Fatalf("%s without key: %d, %v", p, resp.StatusCode, doc.Data)
+		}
+	}
+	if got != nil {
+		t.Fatal("/models must never call upstream")
 	}
 }
 
