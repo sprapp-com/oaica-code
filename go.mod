@@ -31,7 +31,6 @@ require (
 	github.com/nlpodyssey/gopickle v0.3.0
 	github.com/pdevine/tensor v0.0.0-20240510204454-f88f4562727c
 	github.com/pelletier/go-toml/v2 v2.2.2
-	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/tkrajina/typescriptify-golang-structs v0.2.0
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-cpp v0.23.4
@@ -101,7 +100,7 @@ require (
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/crypto v0.43.0
 	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa // indirect
-	golang.org/x/net v0.46.0 // indirect
+	golang.org/x/net v0.46.0
 	golang.org/x/term v0.36.0
 	golang.org/x/text v0.30.0
 	google.golang.org/protobuf v1.34.1
