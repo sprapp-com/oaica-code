@@ -21,4 +21,4 @@ Health endpoint (unauthenticated, for monitors)
 - GET https://api.oaica.com/health -> 200 when the upstream answers a
   real request, 503 otherwise. Body: {"status":"ok"} or {"status":"down","reason":...}.
 
-Incident contact: biztransit@bcz.com
+Incident contact: oaica@sprapp.com

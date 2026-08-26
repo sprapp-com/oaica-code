@@ -24,7 +24,7 @@ govern your relationship with them; these terms govern what our Service does.
    The Service is provided on a best-effort basis with NO uptime guarantee
    and NO SLA. It currently runs on a single rented GPU server; outages,
    capacity limits (HTTP 429/503) and maintenance windows can occur without
-   notice. Support is by email at biztransit@bcz.com, best effort, no
+   notice. Support is by email at oaica@sprapp.com, best effort, no
    response-time commitment.
 
 4. Fees
@@ -65,4 +65,4 @@ govern your relationship with them; these terms govern what our Service does.
    These terms are governed by the laws of Malaysia; courts of Malaysia have
    exclusive jurisdiction.
 
-Contact: biztransit@bcz.com
+Contact: oaica@sprapp.com

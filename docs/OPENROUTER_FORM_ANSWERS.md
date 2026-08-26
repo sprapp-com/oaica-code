@@ -14,7 +14,7 @@ into the form.
 |---|---|
 | Company | BizTransit Sdn Bhd |
 | Website | https://bcz.com/ |
-| Email | biztransit@bcz.com |
+| Email | oaica@sprapp.com |
 | Display name | Oaica |
 | Slug | oaica |
 | Distinguishing features | Unique Models, Unique Infrastructure, Low Pricing |
@@ -54,7 +54,7 @@ Independent re-check of every row above (15 agents, read-only, adversarial
 re-check of each discrepancy), then fixes applied and re-verified:
 
 - `GET /models` without key -> 401 `{"error":{"code":"invalid_api_key",…}}`; with key -> 200, one entry `kat-awq`: `pricing {prompt:"0.00000005", completion:"0.00000012"}`, `context_length 262144`, `max_completion_tokens 32768`, `architecture.input_modalities ["text"]`, `supported_parameters [max_tokens, temperature, top_p, stream, tools, tool_choice, stop, seed, response_format]`, `created` stable across calls. `/v1/models` identical.
-- `/privacy` `/terms` `/status` `/health` -> 200; legal pages name BizTransit Sdn Bhd / biztransit@bcz.com / JP inference / ledger retention; `/status` states single host, no cross-region failover.
+- `/privacy` `/terms` `/status` `/health` -> 200; legal pages name BizTransit Sdn Bhd / oaica@sprapp.com / JP inference / ledger retention; `/status` states single host, no cross-region failover.
 - No `X-Katlb-Backend` / `X-Gatekeeper-*` headers on `/models` or on a chat completion.
 - Image `image_url` part -> 400, OpenAI error shape, not forwarded.
 - Tools: `finish_reason: tool_calls`, `tool_calls[0].function = get_weather({"city": "Johor Bahru"})` — `chatcmpl-b9284eee7a411f9e`.

@@ -3,7 +3,7 @@
 Effective: 2026-08-26
 
 Operator: BizTransit Sdn Bhd, Malaysia ("oaica", "we").
-Contact: biztransit@bcz.com
+Contact: oaica@sprapp.com
 
 ## What this covers
 The OpenAI-compatible inference API at https://api.oaica.com (the "Service"),
@@ -59,7 +59,7 @@ ISO 27001 or similar certification.
 ## Your rights
 Because we do not store request content or identify end users, we generally
 cannot locate or delete data about a specific person. Requests about
-metadata logs, or any other privacy question: biztransit@bcz.com. Malaysian
+metadata logs, or any other privacy question: oaica@sprapp.com. Malaysian
 Personal Data Protection Act 2010 applies to any personal data we do hold.
 
 ## Changes
