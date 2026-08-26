@@ -113,13 +113,13 @@ Then `https://api.oaica.com/models` and
 
 ## Cog fallback (not built -- do not list it)
 
-A `tools/cog-kat-awq/` sketch exists (cog.yaml + a raw-text `predict.py`,
-8192 ctx, never pushed, `cog` not installed). It is NOT a usable failover:
-it speaks Cog's predict API, not OpenAI; it has no tool calling; and
-Replicate runs in the US, which would change the inference-location answer
-on the OpenRouter form. Until it is actually built, tested end-to-end and
-its region documented, the provider is single-region (JP) with no failover.
-Keeping the sketch out of git so nobody mistakes it for capacity.
+A Replicate/Cog sketch (cog.yaml + a raw-text `predict.py`, 8192 ctx) was
+tried and deleted on 2026-08-26 so nobody mistakes it for capacity. It was
+NOT a usable failover: it spoke Cog's predict API, not OpenAI; it had no
+tool calling; and Replicate runs in the US, which would change the
+inference-location answer on the OpenRouter form. Until a fallback is
+actually built, tested end-to-end and its region documented, the provider
+is single-region (JP) with no failover.
 
 ## Pricing decision (see OpenRouter form)
 

@@ -24,3 +24,6 @@ tools/katlb/katlb-linux-amd64
 
 # stray gateway binary built at repo root
 /gw
+
+# graphify knowledge-graph output (50MB, regenerable)
+/graphify-out/
