@@ -11,10 +11,13 @@
 //	       hashed backend is marked unhealthy
 //
 // Health checks: GET /v1/models every 3s, 2 consecutive failures marks a
-// backend down, 2 consecutive successes marks it back up.
+// backend down, 2 consecutive successes marks it back up. A backend with
+// stalled in-flight requests (older than stall_sec) is marked down on a
+// SINGLE probe failure -- see lbConfig.StallSec.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -57,6 +60,30 @@ type lbConfig struct {
 	// a healthy A100 replica is well under 1s, but a replica mid-startup can
 	// stall while loading weights and must not be marked DOWN for that).
 	ProbeTimeoutSec int `json:"probe_timeout_sec"`
+
+	// StallSec is the hung-replica threshold (default 120; negative disables).
+	// A replica that is LISTENING but hung -- accepts the connection and never
+	// answers, or answers the cheap probe while real generations stall -- is
+	// only caught by the probe when the probe itself fails twice in a row. A
+	// replica whose probe flaps (ok, timeout, ok, ...) never trips that rule
+	// while every real request on it sits forever. So: if a backend has at
+	// least StallMinInflight in-flight requests each older than StallSec AND
+	// its latest probe failed or timed out, it is marked DOWN on that single
+	// failure and takes no new requests until the probe succeeds again (the
+	// usual 2-consecutive-successes rule). A probe failure alone still needs
+	// 2 in a row; old in-flight requests alone never mark a backend down (a
+	// long legitimate generation on a replica whose probe passes is fine).
+	StallSec int `json:"stall_sec"`
+	// StallMinInflight is the N in "N stalled requests" above (default 1).
+	StallMinInflight int `json:"stall_min_inflight"`
+}
+
+// stallThreshold returns the effective hung-replica threshold, 0 if disabled.
+func (c lbConfig) stallThreshold() time.Duration {
+	if c.StallSec < 0 {
+		return 0
+	}
+	return time.Duration(c.StallSec) * time.Second
 }
 
 func loadConfig(path string) (lbConfig, error) {
@@ -88,6 +115,12 @@ func loadConfig(path string) (lbConfig, error) {
 	if cfg.ProbeTimeoutSec <= 0 {
 		cfg.ProbeTimeoutSec = 10
 	}
+	if cfg.StallSec == 0 {
+		cfg.StallSec = 120
+	}
+	if cfg.StallMinInflight <= 0 {
+		cfg.StallMinInflight = 1
+	}
 	return cfg, nil
 }
 
@@ -98,7 +131,15 @@ type backend struct {
 	healthy   atomic.Bool
 	failCount int
 	okCount   int
-	mu        sync.Mutex
+	// lastProbeOK is the result of the most recent probe, for /status.
+	lastProbeOK atomic.Bool
+	// starts holds the start time of every in-flight request proxied to this
+	// backend, keyed by a per-backend sequence number, so the health loop can
+	// see how long the oldest one has been waiting (see lbConfig.StallSec).
+	// inflight stays a separate atomic so leastConnPick never takes mu.
+	starts map[uint64]time.Time
+	nextID uint64
+	mu     sync.Mutex
 }
 
 func newBackend(raw string) *backend {
@@ -106,15 +147,80 @@ func newBackend(raw string) *backend {
 	if err != nil {
 		log.Fatal(err)
 	}
-	b := &backend{url: u, proxy: httputil.NewSingleHostReverseProxy(u)}
+	b := &backend{url: u, proxy: httputil.NewSingleHostReverseProxy(u), starts: map[uint64]time.Time{}}
 	b.healthy.Store(true)
+	b.lastProbeOK.Store(true)
 	return b
 }
+
+// begin records a request being proxied to b; end(id) must follow.
+func (b *backend) begin() uint64 {
+	b.mu.Lock()
+	id := b.nextID
+	b.nextID++
+	b.starts[id] = time.Now()
+	b.mu.Unlock()
+	atomic.AddInt64(&b.inflight, 1)
+	return id
+}
+
+func (b *backend) end(id uint64) {
+	atomic.AddInt64(&b.inflight, -1)
+	b.mu.Lock()
+	delete(b.starts, id)
+	b.mu.Unlock()
+}
+
+// stalledLocked returns how many in-flight requests started more than stall
+// ago (0 when stall detection is disabled), and the age of the oldest
+// in-flight request. Caller holds b.mu.
+func (b *backend) stalledLocked(now time.Time, stall time.Duration) (stalled int, oldest time.Duration) {
+	for _, t := range b.starts {
+		age := now.Sub(t)
+		if age > oldest {
+			oldest = age
+		}
+		if stall > 0 && age >= stall {
+			stalled++
+		}
+	}
+	return stalled, oldest
+}
+
+// oldestInflight is the age of the oldest request still proxied to b.
+func (b *backend) oldestInflight() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, oldest := b.stalledLocked(time.Now(), 0)
+	return oldest
+}
+
+// probeBodyOK reports whether a 200 chat-probe body is a real completion:
+// a JSON object with a non-empty "choices" array. A replica that is wedged
+// after writing its headers (or an intermediary answering 200 with nothing)
+// returns 200 with an empty or truncated body, which must count as a
+// failure, exactly as the customer request would have failed. Content is
+// deliberately not required to be non-empty: a 1-token reply can legally be
+// "" (reasoning/tool-call opener).
+func probeBodyOK(body []byte) bool {
+	var v struct {
+		Choices []json.RawMessage `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return false
+	}
+	return len(v.Choices) > 0
+}
+
+// probeBodyLimit bounds how much of a probe reply is read. A 1-token vLLM
+// completion is well under 1 KB; anything past this is not a probe reply.
+const probeBodyLimit = 1 << 20
 
 // probeOnce runs ONE health probe against b. With probeModel set it is a
 // real 1-token chat completion (see lbConfig.ProbeModel); otherwise a GET on
 // healthPath. A backend is healthy only when the probe returns 200 -- a 400
-// from a chat probe is the signal GET /v1/models can never give.
+// from a chat probe is the signal GET /v1/models can never give -- and, for
+// the chat probe, only when the 200 carries an actual completion body.
 func (b *backend) probeOnce(client *http.Client, healthPath, probeModel string) bool {
 	if probeModel == "" {
 		resp, err := client.Get(b.url.String() + healthPath)
@@ -125,33 +231,87 @@ func (b *backend) probeOnce(client *http.Client, healthPath, probeModel string) 
 	}
 	body := `{"model":` + strconv.Quote(probeModel) + `,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}`
 	resp, err := client.Post(b.url.String()+"/v1/chat/completions", "application/json", strings.NewReader(body))
-	if resp != nil {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+	if err != nil || resp == nil {
+		return false
 	}
-	return err == nil && resp != nil && resp.StatusCode == 200
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, probeBodyLimit))
+		return false
+	}
+	// The body read shares the client's timeout, so a replica that sends
+	// headers and then hangs fails here instead of counting as UP.
+	reply, err := io.ReadAll(io.LimitReader(resp.Body, probeBodyLimit))
+	if err != nil {
+		return false
+	}
+	return probeBodyOK(reply)
 }
 
-func (b *backend) healthCheck(healthPath, probeModel string, timeout time.Duration) {
-	client := &http.Client{Timeout: timeout}
+// probeOpts is everything one backend's health loop needs. interval and
+// stall are durations (not the config's integer seconds) so tests can run
+// the loop at millisecond cadence.
+type probeOpts struct {
+	healthPath string
+	probeModel string
+	timeout    time.Duration // one probe
+	interval   time.Duration // between probes; 0 = 3s
+	stall      time.Duration // hung-replica threshold; 0 = disabled
+	stallMin   int           // stalled requests needed; <1 = 1
+}
+
+func (o probeOpts) withDefaults() probeOpts {
+	if o.interval <= 0 {
+		o.interval = 3 * time.Second
+	}
+	if o.stallMin < 1 {
+		o.stallMin = 1
+	}
+	return o
+}
+
+// healthCheck probes b every opts.interval until ctx is done. Down after 2
+// consecutive failures, or after ONE failure while at least opts.stallMin
+// in-flight requests are older than opts.stall; up again after 2
+// consecutive successes.
+func (b *backend) healthCheck(ctx context.Context, opts probeOpts) {
+	opts = opts.withDefaults()
+	client := &http.Client{Timeout: opts.timeout}
 	for {
-		ok := b.probeOnce(client, healthPath, probeModel)
+		ok := b.probeOnce(client, opts.healthPath, opts.probeModel)
+		b.lastProbeOK.Store(ok)
 		b.mu.Lock()
 		if ok {
 			b.okCount++
 			b.failCount = 0
-			if b.okCount >= 2 {
+			if b.okCount >= 2 && !b.healthy.Load() {
 				b.healthy.Store(true)
+				log.Printf("katlb: %s UP (probe ok x%d)", b.url, b.okCount)
 			}
 		} else {
 			b.failCount++
 			b.okCount = 0
-			if b.failCount >= 2 {
-				b.healthy.Store(false)
+			stalled, oldest := b.stalledLocked(time.Now(), opts.stall)
+			switch {
+			case b.failCount >= 2:
+				if b.healthy.Load() {
+					b.healthy.Store(false)
+					log.Printf("katlb: %s DOWN (probe failed x%d)", b.url, b.failCount)
+				}
+			case stalled >= opts.stallMin:
+				if b.healthy.Load() {
+					b.healthy.Store(false)
+					log.Printf("katlb: %s DOWN (probe failed, %d in-flight request(s) stalled >= %s, oldest %s)",
+						b.url, stalled, opts.stall, oldest.Round(time.Second))
+				}
 			}
 		}
 		b.mu.Unlock()
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(opts.interval):
+		}
 	}
 }
 
@@ -208,10 +368,23 @@ func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
 			http.Error(w, "no healthy backend", http.StatusServiceUnavailable)
 			return
 		}
-		atomic.AddInt64(&b.inflight, 1)
-		defer atomic.AddInt64(&b.inflight, -1)
+		id := b.begin()
+		defer b.end(id)
 		w.Header().Set("X-Katlb-Backend", b.url.String())
 		b.proxy.ServeHTTP(w, r)
+	}
+}
+
+// sessionHandler pins a request to the backend hashed from its X-Session-Id
+// (per-client address when absent), degrading to leastconn when that
+// backend is DOWN.
+func sessionHandler(bs []*backend) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("X-Session-Id")
+		if key == "" {
+			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
+		}
+		serveWith(bs, func(bs []*backend) *backend { return hashPick(bs, key) })(w, r)
 	}
 }
 
@@ -225,11 +398,23 @@ func main() {
 	if cfg.ProbeModel != "" {
 		log.Printf("katlb: health probe = 1-token chat on %q (timeout %ds)", cfg.ProbeModel, cfg.ProbeTimeoutSec)
 	}
+	if stall := cfg.stallThreshold(); stall > 0 {
+		log.Printf("katlb: hung-replica detection = %d in-flight request(s) stalled >= %s + probe failure", cfg.StallMinInflight, stall)
+	} else {
+		log.Printf("katlb: hung-replica detection disabled (stall_sec < 0)")
+	}
+	opts := probeOpts{
+		healthPath: cfg.HealthPath,
+		probeModel: cfg.ProbeModel,
+		timeout:    time.Duration(cfg.ProbeTimeoutSec) * time.Second,
+		stall:      cfg.stallThreshold(),
+		stallMin:   cfg.StallMinInflight,
+	}
 
 	bs := make([]*backend, 0, len(cfg.Backends))
 	for _, raw := range cfg.Backends {
 		b := newBackend(raw)
-		go b.healthCheck(cfg.HealthPath, cfg.ProbeModel, time.Duration(cfg.ProbeTimeoutSec)*time.Second)
+		go b.healthCheck(context.Background(), opts)
 		bs = append(bs, b)
 	}
 	time.Sleep(1 * time.Second) // let first health check land before serving
@@ -238,13 +423,7 @@ func main() {
 	leastconnMux.HandleFunc("/", serveWith(bs, leastConnPick))
 
 	hashMux := http.NewServeMux()
-	hashMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-Session-Id")
-		if key == "" {
-			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
-		}
-		serveWith(bs, func(bs []*backend) *backend { return hashPick(bs, key) })(w, r)
-	})
+	hashMux.HandleFunc("/", sessionHandler(bs))
 
 	statusMux := http.NewServeMux()
 	statusMux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +432,12 @@ func main() {
 			if !b.healthy.Load() {
 				healthy = "DOWN"
 			}
-			w.Write([]byte(b.url.String() + " " + healthy + " inflight=" + itoa(atomic.LoadInt64(&b.inflight)) + "\n"))
+			probe := "ok"
+			if !b.lastProbeOK.Load() {
+				probe = "fail"
+			}
+			w.Write([]byte(b.url.String() + " " + healthy + " inflight=" + itoa(atomic.LoadInt64(&b.inflight)) +
+				" oldest_inflight_sec=" + itoa(int64(b.oldestInflight()/time.Second)) + " probe=" + probe + "\n"))
 		}
 	})
 

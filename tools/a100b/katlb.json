@@ -12,5 +12,6 @@
   "session_hash_addr": ":8091",
   "status_addr": ":8092",
   "probe_model": "kat-awq",
-  "probe_timeout_sec": 10
+  "probe_timeout_sec": 10,
+  "stall_sec": 120
 }
