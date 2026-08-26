@@ -19,6 +19,8 @@ OpenAI-compatible).
 
 **Docs:** [docs/RELEASE.md](docs/RELEASE.md) (cutting a release),
 [docs/SITE_BUILDER.md](docs/SITE_BUILDER.md) (the static site builder),
+[docs/CLAUDE_TIERS.md](docs/CLAUDE_TIERS.md) (plan on one model, execute on
+another — any mix of remote, router, local),
 [docs/OPENROUTER_PROVIDER.md](docs/OPENROUTER_PROVIDER.md) (how the API is
 served).
 

@@ -53,6 +53,7 @@ func TestNormalizeSystemFirst(t *testing.T) {
 // is what lets claude.go point ANTHROPIC_DEFAULT_OPUS_MODEL and
 // ANTHROPIC_DEFAULT_SONNET_MODEL at two different bare ids through one proxy.
 func TestProxyHonorsPerRequestModel(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir()) // request log must not land in the developer's real ~/.oaica
 	var gotModels []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -122,6 +123,7 @@ func TestProxyHonorsPerRequestModel(t *testing.T) {
 // byte-identical-for-non-split-launches guarantee: a request with no model
 // field (or an empty one) still resolves to the proxy's fixed upstreamModel.
 func TestProxyFallsBackToFixedModelWhenRequestOmitsIt(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir()) // request log must not land in the developer's real ~/.oaica
 	var gotModel string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {

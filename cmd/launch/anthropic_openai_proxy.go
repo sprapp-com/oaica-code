@@ -81,7 +81,7 @@ type openAIChatResponse struct {
 	ID      string `json:"id"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Index int `json:"index"`
+		Index   int `json:"index"`
 		Message struct {
 			Role             string `json:"role"`
 			Content          string `json:"content"`
@@ -308,7 +308,7 @@ func parseOpenAIToolCalls(tcs []struct {
 			args.Set("_raw", raw)
 		}
 		out = append(out, api.ToolCall{
-			ID:   tc.ID,
+			ID:       tc.ID,
 			Function: api.ToolCallFunction{Name: tc.Function.Name, Arguments: args},
 		})
 	}
@@ -319,8 +319,8 @@ func parseOpenAIToolCalls(tcs []struct {
 // OpenAI chat-completions response (non-streaming).
 func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string) api.ChatResponse {
 	chatResp := api.ChatResponse{
-		Model:    upstreamModel,
-		Done:     true,
+		Model: upstreamModel,
+		Done:  true,
 	}
 	if len(resp.Choices) > 0 {
 		c := resp.Choices[0]
@@ -363,8 +363,45 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	// so the upstream endpoint is hit exactly once — otherwise a base_url that
 	// already includes /v1 (e.g. https://api.deepseek.com/v1) would produce
 	// /v1/v1/chat/completions and 404.
-	baseURL := remote.openAIBase()
-	key := remote.key()
+	return RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
+	})
+}
+
+// proxyRoute is one upstream an Anthropic request can be forwarded to.
+type proxyRoute struct {
+	BaseURL       string // OpenAI base including the version prefix (".../v1")
+	Key           string // bearer sent upstream; empty = none
+	UpstreamModel string // model id the upstream expects
+	Label         string // for the request log / diagnostics
+}
+
+// proxyRouteTable maps the model id Claude Code puts in each request to an
+// upstream. Unknown ids fall back to Default with the id passed through
+// unchanged (a single-model launch keeps working byte-identically: every
+// tier is pinned to one id, which is either in ByModel or equals
+// Default.UpstreamModel). This is what lets primary and --sonnet-model live
+// on different remotes, or one on a remote and one on the local daemon.
+type proxyRouteTable struct {
+	Default proxyRoute
+	ByModel map[string]proxyRoute
+}
+
+func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
+	if requested == "" {
+		return t.Default, t.Default.UpstreamModel
+	}
+	if r, ok := t.ByModel[requested]; ok {
+		return r, r.UpstreamModel
+	}
+	return t.Default, requested
+}
+
+// RunAnthropicOpenAIProxyRoutes is RunAnthropicOpenAIProxy with a routing
+// table; see proxyRouteTable.
+func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
+	baseURL := table.Default.BaseURL
+	key := table.Default.Key
 
 	mux := http.NewServeMux()
 
@@ -415,10 +452,10 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 		// proxy was started with when the request carries none, so a normal
 		// single-model launch (all tiers pinned to the same bare id) is
 		// unaffected — byte-identical to before this existed.
-		reqModel := upstreamModel
-		if anthReq.Model != "" {
-			reqModel = anthReq.Model
-		}
+		// With a routing table (tier_routing.go) the id also selects WHICH
+		// upstream: primary and --sonnet-model can be different backends.
+		route, reqModel := table.resolve(anthReq.Model)
+		started := time.Now()
 
 		oaiReq := chatRequestToOpenAI(chatReq, anthReq, reqModel)
 		oaiBody, err := json.Marshal(oaiReq)
@@ -427,14 +464,14 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 			return
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(oaiBody))
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.BaseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
 			return
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
-		if key != "" {
-			upstreamReq.Header.Set("Authorization", "Bearer "+key)
+		if route.Key != "" {
+			upstreamReq.Header.Set("Authorization", "Bearer "+route.Key)
 		}
 
 		client := &http.Client{Timeout: 5 * time.Minute}
@@ -444,6 +481,22 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 			return
 		}
 		defer resp.Body.Close()
+
+		// Same local-only log the router path used to keep (request_log.go):
+		// model, which backend, sizes, status -- never content.
+		lastLen, totalLen := extractLastAndTotalMessageLen(body)
+		appendRequestLog(requestLogEntry{
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			Model:            anthReq.Model,
+			Path:             r.URL.Path,
+			Backend:          route.Label + " " + route.BaseURL,
+			LastMessageLen:   lastLen,
+			TotalMessagesLen: totalLen,
+			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
+			WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
+			StatusCode:       resp.StatusCode,
+			DurationMs:       time.Since(started).Milliseconds(),
+		})
 
 		if resp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(resp.Body)

@@ -34,6 +34,15 @@ verified; site builder shipped; OpenRouter form answers verified
       (sudo) -> 0.4.0 with `oaica site`.
 - [ ] `wrangler pages project delete oaica-site-demo` when done with the demo.
 
+## Release 0.4.1 (needs your "go")
+
+- [ ] The 0.4.0 binary's `oaica launch claude --model kat-awq` (router model,
+      fresh install) fails with `unrecognized_model`: Claude Code was pointed
+      at the gateway directly, which has no `/v1/messages`. Fixed on main
+      2026-08-26 (every source now goes through the translation proxy;
+      cross-source `--sonnet-model` tiers — see docs/CLAUDE_TIERS.md). Ship
+      as 0.4.1 with `docs/RELEASE.md`.
+
 ## Me (Claude) — on request, each needs a short 503 window
 
 - [ ] Rotate the gatekeeper upstream key on a100b (it sat in a

@@ -80,6 +80,10 @@ oaica run kat-awq "explain this error: ..."  # one-shot
 oaica launch claude --model kat-awq        # run Claude Code / opencode / codex on it
 oaica launch claude                        # or pick from a searchable menu (add OPENROUTER_API_KEY for 400+ more)</code></pre>
 <p class="hint">The model list is live: <code>oaica run</code> with an unknown name prints what your key can use.</p>
+<p><strong>Plan with one model, execute with another.</strong> Claude Code's tiers (Opus for plan mode, Sonnet for execution) can point at different backends — a cloud model and a local one, two different remotes, anything:</p>
+<pre><code>oaica launch claude --model deepseek-v4-flash:0731-cloud -- --sonnet-model kat-awq
+# inside Claude Code:  /model opusplan   → plans on deepseek, executes on kat-awq</code></pre>
+<p class="hint">Any name works for either side: a remote from <code>~/.oaica/remotes.json</code>, a model on api.oaica.com, a running <code>oaica serve</code> (<code>name:local</code>), or anything your local Ollama daemon has pulled.</p>
 
 <h2>Inside the interactive session</h2>
 <table>

@@ -3551,6 +3551,12 @@ func TestLaunchIntegration_ClaudeModelOverrideSkipsSelector(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/show":
+			// like a real daemon: known once pulled (the launcher's endpoint
+			// resolver probes /api/show after the pull, see tier_routing.go)
+			if pullCalled {
+				fmt.Fprint(w, `{"modelfile":""}`)
+				return
+			}
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprint(w, `{"error":"model not found"}`)
 		case "/api/pull":
