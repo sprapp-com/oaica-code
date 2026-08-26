@@ -13,7 +13,7 @@ into the form.
 | Form field | Answer |
 |---|---|
 | Company | BizTransit Sdn Bhd |
-| Website | https://bcz.com/ |
+| Website | https://oaica.com/ |
 | Email | oaica@sprapp.com |
 | Display name | Oaica |
 | Slug | oaica |
@@ -44,9 +44,9 @@ into the form.
 3. Rotate the gateway key after OpenRouter has it stored, if you handed it
    over any channel other than the form itself (procedure: "Rotating the
    OpenRouter key" in `docs/OPENROUTER_PROVIDER.md`).
-4. Open https://bcz.com/ in a browser: a headless `curl` gets an instant 403
-   (WAF/bot challenge, most likely). If humans get 403 too, put
-   https://oaica.com/ in the Website field instead.
+4. Make sure oaica@sprapp.com is a real, monitored mailbox before
+   submitting — OpenRouter invites it to a Slack Connect channel and the
+   legal pages tell customers to write to it.
 
 ## Verification log (2026-08-26, laptop -> public URL)
 
