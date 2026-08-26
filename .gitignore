@@ -21,3 +21,6 @@ integration/testdata/models/
 .claude/worktrees/
 tools/gateway/oaica-gateway
 tools/katlb/katlb-linux-amd64
+
+# stray gateway binary built at repo root
+/gw

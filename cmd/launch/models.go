@@ -16,6 +16,7 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/config"
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/internal/modelref"
@@ -255,7 +256,7 @@ func ensureCloudAuth(ctx context.Context, client *api.Client, modelList string) 
 
 // showOrPullWithPolicy checks if a model exists and applies the provided missing-model policy.
 //
-// OAICA models never need this: they're served live by the api.sprapp.com
+// OAICA models never need this: they're served live by the api.oaica.com
 // router, not pulled into a local Ollama registry that doesn't exist in
 // this thin-client fork. client.Show() always 404s for them (no local
 // server), which used to fall through into a real pull attempt —
@@ -289,9 +290,23 @@ func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string,
 			return nil
 		}
 
+		// Not a router model, not a user remote, and the local daemon
+		// either doesn't have it (404) or isn't running at all. If the
+		// router REJECTED our credential, that is the actionable cause: a
+		// fresh install with no OAICA_API_KEY used to surface either a raw
+		// "connection refused" or an Ollama registry pull dying with "pull
+		// model manifest: file does not exist", both hiding the real fix.
+		// A router that is merely unreachable still fails open (local
+		// models must keep working offline).
+		if _, rerr := oaicaFetchCloudModelEntries(); isOaicaRouterAuthErr(rerr) {
+			return fmt.Errorf("%q is not a local model, and %s rejected the API key (%w)\nSet OAICA_API_KEY or run `oaica signin`", model, oaicaLaunchHost(), rerr)
+		}
+
 		var statusErr api.StatusError
 		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
-			return err
+			// Transport-level failure: no local daemon is running. Say what
+			// was tried instead of leaking a bare dial error.
+			return fmt.Errorf("%q is not served by %s and no local server answered at %s: %w", model, oaicaLaunchHost(), envconfig.Host(), err)
 		}
 	}
 

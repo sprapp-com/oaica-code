@@ -8,13 +8,13 @@
 #   nat/venv/bin/pip install nvidia-nat nvidia-nat-langchain
 #
 # Requires OAICA_API_KEY to be set (same key oaica-code itself uses) —
-# the sidecar's LLM backend is our own api.sprapp.com router, not a
+# the sidecar's LLM backend is our own api.oaica.com router, not a
 # separate NVIDIA-hosted model.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -z "${OAICA_API_KEY:-}" ]; then
-  echo "OAICA_API_KEY is not set — the sidecar's LLM calls to api.sprapp.com will fail without it." >&2
+  echo "OAICA_API_KEY is not set — the sidecar's LLM calls to api.oaica.com will fail without it." >&2
   exit 1
 fi
 

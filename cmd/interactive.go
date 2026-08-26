@@ -676,7 +676,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 
 		if sb.Len() > 0 && multiline == MultilineNone && oaicaActiveModel != "" {
 			// OAICA thin-client path: bypass Ollama's native chat() entirely,
-			// speak OpenAI-shaped /v1/chat/completions to api.sprapp.com.
+			// speak OpenAI-shaped /v1/chat/completions to api.oaica.com.
 			oaicaHistory = append(oaicaHistory, oaicaChatMessage{Role: "user", Content: sb.String()})
 			reply, err := oaicaChat(oaicaActiveModel, oaicaHistory)
 			if err != nil {

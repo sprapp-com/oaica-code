@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Manual smoke test against the LIVE api.sprapp.com router — not part of the
+// Manual smoke test against the LIVE api.oaica.com router — not part of the
 // normal `go test` suite (network-dependent), run explicitly:
 //
 //	go test ./cmd/ -run TestOaicaClientLiveSmoke -v

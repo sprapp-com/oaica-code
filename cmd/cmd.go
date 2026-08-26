@@ -697,7 +697,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 	}
 	opts.WordWrap = !nowrap
 
-	// OAICA thin-client short-circuit: this fork talks to api.sprapp.com's
+	// OAICA thin-client short-circuit: this fork talks to api.oaica.com's
 	// OpenAI-compatible router, not a local Ollama server (OAICA_FORK_PLAN.md
 	// option 2) — skip Ollama's client.Show()/PullHandler local-model
 	// resolution entirely (it requires 127.0.0.1:11434, which we don't run)
@@ -749,130 +749,10 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		}
 		return nil
 	}
-
-	// Fill out the rest of the options based on information about the
-	// model.
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return err
-	}
-
-	name := args[0]
-	requestedCloud := modelref.HasExplicitCloudSource(name)
-
-	info, err := func() (*api.ShowResponse, error) {
-		showReq := &api.ShowRequest{Name: name}
-		info, err := client.Show(cmd.Context(), showReq)
-		var se api.StatusError
-		if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
-			if requestedCloud {
-				return nil, err
-			}
-			if err := PullHandler(cmd, []string{name}); err != nil {
-				return nil, err
-			}
-			return client.Show(cmd.Context(), &api.ShowRequest{Name: name})
-		}
-		return info, err
-	}()
-	if err != nil {
-		if handleCloudAuthorizationError(err) {
-			return nil
-		}
-		return err
-	}
-
-	ensureCloudStub(cmd.Context(), client, name)
-
-	opts.Think, err = inferThinkingOption(&info.Capabilities, &opts, thinkFlag.Changed)
-	if err != nil {
-		return err
-	}
-
-	audioCapable := slices.Contains(info.Capabilities, model.CapabilityAudio)
-	opts.MultiModal = slices.Contains(info.Capabilities, model.CapabilityVision) || audioCapable
-
-	// TODO: remove the projector info and vision info checks below,
-	// these are left in for backwards compatibility with older servers
-	// that don't have the capabilities field in the model info
-	if len(info.ProjectorInfo) != 0 {
-		opts.MultiModal = true
-	}
-	for k := range info.ModelInfo {
-		if strings.Contains(k, ".vision.") {
-			opts.MultiModal = true
-			break
-		}
-	}
-
-	applyShowResponseToRunOptions(&opts, info)
-
-	// Check if this is an embedding model
-	isEmbeddingModel := slices.Contains(info.Capabilities, model.CapabilityEmbedding)
-
-	// If it's an embedding model, handle embedding generation
-	if isEmbeddingModel {
-		if opts.Prompt == "" {
-			return errors.New("embedding models require input text. Usage: ollama run " + name + " \"your text here\"")
-		}
-
-		// Get embedding-specific flags
-		var truncate *bool
-		if truncateFlag, err := cmd.Flags().GetBool("truncate"); err == nil && cmd.Flags().Changed("truncate") {
-			truncate = &truncateFlag
-		}
-
-		dimensions, err := cmd.Flags().GetInt("dimensions")
-		if err != nil {
-			return err
-		}
-
-		return generateEmbedding(cmd, name, opts.Prompt, opts.KeepAlive, truncate, dimensions)
-	}
-
-	if slices.Contains(info.Capabilities, model.CapabilityImage) {
-		return errors.New("image generation models are not currently supported")
-	}
-
-	if interactive {
-		if err := loadOrUnloadModel(cmd, &opts); err != nil {
-			var sErr api.AuthorizationError
-			if errors.As(err, &sErr) && sErr.StatusCode == http.StatusUnauthorized {
-				fmt.Printf("You need to be signed in to Ollama to run Cloud models.\n\n")
-
-				if sErr.SigninURL != "" {
-					fmt.Printf(ConnectInstructions, sErr.SigninURL)
-				}
-				return nil
-			}
-			return err
-		}
-
-		for _, msg := range info.Messages {
-			switch msg.Role {
-			case "user":
-				fmt.Printf(">>> %s\n", msg.Content)
-			case "assistant":
-				state := &displayResponseState{}
-				displayResponse(msg.Content, opts.WordWrap, state)
-				fmt.Println()
-				fmt.Println()
-			}
-		}
-
-		return generateInteractive(cmd, opts)
-	}
-	if err := generate(cmd, opts); err != nil {
-		if handleCloudAuthorizationError(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 // SigninHandler prompts for an OAICA_API_KEY (the client-facing key the
-// api.sprapp.com router requires — separate from ADMIN_KEY / provider
+// api.oaica.com router requires — separate from ADMIN_KEY / provider
 // registration, see cmd/oaica_client.go and the authCmd family below) and
 // persists it to disk so it doesn't need to be exported every session.
 // Rewritten from upstream Ollama's ollama.com OAuth-signin flow, which
@@ -917,7 +797,7 @@ func signinOAICA() error {
 // existing auth.json) and an "add a new opencode provider" entry, returning
 // "" for OAICA and the chosen provider id for opencode.
 func chooseSigninProvider() (string, error) {
-	items := []launch.SelectionItem{{Name: "OAICA", Description: "api.sprapp.com router key"}}
+	items := []launch.SelectionItem{{Name: "OAICA", Description: "api.oaica.com router key"}}
 	for _, name := range launch.OpencodeKnownProviders() {
 		items = append(items, launch.SelectionItem{Name: "opencode: " + name, Description: "opencode provider credential"})
 	}
@@ -996,7 +876,7 @@ func oaicaInteractiveSignin() (bool, error) {
 		return false, nil
 	}
 
-	fmt.Print("Enter your OAICA API key (from api.sprapp.com): ")
+	fmt.Print("Enter your OAICA API key (from api.oaica.com): ")
 	reader := bufio.NewReader(os.Stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -2272,7 +2152,7 @@ func NewCLI() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		// NOT checkServerHeartbeat — that pings a local Ollama server
 		// (127.0.0.1:11434) this thin-client fork doesn't run. PullHandler
-		// talks to api.sprapp.com's /v1/manifest + /v1/pull instead.
+		// talks to api.oaica.com's /v1/manifest + /v1/pull instead.
 		RunE: PullHandler,
 	}
 
@@ -2371,7 +2251,7 @@ func NewCLI() *cobra.Command {
 	}
 
 	// authCmd — opencode-style provider credential management for the
-	// api.sprapp.com router's hot-reloadable KV provider registry. Distinct
+	// api.oaica.com router's hot-reloadable KV provider registry. Distinct
 	// from signinCmd/loginCmd above (those are OAICA's own OAICA_API_KEY
 	// flow — SigninHandler/SignoutHandler, rewritten from ollama.com's OAuth
 	// sign-in, which this fork never uses). Requires OAICA_ADMIN_KEY, NOT
@@ -2448,7 +2328,7 @@ func NewCLI() *cobra.Command {
 
 	authCmd := &cobra.Command{
 		Use:   "auth",
-		Short: "Manage provider backends on the api.sprapp.com router (requires OAICA_ADMIN_KEY)",
+		Short: "Manage provider backends on the api.oaica.com router (requires OAICA_ADMIN_KEY)",
 	}
 	authCmd.AddCommand(authLoginCmd, authListCmd, authLogoutCmd)
 

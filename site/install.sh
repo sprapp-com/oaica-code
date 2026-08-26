@@ -77,7 +77,7 @@ fi
 ###########################################
 
 if [ "$OS" = "Darwin" ]; then
-    # OAICA is a thin CLI (talks to api.sprapp.com — OAICA_FORK_PLAN.md
+    # OAICA is a thin CLI (talks to api.oaica.com — OAICA_FORK_PLAN.md
     # option 2), not a GUI desktop app, so unlike upstream Ollama this
     # ships a plain binary in a zip, not an OAICA.app bundle.
     NEEDS=$(require curl unzip)
@@ -201,11 +201,11 @@ if [ "$OAICA_INSTALL_DIR/bin/oaica" != "$BINDIR/oaica" ] ; then
 fi
 
 
-# OAICA is a thin CLI (talks to api.sprapp.com — OAICA_FORK_PLAN.md
+# OAICA is a thin CLI (talks to api.oaica.com — OAICA_FORK_PLAN.md
 # option 2). No local inference server ever runs here, so — unlike
 # upstream Ollama, which this installer was forked from — there is
 # nothing to systemd-service-ify and no local GPU driver to install.
-# The only prerequisite is a working network path to api.sprapp.com.
+# The only prerequisite is a working network path to api.oaica.com.
 status "Install complete. Run 'oaica' from the command line."
 status "Set OAICA_API_KEY before your first run: export OAICA_API_KEY=<your-key>"
 

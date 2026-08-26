@@ -2,7 +2,7 @@ package cmd
 
 // oaica_pull_serve.go — ollama-style `oaica pull <model>` / `oaica serve
 // <model>` for true local self-hosting, distinct from `oaica run` (which
-// stays a thin client to api.sprapp.com — unchanged). Talks to the router's
+// stays a thin client to api.oaica.com — unchanged). Talks to the router's
 // /v1/manifest and /v1/pull endpoints (prism-api-router/src/index.ts),
 // which stream the GGUF directly through the Worker rather than issuing a
 // presigned URL — same reasoning here: the license key is checked once at

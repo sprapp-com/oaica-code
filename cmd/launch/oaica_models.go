@@ -1,7 +1,7 @@
 package launch
 
 // oaica_models.go — fetches the REAL live model roster from the OAICA
-// router (api.sprapp.com) for the launch/picker flow (`oaica launch
+// router (api.oaica.com) for the launch/picker flow (`oaica launch
 // claude`, etc). The rest of this package (recommendations(),
 // modelInventory) defaults to Ollama's native local-server/cloud-catalog
 // APIs, which don't exist in this thin-client fork — that surfaced as the
@@ -12,6 +12,7 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +28,7 @@ func oaicaLaunchHost() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_HOST")); h != "" {
 		return strings.TrimRight(h, "/")
 	}
-	return "https://api.sprapp.com"
+	return "https://api.oaica.com"
 }
 
 // oaicaLocalServersRegistryEntry mirrors cmd/oaica_pull_serve.go's
@@ -204,11 +205,31 @@ func oaicaLiveModelEntries() []oaicaModelEntry {
 // comes up empty.
 // oaicaFetchCloudModelEntries is a package var so tests can replace the
 // network call. Every launch-path test previously reached the REAL router
-// (api.sprapp.com, or whatever OAICA_HOST pointed at) and either polluted
+// (api.oaica.com, or whatever OAICA_HOST pointed at) and either polluted
 // the picker with live production models or failed outright when the host
 // was unreachable -- 9 tests were red for exactly this reason. Tests that
 // want a router stub set this; the default hits the network.
 var oaicaFetchCloudModelEntries = oaicaFetchCloudModelEntriesLive
+
+// oaicaRouterError is a non-2xx answer from the router's /v1/models. It is
+// typed so callers can tell "your key is wrong" (401/403 — the user must
+// act) apart from "router unreachable" (fail open to local models).
+type oaicaRouterError struct {
+	Status int
+	Host   string
+	Body   string
+}
+
+func (e *oaicaRouterError) Error() string {
+	return fmt.Sprintf("HTTP %d from %s: %s", e.Status, e.Host, e.Body)
+}
+
+// isOaicaRouterAuthErr reports whether err is the router rejecting the
+// credential (missing or invalid OAICA_API_KEY).
+func isOaicaRouterAuthErr(err error) bool {
+	var re *oaicaRouterError
+	return errors.As(err, &re) && (re.Status == http.StatusUnauthorized || re.Status == http.StatusForbidden)
+}
 
 func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
@@ -224,7 +245,7 @@ func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, oaicaLaunchHost(), strings.TrimSpace(string(body)))
+		return nil, &oaicaRouterError{Status: resp.StatusCode, Host: oaicaLaunchHost(), Body: strings.TrimSpace(string(body))}
 	}
 	var list struct {
 		Data []struct {

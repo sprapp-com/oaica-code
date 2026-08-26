@@ -5,7 +5,7 @@ package launch
 // Anyone running their own box (llama-server, prism_server, vLLM, an OpenAI
 // gateway) can list it in ~/.oaica/remotes.json and have its models appear in
 // the SAME picker as local and OAICA-hosted ones. Nothing routes through
-// api.sprapp.com, which is a convenience router, not a licence gate — see
+// api.oaica.com, which is a convenience router, not a licence gate — see
 // docs/architecture/PER_MODEL_ROUTING.md for per-model wire routing.
 //
 //	{

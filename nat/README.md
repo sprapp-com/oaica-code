@@ -3,7 +3,7 @@
 Gives oaica-code's `/agent <task>` command real tool-calling via [NVIDIA
 NeMo Agent Toolkit](https://github.com/NVIDIA/NeMo-Agent-Toolkit)
 (`nvidia-nat`, formerly AIQ Toolkit). The agent's LLM backend is our own
-`api.sprapp.com` router (model `flashplan`) — this sidecar adds the
+`api.oaica.com` router (model `flashplan`) — this sidecar adds the
 ReAct tool-loop on top, it does not add a new model.
 
 ## Setup (one-time)

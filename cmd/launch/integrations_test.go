@@ -948,6 +948,7 @@ func TestShowOrPullWithPolicy_ModelExists(t *testing.T) {
 }
 
 func TestShowOrPullWithPolicy_ModelNotFound_FailDoesNotPromptOrPull(t *testing.T) {
+	stubCloudFetch(t, nil, errors.New("router unreachable (test stub: this test covers the local pull path)"))
 	oldHook := DefaultConfirmPrompt
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {
 		t.Fatal("confirm prompt should not be called with fail policy")
@@ -987,6 +988,7 @@ func TestShowOrPullWithPolicy_ModelNotFound_FailDoesNotPromptOrPull(t *testing.T
 }
 
 func TestShowOrPullWithPolicy_ModelNotFound_PromptPolicyPulls(t *testing.T) {
+	stubCloudFetch(t, nil, errors.New("router unreachable (test stub: this test covers the local pull path)"))
 	oldHook := DefaultConfirmPrompt
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {
 		if !strings.Contains(prompt, "missing-model") {
@@ -1025,6 +1027,7 @@ func TestShowOrPullWithPolicy_ModelNotFound_PromptPolicyPulls(t *testing.T) {
 }
 
 func TestShowOrPullWithPolicy_ModelNotFound_AutoPullPolicyPullsWithoutPrompt(t *testing.T) {
+	stubCloudFetch(t, nil, errors.New("router unreachable (test stub: this test covers the local pull path)"))
 	oldHook := DefaultConfirmPrompt
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {
 		t.Fatalf("confirm prompt should not be called with auto-pull policy: %q", prompt)
@@ -1240,6 +1243,7 @@ func TestShowOrPull_ShowCalledWithCorrectModel(t *testing.T) {
 }
 
 func TestShowOrPull_ModelNotFound_ConfirmYes_Pulls(t *testing.T) {
+	stubCloudFetch(t, nil, errors.New("router unreachable (test stub: this test covers the local pull path)"))
 	// Set up hook so confirmPrompt doesn't need a terminal
 	oldHook := DefaultConfirmPrompt
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {

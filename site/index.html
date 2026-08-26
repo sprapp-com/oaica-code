@@ -27,7 +27,7 @@ th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(1
 </head>
 <body>
 <h1>OAICA</h1>
-<p>A terminal AI CLI (fork of Ollama's client) backed by our own API. No local GPU or model download required — every request goes to <code>api.sprapp.com</code>, which routes to whichever GPU box is currently serving the model you asked for.</p>
+<p>A terminal AI CLI (fork of Ollama's client) backed by our own API. No local GPU or model download required — every request goes to <code>api.oaica.com</code>, which routes to whichever GPU box is currently serving the model you asked for.</p>
 
 <h2>Install</h2>
 <p><strong>macOS / Linux</strong></p>
@@ -51,7 +51,7 @@ $env:OAICA_UNINSTALL=1; irm https://oaica.com/install.ps1 | iex           # Wind
 <p>There's no self-serve signup yet — get a key from whoever manages <code>prism-api-router</code>'s Cloudflare secrets (<code>wrangler secret put API_KEY</code>).</p>
 <p><strong>Recommended: sign in once, it's saved for you</strong> — no need to export anything every session:</p>
 <pre><code>oaica signin
-Enter your OAICA API key (from api.sprapp.com): &lt;paste your key&gt;
+Enter your OAICA API key (from api.oaica.com): &lt;paste your key&gt;
 Verifying...
 Signed in. Key saved — future sessions won't need OAICA_API_KEY set.</code></pre>
 <p class="hint">Saved to <code>~/.oaica/api_key</code> (mode 0600, your user only). <code>oaica signout</code> removes it. An <code>OAICA_API_KEY</code> environment variable, if set, always takes priority over the saved key.</p>
@@ -71,10 +71,10 @@ Available models:
   sfc6-i-compact
 &gt; /model flashplan
 Switched to model 'flashplan'</code></pre>
-<p class="hint">Same list from the shell without opening a session: <code>curl -s https://api.sprapp.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-coder-i-compact</code>.</p>
+<p class="hint">Same list from the shell without opening a session: <code>curl -s https://api.oaica.com/v1/models -H "Authorization: Bearer $OAICA_API_KEY"</code>. Also works piped/non-interactively — <code>printf '/model list\n' | oaica run kat-coder-i-compact</code>.</p>
 
 <h2>Connecting to a specific box (e.g. bitdeer) directly</h2>
-<p>By default <code>oaica</code> talks to <code>api.sprapp.com</code>, which routes to whichever GPU box is currently live. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
+<p>By default <code>oaica</code> talks to <code>api.oaica.com</code>, which routes to whichever GPU box is currently live. To bypass the router and hit a specific backend directly (debugging, or a box not yet registered with the router):</p>
 <pre><code>export OAICA_HOST=http://&lt;bitdeer-host&gt;:&lt;port&gt;   # e.g. the bitdeer tunnel URL for a model's port
 oaica run kat-coder-i-compact</code></pre>
 <p class="hint">Direct-to-box mode usually has no auth of its own (the router is what enforces <code>OAICA_API_KEY</code>) — only point at a box you trust on a network you trust.</p>
@@ -118,7 +118,7 @@ Per-request LoRA disabled for this session.</code></pre>
 <p class="hint"><strong>Stacked LoRA</strong> composes multiple adapters in one request (e.g. a fitness adapter + a nutrition adapter together) — real weighted composition, verified to produce a blended response distinct from either adapter alone. All stacked adapters must share the same backend model (they need to already be loaded together on one server via multiple <code>--lora</code> flags at launch — this is a private/local-deployment feature, not something the CLI provisions on the fly). Adapters can be toggled/scaled/stacked freely at runtime; loading a brand-new adapter file not already on the server requires a restart — that's a real llama.cpp limitation, not ours.</p>
 
 <h2>Calling the API directly (curl, any language)</h2>
-<pre><code>curl -X POST https://api.sprapp.com/v1/chat/completions \
+<pre><code>curl -X POST https://api.oaica.com/v1/chat/completions \
   -H "Authorization: Bearer $OAICA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"flashplan","messages":[{"role":"user","content":"..."}],"max_tokens":256}'</code></pre>

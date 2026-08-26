@@ -1,6 +1,6 @@
 package cmd
 
-// oaica_client.go — minimal OpenAI-compatible client for the api.sprapp.com
+// oaica_client.go — minimal OpenAI-compatible client for the api.oaica.com
 // router, used by the `/model` interactive command. Deliberately separate
 // from api.Client (Ollama's native /api/generate protocol, a different wire
 // shape) — this fork's chosen architecture (OAICA_FORK_PLAN.md, option 2) is
@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const oaicaDefaultHost = "https://api.sprapp.com"
+const oaicaDefaultHost = "https://api.oaica.com"
 
 func oaicaHost() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_HOST")); h != "" {
@@ -146,6 +146,9 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, fmt.Errorf("%s rejected the API key (HTTP %d) — set OAICA_API_KEY or run `oaica signin`", oaicaHost(), resp.StatusCode)
+		}
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	var list oaicaModelList
@@ -566,8 +569,8 @@ func oaicaAuthLogout(name string) error {
 
 // oaicaAgentHost is the NeMo Agent Toolkit sidecar's base URL — a local
 // FastAPI service wrapping a react_agent workflow (see /tmp/nat_workflow.yml
-// on the box this was built on; the sidecar is NOT api.sprapp.com, it's a
-// separate local process that itself calls api.sprapp.com as its LLM
+// on the box this was built on; the sidecar is NOT api.oaica.com, it's a
+// separate local process that itself calls api.oaica.com as its LLM
 // backend). Override via OAICA_AGENT_HOST for a different sidecar address.
 func oaicaAgentHost() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_AGENT_HOST")); h != "" {
