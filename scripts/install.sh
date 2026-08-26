@@ -42,6 +42,118 @@ esac
 VER_PARAM="${OAICA_VERSION:+?version=$OAICA_VERSION}"
 
 ###########################################
+# Download + checksum helpers (macOS and Linux)
+###########################################
+# Every archive is verified against https://oaica.com/download/SHA256SUMS
+# (written by scripts/build_oaica.sh) before it is extracted. Cloudflare Pages
+# once served an HTTP 200 with a truncated body (1.6 MB of 4.9 MB) during a
+# cache fill; that used to surface as a cryptic zstd/tar error. Now a short
+# body or a checksum mismatch is retried up to DOWNLOAD_ATTEMPTS times and
+# then fails with a clear message.
+#
+# scripts/tests/install_checksum_test.sh extracts and exercises the block
+# between the begin/end markers; keep the markers and keep the block
+# self-contained (it may only depend on status/error/warning/available,
+# TEMP_DIR and VER_PARAM).
+# --- download helpers (begin) ---
+DOWNLOAD_ATTEMPTS=3
+
+# Print the SHA-256 hex digest of "$1", or nothing when no tool is available.
+sha256_of() {
+    if available sha256sum; then
+        sha256sum "$1" | cut -d ' ' -f1
+    elif available shasum; then
+        shasum -a 256 "$1" | cut -d ' ' -f1
+    fi
+}
+
+# Print the digest recorded for archive "$2" in the SHA256SUMS file "$1"
+# (lines are "<sha256>  <filename>"). Returns 1 when there is no entry.
+expected_sha256() {
+    local sum name
+    while read -r sum name; do
+        name="${name#\*}"
+        if [ "$name" = "$2" ]; then
+            echo "$sum"
+            return 0
+        fi
+    done < "$1"
+    return 1
+}
+
+# Verify the downloaded archive "$1", published as "$2" under "$3", against
+# "$3/SHA256SUMS". Returns 1 on a mismatch (or an unusable digest in
+# SHA256SUMS) so the caller can retry. When verification is impossible — no
+# sha256 tool, no SHA256SUMS on the server, no entry for this archive — it
+# warns and returns 0 rather than blocking the install.
+verify_archive() {
+    local file="$1" name="$2" url_base="$3"
+    local actual expected
+
+    actual=$(sha256_of "$file")
+    if [ -z "$actual" ]; then
+        warning "Neither sha256sum nor shasum is available; skipping checksum verification of $name"
+        return 0
+    fi
+
+    if ! curl --fail --silent --show-error --location --retry 3 \
+            -o "$TEMP_DIR/SHA256SUMS" "${url_base}/SHA256SUMS${VER_PARAM}"; then
+        warning "Could not download SHA256SUMS; skipping checksum verification of $name"
+        return 0
+    fi
+
+    if ! expected=$(expected_sha256 "$TEMP_DIR/SHA256SUMS" "$name"); then
+        warning "SHA256SUMS has no entry for $name; skipping checksum verification"
+        return 0
+    fi
+
+    case "$expected" in
+        *[!0-9a-fA-F]*|'') expected="<unreadable>" ;;
+    esac
+    if [ "$actual" = "$expected" ]; then
+        status "Checksum OK: $name"
+        return 0
+    fi
+    status "Checksum mismatch for $name: expected $expected, got $actual"
+    return 1
+}
+
+# Download archive "$2" from "$1" to "$3" and verify it. Retries on a failed
+# or short (truncated) transfer and on a checksum mismatch, up to
+# DOWNLOAD_ATTEMPTS attempts, then fails with a clear error.
+fetch_archive() {
+    local url_base="$1" name="$2" dest="$3"
+    local attempt=1 rc reason
+
+    while :; do
+        rm -f "$dest"
+        rc=0
+        curl --fail --show-error --location --progress-bar \
+            -o "$dest" "${url_base}/${name}${VER_PARAM}" || rc=$?
+        if [ "$rc" -eq 0 ] && [ ! -s "$dest" ]; then
+            rc=18
+        fi
+        case "$rc" in
+            0)
+                if verify_archive "$dest" "$name" "$url_base"; then
+                    return 0
+                fi
+                reason="checksum mismatch"
+                ;;
+            18) reason="short body (partial download)" ;; # CURLE_PARTIAL_FILE
+            *) reason="download failed (curl exit $rc)" ;;
+        esac
+
+        if [ "$attempt" -ge "$DOWNLOAD_ATTEMPTS" ]; then
+            error "$reason for $name after $DOWNLOAD_ATTEMPTS attempts. The download from oaica.com is incomplete or corrupt; please re-run the installer."
+        fi
+        attempt=$((attempt + 1))
+        status "$reason, retrying ($attempt/$DOWNLOAD_ATTEMPTS)"
+    done
+}
+# --- download helpers (end) ---
+
+###########################################
 # Uninstall
 ###########################################
 # OAICA_UNINSTALL=1 curl -fsSL https://oaica.com/install.sh | bash
@@ -96,12 +208,11 @@ if [ "$OS" = "Darwin" ]; then
         *) error "Unsupported macOS architecture: $ARCH" ;;
     esac
 
-    DOWNLOAD_URL="https://oaica.com/download/oaica-darwin-${DARWIN_ARCH}.zip${VER_PARAM}"
+    DARWIN_ARCHIVE="oaica-darwin-${DARWIN_ARCH}.zip"
     BINDIR="/usr/local/bin"
 
     status "Downloading OAICA for macOS ($DARWIN_ARCH)..."
-    curl --fail --show-error --location --progress-bar \
-        -o "$TEMP_DIR/oaica-darwin.zip" "$DOWNLOAD_URL"
+    fetch_archive "https://oaica.com/download" "$DARWIN_ARCHIVE" "$TEMP_DIR/oaica-darwin.zip"
 
     status "Installing OAICA to $BINDIR..."
     unzip -q "$TEMP_DIR/oaica-darwin.zip" -d "$TEMP_DIR"
@@ -151,7 +262,9 @@ if [ -n "$NEEDS" ]; then
     exit 1
 fi
 
-# Function to download and extract with fallback from zst to tgz
+# Function to download, verify and extract with fallback from zst to tgz.
+# The archive is downloaded to TEMP_DIR and checked against SHA256SUMS
+# (fetch_archive) before anything is extracted into dest_dir.
 download_and_extract() {
     local url_base="$1"
     local dest_dir="$2"
@@ -168,17 +281,15 @@ download_and_extract() {
         fi
 
         status "Downloading ${filename}.tar.zst"
-        curl --fail --show-error --location --progress-bar \
-            "${url_base}/${filename}.tar.zst${VER_PARAM}" | \
-            zstd -d | $SUDO tar -xf - -C "${dest_dir}"
+        fetch_archive "$url_base" "${filename}.tar.zst" "$TEMP_DIR/${filename}.tar.zst"
+        zstd -dc "$TEMP_DIR/${filename}.tar.zst" | $SUDO tar -xf - -C "${dest_dir}"
         return 0
     fi
 
     # Fall back to .tgz for older versions
     status "Downloading ${filename}.tgz"
-    curl --fail --show-error --location --progress-bar \
-        "${url_base}/${filename}.tgz${VER_PARAM}" | \
-        $SUDO tar -xzf - -C "${dest_dir}"
+    fetch_archive "$url_base" "${filename}.tgz" "$TEMP_DIR/${filename}.tgz"
+    $SUDO tar -xzf - -C "${dest_dir}" < "$TEMP_DIR/${filename}.tgz"
 }
 
 for BINDIR in /usr/local/bin /usr/bin /bin; do
