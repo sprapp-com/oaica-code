@@ -19,7 +19,7 @@ fails with ENOSPC on the full overlay.
 | `/workspace/kat_awq.tokenizer_config.json` | chat_template patch | `kat_awq.tokenizer_config.json` |
 | `/workspace/vllm_awq_watchdog.sh` | fleet watchdog (preflight + restore + backoff) | `vllm_awq_watchdog.sh` |
 | `/workspace/katlb-linux-amd64` + `katlb-kat-awq.json` | LB with chat-aware probe | `../katlb/`, `katlb.json` |
-| `/root/gatekeeper` + `/root/gatekeeper.json` | per-key concurrency tiers | `../gatekeeper/`, `gatekeeper.json` |
+| `/workspace/gatekeeper` + `/workspace/gatekeeper.json` (0600, plaintext keys) | per-key concurrency tiers | `../gatekeeper/`, `gatekeeper.json` |
 | `/workspace/oaica-gateway` + `oaica-gateway.json` | public OpenAI gateway (metering, hashed keys) | `../gateway/`, `gateway.json` |
 | `/workspace/oaica-gateway-ledger.jsonl` | billing ledger (append-only) | -- |
 | `/workspace/*-swap.sh` | detached restart scripts (see gotchas) | -- |
@@ -51,7 +51,7 @@ install -m 0644 kat_awq.tokenizer_config.json /dev/shm/kat_awq/tokenizer_config.
 # 4. start (order matters: replicas -> katlb -> gatekeeper -> gateway)
 nohup /workspace/vllm_awq_watchdog.sh > /workspace/vllm_awq_watchdog.out 2>&1 &
 nohup /workspace/katlb-linux-amd64 -config /workspace/katlb-kat-awq.json > /workspace/katlb.log 2>&1 &
-nohup /root/gatekeeper -config /root/gatekeeper.json > /root/gatekeeper.log 2>&1 &
+nohup /workspace/gatekeeper -config /workspace/gatekeeper.json > /workspace/gatekeeper.log 2>&1 &
 OAICA_GATEWAY_UPSTREAM_KEY=<gatekeeper openrouter key> \
   nohup /workspace/oaica-gateway --config /workspace/oaica-gateway.json > /workspace/oaica-gateway.log 2>&1 &
 ```
@@ -108,9 +108,14 @@ replaced the legacy `/root/katlb_watchdog.sh` loop for katlb, which
 relaunched the OLD binary from `/root` and fought the v2 process
 ("bind: address already in use" in /tmp/katlb.log).
 
-gatekeeper (:30098) is **not yet** migrated onto `stack_watchdog.sh` — it's
-still launched by the legacy `/root/gatekeeper_watchdog.sh` (two instances
-currently running); moving it over is pending. `cloudflared` (the
+gatekeeper (:30098) runs from `/workspace` under `stack_watchdog.sh` since
+2026-08-26; the legacy `/root/gatekeeper_watchdog.sh` loops were stopped and
+the script renamed `.disabled`. The gateway's upstream key (a gatekeeper
+key on the `openrouter` tier) was rotated the same day; rotate again with:
+add the new key to `/workspace/gatekeeper.json` AND `/root/gatekeeper.json`
+(kept in sync) -> `kill -HUP` the :30098 listener -> write it to
+`/workspace/gateway_upstream.key` -> `/workspace/gw-swap.sh` -> remove the
+old key -> HUP again. `cloudflared` (the
 `oaica-api` tunnel, `/workspace/cf/run.sh`) IS supervised since
 2026-08-26: `stack_watchdog.sh` detects it by `pgrep -x cloudflared -a |
 grep -- --token` (other sessions' `--url` quick tunnels are deliberately
@@ -127,9 +132,14 @@ nohup /workspace/vllm_awq_watchdog.sh > /workspace/vllm_awq_watchdog.out 2>&1 &
 nohup /workspace/stack_watchdog.sh    > /workspace/stack_watchdog.out    2>&1 &
 ```
 
-The ledger is pulled to the laptop every 30 min by cron
-(`~/.oaica/ledger-backup/pull.sh`, dated daily copies); the box is the only
-other copy.
+The ledger is rotated monthly on the box (`/workspace/ledger-rotate.sh`,
+cron `5 0 1 * *`: `mv` to `oaica-gateway-ledger.YYYY-MM.jsonl` then `kill
+-HUP` the :8081 listener — the gateway reopens the path on reload) and pulled
+to the laptop every 30 min by cron (`~/.oaica/ledger-backup/pull.sh`, rsync
+of `oaica-gateway-ledger*.jsonl` plus dated daily copies); the box is the
+only other copy. Monthly totals: `jq -s 'map(select(.status==200)) |
+{prompt: map(.prompt_tokens)|add, completion: map(.completion_tokens)|add}'
+oaica-gateway-ledger.2026-09.jsonl`.
 
 Reboots of a rented vast.ai instance also wipe /dev/shm (the weights); the
 vLLM watchdog's preflight re-downloads them from the pinned revision, or

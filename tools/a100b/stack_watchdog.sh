@@ -28,8 +28,11 @@ start_katlb() {
   nohup /workspace/katlb-linux-amd64 -config /workspace/katlb-kat-awq.json >> /workspace/katlb.log 2>&1 < /dev/null &
 }
 start_gatekeeper() {
+  # Since 2026-08-26 gatekeeper lives under /workspace like everything else
+  # (binary 0700, config 0600 with plaintext keys -- gatekeeper does not
+  # hash). The legacy /root/gatekeeper_watchdog.sh loop is disabled.
   log "starting gatekeeper on :30098"
-  ( cd /root && nohup ./gatekeeper -config /root/gatekeeper.json >> /workspace/gatekeeper.log 2>&1 < /dev/null & )
+  nohup /workspace/gatekeeper -config /workspace/gatekeeper.json >> /workspace/gatekeeper.log 2>&1 < /dev/null &
 }
 start_gateway() {
   if [ ! -s "$GW_KEY_FILE" ]; then
