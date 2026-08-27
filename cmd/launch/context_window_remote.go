@@ -84,12 +84,31 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 // withContextWindows probes each distinct upstream route for its real
 // context window and records it on the plan. Never fails: an unreachable or
 // non-enumerating upstream just leaves the fields at 0.
+//
+// The live probe wins when it succeeds — it reflects what's actually
+// running right now, including an emergency downsized config (see the
+// 2026-08-27 GPU2-crowding incident: --max-model-len dropped from 262144
+// to 32768 while a co-tenant held VRAM, and the live probe alone caught
+// that; a static manifest would have kept advertising the old number).
+// The manifest (model_manifest.go) is only the fallback for when nothing
+// answered — cold start, unreachable upstream, or an engine whose /models
+// doesn't report context_length/max_model_len at all.
 func (p *tierPlan) withContextWindows() *tierPlan {
 	p.PrimaryContext = remoteContextWindowFn(p.Routes.Default)
+	if p.PrimaryContext <= 0 {
+		if v, ok := contextWindowFromManifest(p.PrimaryName); ok {
+			p.PrimaryContext = v
+		}
+	}
 	if p.SecondaryName != p.PrimaryName {
 		if r, _ := p.Routes.resolve(p.SecondaryName); r.BaseURL != "" &&
 			r.BaseURL != p.Routes.Default.BaseURL {
 			p.SecondaryContext = remoteContextWindowFn(r)
+		}
+		if p.SecondaryContext <= 0 {
+			if v, ok := contextWindowFromManifest(p.SecondaryName); ok {
+				p.SecondaryContext = v
+			}
 		}
 	}
 	return p
@@ -110,7 +129,13 @@ func (p tierPlan) contextEnvVars() []string {
 	if p.PrimaryContext <= 0 {
 		return nil
 	}
-	usable := p.PrimaryContext - maxOutputTokensReserve
+	reserve := maxOutputTokensReserve
+	if m, err := loadModelManifest(); err == nil {
+		if e, ok := m.Get(p.PrimaryName); ok && e.DefaultMaxOutputTokens > 0 {
+			reserve = e.DefaultMaxOutputTokens
+		}
+	}
+	usable := p.PrimaryContext - reserve
 	if usable <= 0 {
 		usable = p.PrimaryContext
 	}

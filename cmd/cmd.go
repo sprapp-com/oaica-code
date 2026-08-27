@@ -2197,6 +2197,93 @@ func NewCLI() *cobra.Command {
 	serveAnthropicProxyCmd.Flags().String("model", "", "Bare upstream model id to send to the remote (e.g. deepseek-v4-flash)")
 	serveAnthropicProxyCmd.Flags().Int("port", 0, "Port to bind (default: auto-pick a free port)")
 
+	// model — a declared manifest of self-hosted models (arch, quant, real
+	// context window, engine, launch flags) separate from the runtime
+	// ~/.oaica/local_servers.json (is a server up right now) and the live
+	// /models probe (what the running server currently reports). See
+	// cmd/launch/model_manifest.go's doc for why all three exist.
+	modelCmd := &cobra.Command{
+		Use:   "model",
+		Short: "Manage the local model manifest (arch, quant, context window, launch flags)",
+	}
+	modelAddCmd := &cobra.Command{
+		Use:   "add ID",
+		Short: "Add or replace a model manifest entry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			engine, _ := cmd.Flags().GetString("engine")
+			arch, _ := cmd.Flags().GetString("arch")
+			quant, _ := cmd.Flags().GetString("quant")
+			ctxWindow, _ := cmd.Flags().GetInt("context-window")
+			maxOut, _ := cmd.Flags().GetInt("max-output-tokens")
+			gpuMem, _ := cmd.Flags().GetFloat64("gpu-mem-gb")
+			ramGB, _ := cmd.Flags().GetFloat64("ram-gb")
+			flagsRaw, _ := cmd.Flags().GetString("launch-flags")
+			modelPath, _ := cmd.Flags().GetString("model-path")
+			notes, _ := cmd.Flags().GetString("notes")
+			var flags []string
+			if strings.TrimSpace(flagsRaw) != "" {
+				flags = strings.Fields(flagsRaw)
+			}
+			e, err := launch.ModelAdd(launch.ModelAddOptions{
+				ID: args[0], Engine: engine, Arch: arch, Quant: quant,
+				ContextWindow: ctxWindow, DefaultMaxOutputTokens: maxOut,
+				GPUMemGB: gpuMem, RAMGB: ramGB, LaunchFlags: flags,
+				ModelPath: modelPath, Notes: notes,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("added %s (engine=%s, context_window=%d)\n", e.ID, e.Engine, e.ContextWindow)
+			return nil
+		},
+	}
+	modelAddCmd.Flags().String("engine", "", "vllm | llama.cpp | prism-engine | ollama-daemon | user-remote")
+	modelAddCmd.Flags().String("arch", "", "Architecture label (informational, e.g. Qwen3_5MoeForConditionalGeneration)")
+	modelAddCmd.Flags().String("quant", "", "Quantization scheme (e.g. awq-w4a16, gguf-q4_k_m, ternary-1.58bit)")
+	modelAddCmd.Flags().Int("context-window", 0, "Real max context in tokens (e.g. vLLM's --max-model-len)")
+	modelAddCmd.Flags().Int("max-output-tokens", 0, "Output tokens to reserve when computing a safe input budget (0 = use the global default)")
+	modelAddCmd.Flags().Float64("gpu-mem-gb", 0, "Approximate GPU memory footprint")
+	modelAddCmd.Flags().Float64("ram-gb", 0, "Approximate RAM footprint")
+	modelAddCmd.Flags().String("launch-flags", "", "Extra engine launch flags, space-separated, quoted as one string")
+	modelAddCmd.Flags().String("model-path", "", "Local weights path (directory for vLLM/HF, file for llama.cpp/prism-engine)")
+	modelAddCmd.Flags().String("notes", "", "Free-text field notes (why these flags, what broke before, etc.)")
+
+	modelListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List models in the manifest",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.WriteModelList(os.Stdout)
+		},
+	}
+	modelShowCmd := &cobra.Command{
+		Use:   "show ID",
+		Short: "Show full detail for one manifest entry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.WriteModelShow(os.Stdout, args[0])
+		},
+	}
+	modelRemoveCmd := &cobra.Command{
+		Use:     "rm ID",
+		Aliases: []string{"remove"},
+		Short:   "Remove a manifest entry",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			existed, err := launch.ModelRemove(args[0])
+			if err != nil {
+				return err
+			}
+			if !existed {
+				return fmt.Errorf("no manifest entry for %q", args[0])
+			}
+			fmt.Printf("removed %s\n", args[0])
+			return nil
+		},
+	}
+	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd)
+
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
@@ -2402,6 +2489,7 @@ func NewCLI() *cobra.Command {
 		pullCmd,
 		serveCmd,
 		serveAnthropicProxyCmd,
+		modelCmd,
 		pushCmd,
 		signinCmd,
 		loginCmd,
