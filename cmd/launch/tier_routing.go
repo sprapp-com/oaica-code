@@ -194,6 +194,10 @@ type tierPlan struct {
 	Primary       launchEndpoint
 	Secondary     launchEndpoint
 	Routes        proxyRouteTable
+	// Real context windows probed from the upstreams' /models metadata
+	// (context_window_remote.go); 0 = unknown, env stays unset.
+	PrimaryContext   int
+	SecondaryContext int
 }
 
 func routeFor(ep launchEndpoint) proxyRoute {
@@ -318,6 +322,11 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 			env = append(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(l.Context))
 		}
 	}
+	// Probed upstream windows (kat-awq on vLLM: 262144) — same knob the
+	// cloud-alias branch sets, so this must not run for that path twice.
+	if p.PrimaryContext > 0 && !isCloudModelName(p.PrimaryName) {
+		env = append(env, p.contextEnvVars()...)
+	}
 	return env
 }
 
@@ -342,6 +351,13 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	plan, err := buildTierPlan(model, sonnetModel, forceTools)
 	if err != nil {
 		return err
+	}
+	// Real context window from the upstreams' /models metadata (claude.go's
+	// cloud-alias map covers :cloud; this covers user remotes and the
+	// router). Probed here, not in buildTierPlan: unit tests build plans
+	// against fake/unroutable URLs and must not wait on network.
+	if s := plan.Primary.Source; s == sourceUserRemote || s == sourceRouter {
+		plan.withContextWindows()
 	}
 	clientToken, err := newProxyClientToken()
 	if err != nil {

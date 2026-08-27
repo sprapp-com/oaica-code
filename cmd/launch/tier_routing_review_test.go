@@ -306,3 +306,66 @@ func TestProxy_ImagesEmittedAsOpenAIImageURL(t *testing.T) {
 		t.Fatalf("text-only message changed form: %s", b2)
 	}
 }
+
+// Context-window discovery: the launch must tell Claude Code the REAL
+// window from upstream /models metadata instead of letting it assume 200k
+// (kat-awq runs 262144 on vLLM; the CLI warned and compacted early).
+func TestDefaultRemoteContextWindow_ProbesUpstream(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"router context_length", `{"data":[{"id":"kat-awq","context_length":262144}]}`, 262144},
+		{"vllm max_model_len", `{"data":[{"id":"kat-awq","max_model_len":24576}]}`, 24576},
+		{"picks larger of both", `{"data":[{"id":"kat-awq","context_length":262144,"max_model_len":32768}]}`, 262144},
+		{"other id, single entry", `{"data":[{"id":"other","context_length":8192}]}`, 8192},
+		{"no match, several entries", `{"data":[{"id":"a","context_length":8192},{"id":"b","context_length":8192}]}`, 0},
+		{"bad json", `nope`, 0},
+	}
+	for _, tc := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write([]byte(tc.body))
+		}))
+		got := defaultRemoteContextWindow(proxyRoute{BaseURL: srv.URL + "/v1", Key: "k", UpstreamModel: "kat-awq"})
+		srv.Close()
+		if got := got0(got, 0); got != tc.want {
+			t.Errorf("%s: got %d want %d", tc.name, got, tc.want)
+		}
+	}
+	// unreachable upstream -> 0, fast (no hang)
+	if got := defaultRemoteContextWindow(proxyRoute{BaseURL: "http://127.0.0.1:1/v1", UpstreamModel: "x"}); got != 0 {
+		t.Fatalf("unreachable: %d", got)
+	}
+}
+
+func TestEnvVars_ProbedContextWindowSet(t *testing.T) {
+	plan := tierPlan{PrimaryName: "kat-awq", SecondaryName: "kat-awq",
+		PrimaryContext: 262144, Routes: proxyRouteTable{Default: proxyRoute{BaseURL: "http://x/v1"}}}
+	env := plan.envVars("http://127.0.0.1:1", "tok")
+	var maxCtx, compact string
+	for _, kv := range env {
+		if kv == "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
+			maxCtx = kv
+		}
+		if kv == "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144" {
+			compact = kv
+		}
+	}
+	if maxCtx == "" || compact == "" {
+		t.Fatalf("context env missing: %v", env)
+	}
+	// unknown window -> no context env at all
+	plan2 := tierPlan{PrimaryName: "m", Routes: proxyRouteTable{Default: proxyRoute{BaseURL: "http://x/v1"}}}
+	for _, kv := range plan2.envVars("http://127.0.0.1:1", "tok") {
+		if strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") || strings.HasPrefix(kv, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=") {
+			t.Fatalf("unexpected context env without probe: %s", kv)
+		}
+	}
+}
+
+func got0(v, zero int) int { return v }
