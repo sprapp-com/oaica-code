@@ -95,6 +95,14 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 	return p
 }
 
+// maxOutputTokensReserve is Claude Code's fixed max_tokens request (32000,
+// unaffected by how much input is already used). vLLM enforces
+// input+output <= max_model_len, so advertising the raw window lets Claude
+// Code fill it with input right up to the edge and then 400 on the next
+// turn ("...262145 tokens" for a 262144 window, one over). Reserve the
+// output budget up front so auto-compact triggers before that happens.
+const maxOutputTokensReserve = 32000
+
 // contextEnvVars is what Claude Code reads for the real window;
 // AUTO_COMPACT_WINDOW is the older knob our cloud-alias path already used —
 // keep both in sync rather than sending contradictory hints.
@@ -102,7 +110,11 @@ func (p tierPlan) contextEnvVars() []string {
 	if p.PrimaryContext <= 0 {
 		return nil
 	}
-	v := strconv.Itoa(p.PrimaryContext)
+	usable := p.PrimaryContext - maxOutputTokensReserve
+	if usable <= 0 {
+		usable = p.PrimaryContext
+	}
+	v := strconv.Itoa(usable)
 	return []string{
 		"CLAUDE_CODE_MAX_CONTEXT_TOKENS=" + v,
 		"CLAUDE_CODE_AUTO_COMPACT_WINDOW=" + v,

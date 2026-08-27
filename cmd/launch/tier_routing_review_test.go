@@ -349,10 +349,10 @@ func TestEnvVars_ProbedContextWindowSet(t *testing.T) {
 	env := plan.envVars("http://127.0.0.1:1", "tok")
 	var maxCtx, compact string
 	for _, kv := range env {
-		if kv == "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
+		if kv == "CLAUDE_CODE_MAX_CONTEXT_TOKENS=230144" {
 			maxCtx = kv
 		}
-		if kv == "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144" {
+		if kv == "CLAUDE_CODE_AUTO_COMPACT_WINDOW=230144" {
 			compact = kv
 		}
 	}
