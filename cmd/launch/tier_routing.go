@@ -316,6 +316,11 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 		// ours has.
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
 		"CLAUDE_CODE_AUTO_MODE_MODEL=" + p.PrimaryName,
+		// Long-prefill backends (262k ctx on vLLM) can take minutes to first
+		// token on big system prompts. Claude Code's default request timeout
+		// aborts and retries, showing "Waiting for API response · will retry
+		// in Nm · check your network" churn. Give it room instead.
+		"API_TIMEOUT_MS=600000",
 	}
 	if isCloudModelName(p.PrimaryName) {
 		if l, ok := lookupCloudModelLimit(p.PrimaryName); ok {
