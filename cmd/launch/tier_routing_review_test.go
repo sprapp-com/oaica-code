@@ -13,6 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ollama/ollama/anthropic"
+	"github.com/ollama/ollama/api"
 )
 
 func writeLocalRegistry(t *testing.T, entries []oaicaLocalServersRegistryEntry) {
@@ -271,5 +274,35 @@ func TestRedactURL(t *testing.T) {
 	}
 	if got := redactURL("https://api.oaica.com/v1"); got != "https://api.oaica.com/v1" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// Caught on .91 2026-08-27: Claude Code sent image.jpg (Anthropic `image`
+// block → api.Message.Images) but the proxy dropped Images when re-emitting
+// OpenAI messages, so the vision model never saw the file ("I can't visually
+// see what it depicts").
+func TestProxy_ImagesEmittedAsOpenAIImageURL(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n" + "fakepngbytes")
+	chatReq := &api.ChatRequest{Messages: []api.Message{
+		{Role: "user", Content: "what is this?", Images: []api.ImageData{png}},
+	}}
+	out := chatRequestToOpenAI(chatReq, anthropic.MessagesRequest{MaxTokens: 100}, "kat-awq")
+	b, err := json.Marshal(out.Messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"type":"image_url"`) || !strings.Contains(s, `data:image/png;base64,`) {
+		t.Fatalf("image part missing: %s", s)
+	}
+	if !strings.Contains(s, `"type":"text"`) || !strings.Contains(s, "what is this?") {
+		t.Fatalf("text part missing: %s", s)
+	}
+	// a text-only message must stay a plain string
+	chatReq2 := &api.ChatRequest{Messages: []api.Message{{Role: "user", Content: "hi"}}}
+	out2 := chatRequestToOpenAI(chatReq2, anthropic.MessagesRequest{MaxTokens: 10}, "kat-awq")
+	b2, _ := json.Marshal(out2.Messages[0])
+	if strings.Contains(string(b2), "image_url") || !strings.Contains(string(b2), `"content":"hi"`) {
+		t.Fatalf("text-only message changed form: %s", b2)
 	}
 }

@@ -31,6 +31,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,10 +48,58 @@ import (
 
 // openAIMessage is the OpenAI chat-completions wire shape for one message.
 type openAIMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
-	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Role       string             `json:"role"`
+	Content    string             `json:"content,omitempty"`
+	ToolCalls  []openAIToolCall   `json:"tool_calls,omitempty"`
+	ToolCallID string             `json:"tool_call_id,omitempty"`
+	Images     []openAIImageBlock `json:"-"`
+}
+
+// openAIImageBlock is one image in an OpenAI multimodal content array
+// ({"type":"image_url","image_url":{"url":"data:...;base64,..."}}).
+type openAIImageBlock struct {
+	DataURL string `json:"-"`
+}
+
+// MarshalJSON emits multimodal content (text + image_url parts) when the
+// message carries images, and the plain string form otherwise. Claude Code
+// attaches Read-tool screenshots and pasted images as Anthropic `image`
+// blocks; FromMessagesRequest decodes those into api.Message.Images, and the
+// proxy must re-emit them in OpenAI vision format or the upstream model
+// never sees the image (seen on .91 2026-08-27: "I can't visually see what
+// it depicts").
+func (m openAIMessage) MarshalJSON() ([]byte, error) {
+	if len(m.Images) == 0 {
+		type alias openAIMessage
+		return json.Marshal(alias(m))
+	}
+	type alias struct {
+		Role       string             `json:"role"`
+		Content    []openAIContentPart `json:"content"`
+		ToolCalls  []openAIToolCall   `json:"tool_calls,omitempty"`
+		ToolCallID string             `json:"tool_call_id,omitempty"`
+	}
+	parts := make([]openAIContentPart, 0, len(m.Images)+1)
+	if strings.TrimSpace(m.Content) != "" {
+		parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		parts = append(parts, openAIContentPart{
+			Type:     "image_url",
+			ImageURL: &openAIImageURL{URL: img.DataURL},
+		})
+	}
+	return json.Marshal(alias{Role: m.Role, Content: parts, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID})
+}
+
+type openAIContentPart struct {
+	Type     string          `json:"type"` // "text" | "image_url"
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+}
+
+type openAIImageURL struct {
+	URL string `json:"url"`
 }
 
 type openAIToolCall struct {
@@ -205,6 +254,9 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 	// Map messages.
 	for _, m := range chatReq.Messages {
 		om := openAIMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, img := range m.Images {
+			om.Images = append(om.Images, openAIImageBlock{DataURL: imageDataURL(img)})
+		}
 		for _, tc := range m.ToolCalls {
 			om.ToolCalls = append(om.ToolCalls, openAIToolCall{
 				ID:   tc.ID,
@@ -251,6 +303,22 @@ func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 	out := make([]openAIMessage, 0, len(msgs))
 	out = append(out, openAIMessage{Role: "system", Content: strings.Join(system, "\n\n")})
 	return append(out, rest...)
+}
+
+// imageDataURL sniffs the image magic bytes for the data-URL MIME type
+// (api.ImageData carries raw bytes with no type). Defaults to jpeg — vLLM's
+// Qwen3.5 vision preprocessor accepts the common web formats.
+func imageDataURL(img api.ImageData) string {
+	mime := "image/jpeg"
+	switch {
+	case len(img) >= 8 && img[0] == 0x89 && img[1] == 'P' && img[2] == 'N' && img[3] == 'G':
+		mime = "image/png"
+	case len(img) >= 3 && img[0] == 'G' && img[1] == 'I' && img[2] == 'F':
+		mime = "image/gif"
+	case len(img) >= 12 && string(img[0:4]) == "RIFF" && string(img[8:12]) == "WEBP":
+		mime = "image/webp"
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img)
 }
 
 // toFloat64 coerces numeric-ish values from the Options map.
