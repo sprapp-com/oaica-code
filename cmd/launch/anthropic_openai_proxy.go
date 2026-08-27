@@ -586,6 +586,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// With a routing table (tier_routing.go) the id also selects WHICH
 		// upstream: primary and --sonnet-model can be different backends.
 		route, reqModel := table.resolve(anthReq.Model)
+
+		// Off by default (see entitlement.go) — a hook point for a future
+		// license/entitlement product decision, not one made here.
+		if allowed, reason := checkEntitlement(r, route.Label, reqModel); !allowed {
+			writeAnthropicError(w, http.StatusForbidden, reason)
+			return
+		}
+
 		started := time.Now()
 
 		oaiReq := chatRequestToOpenAI(chatReq, anthReq, reqModel)
