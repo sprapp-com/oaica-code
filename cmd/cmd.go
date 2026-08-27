@@ -2594,6 +2594,7 @@ func NewCLI() *cobra.Command {
 		serveAnthropicProxyCmd,
 		modelCmd,
 		planCmd,
+		gpuCleanCmd(),
 		pushCmd,
 		signinCmd,
 		loginCmd,
