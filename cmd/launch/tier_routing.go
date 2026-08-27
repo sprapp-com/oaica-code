@@ -340,7 +340,16 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
+	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
+
+	if planName != "" {
+		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
+		if err != nil {
+			return fmt.Errorf("--plan: %w", err)
+		}
+		model, sonnetModel = resolvedModel, resolvedSonnet
+	}
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
 		// briefModeSystemPrompt's doc for why this exact wording and why

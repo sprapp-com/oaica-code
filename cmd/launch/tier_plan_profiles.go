@@ -1,0 +1,212 @@
+package launch
+
+// tier_plan_profiles.go — named tier profiles ("plans"): one flag,
+// `--plan <name>`, resolves to a full opus/sonnet split the same way
+// `--model X --sonnet-model Y` already does, without the caller needing to
+// remember or type both model ids every launch. This is the "own
+// /opusplan" the product needs: Claude Code's own --model opusplan picks
+// (Opus, Sonnet) from Anthropic's catalog by a fixed name; a plan here
+// picks (PrimaryModel, SonnetModel) from OUR catalog (self-hosted OAICA
+// SKUs, user remotes, or router models) by a name we define.
+//
+// Plans live at ~/.oaica/plans.json, same directory/atomic-write
+// convention as model_manifest.go's models.json, kept in a separate file
+// because a plan is a preference (which models to send opus/sonnet-tier
+// requests to) and a manifest entry is a fact (what a model actually is)
+// — mixing them would force "add a model" and "define a plan" into one
+// error-prone edit.
+//
+// Resolution happens entirely in extractPlanFlag, upstream of
+// buildTierPlan: a plan is just a named shortcut for --model/--sonnet-model,
+// so every downstream mechanism (proxy routing, tool-format gating, context
+// probing) is reused unchanged — no new code path to keep in sync.
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// TierPlanProfile is one named plan: which model serves Opus/Haiku-tier
+// requests, and (optionally) which model serves Sonnet/subagent-tier
+// requests. Empty SonnetModel means "same as Model", matching
+// buildTierPlan's own default when --sonnet-model is omitted.
+type TierPlanProfile struct {
+	Model       string `json:"model"`
+	SonnetModel string `json:"sonnet_model,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type tierPlanProfiles struct {
+	Version  int                         `json:"version"`
+	Profiles map[string]TierPlanProfile `json:"profiles"`
+}
+
+const tierPlanProfilesVersion = 1
+
+func tierPlanProfilesPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica", "plans.json"), nil
+}
+
+// TierPlanProfilesPath is the exported form of tierPlanProfilesPath, for
+// cmd/cmd.go's CLI to print in "no plans defined" messages.
+func TierPlanProfilesPath() (string, error) {
+	return tierPlanProfilesPath()
+}
+
+func loadTierPlanProfiles() (*tierPlanProfiles, error) {
+	path, err := tierPlanProfilesPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &tierPlanProfiles{Version: tierPlanProfilesVersion, Profiles: map[string]TierPlanProfile{}}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var p tierPlanProfiles
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if p.Profiles == nil {
+		p.Profiles = map[string]TierPlanProfile{}
+	}
+	return &p, nil
+}
+
+func (p *tierPlanProfiles) save() error {
+	path, err := tierPlanProfilesPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if p.Version == 0 {
+		p.Version = tierPlanProfilesVersion
+	}
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// PlanSet creates or replaces a named plan.
+func PlanSet(name string, profile TierPlanProfile) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("plan name is required")
+	}
+	if strings.TrimSpace(profile.Model) == "" {
+		return errors.New("--model is required")
+	}
+	p, err := loadTierPlanProfiles()
+	if err != nil {
+		return err
+	}
+	if p.Profiles == nil {
+		p.Profiles = map[string]TierPlanProfile{}
+	}
+	p.Profiles[name] = profile
+	return p.save()
+}
+
+// PlanRemove deletes a named plan, reporting whether it existed.
+func PlanRemove(name string) (bool, error) {
+	p, err := loadTierPlanProfiles()
+	if err != nil {
+		return false, err
+	}
+	if _, ok := p.Profiles[name]; !ok {
+		return false, nil
+	}
+	delete(p.Profiles, name)
+	return true, p.save()
+}
+
+// PlanGet resolves a named plan, or an error naming the plans file if not found.
+func PlanGet(name string) (TierPlanProfile, error) {
+	p, err := loadTierPlanProfiles()
+	if err != nil {
+		return TierPlanProfile{}, err
+	}
+	prof, ok := p.Profiles[name]
+	if !ok {
+		path, _ := tierPlanProfilesPath()
+		return TierPlanProfile{}, fmt.Errorf("no plan named %q in %s — create one with `oaica plan set %s --model <id>`", name, path, name)
+	}
+	return prof, nil
+}
+
+// PlanSortedNames returns plan names in stable alphabetical order.
+func PlanSortedNames() ([]string, error) {
+	p, err := loadTierPlanProfiles()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(p.Profiles))
+	for n := range p.Profiles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// extractPlanFlag pulls a launcher-level "--plan <name>" (or "--plan=<name>")
+// out of the passthrough args, same convention as extractSonnetModel. Not
+// forwarded to the child claude binary.
+func extractPlanFlag(args []string) (plan string, rest []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--plan" && i+1 < len(args):
+			plan = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--plan="):
+			plan = strings.TrimPrefix(a, "--plan=")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return plan, rest
+}
+
+// resolvePlanModels turns a --plan name into (model, sonnetModel), applying
+// it over whatever --model/--sonnet-model already resolved to. An explicit
+// --model always wins over a plan's Model (an explicit flag is a stronger
+// signal than a stored default) — but if the caller passed no model at all
+// (model == ""), the plan supplies one. --sonnet-model, if explicitly
+// passed, always wins over the plan's SonnetModel the same way.
+func resolvePlanModels(planName, model, sonnetModel string) (resolvedModel, resolvedSonnet string, err error) {
+	if planName == "" {
+		return model, sonnetModel, nil
+	}
+	prof, err := PlanGet(planName)
+	if err != nil {
+		return "", "", err
+	}
+	resolvedModel = model
+	if resolvedModel == "" {
+		resolvedModel = prof.Model
+	}
+	resolvedSonnet = sonnetModel
+	if resolvedSonnet == "" {
+		resolvedSonnet = prof.SonnetModel
+	}
+	return resolvedModel, resolvedSonnet, nil
+}

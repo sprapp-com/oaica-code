@@ -2284,6 +2284,109 @@ func NewCLI() *cobra.Command {
 	}
 	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd)
 
+	// plan — named opus/sonnet tier splits ("our own /opusplan"). Resolved
+	// by cmd/launch/tier_plan_profiles.go's extractPlanFlag inside
+	// `oaica launch claude --plan NAME`, upstream of buildTierPlan, so it's
+	// a pure convenience over --model/--sonnet-model — no new routing path.
+	orDashStr := func(s, fallback string) string {
+		if s == "" {
+			return fallback
+		}
+		return s
+	}
+	planCmd := &cobra.Command{
+		Use:   "plan",
+		Short: "Manage named tier plans (opus/sonnet model splits) for `oaica launch claude --plan NAME`",
+	}
+	planSetCmd := &cobra.Command{
+		Use:   "set NAME",
+		Short: "Create or replace a tier plan",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			model, _ := cmd.Flags().GetString("model")
+			sonnetModel, _ := cmd.Flags().GetString("sonnet-model")
+			desc, _ := cmd.Flags().GetString("description")
+			if err := launch.PlanSet(args[0], launch.TierPlanProfile{
+				Model: model, SonnetModel: sonnetModel, Description: desc,
+			}); err != nil {
+				return err
+			}
+			fmt.Printf("plan %q: opus/haiku -> %s", args[0], model)
+			if sonnetModel != "" {
+				fmt.Printf(", sonnet/subagents -> %s", sonnetModel)
+			}
+			fmt.Println()
+			return nil
+		},
+	}
+	planSetCmd.Flags().String("model", "", "Model for Opus/Haiku-tier requests (required)")
+	planSetCmd.Flags().String("sonnet-model", "", "Model for Sonnet/subagent-tier requests (default: same as --model)")
+	planSetCmd.Flags().String("description", "", "Free-text description shown in `oaica plan list`")
+
+	planListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List tier plans",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			names, err := launch.PlanSortedNames()
+			if err != nil {
+				return err
+			}
+			if len(names) == 0 {
+				path, _ := launch.TierPlanProfilesPath()
+				fmt.Printf("No plans defined (%s).\nCreate one with `oaica plan set <name> --model <id>`\n", path)
+				return nil
+			}
+			fmt.Printf("%-20s %-24s %-24s %s\n", "NAME", "OPUS/HAIKU", "SONNET", "DESCRIPTION")
+			for _, n := range names {
+				prof, err := launch.PlanGet(n)
+				if err != nil {
+					return err
+				}
+				sonnet := prof.SonnetModel
+				if sonnet == "" {
+					sonnet = "(same)"
+				}
+				fmt.Printf("%-20s %-24s %-24s %s\n", n, prof.Model, sonnet, prof.Description)
+			}
+			return nil
+		},
+	}
+	planShowCmd := &cobra.Command{
+		Use:   "show NAME",
+		Short: "Show one tier plan",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			prof, err := launch.PlanGet(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Printf("name:         %s\n", args[0])
+			fmt.Printf("model:        %s\n", prof.Model)
+			fmt.Printf("sonnet_model: %s\n", orDashStr(prof.SonnetModel, "(same as model)"))
+			fmt.Printf("description:  %s\n", orDashStr(prof.Description, "-"))
+			return nil
+		},
+	}
+	planRemoveCmd := &cobra.Command{
+		Use:     "rm NAME",
+		Aliases: []string{"remove"},
+		Short:   "Remove a tier plan",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			existed, err := launch.PlanRemove(args[0])
+			if err != nil {
+				return err
+			}
+			if !existed {
+				return fmt.Errorf("no plan named %q", args[0])
+			}
+			fmt.Printf("removed plan %q\n", args[0])
+			return nil
+		},
+	}
+	planCmd.AddCommand(planSetCmd, planListCmd, planShowCmd, planRemoveCmd)
+
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
@@ -2490,6 +2593,7 @@ func NewCLI() *cobra.Command {
 		serveCmd,
 		serveAnthropicProxyCmd,
 		modelCmd,
+		planCmd,
 		pushCmd,
 		signinCmd,
 		loginCmd,
