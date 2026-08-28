@@ -5,7 +5,31 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/ollama/ollama/cmd/launch"
 )
+
+func TestConvertItems_PropagatesRemote(t *testing.T) {
+	out := ConvertItems([]launch.SelectionItem{
+		{Name: "ollama/glm-5.3-flash", Remote: true},
+		{Name: "my-local-model", Local: true},
+		{Name: "router-model", Recommended: true},
+	})
+	if len(out) != 3 {
+		t.Fatalf("got %d items, want 3", len(out))
+	}
+	if !out[0].Remote {
+		t.Error("ollama/glm-5.3-flash: Remote should be true")
+	}
+	if out[0].Local {
+		t.Error("ollama/glm-5.3-flash: Local should be false")
+	}
+	if !out[1].Local || out[1].Remote {
+		t.Errorf("my-local-model: got Local=%v Remote=%v, want Local=true Remote=false", out[1].Local, out[1].Remote)
+	}
+	if out[2].Remote || out[2].Local {
+		t.Errorf("router-model: got Local=%v Remote=%v, want both false", out[2].Local, out[2].Remote)
+	}
+}
 
 func items(names ...string) []SelectItem {
 	var out []SelectItem
@@ -266,6 +290,97 @@ func TestRenderContent_SectionHeaders(t *testing.T) {
 	}
 	if !strings.Contains(content, "More") {
 		t.Error("should contain 'More' header")
+	}
+}
+
+func TestRenderContent_RemoteSectionHeader(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "opencode-go/glm-5.3", Remote: true},
+			{Name: "rec-a", Recommended: true},
+			{Name: "other-1"},
+		},
+	}
+	content := m.renderContent()
+
+	if !strings.Contains(content, "Remote Models") {
+		t.Error("should contain 'Remote Models' header when an item has Remote: true")
+	}
+	// Local Models only renders when a Local item is present — none here.
+	if strings.Contains(content, "Local Models") {
+		t.Error("should not contain 'Local Models' header when no item has Local: true")
+	}
+}
+
+func TestRenderContent_LocalAndRemoteSectionsBothPresent(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "my-local-model", Local: true},
+			{Name: "opencode-go/glm-5.3", Remote: true},
+			{Name: "rec-a", Recommended: true},
+		},
+	}
+	content := m.renderContent()
+
+	if !strings.Contains(content, "Local Models") {
+		t.Error("should contain 'Local Models' header")
+	}
+	if !strings.Contains(content, "Remote Models") {
+		t.Error("should contain 'Remote Models' header")
+	}
+	localIdx := strings.Index(content, "Local Models")
+	remoteIdx := strings.Index(content, "Remote Models")
+	recIdx := strings.Index(content, "Recommended")
+	if !(localIdx < remoteIdx && remoteIdx < recIdx) {
+		t.Errorf("expected section order Local < Remote < Recommended, got Local=%d Remote=%d Recommended=%d", localIdx, remoteIdx, recIdx)
+	}
+}
+
+func TestRenderContent_RemoteSectionSortsAggregatorsFirst(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "my-custom-remote/model-a", Remote: true},
+			{Name: "openrouter/anthropic/claude-sonnet-4", Remote: true},
+			{Name: "another-remote/model-b", Remote: true},
+			{Name: "ollama/glm-5.3-flash", Remote: true},
+		},
+	}
+	content := m.renderContent()
+
+	ollamaIdx := strings.Index(content, "ollama/glm-5.3-flash")
+	openrouterIdx := strings.Index(content, "openrouter/anthropic/claude-sonnet-4")
+	customIdx := strings.Index(content, "my-custom-remote/model-a")
+	otherIdx := strings.Index(content, "another-remote/model-b")
+
+	if ollamaIdx == -1 || openrouterIdx == -1 || customIdx == -1 || otherIdx == -1 {
+		t.Fatalf("expected all 4 remote items rendered, got: %q", content)
+	}
+	if !(ollamaIdx < customIdx && ollamaIdx < otherIdx) {
+		t.Errorf("expected ollama/ to sort before non-aggregator remotes, got ollama=%d custom=%d other=%d", ollamaIdx, customIdx, otherIdx)
+	}
+	if !(openrouterIdx < customIdx && openrouterIdx < otherIdx) {
+		t.Errorf("expected openrouter/ to sort before non-aggregator remotes, got openrouter=%d custom=%d other=%d", openrouterIdx, customIdx, otherIdx)
+	}
+}
+
+func TestIsBuiltinAggregatorProvider(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"ollama/glm-5.3-flash", true},
+		{"openrouter/anthropic/claude-sonnet-4", true},
+		{"opencode-go/glm-5.3", false},
+		{"deepseek-v4-flash", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isBuiltinAggregatorProvider(c.name); got != c.want {
+			t.Errorf("isBuiltinAggregatorProvider(%q) = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
@@ -666,6 +781,18 @@ func TestMultiView_SectionHeaders(t *testing.T) {
 	}
 	if !strings.Contains(content, "More") {
 		t.Error("should contain 'More' header")
+	}
+}
+
+func TestMultiView_RemoteSectionHeader(t *testing.T) {
+	m := newMultiSelectorModel("Pick:", []SelectItem{
+		{Name: "ollama/glm-5.3-flash", Remote: true},
+		{Name: "rec-a", Recommended: true},
+	}, nil)
+	content := m.View()
+
+	if !strings.Contains(content, "Remote Models") {
+		t.Error("should contain 'Remote Models' header when an item has Remote: true")
 	}
 }
 

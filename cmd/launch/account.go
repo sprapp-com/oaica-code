@@ -141,6 +141,7 @@ func ApplyAccountStateToSelectionItems(items []ModelItem, state AccountState) []
 			Description:       item.Description,
 			Recommended:       item.Recommended,
 			Local:             item.Local,
+			Remote:            item.Remote,
 			AvailabilityBadge: availabilityBadge(item, state),
 		}
 	}

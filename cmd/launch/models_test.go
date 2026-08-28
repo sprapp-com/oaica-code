@@ -49,6 +49,25 @@ func TestBuildModelList_UsesInventoryMetadataForInstalledModels(t *testing.T) {
 	}
 }
 
+func TestBuildModelList_PropagatesRemoteFromInventory(t *testing.T) {
+	existing := []modelInfo{
+		{Name: "opencode-go/glm-5.3", Remote: true},
+		{Name: "custom-tools:latest", ToolCapable: true},
+	}
+
+	items, _, _, _ := buildModelList(existing, nil, "")
+	byName := map[string]ModelItem{}
+	for _, item := range items {
+		byName[item.Name] = item
+	}
+	if !byName["opencode-go/glm-5.3"].Remote {
+		t.Error("opencode-go/glm-5.3: Remote should be true (from modelInfo.Remote)")
+	}
+	if byName["custom-tools"].Remote {
+		t.Error("custom-tools: Remote should be false for a non-remote installed model")
+	}
+}
+
 func TestBuildModelList_InstalledRecommendedPreservesRecommendationAndMetadata(t *testing.T) {
 	existing := []modelInfo{
 		{

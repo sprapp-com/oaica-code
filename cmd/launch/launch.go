@@ -258,7 +258,14 @@ type ModelItem struct {
 	// non-scrolling groups — see selector.go's render split) but gets its
 	// own header so the choice is visually unambiguous, not just a
 	// description string buried in a shared list.
-	Local           bool
+	Local bool
+	// Remote marks a model served by a user-defined remote
+	// (~/.oaica/remotes.json, surfaced as "<remote>/<id>") or a built-in
+	// aggregator like ollama/openrouter — see modelInfo.Remote, the field
+	// this is copied from. Gets its own "Remote" picker section, distinct
+	// from Local (this box's own `oaica serve`) and the router-sourced
+	// "Recommended"/"More" rows. A model can't be both Local and Remote.
+	Remote          bool
 	VRAMBytes       int64
 	MaxOutputTokens int
 	RequiredPlan    string
@@ -274,6 +281,7 @@ type SelectionItem struct {
 	Description       string
 	Recommended       bool
 	Local             bool
+	Remote            bool
 	AvailabilityBadge string
 }
 

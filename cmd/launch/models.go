@@ -559,6 +559,7 @@ func modelItemFromInventory(name string, info modelInfo, item ModelItem) ModelIt
 	item.Capabilities = slices.Clone(info.Capabilities)
 	item.Size = info.Size
 	item.Details = info.Details
+	item.Remote = info.Remote
 	return item
 }
 

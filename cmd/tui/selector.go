@@ -65,7 +65,12 @@ type SelectItem struct {
 	// launch.ModelItem.Local's doc. Renders in its own "Local" section,
 	// always before "Recommended", in the same always-shown (non-
 	// scrolling) region — only the "More" section ever scrolls.
-	Local             bool
+	Local bool
+	// Remote marks a model from a user-defined remote or a built-in
+	// aggregator (ollama/, openrouter/) — see launch.ModelItem.Remote's
+	// doc. Renders in its own "Remote" section, between "Local" and
+	// "Recommended" — also always-shown/non-scrolling.
+	Remote            bool
 	AvailabilityBadge string
 }
 
@@ -97,6 +102,7 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 			Description:       item.Description,
 			Recommended:       item.Recommended,
 			Local:             item.Local,
+			Remote:            item.Remote,
 			AvailabilityBadge: item.AvailabilityBadge,
 		}
 	}
@@ -104,8 +110,11 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 }
 
 // ReorderItems returns a copy with recommended items first, then non-recommended,
-// preserving relative order within each group. This ensures the data order matches
-// the visual section layout (Recommended / More).
+// preserving relative order within each group. Local/Remote items aren't
+// special-cased here — the render loop (see the Local/Remote/Recommended/
+// other switch below) re-splits into all four sections regardless of this
+// function's order, so this only affects the relative order WITHIN the
+// scrollable "More" section and the underlying data list.
 func ReorderItems(items []SelectItem) []SelectItem {
 	var rec, other []SelectItem
 	for _, item := range items {
@@ -116,6 +125,14 @@ func ReorderItems(items []SelectItem) []SelectItem {
 		}
 	}
 	return append(rec, other...)
+}
+
+// isBuiltinAggregatorProvider reports whether name is namespaced under one
+// of the built-in multi-model aggregators (ollama/<id>, openrouter/<id>) as
+// opposed to a one-off user remote from ~/.oaica/remotes.json. Used to sort
+// the well-known providers first within the "Remote Models" section.
+func isBuiltinAggregatorProvider(name string) bool {
+	return strings.HasPrefix(name, "ollama/") || strings.HasPrefix(name, "openrouter/")
 }
 
 // selectorModel is the bubbletea model for single selection.
@@ -483,27 +500,48 @@ func (m selectorModel) renderContent() string {
 			s.WriteString("\n")
 		}
 	} else {
-		// Split into pinned local, pinned recommended, and scrollable others.
-		// Local and Recommended are BOTH always-shown/non-scrolling (only
-		// "More" scrolls) — Local just gets its own header, rendered
-		// first, so a running `oaica serve` is never ambiguous with a
-		// cloud entry of the same base name.
-		var localItems, recItems, otherItems []int
+		// Split into pinned local, pinned remote, pinned recommended, and
+		// scrollable others. Local, Remote, and Recommended are ALL
+		// always-shown/non-scrolling (only "More" scrolls) — each gets its
+		// own header so a running `oaica serve`, a user-remote/aggregator
+		// model, and a router-catalog entry are never ambiguous with each
+		// other, even when they share a base name.
+		var localItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.Remote:
+				remoteItems = append(remoteItems, i)
 			case item.Recommended:
 				recItems = append(recItems, i)
 			default:
 				otherItems = append(otherItems, i)
 			}
 		}
+		// Within Remote, builtin aggregators (ollama/, openrouter/) sort
+		// first — they're the well-known, always-available providers, as
+		// opposed to a one-off user remote from ~/.oaica/remotes.json.
+		// Stable sort: preserves the original relative order of ties and
+		// of everything after the aggregator prefix group.
+		sort.SliceStable(remoteItems, func(a, b int) bool {
+			pa, pb := isBuiltinAggregatorProvider(filtered[remoteItems[a]].Name), isBuiltinAggregatorProvider(filtered[remoteItems[b]].Name)
+			return pa && !pb
+		})
 
 		if len(localItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Local"))
+			s.WriteString(sectionHeaderStyle.Render("Local Models"))
 			s.WriteString("\n")
 			for _, idx := range localItems {
+				m.renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
+		}
+
+		if len(remoteItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
+			s.WriteString("\n")
+			for _, idx := range remoteItems {
 				m.renderItem(&s, filtered[idx], idx)
 			}
 			s.WriteString("\n")
@@ -523,7 +561,7 @@ func (m selectorModel) renderContent() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(remoteItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
@@ -1141,24 +1179,40 @@ func (m multiSelectorModel) View() string {
 			s.WriteString("\n")
 		}
 	} else {
-		// Split into pinned local, pinned recommended, and scrollable
-		// others (matches single-select layout — see the doc comment there).
-		var localItems, recItems, otherItems []int
+		// Split into pinned local, pinned remote, pinned recommended, and
+		// scrollable others (matches single-select layout — see the doc
+		// comment there).
+		var localItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.Remote:
+				remoteItems = append(remoteItems, i)
 			case item.Recommended:
 				recItems = append(recItems, i)
 			default:
 				otherItems = append(otherItems, i)
 			}
 		}
+		sort.SliceStable(remoteItems, func(a, b int) bool {
+			pa, pb := isBuiltinAggregatorProvider(filtered[remoteItems[a]].Name), isBuiltinAggregatorProvider(filtered[remoteItems[b]].Name)
+			return pa && !pb
+		})
 
 		if len(localItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Local"))
+			s.WriteString(sectionHeaderStyle.Render("Local Models"))
 			s.WriteString("\n")
 			for _, idx := range localItems {
+				renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
+		}
+
+		if len(remoteItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
+			s.WriteString("\n")
+			for _, idx := range remoteItems {
 				renderItem(&s, filtered[idx], idx)
 			}
 			s.WriteString("\n")
@@ -1178,7 +1232,7 @@ func (m multiSelectorModel) View() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(remoteItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
