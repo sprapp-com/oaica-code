@@ -162,6 +162,27 @@ A stall-kill also writes to `/workspace/vllm_awq_watchdog.ALERT`. Poll the
 ALERT file from a monitor; a restore, a backoff, or a stall-kill is the
 signal that something on the box (or under real load) changed under us.
 
+**2026-08-28 recurring stall-kills, root-caused:** both replicas were
+stall-killed and relaunched repeatedly, every 2-4 minutes, with ZERO
+external client traffic in the gateway ledger during the window (confirmed
+via `oaica-gateway-ledger.jsonl` — request logging stopped at 20:13, crashes
+kept happening at 20:39/20:40/20:43/20:44/20:46/20:48) and no established
+connections to oaicalb's public ports. Self-inflicted, not load-driven.
+Cause: vLLM 0.24.0 auto-enables async scheduling by default; combined with
+the experimental Mamba `align`-mode caching this model's architecture
+requires when `--enable-prefix-caching` is on (`Qwen3_5MoeForConditionalGeneration`
+does not support the non-experimental `all` mode — vLLM falls back to
+`align` unconditionally, see `vllm/model_executor/models/config.py`'s
+`MambaModelConfig`), the combination hangs the engine internally within
+minutes of a clean boot. Fix: added `--no-async-scheduling` to `launch()`'s
+vLLM command — prefix caching (and its `align`-mode Mamba caching) stays on
+unchanged, only the async scheduler is disabled. Verified stable afterward:
+zero new ALERT entries and both replicas served real 200s well past the
+previous 2-4 min crash window. `--no-async-scheduling` cannot be removed
+without reintroducing this, and `--enable-prefix-caching` must NOT be
+disabled to "fix" this — that was explicitly ruled out; the actual fix is
+the async-scheduling flag.
+
 `REPLICAS` defaults to `0:30106 1:30108` (GPU0 + GPU1, 2026-08-29 — GPU2
 released for other work, GPU1 added with explicit user override of the
 standing "never touch GPU1" rule). GPU5 is held by the malay35b-offload
