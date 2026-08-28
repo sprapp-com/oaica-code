@@ -215,7 +215,7 @@ tick() {
 # (renamed 2026-08-28, was kat-awq). GPU5 is NOT usable: another session's
 # 52 GB job plus the malay35b-offload server leave 5.9/79 GiB, and vLLM
 # refuses to start below gpu_memory_utilization * total (~73 GiB).
-REPLICAS="${REPLICAS:-2:30105 0:30106}"
+REPLICAS="${REPLICAS:-0:30106 1:30108}"
 
 log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s"
 while true; do

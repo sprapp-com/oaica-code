@@ -64,8 +64,12 @@ Cloudflare (api.oaica.com) -> cloudflared ON a100b (/workspace/cf/run.sh) -> :80
   :8081 oaica-gateway   auth (sha256 key), model rewrite, usage injection, ledger
   :30098 gatekeeper     per-key concurrency ("openrouter" tier = 32)
   :30099 oaicalb        leastconn across replicas, chat-aware health probe (:8091 session-hash)
-  :30106 vLLM oaica-35b-a3b-vision  GPU0    :30105 vLLM oaica-35b-a3b-vision  GPU2
+  :30106 vLLM oaica-35b-a3b-vision  GPU0    :30108 vLLM oaica-35b-a3b-vision  GPU1
 ```
+
+GPU7 (`:30107`, `nvidia-nemotron-3.5-lightning-30b-a3b`) is NOT behind
+oaicalb or the gateway — standalone, reached directly. See "Watchdog
+behaviour" below for why.
 
 The tunnel is the `oaica-api` tunnel in the Cloudflare account that owns
 oaica.com (unisqu, `125f3856…`), run directly on the box with a tunnel token
@@ -123,11 +127,21 @@ A stall-kill also writes to `/workspace/vllm_awq_watchdog.ALERT`. Poll the
 ALERT file from a monitor; a restore, a backoff, or a stall-kill is the
 signal that something on the box (or under real load) changed under us.
 
-`REPLICAS` defaults to `2:30105 0:30106` (GPU2 + GPU0). GPU5 is held by the
-malay35b-offload `prism_server` plus another session's 52 GB job, so an
-oaica-35b-a3b-vision replica OOMs at startup there. A `booting()` guard
-skips a port whose api_server exists but is not yet listening (vLLM takes
-~100 s to load), so a slow start is not treated as a crash.
+`REPLICAS` defaults to `0:30106 1:30108` (GPU0 + GPU1, 2026-08-29 — GPU2
+released for other work, GPU1 added with explicit user override of the
+standing "never touch GPU1" rule). GPU5 is held by the malay35b-offload
+`prism_server` plus another session's 52 GB job, so an oaica-35b-a3b-vision
+replica OOMs at startup there. A `booting()` guard skips a port whose
+api_server exists but is not yet listening (vLLM takes ~100 s to load), so
+a slow start is not treated as a crash.
+
+GPU7 runs a second, unrelated model standalone (not behind oaicalb, no
+watchdog): `nvidia-nemotron-3.5-lightning-30b-a3b`
+(useful-quants/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-W4A16), port `:30107`,
+1M context (`--max-model-len 1048576`, well past the model's native 262144
+— see `nemotron_gpu7_launch.sh`'s doc comment for the tradeoffs accepted).
+`--enforce-eager` because `/dev/shm` is noexec and `/workspace` lacked
+compile-cache headroom when this was set up — a real gap, not fixed yet.
 
 ## Control-plane supervisor + reboot
 
