@@ -85,6 +85,14 @@ every place that was tried (and the fix when the router rejected the key).
   model, backend label + redacted URL, sizes, status — never content).
   Backend labels: `daemon:ollama …`, `remote:<name> …`, `router:oaica …`,
   `local-serve:local …`.
+- Each launch generates a random `X-Session-Id` (`newProxySessionID`, 2026-08-28)
+  sent upstream on every request that launch's proxy forwards — one per
+  launched conversation, not per request. A consistent-hash load balancer in
+  front of a multi-replica backend (e.g. `tools/oaicalb`'s
+  `session_hash_addr`) can use this to pin the whole conversation to one
+  replica, so that replica's own prefix cache actually gets reused
+  turn-to-turn instead of scattering across replicas under plain leastconn.
+  A backend with no such LB just ignores the header.
 - Tool calling is gated per endpoint (`--force-tools` downgrades refusal to
   a warning).
 - Upstream streaming is bounded only by connection setup and by Claude Code

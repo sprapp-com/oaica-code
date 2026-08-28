@@ -466,6 +466,19 @@ type proxyRouteTable struct {
 	// never enter the child environment. Empty = no check (the standalone
 	// serve-anthropic-proxy subcommand and older callers).
 	ClientToken string
+	// SessionID, when set, is sent upstream as X-Session-Id on every
+	// request this proxy forwards. It exists for load balancers that offer
+	// consistent-hash routing (e.g. oaicalb's session_hash_addr): pinning
+	// one launched Claude Code session to the same backend replica for its
+	// whole lifetime lets that replica's own prefix cache actually get
+	// reused turn-to-turn, instead of every turn risking a leastconn hop to
+	// a cold-cache replica. One proxy process = one launched session is the
+	// natural boundary here (a fresh `oaica launch claude`, including a
+	// `resume`, starts a fresh proxy), so newProxySessionID is called once
+	// per launch, not per request. Empty = no header sent (older callers,
+	// or a backend with no session-aware LB in front of it — harmless
+	// either way, since a leastconn-only LB just ignores an unknown header).
+	SessionID string
 }
 
 // authorized reports whether r presents the table's client token.
@@ -487,6 +500,19 @@ func newProxyClientToken() (string, error) {
 		return "", err
 	}
 	return "oaica-proxy-" + hex.EncodeToString(b), nil
+}
+
+// newProxySessionID returns a per-launch identifier for proxyRouteTable.SessionID
+// (see its doc for why this is per-launch, not per-request). Only needs to
+// be unique enough that a consistent-hash LB doesn't collide two unrelated
+// sessions onto the same bucket by chance — 16 random bytes is far more
+// than that requires, matching newProxyClientToken's margin.
+func newProxySessionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "oaica-session-" + hex.EncodeToString(b), nil
 }
 
 // redactURL strips userinfo from a URL for logs.
@@ -611,6 +637,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		upstreamReq.Header.Set("Content-Type", "application/json")
 		if route.Key != "" {
 			upstreamReq.Header.Set("Authorization", "Bearer "+route.Key)
+		}
+		if table.SessionID != "" {
+			upstreamReq.Header.Set("X-Session-Id", table.SessionID)
 		}
 
 		resp, err := proxyUpstreamClient.Do(upstreamReq)

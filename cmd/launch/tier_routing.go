@@ -379,6 +379,18 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	}
 	plan.Routes.ClientToken = clientToken
 
+	// One session ID per launch (not per request — see SessionID's doc):
+	// lets a session-hash-aware LB in front of the backend (e.g. oaicalb's
+	// :8091) pin this whole conversation to one replica, so its own prefix
+	// cache actually gets reused turn-to-turn instead of scattering across
+	// replicas under plain leastconn. A backend with no such LB just sees
+	// (and ignores) an extra header.
+	sessionID, err := newProxySessionID()
+	if err != nil {
+		return fmt.Errorf("proxy session id: %w", err)
+	}
+	plan.Routes.SessionID = sessionID
+
 	ln, port, err := ListenAnthropicOpenAIProxy(userRemote{}, "")
 	if err != nil {
 		// Never fall back to pointing Claude Code at a backend directly: none

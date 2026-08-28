@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -164,5 +165,109 @@ func TestProxyFallsBackToFixedModelWhenRequestOmitsIt(t *testing.T) {
 	}
 	if gotModel != "deepseek-v4-flash" {
 		t.Errorf("upstream model = %q, want fixed upstreamModel deepseek-v4-flash (regression: non-split launch changed)", gotModel)
+	}
+}
+
+// TestProxy_SessionIDHeaderForwarded verifies proxyRouteTable.SessionID is
+// sent upstream as X-Session-Id on every request — the piece a
+// consistent-hash LB (e.g. oaicalb's session_hash_addr) needs to pin one
+// launched conversation to the same backend replica for prefix-cache reuse.
+// Two requests through the same proxy (same launch = same SessionID) must
+// carry an identical header value; an empty SessionID must send none at all
+// (older callers / non-session-aware backends stay byte-identical).
+func TestProxy_SessionIDHeaderForwarded(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+
+	var gotHeaders []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = append(gotHeaders, r.Header.Get("X-Session-Id"))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "kat-awq",
+			"choices": []map[string]any{{"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	table := proxyRouteTable{
+		Default:   proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", Label: "test:kat-awq"},
+		SessionID: "oaica-session-abc123",
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+
+	post := func() {
+		body, _ := json.Marshal(map[string]any{
+			"model": "kat-awq", "max_tokens": 10,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		})
+		resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	post()
+	post()
+
+	if len(gotHeaders) != 2 {
+		t.Fatalf("upstream got %d requests, want 2", len(gotHeaders))
+	}
+	for i, h := range gotHeaders {
+		if h != "oaica-session-abc123" {
+			t.Errorf("request %d X-Session-Id = %q, want %q", i, h, "oaica-session-abc123")
+		}
+	}
+
+	// Empty SessionID (older callers / standalone proxy) sends no header.
+	gotHeaders = nil
+	table2 := proxyRouteTable{Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", Label: "test:kat-awq"}}
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln2, table2)
+	proxyURL2 := "http://" + ln2.Addr().String()
+	body, _ := json.Marshal(map[string]any{
+		"model": "kat-awq", "max_tokens": 10,
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	resp, err := http.Post(proxyURL2+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(gotHeaders) != 1 || gotHeaders[0] != "" {
+		t.Errorf("empty SessionID: got headers %v, want a single empty value", gotHeaders)
+	}
+}
+
+// TestNewProxySessionID verifies the generator returns a non-empty, prefixed,
+// and non-colliding value across calls — the same shape guarantee
+// newProxyClientToken already has, since session IDs feed a consistent-hash
+// bucket and a collision would silently merge two unrelated conversations
+// onto one backend.
+func TestNewProxySessionID(t *testing.T) {
+	a, err := newProxySessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newProxySessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == "" || b == "" {
+		t.Fatal("newProxySessionID returned an empty value")
+	}
+	if a == b {
+		t.Fatal("newProxySessionID returned the same value twice")
+	}
+	if !strings.HasPrefix(a, "oaica-session-") {
+		t.Errorf("newProxySessionID() = %q, want oaica-session- prefix", a)
 	}
 }
