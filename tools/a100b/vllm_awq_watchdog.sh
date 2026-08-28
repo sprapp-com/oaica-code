@@ -153,25 +153,35 @@ force_kill_replica() {
     sleep 5
     kill -0 "$main_pid" 2>/dev/null && { alert ":${port} PID $main_pid ignored SIGTERM -- SIGKILL"; kill -9 "$main_pid" 2>/dev/null; }
   fi
-  # Orphaned EngineCore: reparented to PID 1, no longer matches the
-  # "--port N" pgrep pattern above once api_server is gone, so it is found
-  # by process name only. This is the exact class of stray process that
-  # cost real debugging time earlier this session (mistaken for a "rogue
-  # spawner") until traced to this same root cause.
-  local i
-  for i in 1 2 3 4 5 6; do
-    local orphans
+  sweep_orphans ":${port}" 6
+}
+
+# sweep_orphans TAG ROUNDS: kill every VLLM::EngineCore reparented to PID 1.
+# An EngineCore is vLLM's separate generation process; when its api_server
+# dies (SIGKILL from force_kill_replica, OR a crash-on-boot in the "died
+# within 60s of launch" path) the child reparents to init and keeps holding
+# the full GPU allocation (~74 GB) forever -- nvidia-smi then shows a HOST
+# pid that has no /proc entry in this container, which was mistaken for an
+# unreclaimable "zombie" on 2026-08-28 (GPU2, PID 2263066, born 20:40:28
+# during a burst of boot-deaths that the post-stall-kill sweep never ran
+# for). Now called once per main-loop tick as well as after a stall-kill,
+# so no code path can leak an EngineCore for more than one tick.
+# Matching by process name + ppid=1 only: a healthy EngineCore always has
+# a live api_server parent, so this cannot touch a serving replica -- ours
+# or any other tenant's on this box.
+sweep_orphans() {
+  local tag=$1 rounds=${2:-1} i orphans pid ppid
+  for i in $(seq 1 "$rounds"); do
     orphans=$(pgrep -f 'VLLM::EngineCore' 2>/dev/null)
     [ -z "$orphans" ] && break
     for pid in $orphans; do
-      local ppid
       ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
       if [ "$ppid" = "1" ]; then
-        alert ":${port} killing orphaned VLLM::EngineCore PID $pid (reparented to init)"
+        alert "${tag} killing orphaned VLLM::EngineCore PID $pid (reparented to init)"
         kill -9 "$pid" 2>/dev/null
       fi
     done
-    sleep 2
+    [ "$rounds" -gt 1 ] && sleep 2
   done
 }
 
@@ -220,6 +230,7 @@ REPLICAS="${REPLICAS:-0:30106 1:30108}"
 
 log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s"
 while true; do
+  sweep_orphans "tick" 1
   for r in $REPLICAS; do
     tick "${r%%:*}" "${r##*:}" "/workspace/vllm_awq_gpu${r%%:*}.log"
   done
