@@ -22,14 +22,14 @@ things that already exist and do NOT replace it:
 ### Add a model
 
 ```shell
-oaica model add kat-awq \
+oaica model add oaica-35b-a3b-vision \
   --engine vllm \
   --arch Qwen3_5MoeForConditionalGeneration \
   --quant awq-w4a16 \
   --context-window 262144 \
   --max-output-tokens 32000 \
   --gpu-mem-gb 73 \
-  --notes "GPU2 on a100b; Mamba align mode needs max-num-batched-tokens>=2096"
+  --notes "GPU0+GPU2 on a100b behind oaicalb; Mamba align mode needs max-num-batched-tokens>=2096"
 ```
 
 `--engine` is one of `vllm`, `llama.cpp`, `prism-engine`, `ollama-daemon`,
@@ -50,9 +50,9 @@ overwrites a hand-added entry.
 ### Inspect and remove
 
 ```shell
-oaica model list          # table of every model in the manifest
-oaica model show kat-awq  # full detail for one
-oaica model rm kat-awq
+oaica model list                          # table of every model in the manifest
+oaica model show oaica-35b-a3b-vision     # full detail for one
+oaica model rm oaica-35b-a3b-vision
 ```
 
 ### Live probe vs. manifest — which one wins
@@ -73,9 +73,9 @@ own models:
 
 ```shell
 oaica plan set oaica-full \
-  --model kat-awq \
-  --sonnet-model kat-awq \
-  --description "Full-power kat-awq, 262k ctx, vision"
+  --model oaica-35b-a3b-vision \
+  --sonnet-model oaica-35b-a3b-vision \
+  --description "Full-power vision model, 262k ctx"
 
 oaica launch claude --plan oaica-full
 ```
