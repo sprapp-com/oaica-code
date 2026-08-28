@@ -1,5 +1,6 @@
-// katlb is a 1-box simulation of session-hashed vs leastconn load balancing
-// across the 6 kat-awq vLLM replicas, to measure whether pinning a
+// oaicalb (formerly katlb) is a 1-box simulation of session-hashed vs
+// leastconn load balancing across a box's oaica-35b-a3b-vision vLLM
+// replicas, to measure whether pinning a
 // conversation to one replica (so its prefix cache actually gets reused)
 // beats scattering requests round-robin/leastconn (each turn hits a
 // cold-cache replica, reprocessing the whole prefix from scratch).
@@ -35,11 +36,11 @@ import (
 	"time"
 )
 
-// katlb is not kat-awq-specific -- it's a plain reverse proxy over any set of
+// oaicalb is not model-specific -- it's a plain reverse proxy over any set of
 // OpenAI-compatible backends. The backend list, health-check path, and the
 // three listen ports are all config so any future multi-replica model (e.g.
 // malay35b once it's scaled past one instance) gets the same leastconn +
-// session-hash load balancing by running a second katlb with its own
+// session-hash load balancing by running a second oaicalb with its own
 // -config, not by touching this code.
 type lbConfig struct {
 	Backends      []string `json:"backends"`
@@ -52,7 +53,7 @@ type lbConfig struct {
 	// POST /v1/chat/completions for this served model name. GET /v1/models
 	// only proves the HTTP server is up: vLLM answers it 200 while every
 	// chat request 400s (e.g. tokenizer missing a chat_template -- the exact
-	// outage hit on 2026-08-25), so katlb kept routing into errors with all
+	// outage hit on 2026-08-25), so oaicalb kept routing into errors with all
 	// backends "UP". A chat probe fails the way a customer request fails.
 	// Empty keeps the cheap GET probe.
 	ProbeModel string `json:"probe_model"`
@@ -106,11 +107,11 @@ func loadConfig(path string) (lbConfig, error) {
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("katlb: no config at %s (%v), using kat-awq defaults", path, err)
+		log.Printf("oaicalb: no config at %s (%v), using built-in defaults", path, err)
 		return cfg, nil
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		return cfg, fmt.Errorf("katlb: bad config %s: %w", path, err)
+		return cfg, fmt.Errorf("oaicalb: bad config %s: %w", path, err)
 	}
 	if cfg.ProbeTimeoutSec <= 0 {
 		cfg.ProbeTimeoutSec = 10
@@ -286,7 +287,7 @@ func (b *backend) healthCheck(ctx context.Context, opts probeOpts) {
 			b.failCount = 0
 			if b.okCount >= 2 && !b.healthy.Load() {
 				b.healthy.Store(true)
-				log.Printf("katlb: %s UP (probe ok x%d)", b.url, b.okCount)
+				log.Printf("oaicalb: %s UP (probe ok x%d)", b.url, b.okCount)
 			}
 		} else {
 			b.failCount++
@@ -296,12 +297,12 @@ func (b *backend) healthCheck(ctx context.Context, opts probeOpts) {
 			case b.failCount >= 2:
 				if b.healthy.Load() {
 					b.healthy.Store(false)
-					log.Printf("katlb: %s DOWN (probe failed x%d)", b.url, b.failCount)
+					log.Printf("oaicalb: %s DOWN (probe failed x%d)", b.url, b.failCount)
 				}
 			case stalled >= opts.stallMin:
 				if b.healthy.Load() {
 					b.healthy.Store(false)
-					log.Printf("katlb: %s DOWN (probe failed, %d in-flight request(s) stalled >= %s, oldest %s)",
+					log.Printf("oaicalb: %s DOWN (probe failed, %d in-flight request(s) stalled >= %s, oldest %s)",
 						b.url, stalled, opts.stall, oldest.Round(time.Second))
 				}
 			}
@@ -396,12 +397,12 @@ func main() {
 		log.Fatal(err)
 	}
 	if cfg.ProbeModel != "" {
-		log.Printf("katlb: health probe = 1-token chat on %q (timeout %ds)", cfg.ProbeModel, cfg.ProbeTimeoutSec)
+		log.Printf("oaicalb: health probe = 1-token chat on %q (timeout %ds)", cfg.ProbeModel, cfg.ProbeTimeoutSec)
 	}
 	if stall := cfg.stallThreshold(); stall > 0 {
-		log.Printf("katlb: hung-replica detection = %d in-flight request(s) stalled >= %s + probe failure", cfg.StallMinInflight, stall)
+		log.Printf("oaicalb: hung-replica detection = %d in-flight request(s) stalled >= %s + probe failure", cfg.StallMinInflight, stall)
 	} else {
-		log.Printf("katlb: hung-replica detection disabled (stall_sec < 0)")
+		log.Printf("oaicalb: hung-replica detection disabled (stall_sec < 0)")
 	}
 	opts := probeOpts{
 		healthPath: cfg.HealthPath,
@@ -443,7 +444,7 @@ func main() {
 
 	go func() { log.Fatal(http.ListenAndServe(cfg.LeastConnAddr, leastconnMux)) }()
 	go func() { log.Fatal(http.ListenAndServe(cfg.SessionAddr, hashMux)) }()
-	log.Printf("katlb: %d backends, leastconn on %s, session-hash on %s, status on %s/status",
+	log.Printf("oaicalb: %d backends, leastconn on %s, session-hash on %s, status on %s/status",
 		len(bs), cfg.LeastConnAddr, cfg.SessionAddr, cfg.StatusAddr)
 	log.Fatal(http.ListenAndServe(cfg.StatusAddr, statusMux))
 }

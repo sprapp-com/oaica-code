@@ -206,7 +206,7 @@ func newHungVLLM(t *testing.T) *hungVLLM {
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
-		if bytes.Contains(body, []byte(`"content":"ping"`)) { // katlb's probe
+		if bytes.Contains(body, []byte(`"content":"ping"`)) { // oaicalb's probe
 			if n := h.probes.Add(1); h.flaky.Load() && n%2 == 0 {
 				<-r.Context().Done() // hang until the prober gives up
 				return
