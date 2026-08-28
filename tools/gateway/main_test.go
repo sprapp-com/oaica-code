@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -753,5 +754,338 @@ func TestModels_AdvertisesInputModalities(t *testing.T) {
 	in, _ := arch["input_modalities"].([]any)
 	if len(in) != 1 || in[0] != "text" {
 		t.Fatalf("text-only model must advertise input_modalities [text], got %v", arch)
+	}
+}
+
+// fakeMeterHub records every /ingest POST it receives, thread-safely
+// (the reporter runs on its own goroutine).
+type fakeMeterHub struct {
+	mu      sync.Mutex
+	reports []usageReport
+	authHdr []string
+}
+
+func newFakeMeterHub(t *testing.T) (*httptest.Server, *fakeMeterHub) {
+	t.Helper()
+	fh := &fakeMeterHub{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ingest" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var rep usageReport
+		json.NewDecoder(r.Body).Decode(&rep)
+		fh.mu.Lock()
+		fh.reports = append(fh.reports, rep)
+		fh.authHdr = append(fh.authHdr, r.Header.Get("Authorization"))
+		fh.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, fh
+}
+
+func (fh *fakeMeterHub) count() int {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return len(fh.reports)
+}
+
+func (fh *fakeMeterHub) last() usageReport {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.reports[len(fh.reports)-1]
+}
+
+func waitForCount(t *testing.T, fh *fakeMeterHub, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if fh.count() >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("meterhub never received %d report(s), got %d", n, fh.count())
+}
+
+// TestMeterHub_DisabledByDefault proves MeterHubAddr="" (the zero value,
+// what every existing config has) never starts a reporter goroutine and
+// never touches meterCh — byte-identical to before meterhub existed.
+func TestMeterHub_DisabledByDefault(t *testing.T) {
+	upstream := fakeUpstream(t, nil)
+	g, _ := newTestGateway(t, upstream.URL)
+	if g.meterCh != nil {
+		t.Fatal("meterCh must be nil when MeterHubAddr is unset")
+	}
+	// writeLedger must not panic/block with a nil meterCh.
+	g.writeLedger(ledgerEntry{RequestID: "req_x"})
+}
+
+// TestMeterHub_ReceivesReportWithRegionAndAuth verifies a real end-to-end
+// completion gets reported to meterhub, with the region tag and bearer
+// auth header meterhub's own authed() checks for.
+func TestMeterHub_ReceivesReportWithRegionAndAuth(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterSrv, fh := newFakeMeterHub(t)
+
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream.URL, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}}},
+		MeterHubAddr: meterSrv.URL, MeterHubToken: "hub-secret", Region: "a100b",
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	w := httptest.NewRecorder()
+	mux(g).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("completion status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	waitForCount(t, fh, 1)
+	rep := fh.last()
+	if rep.Region != "a100b" {
+		t.Errorf("reported Region = %q, want a100b", rep.Region)
+	}
+	if rep.KeyLabel != "openrouter" {
+		t.Errorf("reported KeyLabel = %q, want openrouter", rep.KeyLabel)
+	}
+	if rep.PromptTokens != 7 || rep.CompletionTokens != 3 {
+		t.Errorf("reported tokens = (%d, %d), want (7, 3)", rep.PromptTokens, rep.CompletionTokens)
+	}
+	if got := fh.authHdr[0]; got != "Bearer hub-secret" {
+		t.Errorf("Authorization header sent to meterhub = %q, want %q", got, "Bearer hub-secret")
+	}
+}
+
+// TestMeterHub_UnreachableNeverBlocksOrFailsTheRequest is the core safety
+// property: a real chat completion must succeed and be written to the
+// LOCAL ledger even when meterhub is completely unreachable.
+func TestMeterHub_UnreachableNeverBlocksOrFailsTheRequest(t *testing.T) {
+	// Shrink the reporter's retry backoff for this test only: the
+	// production default (1s, 2s) is correct for a real meterhub outage
+	// but left this test's background goroutine retrying for seconds
+	// after the test function returned, competing for scheduler time with
+	// every test that ran after it under `go test ./...`.
+	oldBackoff := meterReporterBackoff
+	meterReporterBackoff = func(attempt int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() { meterReporterBackoff = oldBackoff })
+
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream.URL, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}}},
+		// Deliberately unreachable: nothing listens on this port.
+		MeterHubAddr: "http://127.0.0.1:1", Region: "a100b",
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	start := time.Now()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	w := httptest.NewRecorder()
+	mux(g).ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("completion status = %d, want 200 (an unreachable meterhub must never fail the request)", w.Code)
+	}
+	if elapsed > time.Second {
+		t.Errorf("request took %v — an unreachable meterhub must not add request latency (reportUsage is a non-blocking channel send)", elapsed)
+	}
+
+	b, err := os.ReadFile(ledger)
+	if err != nil || len(b) == 0 {
+		t.Fatal("local JSONL ledger must still be written even when meterhub is unreachable")
+	}
+
+	// Bound the background reporter goroutine's lifetime: with the
+	// shrunk backoff above its 3-attempt retry cycle is now ~3ms instead
+	// of ~3s, so a short sleep here reliably lets it finish and exit its
+	// `for range ch` loop (via the close below) before the test returns,
+	// instead of leaking it to run concurrently with later tests.
+	time.Sleep(50 * time.Millisecond)
+	close(g.meterCh)
+}
+
+// fakeSubscriberService serves /subscribers/get with a fixed, configurable
+// status per key label — stands in for meterhub in entitlement tests.
+func fakeSubscriberService(t *testing.T, statuses map[string]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/subscribers/get" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		key := r.URL.Query().Get("key")
+		status, ok := statuses[key]
+		if !ok {
+			status = "unknown"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"key_label": key, "status": status})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newTestGatewayWithEntitlement(t *testing.T, upstream, meterhubAddr string, failOpen bool) *gateway {
+	t.Helper()
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{
+			{SHA256: keyHash("sk-active"), Label: "alice"},
+			{SHA256: keyHash("sk-canceled"), Label: "bob"},
+			{SHA256: keyHash("sk-unknown"), Label: "carol"},
+		},
+		Models: []gwModel{{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}}},
+		MeterHubAddr: meterhubAddr, Region: "a100b",
+		EntitlementEnabled: true, EntitlementFailOpen: failOpen, EntitlementCacheTTLSec: 60,
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	return g
+}
+
+func postCompletion(t *testing.T, g *gateway, apiKey string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	mux(g).ServeHTTP(w, req)
+	return w
+}
+
+func TestEntitlement_DisabledByDefault(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	g, _ := newTestGateway(t, upstream.URL) // no MeterHubAddr, no EntitlementEnabled
+	if g.entitlement != nil {
+		t.Fatal("entitlement cache must be nil when EntitlementEnabled is unset")
+	}
+	w := postCompletion(t, g, "sk-new")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (entitlement disabled must never block a valid key)", w.Code)
+	}
+}
+
+func TestEntitlement_ActiveKeyAllowed(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberService(t, map[string]string{"alice": "active"})
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusOK {
+		t.Fatalf("active subscriber: status = %d, body=%s, want 200", w.Code, w.Body.String())
+	}
+}
+
+func TestEntitlement_PastDueKeyStillAllowed(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberService(t, map[string]string{"alice": "past_due"})
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusOK {
+		t.Fatalf("past_due subscriber: status = %d, want 200 (grace period, matches Stripe's own semantics)", w.Code)
+	}
+}
+
+func TestEntitlement_CanceledKeyBlocked(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberService(t, map[string]string{"bob": "canceled"})
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-canceled")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("canceled subscriber: status = %d, body=%s, want 403", w.Code, w.Body.String())
+	}
+}
+
+func TestEntitlement_UnknownKeyBlockedWhenFailClosed(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberService(t, map[string]string{}) // carol has no record
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-unknown")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unknown key, fail-closed: status = %d, want 403 (this is literally \"block unsubscribed users\")", w.Code)
+	}
+}
+
+func TestEntitlement_UnreachableMeterHubFailsOpenWhenConfigured(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	g := newTestGatewayWithEntitlement(t, upstream.URL, "http://127.0.0.1:1", true) // unreachable, failOpen=true
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusOK {
+		t.Fatalf("unreachable meterhub, fail-open: status = %d, want 200 (an aggregation-layer outage must never block real traffic when fail-open is chosen)", w.Code)
+	}
+}
+
+func TestEntitlement_UnreachableMeterHubFailsClosedWhenConfigured(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	g := newTestGatewayWithEntitlement(t, upstream.URL, "http://127.0.0.1:1", false) // unreachable, failOpen=false
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unreachable meterhub, fail-closed: status = %d, want 403 (explicit operator choice: block when the check itself fails)", w.Code)
+	}
+}
+
+func TestEntitlement_CacheAvoidsRepeatedMeterHubCalls(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	var hits int32
+	meterhub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/subscribers/get" {
+			atomic.AddInt32(&hits, 1)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"key_label": "alice", "status": "active"})
+	}))
+	defer meterhub.Close()
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	for range 5 {
+		w := postCompletion(t, g, "sk-active")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("meterhub hit %d times for 5 requests within the cache TTL, want 1 (cache should avoid repeated calls)", got)
 	}
 }

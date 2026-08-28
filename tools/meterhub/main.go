@@ -1,0 +1,625 @@
+// meterhub is the central usage/billing service for oaica's inference
+// fleet. Every region's oaica-gateway already writes a local, append-only
+// JSONL ledger (see tools/gateway/main.go's writeLedger) — that stays the
+// durable audit trail per box and never depends on this service being
+// reachable. meterhub is the AGGREGATION layer on top: each gateway
+// additionally reports the same entry here, async and best-effort, so
+// "how many tokens has key X used across every region, right now" is one
+// query instead of ssh-ing into N boxes and summing JSONL files by hand.
+//
+// This is the first piece of a real multi-region answer (see
+// docs/MULTI_REGION_ROUTING.md for the rest): a single global source of
+// truth for billing that does NOT sit on the request's critical path — a
+// region keeps serving even if meterhub is unreachable, it just reports
+// late (the reporter retries; nothing here can make a chat completion
+// fail).
+//
+//	POST /ingest             -- one usage record (from a gateway's writeLedger)
+//	GET  /usage?key=X        -- all records for one API key label
+//	GET  /usage?model=X      -- all records for one model
+//	GET  /usage/summary      -- global totals, grouped by key and model
+//	GET  /health             -- unauthenticated liveness
+//
+// Storage: SQLite (modernc.org/sqlite, pure Go — no cgo, so this cross-
+// compiles the same way every other tools/ binary does). Good enough for
+// a single meterhub instance handling periodic async reports from a
+// handful of gateways; if usage ever outgrows one SQLite file, the
+// ingest/query API here doesn't change — only the storage backend would,
+// same as gateway's own "flat JSON now, could be a DB later" design note.
+//
+// Auth: same shape as oaica-gateway -- "Authorization: Bearer <token>",
+// sha256 digests in config, constant-time compare. A separate token from
+// any gateway's own API keys: this token authenticates GATEWAYS reporting
+// usage, not end users making inference calls.
+package main
+
+import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+type meterConfig struct {
+	ListenAddr string `json:"listen_addr"`
+	DBPath     string `json:"db_path"`
+	// ReportTokens: sha256 hex digests of tokens gateways use to report
+	// usage. Same never-plaintext convention as oaica-gateway's api_keys.
+	ReportTokens []reportToken `json:"report_tokens"`
+}
+
+type reportToken struct {
+	SHA256 string `json:"sha256"`
+	Label  string `json:"label"` // which gateway/region this token belongs to — recorded per usage row
+}
+
+func defaultConfig() meterConfig {
+	return meterConfig{
+		ListenAddr: ":8095",
+		DBPath:     "/workspace/meterhub.db",
+	}
+}
+
+func loadConfig(path string) (meterConfig, error) {
+	cfg := defaultConfig()
+	if path == "" {
+		return cfg, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = ":8095"
+	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = "/workspace/meterhub.db"
+	}
+	return cfg, nil
+}
+
+// usageRecord is what a gateway POSTs to /ingest — a superset of
+// tools/gateway's ledgerEntry (same field names/JSON tags on the shared
+// fields, so a gateway can marshal its own ledgerEntry with one added
+// "region" field and send it as-is). RequestID is the idempotency key: a
+// gateway retrying a failed report after a network blip must not double-
+// count usage.
+type usageRecord struct {
+	TS               string `json:"ts"`
+	RequestID        string `json:"request_id"`
+	Region           string `json:"region"` // which gateway/box reported this — "a100b", future region names
+	KeyLabel         string `json:"key"`
+	Model            string `json:"model"`
+	UpstreamModel    string `json:"upstream_model"`
+	Path             string `json:"path"`
+	Stream           bool   `json:"stream"`
+	Status           int    `json:"status"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	LatencyMS        int64  `json:"latency_ms"`
+	UsageSeen        bool   `json:"usage_seen"`
+	Aborted          bool   `json:"aborted"`
+}
+
+type meterHub struct {
+	db      *sql.DB
+	tokens  map[string]string // sha256 hex -> label
+}
+
+func newMeterHub(cfg meterConfig) (*meterHub, error) {
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db %s: %w", cfg.DBPath, err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS usage (
+			request_id TEXT PRIMARY KEY,
+			ts TEXT NOT NULL,
+			region TEXT NOT NULL,
+			key_label TEXT NOT NULL,
+			model TEXT NOT NULL,
+			upstream_model TEXT NOT NULL,
+			path TEXT NOT NULL,
+			stream INTEGER NOT NULL,
+			status INTEGER NOT NULL,
+			prompt_tokens INTEGER NOT NULL,
+			completion_tokens INTEGER NOT NULL,
+			latency_ms INTEGER NOT NULL,
+			usage_seen INTEGER NOT NULL,
+			aborted INTEGER NOT NULL,
+			received_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_usage_key ON usage(key_label);
+		CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model);
+		CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
+
+		CREATE TABLE IF NOT EXISTS subscribers (
+			key_label TEXT PRIMARY KEY,
+			status TEXT NOT NULL,
+			plan TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT 'manual',
+			external_id TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL,
+			note TEXT NOT NULL DEFAULT ''
+		);
+	`); err != nil {
+		return nil, fmt.Errorf("create schema: %w", err)
+	}
+
+	tokens := make(map[string]string, len(cfg.ReportTokens))
+	for _, t := range cfg.ReportTokens {
+		tokens[strings.ToLower(t.SHA256)] = t.Label
+	}
+	return &meterHub{db: db, tokens: tokens}, nil
+}
+
+// authed checks "Authorization: Bearer <token>" against the configured
+// report tokens, constant-time, same pattern as oaica-gateway.
+func (h *meterHub) authed(r *http.Request) (label string, ok bool) {
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, prefix))
+	if token == "" {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(token))
+	hexSum := hex.EncodeToString(sum[:])
+	for known, lbl := range h.tokens {
+		if subtle.ConstantTimeCompare([]byte(known), []byte(hexSum)) == 1 {
+			return lbl, true
+		}
+	}
+	return "", false
+}
+
+func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var rec usageRecord
+	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if rec.RequestID == "" {
+		http.Error(w, `{"error":"request_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	// INSERT OR IGNORE: request_id is the idempotency key. A gateway
+	// retrying a report after a timeout must not double-count usage — the
+	// second (identical) insert silently no-ops instead of erroring, so
+	// the reporter's retry logic can stay dumb (always retry on any
+	// non-2xx, never worry about "did the first attempt actually land").
+	_, err := h.db.Exec(`
+		INSERT OR IGNORE INTO usage
+			(request_id, ts, region, key_label, model, upstream_model, path,
+			 stream, status, prompt_tokens, completion_tokens, latency_ms,
+			 usage_seen, aborted, received_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.RequestID, rec.TS, rec.Region, rec.KeyLabel, rec.Model, rec.UpstreamModel,
+		rec.Path, rec.Stream, rec.Status, rec.PromptTokens, rec.CompletionTokens,
+		rec.LatencyMS, rec.UsageSeen, rec.Aborted, time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		log.Printf("meterhub: insert failed: %v", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type usageRow struct {
+	RequestID        string `json:"request_id"`
+	TS               string `json:"ts"`
+	Region           string `json:"region"`
+	KeyLabel         string `json:"key"`
+	Model            string `json:"model"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	Status           int    `json:"status"`
+	LatencyMS        int64  `json:"latency_ms"`
+}
+
+func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	q := r.URL.Query()
+	where := []string{"1=1"}
+	args := []any{}
+	if v := q.Get("key"); v != "" {
+		where = append(where, "key_label = ?")
+		args = append(args, v)
+	}
+	if v := q.Get("model"); v != "" {
+		where = append(where, "model = ?")
+		args = append(args, v)
+	}
+	if v := q.Get("region"); v != "" {
+		where = append(where, "region = ?")
+		args = append(args, v)
+	}
+	if v := q.Get("since"); v != "" {
+		where = append(where, "ts >= ?")
+		args = append(args, v)
+	}
+	limit := 1000
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 10000 {
+			limit = n
+		}
+	}
+	query := fmt.Sprintf(`SELECT request_id, ts, region, key_label, model, prompt_tokens, completion_tokens, status, latency_ms
+		FROM usage WHERE %s ORDER BY ts DESC LIMIT ?`, strings.Join(where, " AND "))
+	args = append(args, limit)
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := make([]usageRow, 0, limit)
+	for rows.Next() {
+		var u usageRow
+		if err := rows.Scan(&u.RequestID, &u.TS, &u.Region, &u.KeyLabel, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.Status, &u.LatencyMS); err != nil {
+			continue
+		}
+		out = append(out, u)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"records": out, "count": len(out)})
+}
+
+type summaryRow struct {
+	KeyLabel         string `json:"key"`
+	Model            string `json:"model"`
+	Requests         int    `json:"requests"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	Errors           int    `json:"errors"`
+}
+
+// summaryHandler answers "global usage right now" -- every key x model
+// combination with request counts and token totals, the shape a billing
+// job or a dashboard actually wants (not a raw row dump).
+func (h *meterHub) summaryHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	where := []string{"1=1"}
+	args := []any{}
+	if v := r.URL.Query().Get("since"); v != "" {
+		where = append(where, "ts >= ?")
+		args = append(args, v)
+	}
+	query := fmt.Sprintf(`
+		SELECT key_label, model,
+		       COUNT(*) as requests,
+		       COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+		       COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+		       SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as errors
+		FROM usage WHERE %s
+		GROUP BY key_label, model
+		ORDER BY key_label, model`, strings.Join(where, " AND "))
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	out := []summaryRow{}
+	for rows.Next() {
+		var s summaryRow
+		if err := rows.Scan(&s.KeyLabel, &s.Model, &s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.Errors); err != nil {
+			continue
+		}
+		out = append(out, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"summary": out})
+}
+
+// --- Subscriber status: the entitlement source of truth every gateway
+// checks before serving a request. ---
+//
+// This is deliberately shaped like the professional pattern (OpenAI/
+// Anthropic/OpenRouter): a real payment processor (Stripe or similar) is
+// the actual source of truth for billing, but you never call it
+// synchronously on the request path — too slow, and an outage there must
+// never take down inference. Instead the processor's webhooks write
+// status HERE (via /subscribers/webhook, shaped for Stripe's event
+// envelope but generic enough for any processor), and every gateway
+// checks THIS fast local cache. Until a real processor is wired up,
+// /subscribers/set is the manual equivalent — same table, same read
+// path, so nothing about the gateway's check needs to change later.
+//
+// Status values: "active" (serve normally), "past_due" (still serve —
+// matches Stripe's own grace-period semantics: a failed card is not an
+// instant cutoff), "canceled" / "suspended" (block). Unknown key_label =
+// treated as blocked by default (fail closed) UNLESS the gateway's
+// entitlement check itself is disabled — see docs/BILLING_ENTITLEMENT.md.
+type subscriberStatus struct {
+	KeyLabel   string `json:"key_label"`
+	Status     string `json:"status"`
+	Plan       string `json:"plan,omitempty"`
+	Source     string `json:"source,omitempty"`
+	ExternalID string `json:"external_id,omitempty"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+	Note       string `json:"note,omitempty"`
+}
+
+var validSubscriberStatuses = map[string]bool{
+	"active": true, "past_due": true, "canceled": true, "suspended": true,
+}
+
+// subscriberSetHandler is the manual control surface: mark one key's
+// status directly. This is what "easily block an unsubscribed user"
+// means operationally today — POST here with status=canceled. Once a
+// real payment processor is wired up, /subscribers/webhook does the same
+// write automatically on subscription-lifecycle events.
+func (h *meterHub) subscriberSetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var s subscriberStatus
+	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if s.KeyLabel == "" {
+		http.Error(w, `{"error":"key_label is required"}`, http.StatusBadRequest)
+		return
+	}
+	if !validSubscriberStatuses[s.Status] {
+		http.Error(w, fmt.Sprintf(`{"error":"status must be one of active, past_due, canceled, suspended, got %q"}`, s.Status), http.StatusBadRequest)
+		return
+	}
+	if s.Source == "" {
+		s.Source = "manual"
+	}
+	_, err := h.db.Exec(`
+		INSERT INTO subscribers (key_label, status, plan, source, external_id, updated_at, note)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(key_label) DO UPDATE SET
+			status=excluded.status, plan=excluded.plan, source=excluded.source,
+			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note`,
+		s.KeyLabel, s.Status, s.Plan, s.Source, s.ExternalID, time.Now().UTC().Format(time.RFC3339), s.Note,
+	)
+	if err != nil {
+		log.Printf("meterhub: subscriber set failed: %v", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// subscriberGetHandler is the fast per-request check every gateway makes
+// (see tools/gateway's entitlementCache). No auth beyond the same report
+// token, matching /ingest — gateways are the only expected caller.
+func (h *meterHub) subscriberGetHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, `{"error":"key is required"}`, http.StatusBadRequest)
+		return
+	}
+	var s subscriberStatus
+	err := h.db.QueryRow(`SELECT key_label, status, plan, source, external_id, updated_at, note FROM subscribers WHERE key_label = ?`, key).
+		Scan(&s.KeyLabel, &s.Status, &s.Plan, &s.Source, &s.ExternalID, &s.UpdatedAt, &s.Note)
+	if err == sql.ErrNoRows {
+		// No record at all: reported as status "unknown" rather than 404,
+		// so the gateway's fail-closed/fail-open policy decision lives in
+		// ONE place (the gateway config), not split across HTTP status
+		// code handling here too.
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(subscriberStatus{KeyLabel: key, Status: "unknown"})
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s)
+}
+
+// subscriberListHandler lists every known subscriber — the "update all"
+// / audit view: see at a glance who is active/past_due/canceled/suspended
+// without ssh-ing anywhere.
+func (h *meterHub) subscriberListHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	statusFilter := r.URL.Query().Get("status")
+	query := `SELECT key_label, status, plan, source, external_id, updated_at, note FROM subscribers`
+	args := []any{}
+	if statusFilter != "" {
+		query += ` WHERE status = ?`
+		args = append(args, statusFilter)
+	}
+	query += ` ORDER BY key_label`
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	out := []subscriberStatus{}
+	for rows.Next() {
+		var s subscriberStatus
+		if err := rows.Scan(&s.KeyLabel, &s.Status, &s.Plan, &s.Source, &s.ExternalID, &s.UpdatedAt, &s.Note); err != nil {
+			continue
+		}
+		out = append(out, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"subscribers": out})
+}
+
+// stripeWebhookEvent is the minimal shape this endpoint understands from
+// Stripe's event envelope — just enough to map a subscription lifecycle
+// event to a subscriber status write. NOT a full Stripe SDK integration
+// (that needs a real Stripe account, webhook signing secret, and product/
+// price setup this session cannot create) — this is the receiving end,
+// ready to wire up: point a Stripe webhook at POST /subscribers/webhook
+// with events customer.subscription.{created,updated,deleted} and set
+// metadata.key_label on the Stripe subscription to the oaica-gateway key
+// label it corresponds to.
+//
+// SECURITY NOTE for whoever wires up the real Stripe webhook: this
+// handler currently trusts the SAME report-token Bearer auth as every
+// other meterhub endpoint, which is NOT what Stripe sends — Stripe signs
+// webhooks with a per-endpoint signing secret verified via
+// stripe.Webhook.ConstructEvent, a different mechanism entirely. Swap the
+// auth check in this handler for real Stripe signature verification
+// before pointing a live Stripe webhook at it; the report-token check
+// here is only a placeholder so the endpoint isn't wide open in the
+// meantime.
+type stripeWebhookEvent struct {
+	Type string `json:"type"`
+	Data struct {
+		Object struct {
+			ID       string `json:"id"`
+			Status   string `json:"status"` // Stripe's subscription.status: active, past_due, canceled, unpaid, ...
+			Metadata struct {
+				KeyLabel string `json:"key_label"`
+			} `json:"metadata"`
+			Items struct {
+				Data []struct {
+					Price struct {
+						Nickname string `json:"nickname"`
+					} `json:"price"`
+				} `json:"data"`
+			} `json:"items"`
+		} `json:"object"`
+	} `json:"data"`
+}
+
+var stripeToInternalStatus = map[string]string{
+	"active":   "active",
+	"trialing": "active",
+	"past_due": "past_due",
+	"unpaid":   "past_due",
+	"canceled": "canceled",
+	"paused":   "suspended",
+}
+
+func (h *meterHub) subscriberWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// See the SECURITY NOTE above the type definition: placeholder auth,
+	// replace with real Stripe signature verification before production use.
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var ev stripeWebhookEvent
+	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	keyLabel := ev.Data.Object.Metadata.KeyLabel
+	if keyLabel == "" {
+		// Nothing to map this event to — log and accept (200) rather than
+		// error, so Stripe doesn't retry an event we will never be able
+		// to act on (missing metadata is a config problem on the Stripe
+		// side, not a transient failure worth retrying).
+		log.Printf("meterhub: webhook event %s has no metadata.key_label, ignoring", ev.Type)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	status, ok := stripeToInternalStatus[ev.Data.Object.Status]
+	if !ok {
+		log.Printf("meterhub: webhook event %s: unrecognized Stripe status %q for key %s, ignoring", ev.Type, ev.Data.Object.Status, keyLabel)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	plan := ""
+	if len(ev.Data.Object.Items.Data) > 0 {
+		plan = ev.Data.Object.Items.Data[0].Price.Nickname
+	}
+	_, err := h.db.Exec(`
+		INSERT INTO subscribers (key_label, status, plan, source, external_id, updated_at, note)
+		VALUES (?, ?, ?, 'stripe', ?, ?, ?)
+		ON CONFLICT(key_label) DO UPDATE SET
+			status=excluded.status, plan=excluded.plan, source='stripe',
+			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note`,
+		keyLabel, status, plan, ev.Data.Object.ID, time.Now().UTC().Format(time.RFC3339), "via webhook: "+ev.Type,
+	)
+	if err != nil {
+		log.Printf("meterhub: webhook write failed: %v", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("meterhub: %s -> status=%s (via %s)", keyLabel, status, ev.Type)
+	w.WriteHeader(http.StatusOK)
+}
+
+func main() {
+	configPath := flag.String("config", "", "path to a JSON config (listen_addr, db_path, report_tokens)")
+	flag.Parse()
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	hub, err := newMeterHub(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("meterhub: db=%s listen=%s report_tokens=%d", cfg.DBPath, cfg.ListenAddr, len(cfg.ReportTokens))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/ingest", hub.ingestHandler)
+	mux.HandleFunc("/usage", hub.usageHandler)
+	mux.HandleFunc("/usage/summary", hub.summaryHandler)
+	mux.HandleFunc("/subscribers/set", hub.subscriberSetHandler)
+	mux.HandleFunc("/subscribers/get", hub.subscriberGetHandler)
+	mux.HandleFunc("/subscribers/list", hub.subscriberListHandler)
+	mux.HandleFunc("/subscribers/webhook", hub.subscriberWebhookHandler)
+
+	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+}

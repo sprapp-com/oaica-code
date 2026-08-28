@@ -181,6 +181,42 @@ type gwConfig struct {
 	LedgerPath   string    `json:"ledger_path"`
 	APIKeys      []gwKey   `json:"api_keys"`
 	Models       []gwModel `json:"models"`
+
+	// MeterHubAddr, when set, makes this gateway ALSO report every ledger
+	// entry to a central meterhub instance (tools/meterhub) — async,
+	// best-effort, never on the request's critical path. The local JSONL
+	// ledger (LedgerPath) stays the durable per-box audit trail
+	// regardless; meterhub is purely an aggregation convenience so
+	// "how many tokens has key X used across every region" doesn't
+	// require ssh-ing into every box and summing files by hand. Empty =
+	// disabled, byte-identical to before meterhub existed.
+	MeterHubAddr  string `json:"meterhub_addr"`
+	MeterHubToken string `json:"meterhub_token"`
+	// Region names this gateway in meterhub's records — "a100b" today,
+	// a real region name once there's more than one.
+	Region string `json:"region"`
+
+	// EntitlementEnabled turns on the subscriber-status check (blocking
+	// canceled/suspended keys) — see entitlementCache's doc. False by
+	// default: an unconfigured gateway must never start rejecting
+	// requests it didn't before. Requires MeterHubAddr to be set (the
+	// subscriber table lives in meterhub).
+	EntitlementEnabled bool `json:"entitlement_enabled"`
+	// EntitlementFailOpen decides what happens when meterhub is
+	// unreachable or a key has no subscriber record at all: true = serve
+	// anyway (never let an aggregation-layer outage block real traffic);
+	// false = block anything not explicitly known-active (matches "block
+	// unsubscribed users" literally — an unrecognized key is NOT a
+	// subscriber). Default false (fail closed) once EntitlementEnabled is
+	// true, since the whole point of enabling this is refusing unknown
+	// keys.
+	EntitlementFailOpen bool `json:"entitlement_fail_open"`
+	// EntitlementCacheTTLSec bounds how stale a cached subscriber status
+	// can be before the next request for that key re-checks meterhub.
+	// Default 60. This is what keeps the per-request check fast — it
+	// reads an in-memory map, not a network call, on every request
+	// except the first (or first-after-expiry) for each key.
+	EntitlementCacheTTLSec int `json:"entitlement_cache_ttl_sec"`
 }
 
 func defaultConfig() gwConfig {
@@ -324,6 +360,18 @@ type gateway struct {
 	healthMu   sync.Mutex
 	healthAt   time.Time
 	healthLast healthResult
+
+	// meterCh feeds the background reporter goroutine (see
+	// startMeterReporter); nil when MeterHubAddr is unset. Buffered and
+	// non-blocking on send — a full channel means meterhub is unreachable
+	// for a while, and the right response is to drop that report (the
+	// local JSONL ledger already has it) rather than let a billing
+	// side-channel add latency or backpressure to real chat completions.
+	meterCh chan usageReport
+
+	// entitlement is the subscriber-status cache — see entitlementCache's
+	// doc. nil when EntitlementEnabled is false.
+	entitlement *entitlementCache
 }
 
 func (g *gateway) apply(cfg gwConfig) error {
@@ -353,7 +401,99 @@ func (g *gateway) apply(cfg gwConfig) error {
 	}
 	g.ledger = f
 	g.ledgerMu.Unlock()
+
+	// (Re)start the meter reporter on every apply — a reload that changes
+	// MeterHubAddr must take effect without a process restart, same as
+	// every other config field here. startMeterReporter is idempotent-safe
+	// to call repeatedly: each call gets its own channel/goroutine: the OLD
+	// goroutine (if any) keeps draining its own now-orphaned channel until
+	// it empties and exits on its own — never killed mid-send, never leaks
+	// past a few pending reports.
+	if cfg.MeterHubAddr != "" {
+		g.meterCh = make(chan usageReport, 256)
+		go runMeterReporter(g.meterCh, cfg.MeterHubAddr, cfg.MeterHubToken)
+	} else {
+		g.meterCh = nil
+	}
+
+	if cfg.EntitlementEnabled && cfg.MeterHubAddr != "" {
+		ttl := time.Duration(cfg.EntitlementCacheTTLSec) * time.Second
+		if ttl <= 0 {
+			ttl = 60 * time.Second
+		}
+		g.entitlement = newEntitlementCache(cfg.MeterHubAddr, cfg.MeterHubToken, ttl, cfg.EntitlementFailOpen)
+	} else {
+		g.entitlement = nil
+	}
 	return nil
+}
+
+// usageReport is what gets sent to meterhub's POST /ingest — same shape as
+// ledgerEntry plus the region label meterhub needs to tell gateways apart.
+type usageReport struct {
+	ledgerEntry
+	Region string `json:"region"`
+}
+
+// meterReporterBackoff is the delay before retry N (1-indexed); a package
+// var so tests can shrink it to keep a deliberately-unreachable-meterhub
+// test from leaving a real multi-second retry loop running past the test
+// function's return (it was measurably making unrelated wall-clock-
+// sensitive tests flakier under `go test ./...` before this existed).
+var meterReporterBackoff = func(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
+
+// runMeterReporter drains ch and POSTs each report to meterhub, retrying
+// a failed send a bounded number of times with backoff before giving up on
+// that one record (the local JSONL ledger already has it durably — a
+// meterhub outage can never lose billing data, only delay the aggregated
+// view). Exits when ch is closed AND drained.
+func runMeterReporter(ch <-chan usageReport, addr, token string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	const maxAttempts = 3
+	for rep := range ch {
+		body, err := json.Marshal(rep)
+		if err != nil {
+			continue
+		}
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			req, err := http.NewRequest(http.MethodPost, strings.TrimRight(addr, "/")+"/ingest", bytes.NewReader(body))
+			if err != nil {
+				break
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+					break // delivered
+				}
+			}
+			if attempt < maxAttempts {
+				time.Sleep(meterReporterBackoff(attempt))
+			}
+		}
+	}
+}
+
+// reportUsage sends e to the meter reporter's channel, non-blocking. A full
+// channel (meterhub down/slow for a while) drops the report rather than
+// stalling the request that triggered it — see meterCh's doc.
+func (g *gateway) reportUsage(e ledgerEntry) {
+	g.mu.RLock()
+	ch := g.meterCh
+	region := g.cfg.Region
+	g.mu.RUnlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- usageReport{ledgerEntry: e, Region: region}:
+	default:
+		log.Printf("oaica-gateway: meterhub report channel full, dropping report for %s (local ledger still has it)", e.RequestID)
+	}
 }
 
 func (g *gateway) reload(path string) {
@@ -530,11 +670,14 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 		return
 	}
 	g.ledgerMu.Lock()
-	defer g.ledgerMu.Unlock()
-	if g.ledger == nil {
-		return
+	if g.ledger != nil {
+		g.ledger.Write(append(b, '\n'))
 	}
-	g.ledger.Write(append(b, '\n'))
+	g.ledgerMu.Unlock()
+
+	// Best-effort central aggregation — see meterCh's doc. Never blocks:
+	// reportUsage sends on a buffered channel with a non-blocking select.
+	g.reportUsage(e)
 }
 
 type usage struct {
@@ -655,6 +798,15 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return
 	}
+	if g.entitlement != nil {
+		if allowed, reason := g.entitlement.check(label); !allowed {
+			// 403, not 401: the key itself authenticated fine — this
+			// is "who you are is known and not currently entitled",
+			// a distinct condition from "we don't know who you are".
+			writeErr(w, http.StatusForbidden, "subscription_required", reason)
+			return
+		}
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds limit")
@@ -769,13 +921,102 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	}
 }
 
-func (g *gateway) authed(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if g.keyLabel(r) == "" {
-			writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
-			return
+// entitlementCache is the fast local read-through cache in front of
+// meterhub's subscriber table — see gwConfig.EntitlementEnabled's doc for
+// why this exists as a cache rather than a synchronous per-request call.
+// One entry per key label; refreshed on read when stale, never proactively
+// polled (a key nobody is currently calling costs nothing to track).
+type entitlementCache struct {
+	addr     string
+	token    string
+	ttl      time.Duration
+	failOpen bool
+	client   *http.Client
+
+	mu      sync.Mutex
+	entries map[string]entitlementCacheEntry
+}
+
+type entitlementCacheEntry struct {
+	allowed   bool
+	reason    string
+	fetchedAt time.Time
+}
+
+func newEntitlementCache(addr, token string, ttl time.Duration, failOpen bool) *entitlementCache {
+	return &entitlementCache{
+		addr: strings.TrimRight(addr, "/"), token: token, ttl: ttl, failOpen: failOpen,
+		client:  &http.Client{Timeout: 3 * time.Second},
+		entries: make(map[string]entitlementCacheEntry),
+	}
+}
+
+// check returns whether label may proceed, and a human-readable reason
+// when it may not. Reads the cache first; only reaches meterhub when the
+// entry is missing or older than ttl, so a hot key never pays a network
+// round trip on the request path.
+func (c *entitlementCache) check(label string) (allowed bool, reason string) {
+	c.mu.Lock()
+	e, ok := c.entries[label]
+	c.mu.Unlock()
+	if ok && time.Since(e.fetchedAt) < c.ttl {
+		return e.allowed, e.reason
+	}
+
+	allowed, reason = c.fetchAndDecide(label)
+	c.mu.Lock()
+	c.entries[label] = entitlementCacheEntry{allowed: allowed, reason: reason, fetchedAt: time.Now()}
+	c.mu.Unlock()
+	return allowed, reason
+}
+
+// fetchAndDecide queries meterhub for label's subscriber status and
+// applies the fail-open/fail-closed policy. Never blocks longer than the
+// client's 3s timeout — a slow or unreachable meterhub degrades to
+// whatever failOpen says, it never hangs the request.
+func (c *entitlementCache) fetchAndDecide(label string) (bool, string) {
+	req, err := http.NewRequest(http.MethodGet, c.addr+"/subscribers/get?key="+url.QueryEscape(label), nil)
+	if err != nil {
+		return c.failOpen, "entitlement check unavailable"
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if c.failOpen {
+			return true, ""
 		}
-		h(w, r)
+		return false, "entitlement service unreachable"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "entitlement check failed"
+	}
+	var s struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "entitlement check failed"
+	}
+	switch s.Status {
+	case "active", "past_due":
+		return true, ""
+	case "canceled":
+		return false, "subscription canceled"
+	case "suspended":
+		return false, "account suspended"
+	default: // "unknown" — no subscriber record at all
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "no active subscription for this key"
 	}
 }
 

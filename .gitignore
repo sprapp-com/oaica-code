@@ -27,3 +27,5 @@ tools/katlb/katlb-linux-amd64
 
 # graphify knowledge-graph output (50MB, regenerable)
 /graphify-out/
+tools/gateway/gateway
+tools/meterhub/meterhub
