@@ -99,6 +99,14 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 	if model == "" {
 		return launchEndpoint{}, errors.New("no model given")
 	}
+	// User-defined alias (~/.oaica/aliases.json) wins over everything else:
+	// a user who explicitly aliased a short name wants exactly that target,
+	// not a different thing that happens to share the bare id. See
+	// model_alias.go's doc for why this exists (manual override that never
+	// waits on discovery/refresh).
+	if target, ok := resolveModelAlias(model); ok {
+		model = target
+	}
 	if ep, ok := resolveRemoteEndpoint(model); ok {
 		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
 	}

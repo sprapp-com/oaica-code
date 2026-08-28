@@ -2282,7 +2282,107 @@ func NewCLI() *cobra.Command {
 			return nil
 		},
 	}
-	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd)
+	modelRefreshCmd := &cobra.Command{
+		Use:   "refresh",
+		Short: "Force a fresh, live probe of every model source (daemon, remotes, router) right now",
+		Long: `Every 'oaica launch'/'oaica model' invocation already re-probes model
+sources live -- there is no cross-process cache, so a plain 'ollama pull'
+or a remotes.json edit is visible on the very next launch with no action
+needed. This command exists for confirming RIGHT NOW that a model you just
+pulled or added is actually discoverable, without launching Claude Code
+just to see the picker list.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			result, err := launch.RefreshModelSources(15 * time.Second)
+			if err != nil {
+				return err
+			}
+			launch.WriteRefreshedModelSources(os.Stdout, result)
+			return nil
+		},
+	}
+	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd)
+
+	// model alias — user shortcuts (~/.oaica/aliases.json), resolved first
+	// in resolveLaunchEndpoint, entirely independent of discovery/refresh —
+	// the "don't wait for anyone to fix/rename anything" escape hatch.
+	modelAliasCmd := &cobra.Command{
+		Use:   "alias NAME",
+		Short: "Manage user-defined model name shortcuts (~/.oaica/aliases.json)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, _ := cmd.Flags().GetString("target")
+			if len(args) == 0 {
+				return fmt.Errorf("usage: oaica model alias NAME --target <id> (or: alias list/show/rm)")
+			}
+			if target == "" {
+				return fmt.Errorf("--target is required, e.g. --target ollama/glm-5.3-flash:cloud")
+			}
+			if err := launch.ModelAliasSet(args[0], target); err != nil {
+				return err
+			}
+			fmt.Printf("alias %q -> %q\n", args[0], target)
+			return nil
+		},
+	}
+	modelAliasCmd.Flags().String("target", "", "The real model id this alias resolves to")
+
+	modelAliasListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List model aliases",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			names, err := launch.ModelAliasSortedNames()
+			if err != nil {
+				return err
+			}
+			if len(names) == 0 {
+				path, _ := launch.ModelAliasesPath()
+				fmt.Printf("No aliases defined (%s).\nCreate one with `oaica model alias <name> --target <id>`\n", path)
+				return nil
+			}
+			for _, n := range names {
+				target, err := launch.ModelAliasGet(n)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("%-20s -> %s\n", n, target)
+			}
+			return nil
+		},
+	}
+	modelAliasRemoveCmd := &cobra.Command{
+		Use:     "rm NAME",
+		Aliases: []string{"remove"},
+		Short:   "Remove a model alias",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			existed, err := launch.ModelAliasRemove(args[0])
+			if err != nil {
+				return err
+			}
+			if !existed {
+				return fmt.Errorf("no alias named %q", args[0])
+			}
+			fmt.Printf("removed alias %q\n", args[0])
+			return nil
+		},
+	}
+	modelAliasShowCmd := &cobra.Command{
+		Use:   "show NAME",
+		Short: "Show what one alias resolves to",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := launch.ModelAliasGet(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s -> %s\n", args[0], target)
+			return nil
+		},
+	}
+	modelAliasCmd.AddCommand(modelAliasListCmd, modelAliasShowCmd, modelAliasRemoveCmd)
+	modelCmd.AddCommand(modelAliasCmd)
 
 	// plan — named opus/sonnet tier splits ("our own /opusplan"). Resolved
 	// by cmd/launch/tier_plan_profiles.go's extractPlanFlag inside

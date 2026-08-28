@@ -112,6 +112,66 @@ oaica gpu clean --yes  # actually kill them
 parent has exited) AND matches a known worker pattern — it will not touch
 a process that still has a live parent, even one it doesn't recognize.
 
+## Discovery, drift-safety, and manual refresh
+
+The picker's "Local Models" / "Remote Models" / "Recommended" / "More"
+sections are never cached across launches — every `oaica launch`/`oaica
+model` invocation is a fresh process with no persistent state, so a plain
+`ollama pull <model>` or a `~/.oaica/remotes.json` edit is visible on the
+very next launch automatically. There is nothing to "refresh" in the
+common case; it already is.
+
+**If Ollama (or a remote) changes its response format**, the picker
+degrades safely instead of corrupting: local models are parsed into typed
+Go structs (`api.ListModelResponse`), so an added field is silently
+ignored, and a renamed/missing field just leaves that one entry's name
+empty — which is already filtered out — rather than breaking the rest of
+the list. A dead or unreachable source (router down, a remote asleep) is
+reported but never empties the other sources; local models keep working
+fully offline even if the router is unreachable.
+
+**To confirm a model is discoverable right now**, without launching Claude
+Code just to see the picker:
+
+```shell
+oaica model refresh
+```
+
+Forces a fresh, live probe of the local daemon, every user remote, and the
+OAICA router, and prints what each one currently reports — the same three
+sources the picker sections are built from.
+
+**To make a memorable shortcut** for a model you don't want to wait on a
+rename/config fix for — e.g. `ollama/glm-5.3-flash:cloud` under a short
+name:
+
+```shell
+oaica model alias glm --target ollama/glm-5.3-flash:cloud
+oaica launch claude --model glm    # resolves to the real target first
+```
+
+An alias is checked before anything else in model resolution — it always
+wins if defined, is stored in `~/.oaica/aliases.json`, and is entirely
+local: nothing about it depends on discovery, the router, or waiting for
+anyone to fix or rename something upstream.
+
+```shell
+oaica model alias list
+oaica model alias show glm
+oaica model alias rm glm
+```
+
+**To get an Ollama `:cloud` model (like `glm-5.3-flash:cloud`) onto every
+client box in one shot** — each box's daemon needs its own pull (the pull
+only registers a lightweight manifest pointer locally; the real weights
+stay hosted), so there's no single fleet-wide action — use
+`tools/a100b/pull-ollama-cloud.sh` (edit the `HOSTS=` list for your fleet):
+
+```shell
+tools/a100b/pull-ollama-cloud.sh                        # pulls its DEFAULT_MODELS list
+tools/a100b/pull-ollama-cloud.sh glm-5.3-flash:cloud kimi-k2.7-code:cloud
+```
+
 ## See also
 
 - [docs/CLAUDE_TIERS.md](CLAUDE_TIERS.md) — how tier resolution and

@@ -280,6 +280,14 @@ func ensureCloudAuth(ctx context.Context, client *api.Client, modelList string) 
 // being present in oaicaLiveModels() (or being a valid "+"-composite of
 // one), which is the only readiness check that applies here.
 func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string, policy missingModelPolicy, isCloudModel bool) error {
+	// User-defined alias (~/.oaica/aliases.json): resolve to its real
+	// target before any readiness check, same as resolveLaunchEndpoint —
+	// otherwise a bare alias name never matches oaicaModelIsReady/the
+	// remote check below and falls through to a bogus "run ollama pull"
+	// error even though the real target is perfectly launchable.
+	if target, ok := resolveModelAlias(model); ok {
+		model = target
+	}
 	if oaicaModelIsReady(model) {
 		return nil
 	}
