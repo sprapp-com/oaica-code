@@ -332,9 +332,20 @@ func resolveBareRemoteModel(bare string) (userRemote, string, bool) {
 // version prefix), the bearer token, the bare upstream model id, and the
 // protocol descriptor used by the capability gate.
 type RemoteEndpoint struct {
-	Name            string // remote.Name — provider id in integration catalogs
-	BaseURL         string // r.openAIBase() — includes the /v1 (or /v4) version prefix
-	Token           string // r.key()
+	Name    string // remote.Name — provider id in integration catalogs
+	BaseURL string // r.openAIBase() — includes the /v1 (or /v4) version prefix
+	Token   string // r.key(), resolved once at build time — see TokenEnv for why this is a fallback, not the source of truth
+	// TokenEnv is remote.APIKeyEnv, carried through so the proxy can re-read
+	// the credential from the environment on every request instead of
+	// caching whatever it resolved to when the launch proxy started. A
+	// process built before an env var was exported (or before it was
+	// rotated) otherwise keeps rejecting/using the stale value for its
+	// entire lifetime — hit in production 2026-08-29 (a client box's
+	// OAICA_GATEWAY_KEY was exported to ~/.bashrc after `oaica launch
+	// claude` had already started; every request 401'd until the process
+	// was killed and relaunched). Empty means Token came from a literal
+	// api_key in remotes.json, which has no live source to re-read.
+	TokenEnv        string
 	UpstreamModel   string // bare id the remote expects (part after the first "/")
 	Wire            string
 	ToolFormat      string
@@ -359,6 +370,7 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		Name:            remote.Name,
 		BaseURL:         remote.openAIBase(),
 		Token:           remote.key(),
+		TokenEnv:        strings.TrimSpace(remote.APIKeyEnv),
 		UpstreamModel:   bare,
 		Wire:            d.Wire,
 		ToolFormat:      d.ToolFormat,

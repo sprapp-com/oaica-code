@@ -209,7 +209,7 @@ type tierPlan struct {
 }
 
 func routeFor(ep launchEndpoint) proxyRoute {
-	return proxyRoute{BaseURL: ep.BaseURL, Key: ep.Token, UpstreamModel: ep.UpstreamModel, Label: string(ep.Source) + ":" + ep.Name}
+	return proxyRoute{BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel, Label: string(ep.Source) + ":" + ep.Name}
 }
 
 // resolveSecondaryEndpoint resolves --sonnet-model relative to the primary.

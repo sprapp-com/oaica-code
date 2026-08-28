@@ -38,6 +38,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -436,16 +437,36 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	// already includes /v1 (e.g. https://api.deepseek.com/v1) would produce
 	// /v1/v1/chat/completions and 404.
 	return RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
 	})
 }
 
 // proxyRoute is one upstream an Anthropic request can be forwarded to.
 type proxyRoute struct {
-	BaseURL       string // OpenAI base including the version prefix (".../v1")
-	Key           string // bearer sent upstream; empty = none
+	BaseURL string // OpenAI base including the version prefix (".../v1")
+	Key     string // bearer sent upstream when KeyEnv is empty; empty = none
+	// KeyEnv, when set, is the environment variable resolveKey() re-reads on
+	// every request instead of trusting Key — see RemoteEndpoint.TokenEnv's
+	// doc for why a one-time-resolved credential is wrong for a long-lived
+	// proxy process.
+	KeyEnv        string
 	UpstreamModel string // model id the upstream expects
 	Label         string // for the request log / diagnostics
+}
+
+// resolveKey returns the bearer to send upstream, live: KeyEnv wins whenever
+// it is set and currently non-empty in the environment (so exporting or
+// rotating it takes effect on the very next request), falling back to the
+// value resolved at launch time otherwise — either because the remote uses
+// a literal api_key (KeyEnv empty) or because the env var is unset right
+// now (rare; keeps old behavior rather than suddenly sending no credential).
+func (route proxyRoute) resolveKey() string {
+	if route.KeyEnv != "" {
+		if v := strings.TrimSpace(os.Getenv(route.KeyEnv)); v != "" {
+			return v
+		}
+	}
+	return route.Key
 }
 
 // proxyRouteTable maps the model id Claude Code puts in each request to an
@@ -550,7 +571,6 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 // table; see proxyRouteTable.
 func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
 	baseURL := table.Default.BaseURL
-	key := table.Default.Key
 
 	mux := http.NewServeMux()
 
@@ -562,7 +582,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
 			return
 		}
-		proxyPassThrough(w, r, baseURL+"/models", key)
+		proxyPassThrough(w, r, baseURL+"/models", table.Default.resolveKey())
 	})
 
 	// /health — a trivial liveness probe so callers can confirm the proxy is up.
@@ -635,8 +655,8 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
-		if route.Key != "" {
-			upstreamReq.Header.Set("Authorization", "Bearer "+route.Key)
+		if resolvedKey := route.resolveKey(); resolvedKey != "" {
+			upstreamReq.Header.Set("Authorization", "Bearer "+resolvedKey)
 		}
 		if table.SessionID != "" {
 			upstreamReq.Header.Set("X-Session-Id", table.SessionID)

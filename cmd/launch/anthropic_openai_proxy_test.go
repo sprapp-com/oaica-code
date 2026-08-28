@@ -247,6 +247,69 @@ func TestProxy_SessionIDHeaderForwarded(t *testing.T) {
 	}
 }
 
+// TestProxyResolveKey_ReReadsEnvVarLive is the regression for a production
+// incident (2026-08-29): a client's OAICA_GATEWAY_KEY was exported to
+// ~/.bashrc AFTER `oaica launch claude` had already built its proxy route
+// table, and every request kept 401ing until the process was killed and
+// relaunched — because Key was resolved once via remote.key() at table-build
+// time and cached in the proxyRoute for the rest of the process's life.
+// KeyEnv fixes this: resolveKey() re-reads the environment on every request.
+func TestProxyResolveKey_ReReadsEnvVarLive(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	const envVar = "OAICA_TEST_LIVE_KEY"
+	t.Setenv(envVar, "")
+
+	var gotAuth []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "kat-awq",
+			"choices": []map[string]any{{"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	// Table built BEFORE the env var is ever set, matching the incident:
+	// the proxy process starts, THEN the key gets exported.
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", KeyEnv: envVar, Label: "test:kat-awq"},
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+
+	post := func() {
+		body, _ := json.Marshal(map[string]any{
+			"model": "kat-awq", "max_tokens": 10,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		})
+		resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	// Env var still empty: no Authorization header sent upstream.
+	post()
+	if len(gotAuth) != 1 || gotAuth[0] != "" {
+		t.Fatalf("before export: upstream auth = %v, want a single empty value", gotAuth)
+	}
+
+	// Export the key into the SAME already-running process's environment —
+	// no relaunch, no route-table rebuild.
+	t.Setenv(envVar, "sk-live-value")
+	post()
+	if len(gotAuth) != 2 || gotAuth[1] != "Bearer sk-live-value" {
+		t.Fatalf("after export, same process: upstream auth = %v, want [.. \"Bearer sk-live-value\"]", gotAuth)
+	}
+}
+
 // TestNewProxySessionID verifies the generator returns a non-empty, prefixed,
 // and non-colliding value across calls — the same shape guarantee
 // newProxyClientToken already has, since session IDs feed a consistent-hash
