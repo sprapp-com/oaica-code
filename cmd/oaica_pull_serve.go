@@ -480,8 +480,62 @@ func humanBytes(n int64) string {
 // fork — it required a local Ollama server via checkServerHeartbeat, which
 // pullCmd's PreRunE has already been changed away from below).
 func PullHandler(cmd *cobra.Command, args []string) error {
-	_, err := oaicaPullModel(args[0])
-	return err
+	model := args[0]
+	destPath, err := oaicaPullModel(model)
+	if err != nil {
+		return err
+	}
+	autoPopulateModelManifest(model, destPath)
+	return nil
+}
+
+// autoPopulateModelManifest writes a minimal ~/.oaica/models.json entry
+// after a successful pull, so `oaica model list`/`oaica plan set` have
+// something to work with without the user hand-typing flags via
+// `oaica model add`.
+//
+// Deliberately partial: the router's pull-time manifest
+// (oaicaFetchManifest's oaicaManifest type) carries model id, size, and a
+// checksum — not architecture, quantization, or real context window. Those
+// need either a router schema addition (out of scope here — the router is
+// a separate service) or the user filling them in by hand afterward. What
+// IS known reliably: this pulled model is a GGUF served via `oaica serve`
+// through llama-server (EngineLlamaCPP), and its ModelPath.
+//
+// Never overwrites an existing entry: if the user already ran
+// `oaica model add` with real arch/quant/context (or a previous pull
+// already created one), a bare re-pull must not blow that away with a
+// blanker record.
+func autoPopulateModelManifest(model, modelPath string) {
+	if existing, err := launch.ModelShow(model); err == nil {
+		_ = existing // already present — leave it untouched, whatever detail it has
+		return
+	}
+	e, err := launch.ModelAdd(launch.ModelAddOptions{
+		ID:        model,
+		Engine:    string(launch.EngineLlamaCPP),
+		ModelPath: modelPath,
+		Notes:     "auto-populated by `oaica pull` — arch/quant/context-window unknown until set with `oaica model add --engine llama.cpp --context-window N ...` (the router's pull manifest doesn't carry that metadata yet)",
+	})
+	if err != nil {
+		// Never fail the pull over manifest bookkeeping — the weights are
+		// already on disk and `oaica serve` doesn't need a manifest entry
+		// to run. Surface it as a warning only.
+		fmt.Fprintf(os.Stderr, "warning: failed to record %s in the model manifest: %v\n", model, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "recorded %s in the model manifest (%s) — edit with `oaica model add %s --context-window N ...` to fill in the rest\n", e.ID, mustModelManifestPath(), e.ID)
+}
+
+// mustModelManifestPath returns the manifest path for the message above,
+// falling back to a fixed relative description if HOME can't be resolved
+// (never fatal — this only feeds a user-facing hint string).
+func mustModelManifestPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "~/.oaica/models.json"
+	}
+	return filepath.Join(home, ".oaica", "models.json")
 }
 
 // findLlamaServer locates a llama-server binary: $OAICA_LLAMA_SERVER env
