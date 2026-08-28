@@ -205,3 +205,186 @@ func TestSummaryHandler_RequiresAuth(t *testing.T) {
 		t.Errorf("status = %d, want 401", w.Code)
 	}
 }
+
+func postSubscriberSet(t *testing.T, hub *meterHub, token string, s subscriberStatus) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/set", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberSetHandler(w, req)
+	return w
+}
+
+func getSubscriber(t *testing.T, hub *meterHub, token, key string) (*httptest.ResponseRecorder, subscriberStatus) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/get?key="+key, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberGetHandler(w, req)
+	var s subscriberStatus
+	json.Unmarshal(w.Body.Bytes(), &s)
+	return w, s
+}
+
+func TestSubscriberSet_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/set", bytes.NewReader([]byte(`{}`)))
+	w := httptest.NewRecorder()
+	hub.subscriberSetHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestSubscriberSet_RequiresKeyLabel(t *testing.T) {
+	hub, token := testHub(t)
+	w := postSubscriberSet(t, hub, token, subscriberStatus{Status: "active"})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("missing key_label: status = %d, want 400", w.Code)
+	}
+}
+
+func TestSubscriberSet_RejectsInvalidStatus(t *testing.T) {
+	hub, token := testHub(t)
+	w := postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "alice", Status: "bogus"})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("invalid status: status = %d, want 400", w.Code)
+	}
+}
+
+func TestSubscriberSetAndGet_RoundTrip(t *testing.T) {
+	hub, token := testHub(t)
+	w := postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "alice", Status: "active", Plan: "pro"})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("set status = %d, want 204", w.Code)
+	}
+	_, s := getSubscriber(t, hub, token, "alice")
+	if s.Status != "active" || s.Plan != "pro" || s.Source != "manual" {
+		t.Errorf("got %+v, want status=active plan=pro source=manual", s)
+	}
+}
+
+func TestSubscriberSet_UpsertOverwritesPreviousStatus(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "alice", Status: "active"})
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "alice", Status: "canceled"})
+	_, s := getSubscriber(t, hub, token, "alice")
+	if s.Status != "canceled" {
+		t.Errorf("status = %q, want canceled (upsert must overwrite)", s.Status)
+	}
+}
+
+func TestSubscriberGet_UnknownKeyReturns200Unknown(t *testing.T) {
+	hub, token := testHub(t)
+	w, s := getSubscriber(t, hub, token, "nobody")
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (unknown is not an error)", w.Code)
+	}
+	if s.Status != "unknown" {
+		t.Errorf("status = %q, want unknown", s.Status)
+	}
+}
+
+func TestSubscriberGet_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/get?key=alice", nil)
+	w := httptest.NewRecorder()
+	hub.subscriberGetHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestSubscriberList_FiltersByStatus(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "alice", Status: "active"})
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "bob", Status: "canceled"})
+
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/list?status=canceled", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberListHandler(w, req)
+	var resp struct {
+		Subscribers []subscriberStatus `json:"subscribers"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Subscribers) != 1 || resp.Subscribers[0].KeyLabel != "bob" {
+		t.Errorf("status=canceled filter = %+v, want just bob", resp.Subscribers)
+	}
+}
+
+func TestSubscriberList_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/list", nil)
+	w := httptest.NewRecorder()
+	hub.subscriberListHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func postWebhook(t *testing.T, hub *meterHub, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/webhook", bytes.NewReader([]byte(body)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberWebhookHandler(w, req)
+	return w
+}
+
+func TestWebhook_ActiveSubscriptionSetsStatus(t *testing.T) {
+	hub, token := testHub(t)
+	body := `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active",
+		"metadata":{"key_label":"alice"},"items":{"data":[{"price":{"nickname":"pro"}}]}}}}`
+	w := postWebhook(t, hub, token, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	_, s := getSubscriber(t, hub, token, "alice")
+	if s.Status != "active" || s.Plan != "pro" || s.Source != "stripe" || s.ExternalID != "sub_1" {
+		t.Errorf("got %+v, want status=active plan=pro source=stripe external_id=sub_1", s)
+	}
+}
+
+func TestWebhook_CanceledSubscriptionBlocksKey(t *testing.T) {
+	hub, token := testHub(t)
+	postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active","metadata":{"key_label":"alice"}}}}`)
+	postWebhook(t, hub, token, `{"type":"customer.subscription.deleted","data":{"object":{"id":"sub_1","status":"canceled","metadata":{"key_label":"alice"}}}}`)
+	_, s := getSubscriber(t, hub, token, "alice")
+	if s.Status != "canceled" {
+		t.Errorf("status = %q, want canceled", s.Status)
+	}
+}
+
+func TestWebhook_MissingKeyLabelIsAcceptedNotRetried(t *testing.T) {
+	hub, token := testHub(t)
+	w := postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active"}}}`)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (accept-and-ignore, don't trigger Stripe retry)", w.Code)
+	}
+}
+
+func TestWebhook_UnrecognizedStripeStatusIsAcceptedNotRetried(t *testing.T) {
+	hub, token := testHub(t)
+	w := postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"incomplete_expired","metadata":{"key_label":"alice"}}}}`)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (accept-and-ignore unmapped status)", w.Code)
+	}
+	if _, s := getSubscriber(t, hub, token, "alice"); s.Status != "unknown" {
+		t.Errorf("unrecognized status must not write a row, got %+v", s)
+	}
+}
+
+func TestWebhook_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/webhook", bytes.NewReader([]byte(`{}`)))
+	w := httptest.NewRecorder()
+	hub.subscriberWebhookHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
