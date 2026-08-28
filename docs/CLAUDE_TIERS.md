@@ -75,6 +75,12 @@ every place that was tried (and the fix when the router rejected the key).
   (`Authorization: Bearer` / `x-api-key`). Claude Code receives that token
   as `ANTHROPIC_AUTH_TOKEN`; the real upstream keys live only inside the
   proxy and never enter the child environment.
+- 2026-08-28 audit: every bind site for this proxy (`ListenAnthropicOpenAIProxy`,
+  `ServeAnthropicProxyForRemote`) hardcodes `127.0.0.1` — there is no flag or
+  parameter anywhere in this codebase that can bind it to a non-loopback
+  address. Unlike `oaica serve` (which CAN bind `0.0.0.0` and is gated by
+  `--api-key`/`--insecure`), this proxy structurally cannot be exposed to the
+  network without a code change first.
 - The proxy writes a local-only request log (`~/.oaica/requests.log`:
   model, backend label + redacted URL, sizes, status — never content).
   Backend labels: `daemon:ollama …`, `remote:<name> …`, `router:oaica …`,

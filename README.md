@@ -21,6 +21,8 @@ OpenAI-compatible).
 [docs/SITE_BUILDER.md](docs/SITE_BUILDER.md) (the static site builder),
 [docs/CLAUDE_TIERS.md](docs/CLAUDE_TIERS.md) (plan on one model, execute on
 another — any mix of remote, router, local),
+[docs/MODELS_AND_PLANS.md](docs/MODELS_AND_PLANS.md) (add your own
+self-hosted model to the manifest, define a named `--plan`, GPU cleanup),
 [docs/OPENROUTER_PROVIDER.md](docs/OPENROUTER_PROVIDER.md) (how the API is
 served).
 
