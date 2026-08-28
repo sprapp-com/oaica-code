@@ -1,10 +1,10 @@
 #!/bin/bash
-# Control-plane supervisor for a100b: keeps katlb, gatekeeper and the gateway
+# Control-plane supervisor for a100b: keeps oaicalb, gatekeeper and the gateway
 # alive. The vLLM replicas have their own watchdog (vllm_awq_watchdog.sh);
 # before this script NOTHING supervised the three proxies -- a crash of any
 # one silently took the public API down, and the legacy /root/*_watchdog.sh
 # loops would relaunch the OLD binaries from /root (seen 2026-08-25:
-# "bind: address already in use" in /tmp/katlb.log as the legacy loop fought
+# "bind: address already in use" in /tmp/katlb.log as the legacy loop fought (pre-rename; log now oaicalb.log)
 # the v2 binary).
 #
 # Detection is by LISTENING PORT, not pgrep -f: a pgrep pattern matches the
@@ -23,9 +23,9 @@ listening() { ss -ltn 2>/dev/null | grep -q ":$1 "; }
 # tier. It lives in a 0600 file, never in a script.
 GW_KEY_FILE=/workspace/gateway_upstream.key
 
-start_katlb() {
-  log "starting katlb on :30099"
-  nohup /workspace/katlb-linux-amd64 -config /workspace/katlb-kat-awq.json >> /workspace/katlb.log 2>&1 < /dev/null &
+start_oaicalb() {
+  log "starting oaicalb on :30099"
+  nohup /workspace/oaicalb-linux-amd64 -config /workspace/oaicalb.json >> /workspace/oaicalb.log 2>&1 < /dev/null &
 }
 start_gatekeeper() {
   # Since 2026-08-26 gatekeeper lives under /workspace like everything else
@@ -59,7 +59,7 @@ start_tunnel() {
 
 log "stack watchdog start"
 while true; do
-  listening 30099 || start_katlb
+  listening 30099 || start_oaicalb
   listening 30098 || start_gatekeeper
   listening 8081  || start_gateway
   tunnel_running  || start_tunnel

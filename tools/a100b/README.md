@@ -1,11 +1,12 @@
 # a100b — reproducible serving stack
 
-Everything needed to rebuild the kat-awq public-inference stack on the a100b
-box (vast.ai, 8x A100 80GB, no systemd, 16G root overlay that is 100% full).
-Before this directory existed, the stack lived only as ad-hoc files under
-`/root/` and `/tmp/` on the box; when `/dev/shm/kat_awq` was deleted by
-another session's cleanup the watchdog crash-looped ~49k times and the only
-fix was a from-memory re-download that silently lost the chat-template patch.
+Everything needed to rebuild the oaica-35b-a3b-vision (renamed from kat-awq,
+2026-08-28) public-inference stack on the a100b box (vast.ai, 8x A100 80GB,
+no systemd, 16G root overlay that is 100% full). Before this directory
+existed, the stack lived only as ad-hoc files under `/root/` and `/tmp/` on
+the box; when `/dev/shm/kat_awq` was deleted by another session's cleanup
+the watchdog crash-looped ~49k times and the only fix was a from-memory
+re-download that silently lost the chat-template patch.
 
 ## Layout on the box
 
@@ -17,8 +18,8 @@ fails with ENOSPC on the full overlay.
 |---|---|---|
 | `/dev/shm/kat_awq/` | model weights (volatile tmpfs, shared) | HF `Ar4ikov/KAT-Coder-V2.5-Dev-AWQ-W4A16-ASYM` @ `446ea8c6` |
 | `/workspace/kat_awq.tokenizer_config.json` | chat_template patch | `kat_awq.tokenizer_config.json` |
-| `/workspace/vllm_awq_watchdog.sh` | fleet watchdog (preflight + restore + backoff) | `vllm_awq_watchdog.sh` |
-| `/workspace/katlb-linux-amd64` + `katlb-kat-awq.json` | LB with chat-aware probe | `../katlb/`, `katlb.json` |
+| `/workspace/vllm_awq_watchdog.sh` | fleet watchdog (preflight + restore + backoff + stall-kill) | `vllm_awq_watchdog.sh` |
+| `/workspace/oaicalb-linux-amd64` + `oaicalb.json` | LB with chat-aware probe (formerly katlb) | `../oaicalb/`, `oaicalb.json` |
 | `/workspace/gatekeeper` + `/workspace/gatekeeper.json` (0600, plaintext keys) | per-key concurrency tiers | `../gatekeeper/`, `gatekeeper.json` |
 | `/workspace/oaica-gateway` + `oaica-gateway.json` | public OpenAI gateway (metering, hashed keys) | `../gateway/`, `gateway.json` |
 | `/workspace/oaica-gateway-ledger.jsonl` | billing ledger (append-only) | -- |
@@ -39,7 +40,7 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download(
 install -m 0644 kat_awq.tokenizer_config.json /dev/shm/kat_awq/tokenizer_config.json
 
 # 2. binaries (build on the laptop, scp to /workspace)
-(cd ../katlb   && GOOS=linux GOARCH=amd64 go build -o katlb-linux-amd64 main.go)
+(cd ../oaicalb && GOOS=linux GOARCH=amd64 go build -o oaicalb-linux-amd64 main.go)
 (cd ../gateway && GOOS=linux GOARCH=amd64 go build -o oaica-gateway main.go)
 
 # 3. configs: fill secrets, then
@@ -48,9 +49,9 @@ install -m 0644 kat_awq.tokenizer_config.json /dev/shm/kat_awq/tokenizer_config.
 #    the gateway's upstream credential is one of gatekeeper's keys on the
 #    "openrouter" tier, passed as OAICA_GATEWAY_UPSTREAM_KEY in gw-swap.sh
 
-# 4. start (order matters: replicas -> katlb -> gatekeeper -> gateway)
+# 4. start (order matters: replicas -> oaicalb -> gatekeeper -> gateway)
 nohup /workspace/vllm_awq_watchdog.sh > /workspace/vllm_awq_watchdog.out 2>&1 &
-nohup /workspace/katlb-linux-amd64 -config /workspace/katlb-kat-awq.json > /workspace/katlb.log 2>&1 &
+nohup /workspace/oaicalb-linux-amd64 -config /workspace/oaicalb.json > /workspace/oaicalb.log 2>&1 &
 nohup /workspace/gatekeeper -config /workspace/gatekeeper.json > /workspace/gatekeeper.log 2>&1 &
 OAICA_GATEWAY_UPSTREAM_KEY=<gatekeeper openrouter key> \
   nohup /workspace/oaica-gateway --config /workspace/oaica-gateway.json > /workspace/oaica-gateway.log 2>&1 &
@@ -62,8 +63,8 @@ OAICA_GATEWAY_UPSTREAM_KEY=<gatekeeper openrouter key> \
 Cloudflare (api.oaica.com) -> cloudflared ON a100b (/workspace/cf/run.sh) -> :8081
   :8081 oaica-gateway   auth (sha256 key), model rewrite, usage injection, ledger
   :30098 gatekeeper     per-key concurrency ("openrouter" tier = 32)
-  :30099 katlb          leastconn across replicas, chat-aware health probe
-  :30199 vLLM kat-awq   GPU0        :30105 vLLM kat-awq   GPU2
+  :30099 oaicalb        leastconn across replicas, chat-aware health probe (:8091 session-hash)
+  :30106 vLLM oaica-35b-a3b-vision  GPU0    :30105 vLLM oaica-35b-a3b-vision  GPU2
 ```
 
 The tunnel is the `oaica-api` tunnel in the Cloudflare account that owns
@@ -74,14 +75,16 @@ account, via .91) still resolves but is no longer the published URL.
 ## Health semantics (why the probe is a chat call)
 
 `GET /v1/models` on vLLM returns 200 while every completion 400s (seen when
-the tokenizer had no `chat_template`). katlb's probe is therefore a real
-1-token `POST /v1/chat/completions` for the served model (`probe_model` in
-`katlb.json`). A replica is UP only if a customer request would succeed.
-The gateway's `/health` in turn asks gatekeeper, so an external monitor on
-`https://api.oaica.com/health` sees the whole chain.
+the tokenizer had no `chat_template`) -- and, separately (2026-08-28), while
+a wedged scheduler queues real requests behind ~10 concurrent long-context
+ones with generation throughput near zero. oaicalb's probe is therefore a
+real 1-token `POST /v1/chat/completions` for the served model
+(`probe_model` in `oaicalb.json`). A replica is UP only if a customer
+request would succeed. The gateway's `/health` in turn asks gatekeeper, so
+an external monitor on `https://api.oaica.com/health` sees the whole chain.
 
 Stall detection (`stall_sec`, deployed as 300 with `stall_min_inflight` 2):
-katlb tracks every in-flight request per backend. If at least
+oaicalb tracks every in-flight request per backend. If at least
 `stall_min_inflight` of them are older than `stall_sec` AND the latest probe
 failed or timed out, the replica is marked DOWN on that single failure --
 not the usual two in a row -- and gets no new requests until the probe
@@ -100,29 +103,41 @@ must not shrink capacity at peak. `stall_sec: -1` disables the check.
 
 `vllm_awq_watchdog.sh` per replica in `REPLICAS` ("gpu:port"):
 
-1. if the port is listening, do nothing;
+1. if the port is listening, run the **stall probe**: a real 1-token chat
+   completion (`STALL_PROBE_MODEL`, default `oaica-35b-a3b-vision`), 15 s
+   timeout. Success resets the failure streak and does nothing else. 3
+   consecutive failures (`STALL_FAIL_THRESHOLD`) -- while the port is still
+   LISTENING, so the crash path below never sees it -- triggers
+   `force_kill_replica`: SIGTERM, 5 s grace, SIGKILL if still alive, then
+   hunts and SIGKILLs any `VLLM::EngineCore` process reparented to PID 1
+   (vLLM's V1 engine runs generation in a separate process that outlives
+   `api_server`'s death and keeps holding GPU memory -- exactly what turned
+   a 2026-08-28 stall into hours of stray-process confusion before this was
+   automated). The replica is then relaunched on the next tick.
 2. else **preflight**: weights present (re-download from the pinned revision
    if not) and tokenizer patch sha256-matches (re-apply if not);
 3. launch; if the process dies within 60 s, double the retry delay (cap
    10 min) and write to `/workspace/vllm_awq_watchdog.ALERT`.
 
-Poll the ALERT file from a monitor; a restore or a backoff is the signal
-that something on the box changed under us.
+A stall-kill also writes to `/workspace/vllm_awq_watchdog.ALERT`. Poll the
+ALERT file from a monitor; a restore, a backoff, or a stall-kill is the
+signal that something on the box (or under real load) changed under us.
 
-`REPLICAS` defaults to `0:30199 2:30105` (GPU0 + GPU2). GPU5 is held by the
-malay35b-offload `prism_server` plus another session's 52 GB job, so a
-kat-awq replica OOMs at startup there. A `booting()` guard skips a port whose
-api_server exists but is not yet listening (vLLM takes ~100 s to load), so a
-slow start is not treated as a crash.
+`REPLICAS` defaults to `2:30105 0:30106` (GPU2 + GPU0). GPU5 is held by the
+malay35b-offload `prism_server` plus another session's 52 GB job, so an
+oaica-35b-a3b-vision replica OOMs at startup there. A `booting()` guard
+skips a port whose api_server exists but is not yet listening (vLLM takes
+~100 s to load), so a slow start is not treated as a crash.
 
 ## Control-plane supervisor + reboot
 
-`stack_watchdog.sh` keeps katlb (:30099) and the gateway (:8081) alive,
-detecting each by LISTENING PORT (never `pgrep -f`). The gateway's upstream
-credential is read from `/workspace/gateway_upstream.key` (0600). This
-replaced the legacy `/root/katlb_watchdog.sh` loop for katlb, which
+`stack_watchdog.sh` keeps oaicalb (:30099, formerly katlb) and the gateway
+(:8081) alive, detecting each by LISTENING PORT (never `pgrep -f`). The
+gateway's upstream credential is read from `/workspace/gateway_upstream.key`
+(0600). This replaced the legacy `/root/katlb_watchdog.sh` loop, which
 relaunched the OLD binary from `/root` and fought the v2 process
-("bind: address already in use" in /tmp/katlb.log).
+("bind: address already in use" in /tmp/katlb.log -- the log itself is now
+named oaicalb.log, kept as-written here for the historical incident).
 
 gatekeeper (:30098) runs from `/workspace` under `stack_watchdog.sh` since
 2026-08-26; the legacy `/root/gatekeeper_watchdog.sh` loops were stopped and

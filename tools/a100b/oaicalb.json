@@ -1,13 +1,13 @@
 {
   "backends": [
-    "http://127.0.0.1:30199",
-    "http://127.0.0.1:30105"
+    "http://127.0.0.1:30105",
+    "http://127.0.0.1:30106"
   ],
   "health_path": "/v1/models",
   "leastconn_addr": ":30099",
   "session_hash_addr": ":8091",
   "status_addr": ":8092",
-  "probe_model": "kat-awq",
+  "probe_model": "oaica-35b-a3b-vision",
   "probe_timeout_sec": 10,
   "stall_sec": 300,
   "stall_min_inflight": 2
