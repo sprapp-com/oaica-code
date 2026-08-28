@@ -233,7 +233,7 @@ func sessionKeyFor(t *testing.T, bs []*backend, want *backend) string {
 	t.Helper()
 	for i := 0; i < 1000; i++ {
 		k := "session-" + itoa(int64(i))
-		if hashPick(bs, k) == want {
+		if hashPick(bs, k, 0) == want {
 			return k
 		}
 	}
@@ -284,7 +284,7 @@ func TestStall_HungBackendIsDrainedThenReadmitted(t *testing.T) {
 	go hb.healthCheck(ctx, opts)
 	go ok.healthCheck(ctx, opts)
 
-	lb := httptest.NewServer(sessionHandler(bs))
+	lb := httptest.NewServer(sessionHandler(bs, 0))
 	defer lb.Close()
 	key := sessionKeyFor(t, bs, hb)
 
@@ -400,5 +400,118 @@ func TestStall_DisabledFallsBackToTwoFailures(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return hung.probes.Load() >= 6 })
 	if !b.healthy.Load() {
 		t.Fatal("with stall detection disabled a flapping probe must not mark the backend DOWN")
+	}
+}
+
+// setInflight forces a backend's inflight counter to n, for overflow tests
+// that need a specific load skew without spinning up n real requests.
+func setInflight(b *backend, n int64) {
+	atomic.StoreInt64(&b.inflight, n)
+}
+
+func TestAverageHealthyLoad_IgnoresUnhealthyAndFloorsAtOne(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	c := newBackend("http://127.0.0.1:3")
+	c.healthy.Store(false) // excluded from the average entirely
+	setInflight(a, 0)
+	setInflight(b, 0)
+	setInflight(c, 100) // must not affect the average — c is unhealthy
+
+	if got := averageHealthyLoad([]*backend{a, b, c}); got != 1 {
+		t.Errorf("averageHealthyLoad = %v, want 1 (floor, both healthy backends at 0 load)", got)
+	}
+
+	setInflight(a, 2)
+	setInflight(b, 6)
+	if got := averageHealthyLoad([]*backend{a, b, c}); got != 4 {
+		t.Errorf("averageHealthyLoad = %v, want 4 ((2+6)/2, c excluded)", got)
+	}
+}
+
+func TestAverageHealthyLoad_AllUnhealthyReturnsFloor(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	a.healthy.Store(false)
+	if got := averageHealthyLoad([]*backend{a}); got != 1 {
+		t.Errorf("averageHealthyLoad with no healthy backends = %v, want 1 (floor)", got)
+	}
+}
+
+func TestHashPick_OverflowDisabledStaysSticky(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	key := sessionKeyFor(t, bs, a)
+	setInflight(a, 1000) // wildly overloaded
+	setInflight(b, 0)
+
+	// overflowFactor=0 (disabled): must stay pinned regardless of load skew
+	// — byte-identical to pre-2026-08-29 behavior.
+	if got := hashPick(bs, key, 0); got != a {
+		t.Error("overflowFactor=0 must never reroute away from the hashed backend")
+	}
+}
+
+func TestHashPick_OverflowReroutesWhenHashedBackendIsHot(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	key := sessionKeyFor(t, bs, a)
+
+	// a: 10 inflight, b: 0 inflight -> average of healthy backends is 5;
+	// a's load (10) is 2x the average, so overflowFactor=1.5 must trip.
+	setInflight(a, 10)
+	setInflight(b, 0)
+	if got := hashPick(bs, key, 1.5); got != b {
+		t.Errorf("expected reroute to the least-loaded backend (b) when the hashed one (a) is 2x average load with overflowFactor=1.5")
+	}
+}
+
+func TestHashPick_OverflowStaysPinnedUnderThreshold(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	key := sessionKeyFor(t, bs, a)
+
+	// a: 3 inflight, b: 1 inflight -> average 2; a's load (3) is only
+	// 1.5x average, under a 2.0 threshold -> must stay pinned.
+	setInflight(a, 3)
+	setInflight(b, 1)
+	if got := hashPick(bs, key, 2.0); got != a {
+		t.Error("expected the session to stay pinned to a when its load is under the overflow threshold")
+	}
+}
+
+func TestHashPick_OverflowNextRequestRejoinsAfterDrain(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	key := sessionKeyFor(t, bs, a)
+
+	setInflight(a, 10)
+	setInflight(b, 0)
+	if got := hashPick(bs, key, 1.5); got != b {
+		t.Fatal("expected reroute while a is hot")
+	}
+
+	// a drains back to a normal load — the SAME session's next request
+	// (no separate "un-reroute" state) must rejoin its hashed backend.
+	setInflight(a, 1)
+	setInflight(b, 1)
+	if got := hashPick(bs, key, 1.5); got != a {
+		t.Error("expected the session to rejoin its hashed backend once load drained — overflow reroute must be per-request, not sticky")
+	}
+}
+
+func TestHashPick_OverflowNeverPicksAnUnhealthyAlternate(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	key := sessionKeyFor(t, bs, a)
+
+	b.healthy.Store(false) // the only "alternate" is unhealthy
+	setInflight(a, 10)
+	if got := hashPick(bs, key, 1.5); got != a {
+		t.Error("expected to stay on the hashed backend (a) when the only alternate (b) is unhealthy, even if a is hot — better a slow answer than none")
 	}
 }

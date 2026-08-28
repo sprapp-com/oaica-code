@@ -10,5 +10,6 @@
   "probe_model": "oaica-35b-a3b-vision",
   "probe_timeout_sec": 10,
   "stall_sec": 300,
-  "stall_min_inflight": 2
+  "stall_min_inflight": 2,
+  "session_overflow_factor": 2.0
 }

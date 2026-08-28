@@ -16,11 +16,26 @@ Two listeners, same backends:
   `X-Session-Id` request header, degrading to leastconn if the hashed
   backend is unhealthy. Pins a conversation to one replica so its vLLM
   prefix cache actually gets reused turn-to-turn, instead of every turn
-  landing on a cold-cache replica under round-robin. Not wired into
-  production yet — the Anthropic->OpenAI proxy doesn't emit a stable
-  per-conversation session ID today, so nothing currently sends
-  `X-Session-Id`. Listener is up and correct, just unused until that's
-  added.
+  landing on a cold-cache replica under round-robin. Wired into production
+  since 2026-08-28: oaica-code's Anthropic->OpenAI proxy generates one
+  random session ID per launch (`newProxySessionID`) and sends it as
+  `X-Session-Id` on every request.
+
+  **`session_overflow_factor`** (default `0`, disabled): a healthy but
+  disproportionately loaded hashed backend can also trigger a reroute, not
+  just an unhealthy one. When set > 0, a request reroutes to the
+  least-loaded healthy backend if its hashed backend's inflight count
+  exceeds `session_overflow_factor` × the average inflight across healthy
+  backends. This is a per-REQUEST decision, not sticky — the same
+  session's next request re-hashes to its normal backend and rejoins it
+  once load drains back under the threshold, with no separate
+  "un-reroute" state to manage. Exists because pure session-hash is
+  sticky forever: one replica can queue a growing backlog while another
+  sits idle, purely because of which session IDs happened to hash where
+  (observed 2026-08-29 — a100b's two oaica-35b-a3b-vision replicas can
+  end up unevenly loaded even though both are healthy). Deployed at `2.0`
+  on a100b: a session reroutes once its hashed backend is carrying more
+  than double the fleet's average load.
 
 Active health checks every 3s; 2 consecutive failures marks a backend down,
 2 consecutive successes marks it back up. Two probe modes:

@@ -77,6 +77,23 @@ type lbConfig struct {
 	StallSec int `json:"stall_sec"`
 	// StallMinInflight is the N in "N stalled requests" above (default 1).
 	StallMinInflight int `json:"stall_min_inflight"`
+
+	// SessionOverflowFactor lets a session-hash pick escape an unevenly
+	// loaded (but healthy) hashed backend, not just a DOWN one. Without
+	// this, session affinity is sticky forever: one backend can sit idle
+	// while another queues a growing backlog, because hashPick only ever
+	// degrades to leastconn on an UNHEALTHY hash target (see hashPick).
+	// When set > 0, a session is rerouted to the least-loaded healthy
+	// backend if its hashed backend's inflight count exceeds
+	// SessionOverflowFactor times the average inflight across all healthy
+	// backends (0 average treated as 1 to avoid dividing by zero / always
+	// tripping at zero load). This is a per-REQUEST decision, not
+	// per-session: an overloaded backend draining back under the
+	// threshold is naturally rejoined by the same session's next request
+	// (no separate un-reroute logic needed). Default 0 disables the
+	// check entirely -- session affinity stays sticky no matter the load
+	// skew, matching pre-2026-08-29 behavior.
+	SessionOverflowFactor float64 `json:"session_overflow_factor"`
 }
 
 // stallThreshold returns the effective hung-replica threshold, 0 if disabled.
@@ -348,18 +365,56 @@ func leastConnPick(bs []*backend) *backend {
 	return tied[idx]
 }
 
-func hashPick(bs []*backend, key string) *backend {
+// averageHealthyLoad is the mean inflight count across healthy backends,
+// with a floor of 1 so a 0-average deployment (nothing running yet) never
+// makes the overflow check trip at zero load — a single new request on an
+// otherwise-idle fleet must not immediately look "overflowing".
+func averageHealthyLoad(bs []*backend) float64 {
+	var total int64
+	var n int
+	for _, b := range bs {
+		if !b.healthy.Load() {
+			continue
+		}
+		total += atomic.LoadInt64(&b.inflight)
+		n++
+	}
+	if n == 0 {
+		return 1
+	}
+	avg := float64(total) / float64(n)
+	if avg < 1 {
+		avg = 1
+	}
+	return avg
+}
+
+func hashPick(bs []*backend, key string, overflowFactor float64) *backend {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	idx := int(h.Sum32()) % len(bs)
 	if idx < 0 {
 		idx += len(bs)
 	}
-	if bs[idx].healthy.Load() {
-		return bs[idx]
+	target := bs[idx]
+	if !target.healthy.Load() {
+		// fallback: hashed backend down, degrade to leastconn
+		return leastConnPick(bs)
 	}
-	// fallback: hashed backend down, degrade to leastconn
-	return leastConnPick(bs)
+	if overflowFactor > 0 {
+		load := float64(atomic.LoadInt64(&target.inflight))
+		if load > overflowFactor*averageHealthyLoad(bs) {
+			// Hashed backend is healthy but disproportionately loaded —
+			// reroute THIS request to whichever healthy backend is least
+			// loaded right now. Not sticky: the very next request from the
+			// same session re-hashes to the same target and rejoins it
+			// once load drains back under the threshold.
+			if alt := leastConnPick(bs); alt != nil {
+				return alt
+			}
+		}
+	}
+	return target
 }
 
 func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
@@ -378,14 +433,15 @@ func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
 
 // sessionHandler pins a request to the backend hashed from its X-Session-Id
 // (per-client address when absent), degrading to leastconn when that
-// backend is DOWN.
-func sessionHandler(bs []*backend) http.HandlerFunc {
+// backend is DOWN or (if overflowFactor > 0) disproportionately loaded —
+// see hashPick.
+func sessionHandler(bs []*backend, overflowFactor float64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Session-Id")
 		if key == "" {
 			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
 		}
-		serveWith(bs, func(bs []*backend) *backend { return hashPick(bs, key) })(w, r)
+		serveWith(bs, func(bs []*backend) *backend { return hashPick(bs, key, overflowFactor) })(w, r)
 	}
 }
 
@@ -403,6 +459,11 @@ func main() {
 		log.Printf("oaicalb: hung-replica detection = %d in-flight request(s) stalled >= %s + probe failure", cfg.StallMinInflight, stall)
 	} else {
 		log.Printf("oaicalb: hung-replica detection disabled (stall_sec < 0)")
+	}
+	if cfg.SessionOverflowFactor > 0 {
+		log.Printf("oaicalb: session-hash overflow reroute enabled (>%.1fx average healthy load reroutes to leastconn)", cfg.SessionOverflowFactor)
+	} else {
+		log.Printf("oaicalb: session-hash overflow reroute disabled (session_overflow_factor <= 0) — affinity is fully sticky")
 	}
 	opts := probeOpts{
 		healthPath: cfg.HealthPath,
@@ -424,7 +485,7 @@ func main() {
 	leastconnMux.HandleFunc("/", serveWith(bs, leastConnPick))
 
 	hashMux := http.NewServeMux()
-	hashMux.HandleFunc("/", sessionHandler(bs))
+	hashMux.HandleFunc("/", sessionHandler(bs, cfg.SessionOverflowFactor))
 
 	statusMux := http.NewServeMux()
 	statusMux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
