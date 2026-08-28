@@ -29,6 +29,41 @@ Durable off-box copy of the weights: `lenovo.samwong.com:/mnt/ext4/models/kat_aw
 (rsync mirror, ~21 GB). Restoring from it is faster than HF and keeps the
 tokenizer patch.
 
+## meterhub (central metering + entitlement, added 2026-08-28)
+
+`/workspace/meterhub-linux-amd64` (source: `tools/meterhub/`, pure-Go
+sqlite via `modernc.org/sqlite`, no cgo), config `/workspace/meterhub.json`,
+db `/workspace/meterhub.db`, listens `:8095` (loopback only — not exposed
+through the cloudflare tunnel). The gateway (`oaica-gateway.json`'s
+`meterhub_addr`/`meterhub_token`) fire-and-forget reports every completion
+to `POST /ingest` after writing its own local ledger row; meterhub is pure
+aggregation and is never on the request-critical path — an unreachable
+meterhub cannot slow or fail a real completion.
+
+Endpoints (all require `Authorization: Bearer <plaintext report token>`,
+sha256 of which is in `meterhub.json`'s `report_tokens`):
+- `GET /usage`, `GET /usage/summary` — billing/usage queries
+- `GET /subscribers/get?key=<label>` — the fast check the gateway's
+  entitlement cache polls (TTL 60s by default); returns `{"status":"unknown"}`
+  (200, not 404) for a key with no row — fail-open/fail-closed policy lives
+  entirely in gateway config (`entitlement_fail_open`), not in HTTP status
+- `POST /subscribers/set` — manual control surface: `{"key_label","status"
+  (active|past_due|canceled|suspended),"plan","note"}`. This is how to
+  block/unblock a key TODAY, no Stripe account needed.
+- `GET /subscribers/list?status=X` — audit view
+- `POST /subscribers/webhook` — Stripe-event-shaped receiver, NOT yet safe
+  to point a real Stripe webhook at: auth is still the same bearer report
+  token, not Stripe's per-endpoint signing-secret verification. Swap that
+  in before connecting a live Stripe account.
+
+Gateway-side entitlement enforcement (`entitlement_enabled` in
+`oaica-gateway.json`, currently **unset/false** — capability is deployed
+but not turned on) blocks a key with a non-`active`/`past_due` status with
+`403 subscription_required` from `completionHandler`. Restart either
+service with the box's swap-script pattern (find listener pid by `ss -ltnp`,
+never `pgrep -f`): `/workspace/gw-swap.sh` for the gateway,
+`/workspace/meterhub-swap.sh` for meterhub.
+
 ## Rebuild from nothing
 
 ```bash
