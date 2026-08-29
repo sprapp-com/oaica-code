@@ -479,6 +479,13 @@ type usageRecord struct {
 	LatencyMS    int64 `json:"latency_ms"`
 	UsageSeen    bool  `json:"usage_seen"`
 	Aborted      bool  `json:"aborted"`
+	// Backend: which of this instance's own backends served the request
+	// (its own X-Katlb-Backend value) -- see tools/gateway's
+	// ledgerEntry.Backend doc.
+	Backend string `json:"backend,omitempty"`
+	// SessionID: the caller's X-Session-Id, if any (session-hash requests
+	// on :8091 carry one; leastconn requests on :30099 usually don't).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 var meterReporterBackoff = func(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
@@ -691,9 +698,18 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		next(rec, r)
 		rec.finish()
 
+		// serveWith sets X-Katlb-Backend on rec (the ResponseWriter it was
+		// handed) before proxying -- read it back here rather than
+		// threading the picked *backend through meterAndServe's signature.
+		// Unlike the gateway (which strips this header from what the
+		// public client sees), oaicalb leaves it on the response as-is
+		// today for anyone hitting it directly -- an existing, separate,
+		// lower-priority concern not addressed by this change.
+		backend := rec.Header().Get("X-Katlb-Backend")
+
 		metered.report(usageRecord{
 			RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
-			Region: metered.region, KeyLabel: keyLabelFor(r),
+			Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: r.Header.Get("X-Session-Id"),
 			Model: reqDoc.Model, UpstreamModel: reqDoc.Model, Path: r.URL.Path,
 			Stream: reqDoc.Stream, Status: rec.status,
 			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,

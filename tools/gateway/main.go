@@ -217,6 +217,29 @@ type gwConfig struct {
 	// reads an in-memory map, not a network call, on every request
 	// except the first (or first-after-expiry) for each key.
 	EntitlementCacheTTLSec int `json:"entitlement_cache_ttl_sec"`
+
+	// LargeContextTokenThreshold / MaxConcurrentLargeContext: admission
+	// control for the failure mode found 2026-08-29 — several 140K-190K
+	// prompt-token requests landing on the same replica at once backed up
+	// its scheduler badly enough that OTHER concurrent requests started
+	// 502ing/504ing (real ledger evidence: 6x502 + 2x504 in a 24s window,
+	// alongside 4 successful-but-46-72s-latency completions carrying
+	// 140K-190K prompt tokens each). This is a coarse, cheap admission
+	// gate: any request whose estimated prompt size (message content
+	// bytes / 4, not a real tokenizer call — good enough to catch "this
+	// is huge", not meant to be exact) is at or above the threshold
+	// competes for a small bounded slot pool BEFORE it reaches the
+	// scheduler, rather than piling in unbounded and taking down
+	// unrelated concurrent requests with it. A request that can't get a
+	// slot gets a fast 429 (cheap to retry) instead of a slow 502/504
+	// (expensive: the upstream had already started real work). Normal
+	// (non-large) requests are completely unaffected — this only gates
+	// the specific request shape that caused the incident.
+	// LargeContextTokenThreshold: default 50000 (0 uses the default; set
+	// to a negative value to disable admission control entirely).
+	LargeContextTokenThreshold int `json:"large_context_token_threshold"`
+	// MaxConcurrentLargeContext: default 2 (0 uses the default).
+	MaxConcurrentLargeContext int `json:"max_concurrent_large_context"`
 }
 
 func defaultConfig() gwConfig {
@@ -270,6 +293,12 @@ func loadConfig(path string) (gwConfig, error) {
 	return cfg, nil
 }
 
+// ctxKeyBackend is the request-context key ModifyResponse uses to hand the
+// serving replica's address back to completionHandler — see newProxy's
+// ModifyResponse for why this indirection exists (ModifyResponse only sees
+// *http.Response, not the ledger-building code in completionHandler).
+type ctxKeyBackend struct{}
+
 // newProxy builds a reverse proxy with its own transport and explicit
 // timeouts. ResponseHeaderTimeout returns a clean 504 before Cloudflare's
 // 100s edge timeout would turn it into an opaque 524. No overall client
@@ -288,6 +317,13 @@ func newProxy(upstream string) (*httputil.ReverseProxy, error) {
 	}
 	p.FlushInterval = -1 // flush every write: required for SSE streaming
 	p.ModifyResponse = func(resp *http.Response) error {
+		// Capture which replica actually served this request (oaicalb sets
+		// X-Katlb-Backend) into the request context BEFORE deleting it —
+		// completionHandler reads it back out after ServeHTTP returns to
+		// attribute the ledger row to a GPU. See ctxKeyBackend's doc.
+		if b, ok := resp.Request.Context().Value(ctxKeyBackend{}).(*string); ok {
+			*b = resp.Header.Get("X-Katlb-Backend")
+		}
 		// Internal topology must not leak to the public.
 		resp.Header.Del("X-Katlb-Backend")
 		resp.Header.Del("X-Gatekeeper-Tier")
@@ -355,6 +391,13 @@ type gateway struct {
 
 	ledgerMu sync.Mutex
 	ledger   *os.File
+
+	// largeContextThreshold / largeContextSem: see gwConfig's doc on the
+	// same fields. -1 threshold means admission control is disabled
+	// (largeContextSem is nil in that case too). Guarded by mu since
+	// apply() can rebuild them on a config reload.
+	largeContextThreshold int
+	largeContextSem       chan struct{}
 
 	// /health probe cache; see healthCacheTTL.
 	healthMu   sync.Mutex
@@ -425,6 +468,30 @@ func (g *gateway) apply(cfg gwConfig) error {
 	} else {
 		g.entitlement = nil
 	}
+
+	// Large-context admission control — see gwConfig.LargeContextTokenThreshold's
+	// doc. A negative threshold disables it; everything else gets sane
+	// defaults. Rebuilt on every apply so a config reload changes the pool
+	// size immediately — any request already holding a slot keeps it
+	// (the old channel drains naturally), matching the meter reporter's
+	// own reload pattern above.
+	threshold := cfg.LargeContextTokenThreshold
+	if threshold == 0 {
+		threshold = 50_000
+	}
+	maxConcurrent := cfg.MaxConcurrentLargeContext
+	if maxConcurrent <= 0 {
+		maxConcurrent = 2
+	}
+	g.mu.Lock()
+	if threshold < 0 {
+		g.largeContextThreshold = -1
+		g.largeContextSem = nil
+	} else {
+		g.largeContextThreshold = threshold
+		g.largeContextSem = make(chan struct{}, maxConcurrent)
+	}
+	g.mu.Unlock()
 	return nil
 }
 
@@ -672,6 +739,22 @@ type ledgerEntry struct {
 	LatencyMS    int64 `json:"latency_ms"`
 	UsageSeen    bool  `json:"usage_seen"` // false = upstream sent no usage; do not trust zeros
 	Aborted      bool  `json:"aborted"`    // client disconnected / upstream died mid-response
+	// Backend is which replica actually served this request (oaicalb's
+	// X-Katlb-Backend, e.g. "http://127.0.0.1:30106" = GPU0) — captured via
+	// ctxKeyBackend before the gateway strips the header from the public
+	// response. Empty if the request never reached a backend (blocked
+	// before proxying, or the upstream error path never set the header).
+	// This is the per-GPU usage attribution: group by Backend to see
+	// GPU0-vs-GPU1 load, not just aggregate fleet totals.
+	Backend string `json:"backend,omitempty"`
+	// SessionID is the caller's X-Session-Id (set by cmd/launch's per-
+	// launch proxy for LB session-hash affinity — see
+	// anthropic_openai_proxy.go's newProxySessionID). Lets multiple
+	// concurrent Claude Code sessions under the SAME api key (e.g.
+	// internal-91 today represents 3 client machines combined) be told
+	// apart without issuing each one a separate key. Empty for callers
+	// that don't send one (older clients, direct API use).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 func (g *gateway) writeLedger(e ledgerEntry) {
@@ -809,6 +892,24 @@ func mustRand() io.Reader {
 // /v1/completions. It reads the (capped) body once to: validate the model id
 // and rewrite it to the upstream id, inject stream_options.include_usage on
 // streaming requests, then forwards and meters the response.
+// estimateMessageTokens is a coarse, cheap prompt-size estimate (marshal
+// "messages" back to bytes, divide by 4) — NOT a real tokenizer call. It
+// only needs to distinguish "this is a normal request" from "this is a
+// 140K+ token monster" for admission control; being off by 20-30% in
+// either direction doesn't change that classification for the threshold
+// this gates at (see gwConfig.LargeContextTokenThreshold, default 50000).
+func estimateMessageTokens(req map[string]any) int {
+	msgs, ok := req["messages"]
+	if !ok {
+		return 0
+	}
+	b, err := json.Marshal(msgs)
+	if err != nil {
+		return 0
+	}
+	return len(b) / 4
+}
+
 func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -850,6 +951,8 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	g.mu.RLock()
 	m, ok := g.byID[modelID]
 	proxy := g.proxy
+	threshold := g.largeContextThreshold
+	sem := g.largeContextSem
 	g.mu.RUnlock()
 	if !ok {
 		writeErr(w, http.StatusNotFound, "model_not_found", "unknown model "+fmt.Sprintf("%q", modelID))
@@ -859,6 +962,22 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error",
 			fmt.Sprintf("model %q does not accept image input (text only)", m.ID))
 		return
+	}
+	// Admission control for large-context requests — see
+	// gwConfig.LargeContextTokenThreshold's doc for the incident this
+	// closes. estimateMessageTokens is coarse on purpose (chars/4, no real
+	// tokenizer call) — it only needs to catch "this is huge", not be
+	// exact. threshold < 0 disables the check entirely.
+	if threshold >= 0 && sem != nil && estimateMessageTokens(req) >= threshold {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			w.Header().Set("Retry-After", "2")
+			writeErr(w, http.StatusTooManyRequests, "large_context_admission_limited",
+				fmt.Sprintf("too many large-context requests (>=%d estimated tokens) in flight; retry shortly", threshold))
+			return
+		}
 	}
 	req["model"] = m.upstreamID()
 	stream, _ := req["stream"].(bool)
@@ -912,6 +1031,13 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", rid)
 	rec := &usageRecorder{ResponseWriter: w, status: http.StatusOK, stream: stream}
 	start := time.Now()
+	sessionID := r.Header.Get("X-Session-Id")
+	// backend is filled in by ModifyResponse (see ctxKeyBackend) once the
+	// upstream actually answers -- stays empty if the request never
+	// reached a backend (blocked earlier, or the error path never set
+	// oaicalb's header).
+	backend := new(string)
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyBackend{}, backend))
 	// The ledger write is DEFERRED so it runs on every exit path: normal
 	// completion, a client that disconnects mid-stream (ReverseProxy panics
 	// with http.ErrAbortHandler), or an upstream failure. Before this, an
@@ -922,7 +1048,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		if p := recover(); p != nil {
 			aborted = true
 			rec.finish()
-			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted))
+			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID))
 			panic(p)
 		}
 	}()
@@ -935,11 +1061,11 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("X-Oaica-Metered", "1")
 	proxy.ServeHTTP(rec, r)
 	rec.finish()
-	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted))
+	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID))
 }
 
 // entry builds the ledger row for one completion.
-func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool) ledgerEntry {
+func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string) ledgerEntry {
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,
@@ -955,6 +1081,8 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		LatencyMS:        time.Since(start).Milliseconds(),
 		UsageSeen:        rec.seen,
 		Aborted:          aborted,
+		Backend:          backend,
+		SessionID:        sessionID,
 	}
 }
 

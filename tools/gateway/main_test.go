@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1155,5 +1156,178 @@ func TestEntitlement_CacheAvoidsRepeatedMeterHubCalls(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("meterhub hit %d times for 5 requests within the cache TTL, want 1 (cache should avoid repeated calls)", got)
+	}
+}
+
+// largeMessages builds a "messages" array whose marshaled size divided by 4
+// clears the given estimated-token threshold — see estimateMessageTokens.
+func largeMessages(estimatedTokens int) []map[string]any {
+	content := strings.Repeat("x", estimatedTokens*4)
+	return []map[string]any{{"role": "user", "content": content}}
+}
+
+func newTestGatewayWithAdmission(t *testing.T, upstream string, threshold, maxConcurrent int) *gateway {
+	t.Helper()
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{
+			ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"},
+		}},
+		LargeContextTokenThreshold: threshold,
+		MaxConcurrentLargeContext:  maxConcurrent,
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	return g
+}
+
+func postCompletionWithMessages(t *testing.T, g *gateway, apiKey string, messages []map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"model": "kat-awq", "max_tokens": 10, "messages": messages})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	w := httptest.NewRecorder()
+	mux(g).ServeHTTP(w, req)
+	return w
+}
+
+func TestAdmission_SmallRequestNeverGated(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	// threshold 1 token would classify almost anything as "large" -- use a
+	// generous threshold and a tiny message to prove small requests never
+	// touch the pool at all, even with maxConcurrent effectively 0.
+	g := newTestGatewayWithAdmission(t, upstream.URL, 50_000, 0)
+	w := postCompletionWithMessages(t, g, "sk-new", []map[string]any{{"role": "user", "content": "hi"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("small request: status = %d, want 200", w.Code)
+	}
+}
+
+func TestAdmission_DisabledWhenThresholdNegative(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	g := newTestGatewayWithAdmission(t, upstream.URL, -1, 1)
+	w := postCompletionWithMessages(t, g, "sk-new", largeMessages(100_000))
+	if w.Code != http.StatusOK {
+		t.Fatalf("admission disabled: status = %d, want 200 even for a huge prompt", w.Code)
+	}
+}
+
+func TestAdmission_LargeContextBlockedWhenPoolFull(t *testing.T) {
+	release := make(chan struct{})
+	// holding is buffered so every call into this handler (not just the
+	// first, held one) can send without a receiver waiting -- only the
+	// first send is ever actually read via <-holding below; release is
+	// closed (not sent-once) so every subsequent <-release also returns
+	// immediately, which is what lets the 3rd request finish normally.
+	holding := make(chan struct{}, 10)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		holding <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"message":{"content":"4"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	g := newTestGatewayWithAdmission(t, upstream.URL, 1000, 1) // pool of 1
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postCompletionWithMessages(t, g, "sk-new", largeMessages(5000))
+	}()
+	<-holding // first request now holds the only pool slot, blocked in the handler
+
+	// Second large request must be rejected: the pool is full.
+	w2 := postCompletionWithMessages(t, g, "sk-new", largeMessages(5000))
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second large request while pool full: status = %d, want 429", w2.Code)
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	json.Unmarshal(w2.Body.Bytes(), &body)
+	if body.Error.Code != "large_context_admission_limited" {
+		t.Errorf("error code = %q, want large_context_admission_limited", body.Error.Code)
+	}
+
+	close(release)
+	w1 := <-done
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first (held) large request: status = %d, want 200", w1.Code)
+	}
+
+	// Pool slot released after the first request finished -- a third large
+	// request must now succeed.
+	w3 := postCompletionWithMessages(t, g, "sk-new", largeMessages(5000))
+	if w3.Code != http.StatusOK {
+		t.Fatalf("third large request after pool drained: status = %d, want 200", w3.Code)
+	}
+}
+
+func TestLedger_CapturesBackendAndStripsHeaderFromClient(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Katlb-Backend", "http://127.0.0.1:30106")
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"message":{"content":"4"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	g, ledgerPath := newTestGateway(t, upstream.URL)
+
+	w := postCompletionWithMessages(t, g, "sk-new", []map[string]any{{"role": "user", "content": "hi"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if h := w.Header().Get("X-Katlb-Backend"); h != "" {
+		t.Errorf("X-Katlb-Backend leaked to the client: %q", h)
+	}
+
+	b, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry ledgerEntry
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Backend != "http://127.0.0.1:30106" {
+		t.Errorf("ledger backend = %q, want http://127.0.0.1:30106", entry.Backend)
+	}
+}
+
+func TestLedger_CapturesSessionID(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	g, ledgerPath := newTestGateway(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	req.Header.Set("X-Session-Id", "oaica-session-abc123")
+	w := httptest.NewRecorder()
+	mux(g).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	b, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry ledgerEntry
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.SessionID != "oaica-session-abc123" {
+		t.Errorf("ledger session_id = %q, want oaica-session-abc123", entry.SessionID)
 	}
 }

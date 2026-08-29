@@ -156,6 +156,61 @@ func TestUsageHandler_FiltersByKeyModelRegion(t *testing.T) {
 	}
 }
 
+func TestBackendSummaryHandler_GroupsByRegionAndBackendExcludingEmpty(t *testing.T) {
+	hub, token := testHub(t)
+	// LatencyMS chosen so the average is NOT a whole number (500+1501)/2 =
+	// 1000.5 -- a regression guard for the exact bug this test caught
+	// 2026-08-29: AVG() always returns a float in SQLite, and (500+1500)/2
+	// = 1000.0 exactly happened to Scan cleanly into an int64 destination,
+	// masking a real production failure where AVG()'s fractional part
+	// made every row fail to Scan silently (see backendSummaryHandler's
+	// CAST(...AS INTEGER) fix and its scan-error log line).
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r1", TS: "t1", Region: "a100b", KeyLabel: "alice", Model: "m1",
+		PromptTokens: 100, CompletionTokens: 10, Backend: "http://127.0.0.1:30106", LatencyMS: 500,
+	})
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r2", TS: "t2", Region: "a100b", KeyLabel: "bob", Model: "m1",
+		PromptTokens: 200, CompletionTokens: 20, Backend: "http://127.0.0.1:30106", LatencyMS: 1501,
+	})
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r3", TS: "t3", Region: "a100b", KeyLabel: "alice", Model: "m1",
+		PromptTokens: 50, CompletionTokens: 5, Backend: "http://127.0.0.1:30108", LatencyMS: 300,
+	})
+	// Blocked before reaching any backend (e.g. 401/403/429) -- must be
+	// excluded from a per-GPU load view entirely, not show up as a
+	// misleading empty-string "backend".
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r4", TS: "t4", Region: "a100b", KeyLabel: "carol", Model: "m1", Status: 403,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/usage/by_backend", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.backendSummaryHandler(w, req)
+	var resp struct {
+		Backends []backendSummaryRow `json:"backends"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Backends) != 2 {
+		t.Fatalf("backend rows = %d, want 2 (30106 and 30108, r4 excluded)", len(resp.Backends))
+	}
+	byBackend := map[string]backendSummaryRow{}
+	for _, b := range resp.Backends {
+		byBackend[b.Backend] = b
+	}
+	gpu0 := byBackend["http://127.0.0.1:30106"]
+	if gpu0.Requests != 2 || gpu0.PromptTokens != 300 || gpu0.AvgLatencyMS != 1000 {
+		t.Errorf("GPU0 (30106) row = %+v, want requests=2 prompt_tokens=300 avg_latency_ms=1000", gpu0)
+	}
+	gpu1 := byBackend["http://127.0.0.1:30108"]
+	if gpu1.Requests != 1 || gpu1.PromptTokens != 50 {
+		t.Errorf("GPU1 (30108) row = %+v, want requests=1 prompt_tokens=50", gpu1)
+	}
+}
+
 func TestSummaryHandler_AggregatesByKeyAndModel(t *testing.T) {
 	hub, token := testHub(t)
 	postIngest(t, hub, token, usageRecord{RequestID: "r1", TS: "t1", Region: "a100b", KeyLabel: "alice", Model: "m1", Status: 200, PromptTokens: 100, CompletionTokens: 20})
