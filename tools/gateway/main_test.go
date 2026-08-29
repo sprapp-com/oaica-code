@@ -1756,3 +1756,73 @@ func TestUpstreamErrorLog_CapturesConnectionLevelFailure(t *testing.T) {
 		t.Errorf("expected a connection-error message, got %q", got.Message)
 	}
 }
+
+func TestContextFitClamp_ProportionalMarginCatchesUnderestimatedDenseContent(t *testing.T) {
+	// Real 2026-08-29 recurrence: a fixed 2048-token margin let a request
+	// through whose real (upstream-tokenized) prompt was 230,145 tokens
+	// while our chars/4 estimate said only 183,315 -- a 26% miss, because
+	// dense code/tool-schema content tokenizes more compactly than chars/4
+	// assumes. This builds a request sized so its chars/4 estimate is
+	// deliberately far below what a real tokenizer would count for dense
+	// content, and asserts the now-proportional margin still clamps
+	// max_tokens well below the model's completion cap, not letting it
+	// through near-unclamped the way the old flat 2048 margin did.
+	var gotMaxTokens float64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		json.Unmarshal(b, &req)
+		gotMaxTokens, _ = req["max_tokens"].(float64)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream.URL, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{
+			ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"},
+		}},
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	// Sized so chars/4 estimates ~183,315 tokens (733,260 chars) -- the
+	// exact estimate from the real incident, well under the 262144 ceiling
+	// on its own, but the incident proved the REAL upstream count for
+	// content like this can run ~26% higher.
+	bigContent := strings.Repeat("x", 733260)
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"messages":   []map[string]any{{"role": "user", "content": bigContent}},
+		"max_tokens": 32000,
+		"stream":     true,
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected the gateway to clamp and forward successfully, got %d", resp.StatusCode)
+	}
+	// With the old flat 2048 margin, fitBudget = 262144-183315-2048 =
+	// 76781, so max_tokens=32000 wouldn't have been clamped AT ALL --
+	// exactly the bug. The new 30%-of-estimate margin (>= 54994 here)
+	// must clamp it well below the original 32000.
+	if gotMaxTokens >= 32000 {
+		t.Fatalf("expected the proportional margin to clamp max_tokens below 32000 for this dense-content-sized request, got %v (old flat-margin bug would leave it unclamped)", gotMaxTokens)
+	}
+}

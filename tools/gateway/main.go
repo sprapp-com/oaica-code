@@ -1189,11 +1189,27 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// completion beats a hard failure every time, especially for an
 	// automatic compaction call the client can't retry with a smaller ask
 	// on its own. estTokens is the same coarse chars/4 estimate used for
-	// admission control -- a margin absorbs its inaccuracy so this clamp
-	// undershoots slightly rather than still barely exceeding the limit.
-	const contextFitMargin = 2048
+	// admission control.
+	//
+	// contextFitMarginRatio is NOT a flat token count -- a real 2026-08-29
+	// recurrence (same session, 22x in a row) proved a fixed 2048-token
+	// margin isn't remotely enough: this exact incident's own estimate was
+	// 183,315 tokens against a REAL upstream count of 230,145 -- a 26%
+	// underestimate, because dense code/tool-schema content tokenizes far
+	// more compactly than chars/4 assumes. chars/4 is calibrated for
+	// average English prose; it can miss badly on code-heavy payloads,
+	// and the miss scales with prompt size, not a fixed amount. 30% is a
+	// deliberate buffer above that observed 26% error, not a guess -- still
+	// a heuristic, not a hard guarantee, but calibrated against a real
+	// failure instead of an arbitrary round number.
+	const contextFitMarginRatio = 0.30
+	const contextFitMarginFloor = 4096
 	if m.ContextLength > 0 {
-		fitBudget := m.ContextLength - estTokens - contextFitMargin
+		margin := int(float64(estTokens) * contextFitMarginRatio)
+		if margin < contextFitMarginFloor {
+			margin = contextFitMarginFloor
+		}
+		fitBudget := m.ContextLength - estTokens - margin
 		if fitBudget < 256 {
 			fitBudget = 256 // never clamp to something too small to be a useful reply
 		}

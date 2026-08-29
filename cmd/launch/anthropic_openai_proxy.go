@@ -664,8 +664,24 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// server-side for the identical purpose -- consistent, not exact
 		// by design.
 		if route.ContextWindow > 0 {
-			const contextFitMargin = 2048
-			fitBudget := route.ContextWindow - len(body)/4 - contextFitMargin
+			// contextFitMarginRatio is NOT a flat token count -- a real
+			// 2026-08-29 recurrence (same incident class, 22x in one
+			// session, on the server-side gateway's identical clamp)
+			// proved a fixed 2048-token margin isn't remotely enough: the
+			// chars/4 estimate for that request was 183,315 tokens against
+			// a REAL upstream count of 230,145 -- a 26% underestimate,
+			// because dense code/tool-schema content tokenizes more
+			// compactly than chars/4 assumes, and the miss scales with
+			// prompt size. 30% is a deliberate buffer above that observed
+			// error, not a guess -- still a heuristic, not a hard
+			// guarantee, but matches the server-side gateway's identical
+			// fix for consistency.
+			estTokens := len(body) / 4
+			margin := int(float64(estTokens) * 0.30)
+			if margin < 4096 {
+				margin = 4096
+			}
+			fitBudget := route.ContextWindow - estTokens - margin
 			if fitBudget < 256 {
 				fitBudget = 256
 			}
