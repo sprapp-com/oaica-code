@@ -110,7 +110,7 @@ launch() {
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
     --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 \
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
-    --max-num-batched-tokens 8192 --max-num-seqs 18 --enable-prefix-caching \
+    --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
     > "$logfile" 2>&1 &
   disown
