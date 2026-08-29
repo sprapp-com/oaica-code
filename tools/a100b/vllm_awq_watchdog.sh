@@ -131,6 +131,20 @@ launch() {
   # num_speculative_tokens > 1 will run multiple times of forward on same
   # MTP layer, which may result in lower acceptance rate") -- >1 is
   # flagged by vLLM itself as an atypical, less-hardened configuration.
+  #
+  # "enforce_eager":true (draft only; the target model keeps its PIECEWISE
+  # CUDA graphs -- see SpeculativeConfig.enforce_eager and
+  # llm_base_proposer.initialize_cudagraph_keys in vLLM 0.24.0) is the
+  # upstream-endorsed workaround for that illegal-memory-access: vllm
+  # issue #53726 root-causes it to the MTP draft's CUDA-graph replay
+  # racing the GDN/Mamba recurrent-state updates, and running the draft
+  # eagerly eliminated it in the reporters' soaks. No released vLLM
+  # (0.24-0.28) carries the real fix (PRs #50729/#53613). Measured on
+  # GPU7 2026-08-29 with production-shaped load: throughput-neutral
+  # (184 vs 182 tok/s mean, acceptance 1.83 vs 1.75) and identical KV
+  # cache size. Could not reproduce the crash on demand in ~60 min of
+  # load, so this is a mitigation with upstream evidence, not a proven
+  # fix; the OOM/crash instrumentation below attributes any recurrence.
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
@@ -138,7 +152,7 @@ launch() {
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":true}' \
     > "$logfile" 2>&1 &
   disown
 }
