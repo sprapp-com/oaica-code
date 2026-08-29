@@ -1202,6 +1202,17 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// deliberate buffer above that observed 26% error, not a guess -- still
 	// a heuristic, not a hard guarantee, but calibrated against a real
 	// failure instead of an arbitrary round number.
+	// minViableCompletion is the smallest max_tokens worth forwarding at
+	// all. A real 2026-08-30 recurrence proved the OLD unconditional
+	// "floor fitBudget at 256" rule was itself unsafe: that request's real
+	// prompt was 261,889 tokens -- already 255 tokens short of the
+	// 262,144 ceiling on its own -- so flooring max_tokens to 256 still
+	// produced prompt+output=262,145, one over, the exact failure this
+	// clamp exists to prevent. When the real prompt leaves less room than
+	// this, there is no safe positive max_tokens to force -- reject the
+	// request client-side with a clear reason instead of forwarding one
+	// still guaranteed to 400 upstream.
+	const minViableCompletion = 16
 	const contextFitMarginRatio = 0.30
 	const contextFitMarginFloor = 4096
 	if m.ContextLength > 0 {
@@ -1210,8 +1221,10 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			margin = contextFitMarginFloor
 		}
 		fitBudget := m.ContextLength - estTokens - margin
-		if fitBudget < 256 {
-			fitBudget = 256 // never clamp to something too small to be a useful reply
+		if fitBudget < minViableCompletion {
+			writeErr(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("prompt is too large to fit this model's %d-token context window with any output budget; please reduce the prompt length", m.ContextLength))
+			return
 		}
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
 			if v, ok := req[k].(float64); ok && int(v) > fitBudget {

@@ -343,7 +343,11 @@ func TestNewProxySessionID(t *testing.T) {
 // request with ~230145 estimated prompt tokens + max_tokens=32000 against a
 // route with ContextWindow=262144 straight to the upstream, which 400'd
 // with "one token over the ceiling" and no recovery path except /clear.
-func TestContextFitClamp_ClientProxy_ReproducesRealIncident(t *testing.T) {
+func TestContextFitClamp_ClientProxy_ClampsMaxTokensWhenRoomRemains(t *testing.T) {
+	// A prompt with real room to spare after the 30%-margin reservation:
+	// estimate ~100,000 tokens (400,000 chars), leaving a fitBudget well
+	// above the request's own max_tokens=200000, so the proxy must clamp
+	// down (not reject) and forward successfully.
 	setLaunchTestHome(t, t.TempDir())
 	var gotMaxTokens int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -375,11 +379,10 @@ func TestContextFitClamp_ClientProxy_ReproducesRealIncident(t *testing.T) {
 	proxyURL := "http://" + ln.Addr().String()
 	time.Sleep(50 * time.Millisecond)
 
-	// ~230145 tokens at chars/4 -> ~920580 chars of message content.
-	bigContent := strings.Repeat("x", 920580)
+	bigContent := strings.Repeat("x", 400000) // ~100,000 tokens at chars/4
 	body, _ := json.Marshal(map[string]any{
 		"model":      "kat-awq",
-		"max_tokens": 32000,
+		"max_tokens": 200000,
 		"messages":   []map[string]any{{"role": "user", "content": bigContent}},
 	})
 	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
@@ -391,11 +394,62 @@ func TestContextFitClamp_ClientProxy_ReproducesRealIncident(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected the proxy to clamp and forward successfully, got %d", resp.StatusCode)
 	}
-	if gotMaxTokens >= 32000 {
-		t.Fatalf("expected max_tokens clamped below the original 32000, got %d", gotMaxTokens)
+	if gotMaxTokens >= 200000 {
+		t.Fatalf("expected max_tokens clamped below the original 200000, got %d", gotMaxTokens)
 	}
 	if gotMaxTokens <= 0 {
 		t.Fatalf("expected a positive, still-useful max_tokens after clamping, got %d", gotMaxTokens)
+	}
+}
+
+func TestContextFitClamp_ClientProxy_RejectsWhenPromptLeavesNoSafeRoom(t *testing.T) {
+	// Real 2026-08-30 recurrence: a request whose REAL prompt (261,889
+	// tokens) was already within 255 tokens of the 262,144 ceiling on its
+	// own -- close enough that even flooring max_tokens to a small
+	// positive number (the OLD behavior) still produced a request
+	// guaranteed to 400 upstream. This fixture's estimate is deliberately
+	// close enough to the ceiling that the 30% margin leaves no safe room
+	// -- the proxy must reject client-side, never call upstream.
+	setLaunchTestHome(t, t.TempDir())
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", ContextWindow: 262144},
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	// ~230145 tokens at chars/4 -> ~920580 chars of message content.
+	bigContent := strings.Repeat("x", 920580)
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"max_tokens": 32000,
+		"messages":   []map[string]any{{"role": "user", "content": bigContent}},
+	})
+	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 (no safe room to clamp into), got %d: %s", resp.StatusCode, respBody)
+	}
+	if upstreamCalled {
+		t.Error("expected the proxy to reject client-side WITHOUT ever calling upstream")
+	}
+	if !strings.Contains(string(respBody), "too large") {
+		t.Errorf("expected a clear 'prompt too large' reason in the response, got %s", respBody)
 	}
 }
 

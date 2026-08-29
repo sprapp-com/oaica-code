@@ -682,8 +682,19 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				margin = 4096
 			}
 			fitBudget := route.ContextWindow - estTokens - margin
-			if fitBudget < 256 {
-				fitBudget = 256
+			// minViableCompletion: a real 2026-08-30 recurrence proved the
+			// OLD unconditional "floor fitBudget at 256" rule was itself
+			// unsafe -- that request's real prompt was already within 255
+			// tokens of the ceiling on its own, so flooring max_tokens to
+			// 256 still produced a request guaranteed to 400 upstream. When
+			// the real prompt leaves less room than this, there is no safe
+			// positive max_tokens to force -- reject client-side with a
+			// clear reason instead of forwarding one still doomed to fail.
+			const minViableCompletion = 16
+			if fitBudget < minViableCompletion {
+				writeAnthropicError(w, http.StatusBadRequest,
+					fmt.Sprintf("prompt is too large to fit this model's %d-token context window with any output budget; please reduce the prompt length", route.ContextWindow))
+				return
 			}
 			if oaiReq.MaxTokens > fitBudget {
 				oaiReq.MaxTokens = fitBudget
