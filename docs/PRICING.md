@@ -345,6 +345,15 @@ GPUs or denser hardware (H200/B200), neither done today.
 **How to actually be more competitive, without cutting the headline
 rate below cost:**
 
+> **Status 2026-08-29 (late):** `cached_prompt` was deployed to the gateway
+> config the same day, but a metering audit found vLLM 0.24.0 never reported
+> `prompt_tokens_details.cached_tokens` (flag `--enable-prompt-tokens-details`
+> is off by default), so the discount was inert and every cache hit billed at
+> the fresh rate. Fixed by adding the flag to the replica launch
+> (`tools/a100b/vllm_awq_watchdog.sh`); verified `cached_tokens: 6336` on a
+> repeated 9,016-token prompt. Effective from the rolling restart on
+> 2026-08-29 ~22:30 UTC. See `docs/METERING_AUDIT_2026-08-29.md`.
+
 1. **Ship the cache-hit discount that's already built.** `gwPricing.CachedPrompt`
    exists in code (`tools/gateway`) but isn't populated in the deployed
    config — cached prefix tokens still bill at the full $0.05 rate today
