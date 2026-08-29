@@ -1695,3 +1695,64 @@ func TestContextFitClamp_SmallPromptUnaffected(t *testing.T) {
 		t.Errorf("expected max_tokens to pass through unclamped for a small request, got %v", gotMaxTokens)
 	}
 }
+
+// -- connection-level upstream errors now logged too (2026-08-29) --
+
+func TestUpstreamErrorLog_CapturesConnectionLevelFailure(t *testing.T) {
+	// Real gap found 2026-08-29: a 502 from a dead/unreachable upstream
+	// (connection refused, no ModifyResponse call at all -- handled by
+	// ReverseProxy's ErrorHandler instead) was invisible to
+	// UpstreamErrorLogPath, only findable in the raw ledger as a bare
+	// status code with no message. This must now show up in the log too.
+	deadUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := deadUpstream.URL
+	deadUpstream.Close() // closed immediately -> guaranteed connection refused
+
+	g, errLogPath := newTestGatewayWithErrorLog(t, deadURL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"messages":   []map[string]any{{"role": "user", "content": "hello"}},
+		"max_tokens": 10,
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	req.Header.Set("X-Session-Id", "sess-conn-fail-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 502 {
+		t.Fatalf("expected 502 from the dead upstream, got %d", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lines []string
+	for {
+		b, _ := os.ReadFile(errLogPath)
+		lines = strings.Split(strings.TrimSpace(string(b)), "\n")
+		if (len(lines) >= 1 && lines[0] != "") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("expected the connection-level failure to be logged to the upstream error log")
+	}
+	var got upstreamErrorLogLine
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &got); err != nil {
+		t.Fatalf("bad JSON line: %v (%s)", err, lines[len(lines)-1])
+	}
+	if got.Status != 502 {
+		t.Errorf("expected status=502, got %d", got.Status)
+	}
+	if got.SessionID != "sess-conn-fail-test" {
+		t.Errorf("expected session_id correlation even for a connection-level failure, got %q", got.SessionID)
+	}
+	if !strings.Contains(got.Message, "upstream unavailable") {
+		t.Errorf("expected a connection-error message, got %q", got.Message)
+	}
+}

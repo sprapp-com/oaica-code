@@ -451,6 +451,20 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timeout") {
 			status = http.StatusGatewayTimeout
 		}
+		// Real gap found 2026-08-29: a connection-level failure (dial
+		// refused/timeout, no healthy backend) never reaches ModifyResponse
+		// -- it's handled entirely here instead -- so it was invisible to
+		// UpstreamErrorLogPath despite being a real upstream failure, only
+		// findable by grepping the raw ledger for a bare status code with
+		// no message. Log it the same way as a ModifyResponse-path error so
+		// every upstream failure lands in one place.
+		if onUpstreamError != nil {
+			var info *errCaptureInfo
+			if v, ok := r.Context().Value(ctxKeyErrCapture{}).(*errCaptureInfo); ok {
+				info = v
+			}
+			onUpstreamError(info, status, "upstream_error", "upstream unavailable: "+err.Error())
+		}
 		w.Header().Set("Retry-After", "2")
 		writeErr(w, status, "upstream_error", "upstream unavailable: "+err.Error())
 	}
