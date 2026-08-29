@@ -124,6 +124,13 @@ launch() {
   # profile difference between AWQ and this int4-AutoRound quant is in
   # the weights only (~21GB either way), not the KV-cache budget, so
   # reusing our proven values is the safer bet for real concurrency here.
+  # num_speculative_tokens dropped 3 -> 1 after a real 2026-08-29 crash:
+  # GPU1+GPU2 both died with "torch.AcceleratorError: CUDA error: an
+  # illegal memory access was encountered" in the sampling/token-transfer
+  # path, matching vLLM's own boot-time warning ("Enabling
+  # num_speculative_tokens > 1 will run multiple times of forward on same
+  # MTP layer, which may result in lower acceptance rate") -- >1 is
+  # flagged by vLLM itself as an atypical, less-hardened configuration.
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
@@ -131,7 +138,7 @@ launch() {
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
     > "$logfile" 2>&1 &
   disown
 }
