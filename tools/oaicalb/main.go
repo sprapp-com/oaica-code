@@ -46,11 +46,19 @@ import (
 // session-hash load balancing by running a second oaicalb with its own
 // -config, not by touching this code.
 type lbConfig struct {
-	Backends      []string `json:"backends"`
-	HealthPath    string   `json:"health_path"`       // default "/v1/models"
-	LeastConnAddr string   `json:"leastconn_addr"`    // default ":8090"
-	SessionAddr   string   `json:"session_hash_addr"` // default ":8091"
-	StatusAddr    string   `json:"status_addr"`       // default ":8092"
+	Backends []string `json:"backends"`
+	// BackendConfigs, when non-empty, replaces Backends entirely and lets
+	// each backend declare its own MaxContext (estimated prompt tokens it
+	// can accept) -- see backend.maxContext / contextEligible. Backends
+	// stays the plain-string form for every existing deployment; this is
+	// additive, not a breaking change. A backend with MaxContext <= 0 is
+	// treated as unbounded (today's behavior for every deployed replica,
+	// which all run the same --max-model-len).
+	BackendConfigs []backendConfigEntry `json:"backend_configs,omitempty"`
+	HealthPath     string               `json:"health_path"`       // default "/v1/models"
+	LeastConnAddr  string               `json:"leastconn_addr"`    // default ":8090"
+	SessionAddr    string               `json:"session_hash_addr"` // default ":8091"
+	StatusAddr     string               `json:"status_addr"`       // default ":8092"
 
 	// ProbeModel turns the health check into a real 1-token
 	// POST /v1/chat/completions for this served model name. GET /v1/models
@@ -123,6 +131,19 @@ type lbConfig struct {
 	Region        string `json:"region"`
 }
 
+// backendConfigEntry is one entry of lbConfig.BackendConfigs -- a backend
+// URL plus the context-size band it should serve.
+type backendConfigEntry struct {
+	URL string `json:"url"`
+	// MaxContext is the largest estimated-token request this backend should
+	// receive (same len(body)/4 heuristic as tools/gateway's
+	// estimateMessageTokens -- coarse, not a real tokenizer call, deliberately
+	// consistent with the admission-control gate it complements). <= 0 means
+	// unbounded: this backend accepts any request size, matching every
+	// deployment before this field existed.
+	MaxContext int `json:"max_context"`
+}
+
 // stallThreshold returns the effective hung-replica threshold, 0 if disabled.
 func (c lbConfig) stallThreshold() time.Duration {
 	if c.StallSec < 0 {
@@ -185,14 +206,22 @@ type backend struct {
 	starts map[uint64]time.Time
 	nextID uint64
 	mu     sync.Mutex
+	// maxContext is this backend's context-size band -- see
+	// backendConfigEntry.MaxContext. 0 (the default via newBackend) means
+	// unbounded, preserving every pre-existing deployment's behavior.
+	maxContext int
 }
 
 func newBackend(raw string) *backend {
+	return newBackendWithContext(raw, 0)
+}
+
+func newBackendWithContext(raw string, maxContext int) *backend {
 	u, err := url.Parse(raw)
 	if err != nil {
 		log.Fatal(err)
 	}
-	b := &backend{url: u, proxy: httputil.NewSingleHostReverseProxy(u), starts: map[uint64]time.Time{}}
+	b := &backend{url: u, proxy: httputil.NewSingleHostReverseProxy(u), starts: map[uint64]time.Time{}, maxContext: maxContext}
 	b.healthy.Store(true)
 	b.lastProbeOK.Store(true)
 	return b
@@ -368,7 +397,41 @@ func (b *backend) healthCheck(ctx context.Context, opts probeOpts) {
 // once load actually differs (e.g. one replica running a slow generation).
 var rrCounter atomic.Uint64
 
-func leastConnPick(bs []*backend) *backend {
+// contextEligible narrows bs to backends that can fit a request estimated at
+// estTokens (see backendConfigEntry.MaxContext), ratcheting DOWN the
+// candidate set only, never rejecting a request: an estTokens of 0 (unknown,
+// or context limits aren't configured at all) skips filtering entirely, and
+// if every backend is too small for a giant estimate, the full set is
+// returned rather than an empty one -- oaicalb has no way to reject a
+// request outright (that's tools/gateway's admission-control gate's job);
+// the worst case here is just "send it to the least-bad backend, let the
+// upstream reject if it truly can't fit."
+func contextEligible(bs []*backend, estTokens int) []*backend {
+	if estTokens <= 0 {
+		return bs
+	}
+	eligible := make([]*backend, 0, len(bs))
+	for _, b := range bs {
+		if b.maxContext <= 0 || estTokens <= b.maxContext {
+			eligible = append(eligible, b)
+		}
+	}
+	if len(eligible) == 0 {
+		return bs
+	}
+	return eligible
+}
+
+// estimateRequestTokens is the same coarse chars/4 heuristic as
+// tools/gateway's estimateMessageTokens -- not a real tokenizer, deliberately
+// consistent with the gateway's admission-control gate so the two features
+// reason about request size the same way.
+func estimateRequestTokens(body []byte) int {
+	return len(body) / 4
+}
+
+func leastConnPick(bs []*backend, estTokens int) *backend {
+	bs = contextEligible(bs, estTokens)
 	var bestLoad int64 = -1
 	tied := make([]*backend, 0, len(bs))
 	for _, b := range bs {
@@ -416,7 +479,20 @@ func averageHealthyLoad(bs []*backend) float64 {
 	return avg
 }
 
-func hashPick(bs []*backend, key string, overflowFactor float64) *backend {
+// hashPick pins key to a consistent-hash target in bs, degrading to
+// leastconn (among backends that can actually fit estTokens -- see
+// contextEligible) when that target is unhealthy, disproportionately
+// loaded, or too small for this request's estimated size. The too-small
+// case is a one-way ratchet in practice, not per-request logic: once a
+// session's requests grow past its hashed backend's MaxContext, EVERY
+// subsequent request of that size degrades the same way and lands on the
+// same (larger) leastconn-picked backend, so the session naturally settles
+// there rather than bouncing every request. A session that shrinks back
+// down does NOT ratchet back to the small backend -- deliberately: the
+// point of tiering is protecting small/cheap replicas from big prompts,
+// not chasing every request to the cheapest backend that could serve it,
+// and a real conversation's context only grows.
+func hashPick(bs []*backend, key string, overflowFactor float64, estTokens int) *backend {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	idx := int(h.Sum32()) % len(bs)
@@ -424,9 +500,11 @@ func hashPick(bs []*backend, key string, overflowFactor float64) *backend {
 		idx += len(bs)
 	}
 	target := bs[idx]
-	if !target.healthy.Load() {
-		// fallback: hashed backend down, degrade to leastconn
-		return leastConnPick(bs)
+	tooSmall := target.maxContext > 0 && estTokens > target.maxContext
+	if !target.healthy.Load() || tooSmall {
+		// fallback: hashed backend down or can't fit this request, degrade
+		// to leastconn among backends that CAN fit it
+		return leastConnPick(bs, estTokens)
 	}
 	if overflowFactor > 0 {
 		load := float64(atomic.LoadInt64(&target.inflight))
@@ -436,7 +514,7 @@ func hashPick(bs []*backend, key string, overflowFactor float64) *backend {
 			// loaded right now. Not sticky: the very next request from the
 			// same session re-hashes to the same target and rejoins it
 			// once load drains back under the threshold.
-			if alt := leastConnPick(bs); alt != nil {
+			if alt := leastConnPick(bs, estTokens); alt != nil {
 				return alt
 			}
 		}
@@ -718,9 +796,30 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
+// serveWith wraps pick with request-size estimation: if any backend in bs
+// declares a MaxContext (see backendConfigEntry), the request body is read
+// once, restored (proxying still needs the full body), and the estimate is
+// passed to pick. When no backend declares a MaxContext, the body is never
+// touched here -- zero behavior change for every deployment that hasn't
+// configured context tiering.
+func serveWith(bs []*backend, pick func([]*backend, int) *backend) http.HandlerFunc {
+	hasContextLimits := false
+	for _, b := range bs {
+		if b.maxContext > 0 {
+			hasContextLimits = true
+			break
+		}
+	}
 	return meterAndServe(func(w http.ResponseWriter, r *http.Request) {
-		b := pick(bs)
+		estTokens := 0
+		if hasContextLimits && r.Method == http.MethodPost {
+			if body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20)); err == nil {
+				r.Body.Close()
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				estTokens = estimateRequestTokens(body)
+			}
+		}
+		b := pick(bs, estTokens)
 		if b == nil {
 			http.Error(w, "no healthy backend", http.StatusServiceUnavailable)
 			return
@@ -734,15 +833,15 @@ func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
 
 // sessionHandler pins a request to the backend hashed from its X-Session-Id
 // (per-client address when absent), degrading to leastconn when that
-// backend is DOWN or (if overflowFactor > 0) disproportionately loaded —
-// see hashPick.
+// backend is DOWN, too small for this request (see hashPick's ratchet-up
+// doc), or (if overflowFactor > 0) disproportionately loaded.
 func sessionHandler(bs []*backend, overflowFactor float64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Session-Id")
 		if key == "" {
 			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
 		}
-		serveWith(bs, func(bs []*backend) *backend { return hashPick(bs, key, overflowFactor) })(w, r)
+		serveWith(bs, func(bs []*backend, estTokens int) *backend { return hashPick(bs, key, overflowFactor, estTokens) })(w, r)
 	}
 }
 
@@ -778,11 +877,22 @@ func main() {
 		stallMin:   cfg.StallMinInflight,
 	}
 
-	bs := make([]*backend, 0, len(cfg.Backends))
-	for _, raw := range cfg.Backends {
-		b := newBackend(raw)
-		go b.healthCheck(context.Background(), opts)
-		bs = append(bs, b)
+	var bs []*backend
+	if len(cfg.BackendConfigs) > 0 {
+		bs = make([]*backend, 0, len(cfg.BackendConfigs))
+		for _, bc := range cfg.BackendConfigs {
+			b := newBackendWithContext(bc.URL, bc.MaxContext)
+			go b.healthCheck(context.Background(), opts)
+			bs = append(bs, b)
+		}
+		log.Printf("oaicalb: %d backends from backend_configs (context-size tiering active)", len(bs))
+	} else {
+		bs = make([]*backend, 0, len(cfg.Backends))
+		for _, raw := range cfg.Backends {
+			b := newBackend(raw)
+			go b.healthCheck(context.Background(), opts)
+			bs = append(bs, b)
+		}
 	}
 	time.Sleep(1 * time.Second) // let first health check land before serving
 

@@ -109,7 +109,7 @@ func TestMeter_DisabledByDefault(t *testing.T) {
 	metered = nil // explicit: no test before this one may have left it set
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	w := httptest.NewRecorder()
@@ -126,7 +126,7 @@ func TestMeter_ReportsRequestWithoutXOaicaMeteredHeader(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	w := httptest.NewRecorder()
@@ -160,7 +160,7 @@ func TestMeter_SkipsRequestAlreadyMeteredByGateway(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("X-Oaica-Metered", "1")
@@ -183,7 +183,7 @@ func TestMeter_AuthenticatedRequestLabelledDifferently(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-something")
@@ -203,7 +203,7 @@ func TestMeter_NonCompletionPathNeverReported(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	w := httptest.NewRecorder()
@@ -392,7 +392,7 @@ func sessionKeyFor(t *testing.T, bs []*backend, want *backend) string {
 	t.Helper()
 	for i := 0; i < 1000; i++ {
 		k := "session-" + itoa(int64(i))
-		if hashPick(bs, k, 0) == want {
+		if hashPick(bs, k, 0, 0) == want {
 			return k
 		}
 	}
@@ -606,7 +606,7 @@ func TestHashPick_OverflowDisabledStaysSticky(t *testing.T) {
 
 	// overflowFactor=0 (disabled): must stay pinned regardless of load skew
 	// — byte-identical to pre-2026-08-29 behavior.
-	if got := hashPick(bs, key, 0); got != a {
+	if got := hashPick(bs, key, 0, 0); got != a {
 		t.Error("overflowFactor=0 must never reroute away from the hashed backend")
 	}
 }
@@ -621,7 +621,7 @@ func TestHashPick_OverflowReroutesWhenHashedBackendIsHot(t *testing.T) {
 	// a's load (10) is 2x the average, so overflowFactor=1.5 must trip.
 	setInflight(a, 10)
 	setInflight(b, 0)
-	if got := hashPick(bs, key, 1.5); got != b {
+	if got := hashPick(bs, key, 1.5, 0); got != b {
 		t.Errorf("expected reroute to the least-loaded backend (b) when the hashed one (a) is 2x average load with overflowFactor=1.5")
 	}
 }
@@ -636,7 +636,7 @@ func TestHashPick_OverflowStaysPinnedUnderThreshold(t *testing.T) {
 	// 1.5x average, under a 2.0 threshold -> must stay pinned.
 	setInflight(a, 3)
 	setInflight(b, 1)
-	if got := hashPick(bs, key, 2.0); got != a {
+	if got := hashPick(bs, key, 2.0, 0); got != a {
 		t.Error("expected the session to stay pinned to a when its load is under the overflow threshold")
 	}
 }
@@ -649,7 +649,7 @@ func TestHashPick_OverflowNextRequestRejoinsAfterDrain(t *testing.T) {
 
 	setInflight(a, 10)
 	setInflight(b, 0)
-	if got := hashPick(bs, key, 1.5); got != b {
+	if got := hashPick(bs, key, 1.5, 0); got != b {
 		t.Fatal("expected reroute while a is hot")
 	}
 
@@ -657,7 +657,7 @@ func TestHashPick_OverflowNextRequestRejoinsAfterDrain(t *testing.T) {
 	// (no separate "un-reroute" state) must rejoin its hashed backend.
 	setInflight(a, 1)
 	setInflight(b, 1)
-	if got := hashPick(bs, key, 1.5); got != a {
+	if got := hashPick(bs, key, 1.5, 0); got != a {
 		t.Error("expected the session to rejoin its hashed backend once load drained — overflow reroute must be per-request, not sticky")
 	}
 }
@@ -670,7 +670,125 @@ func TestHashPick_OverflowNeverPicksAnUnhealthyAlternate(t *testing.T) {
 
 	b.healthy.Store(false) // the only "alternate" is unhealthy
 	setInflight(a, 10)
-	if got := hashPick(bs, key, 1.5); got != a {
+	if got := hashPick(bs, key, 1.5, 0); got != a {
 		t.Error("expected to stay on the hashed backend (a) when the only alternate (b) is unhealthy, even if a is hot — better a slow answer than none")
+	}
+}
+
+// -- context-size tiering (2026-08-29) --
+
+func TestContextEligible_UnboundedBackendsUnaffectedByEstimate(t *testing.T) {
+	a := newBackend("http://127.0.0.1:1")
+	b := newBackend("http://127.0.0.1:2")
+	bs := []*backend{a, b}
+	got := contextEligible(bs, 999999)
+	if len(got) != 2 {
+		t.Errorf("expected both unbounded backends eligible regardless of estimate, got %d", len(got))
+	}
+}
+
+func TestContextEligible_FiltersOutTooSmallBackend(t *testing.T) {
+	small := newBackendWithContext("http://127.0.0.1:1", 10000)
+	big := newBackendWithContext("http://127.0.0.1:2", 0) // unbounded
+	bs := []*backend{small, big}
+	got := contextEligible(bs, 50000)
+	if len(got) != 1 || got[0] != big {
+		t.Errorf("expected only the unbounded backend eligible for a 50k-token request, got %v", got)
+	}
+}
+
+func TestContextEligible_ZeroEstimateSkipsFilteringEntirely(t *testing.T) {
+	small := newBackendWithContext("http://127.0.0.1:1", 10000)
+	bs := []*backend{small}
+	got := contextEligible(bs, 0)
+	if len(got) != 1 {
+		t.Error("estTokens=0 (unknown / GET request) must never filter anything out")
+	}
+}
+
+func TestContextEligible_NeverReturnsEmptyEvenWhenNothingFits(t *testing.T) {
+	small := newBackendWithContext("http://127.0.0.1:1", 1000)
+	bs := []*backend{small}
+	got := contextEligible(bs, 999999)
+	if len(got) != 1 {
+		t.Error("no backend can fit the request, but oaicalb cannot reject outright -- must fall back to the full set, not an empty one")
+	}
+}
+
+func TestLeastConnPick_RoutesAroundTooSmallBackend(t *testing.T) {
+	small := newBackendWithContext("http://127.0.0.1:1", 10000)
+	big := newBackendWithContext("http://127.0.0.1:2", 0)
+	bs := []*backend{small, big}
+	for i := 0; i < 10; i++ {
+		if got := leastConnPick(bs, 50000); got != big {
+			t.Fatal("a 50k-token request must never land on a backend declaring a 10k max_context")
+		}
+	}
+}
+
+func TestHashPick_RatchetsUpWhenHashedBackendTooSmall(t *testing.T) {
+	small := newBackendWithContext("http://127.0.0.1:1", 10000)
+	big := newBackendWithContext("http://127.0.0.1:2", 0)
+	bs := []*backend{small, big}
+	key := sessionKeyFor(t, bs, small)
+
+	// small request: stays on the hashed (small) backend
+	if got := hashPick(bs, key, 0, 5000); got != small {
+		t.Error("a request that fits should stay on its hashed backend")
+	}
+	// same session grows past small's max_context: ratchets to big
+	if got := hashPick(bs, key, 0, 50000); got != big {
+		t.Error("a request too big for the hashed backend must degrade to a backend that fits, not stay pinned")
+	}
+	// shrinks back down: deliberately does NOT ratchet back (see hashPick doc)
+	if got := hashPick(bs, key, 0, 5000); got != small {
+		t.Error("a subsequent small request from the same session should rejoin its original hashed backend")
+	}
+}
+
+func TestServeWith_NoContextLimitsNeverReadsBodyTwice(t *testing.T) {
+	// Regression guard: when no backend declares max_context, serveWith must
+	// not touch the body at all, so a handler downstream sees it exactly
+	// once, unmodified -- proving the zero-config path is untouched.
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	b := newBackend(srv.URL) // maxContext=0, unbounded
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"probe":"body"}`))
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if gotBody != `{"probe":"body"}` {
+		t.Errorf("expected body to reach the backend unmodified, got %q", gotBody)
+	}
+}
+
+func TestServeWith_ContextLimitsRestoreBodyForProxying(t *testing.T) {
+	// With context limits active, serveWith reads the body to estimate size
+	// -- it must still restore it so the real proxied request carries the
+	// full original body, not an empty one.
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	b := newBackendWithContext(srv.URL, 999999) // declares a max_context -> triggers body read
+	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+
+	body := `{"model":"x","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if gotBody != body {
+		t.Errorf("expected the full original body to reach the backend after the estimate read, got %q", gotBody)
 	}
 }
