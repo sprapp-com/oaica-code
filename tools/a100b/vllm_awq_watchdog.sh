@@ -95,6 +95,15 @@ preflight() {
 
 launch() {
   local gpu=$1 port=$2 logfile=$3
+  # Preserve the PREVIOUS boot's full log before truncating for the new one
+  # -- `> "$logfile"` below destroys whatever crash evidence was in there.
+  # 2026-08-29 incident: GPU0/1 crash-looped 6x over 90 minutes (orphaned
+  # EngineCore killed repeatedly by sweep_orphans) and every single
+  # traceback was gone by the time anyone looked, because each relaunch's
+  # truncation raced the investigation. Only one snapshot kept (not
+  # unbounded) -- enough to diagnose "why did the last boot die" without
+  # accumulating logs forever.
+  [ -s "$logfile" ] && mv -f "$logfile" "${logfile}.prev_crash"
   log "launching oaica-35b-a3b-vision on GPU${gpu} :${port}"
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
