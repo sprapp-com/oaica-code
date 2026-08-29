@@ -1,0 +1,17 @@
+{
+  "backends": [
+    "http://127.0.0.1:30107"
+  ],
+  "health_path": "/v1/models",
+  "leastconn_addr": ":30120",
+  "session_hash_addr": ":8191",
+  "status_addr": ":8192",
+  "probe_model": "nvidia-nemotron-3.5-lightning-30b-a3b",
+  "probe_timeout_sec": 25,
+  "stall_sec": 300,
+  "stall_min_inflight": 2,
+  "session_overflow_factor": 0,
+  "meterhub_addr": "http://127.0.0.1:8095",
+  "meterhub_token": "<plaintext report token, sha256 registered in meterhub.json>",
+  "region": "a100b"
+}

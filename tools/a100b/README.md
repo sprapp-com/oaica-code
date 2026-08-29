@@ -191,13 +191,30 @@ replica OOMs at startup there. A `booting()` guard skips a port whose
 api_server exists but is not yet listening (vLLM takes ~100 s to load), so
 a slow start is not treated as a crash.
 
-GPU7 runs a second, unrelated model standalone (not behind oaicalb, no
-watchdog): `nvidia-nemotron-3.5-lightning-30b-a3b`
+GPU7 runs a second, unrelated model standalone (no watchdog):
+`nvidia-nemotron-3.5-lightning-30b-a3b`
 (useful-quants/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-W4A16), port `:30107`,
 1M context (`--max-model-len 1048576`, well past the model's native 262144
 — see `nemotron_gpu7_launch.sh`'s doc comment for the tradeoffs accepted).
 `--enforce-eager` because `/dev/shm` is noexec and `/workspace` lacked
 compile-cache headroom when this was set up — a real gap, not fixed yet.
+
+**Metered since 2026-08-29** via a second, single-backend oaicalb
+instance (`nemotron-oaicalb.json`, binary `/workspace/oaicalb-linux-amd64`
+— same binary as the main fleet's, just a different `-config`): leastconn
+`:30120`, session-hash `:8191`, status `:8192/status`, reports to meterhub
+the same way the main fleet does. Before this, GPU7 traffic went straight
+to `:30107` and was completely invisible to metering (found via the same
+class of gap fixed for the main fleet's stale client sessions — see
+oaicalb's own file header comment: "any future multi-replica model...
+gets the same leastconn + session-hash load balancing by running a second
+oaicalb with its own `-config`, not by touching this code" — this is that
+extension point in use). All 3 client boxes' `remotes.json` repointed from
+direct `:30107` to `:30120` (tunneled 1:1, added to each box's
+`apex_tunloop.sh` `PORTS` list). Launch:
+`nohup /workspace/oaicalb-linux-amd64 -config /workspace/nemotron-oaicalb.json > /workspace/nemotron-oaicalb.log 2>&1 &`
+— not yet under `stack_watchdog.sh` supervision (tracked as a gap, same
+as the rest of GPU7's setup).
 
 ## Control-plane supervisor + reboot
 
