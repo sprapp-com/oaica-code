@@ -114,3 +114,56 @@ shipped, so it's reported in full:
 - `tools/meterhub`: 22/22 pass
 - All changes committed; 3 commits pushed to `origin/main` this session
   (meterhub service, docs, subscriber/webhook tests).
+
+## Addendum — 2026-08-29: rolling-window caps, admission control, cost/overage billing
+
+Follow-on work after the report above, closing gaps found once the metering
+arc was live:
+
+- **Per-subscriber rolling-window usage** (5h/weekly caps matching
+  `docs/PRICING.md` tiers) + a live reset mechanism (`reset_at` marker,
+  no restart needed) — `GET/POST /subscribers/usage`, `/subscribers/reset`.
+- **Caps enforced in the gateway request path** (previously read-only
+  instrumentation): `entitlementCache.check()` returns
+  `(allowed, reason, overage)`; over-cap → 429, not-entitled → 403.
+- **GPU7/nemotron metering gap closed**: that traffic bypassed gateway and
+  oaicalb entirely; a second metered oaicalb instance was stood up in
+  front of it, then the whole workload was later stopped per user request.
+- **Per-backend and per-session attribution**: `X-Katlb-Backend` and
+  `X-Session-Id` threaded into the ledger; `GET /usage/by_backend`.
+  Real bug found+fixed here: `AVG(latency_ms)` (float) scanned into an
+  `int64` struct field silently failed row-scan on any fractional average,
+  making the endpoint return an empty list despite correct underlying
+  data — fixed with `CAST(... AS INTEGER)`, plus scan-error logging added
+  everywhere in meterhub so this class of bug can't be silently swallowed
+  again.
+- **Admission control for large-context requests**: bounded semaphore
+  (default cap 2) gates requests at/above a token-estimate threshold
+  (default 50,000), returning fast 429 instead of a slow failure after
+  upstream GPU work has already started. Targets a real diagnosed
+  incident (several 140K–190K-token prompts landing concurrently backed
+  up a replica's scheduler).
+- **Cache-hit-aware pricing**: `CostUSD` split across fresh vs.
+  prefix-cache-hit prompt tokens at different rates (matching real
+  provider pricing shapes), informational only — no invoicing exists.
+- **Overage billing** (config-gated, default off): `EntitlementOverageBilling`
+  lets an over-cap request through flagged `Overage=true` for later
+  charge-at-overage-rate billing, instead of a hard 429. Existing
+  hard-block behavior is the unchanged default.
+- Deployed to a100b, verified end-to-end (gateway ledger `cost_usd`
+  matched meterhub `/usage` on a real completion). 41 new tests across
+  gateway+meterhub this arc, all passing. Committed locally
+  (`ed020a47` and prior); **not pushed** — awaiting explicit go-ahead.
+
+### Still deferred (unchanged from above, plus)
+
+- `tools/oaicalb`'s own usage reporter has no `CostUSD`/`Overage` fields
+  (it lacks per-model pricing config) — bypass/direct traffic through
+  oaicalb won't carry cost data, only gateway-routed traffic does.
+- The other profitability levers discussed (hybrid reserved+serverless
+  infra, peak/off-peak pricing, subscriber seeding, annual discount) are
+  business/pricing decisions, not code — not attempted.
+- `SMART_CONTEXT_TIER_ROUTING.md`'s multi-tier context routing: assessed,
+  not implemented — the source doc itself states its thresholds are
+  uncalibrated placeholders; would swap one uncalibrated heuristic
+  (current admission-control gate) for a more complex uncalibrated one.
