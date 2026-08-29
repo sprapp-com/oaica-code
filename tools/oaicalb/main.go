@@ -32,10 +32,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -210,6 +212,125 @@ type backend struct {
 	// backendConfigEntry.MaxContext. 0 (the default via newBackend) means
 	// unbounded, preserving every pre-existing deployment's behavior.
 	maxContext int
+	// cancelHealth stops this backend's health-check goroutine; set by
+	// backendPool.reload when the loop is started, called when the backend
+	// is dropped from the config (see backendPool.reload).
+	cancelHealth context.CancelFunc
+}
+
+// backendPool is the live backend set behind an atomic pointer, so the
+// request handlers read a consistent snapshot per request while
+// reload() swaps in a new set without stopping the listeners.
+//
+// Why: adding or removing a replica used to require restarting oaicalb
+// (the backend list was read once in main), a ~12 s "no healthy backend"
+// blip for every client each time -- done five times on 2026-08-29 alone.
+// SIGHUP now re-reads the config file, the same contract nginx/HAProxy
+// use. Rules that keep a reload safe: an unparseable/invalid file keeps
+// the current set (logged, nothing changes); backends whose URL and
+// max_context are unchanged keep their object -- health state, in-flight
+// counters and stall bookkeeping survive; new URLs get a fresh health
+// loop; removed backends have their health loop cancelled and are simply
+// no longer in the snapshot, so nothing new is routed to them while
+// requests already proxied to them finish normally (drain, not cut).
+//
+// Caveat inherent to any backend-set change, restart or not: hashPick maps
+// X-Session-Id onto the slice by index, so sessions re-pin once the count
+// changes and lose their replica's prefix cache for that first turn.
+type backendPool struct {
+	snap atomic.Pointer[poolSnapshot]
+	opts probeOpts
+	mu   sync.Mutex // serializes reload()
+}
+
+type poolSnapshot struct {
+	bs []*backend
+	// hasContextLimits caches "any backend declares max_context" so
+	// serveWith only reads request bodies when tiering is actually on.
+	hasContextLimits bool
+}
+
+func newBackendPool(opts probeOpts) *backendPool {
+	p := &backendPool{opts: opts}
+	p.snap.Store(&poolSnapshot{})
+	return p
+}
+
+// newStaticPool wraps an already-built backend slice (tests, and callers
+// that manage health loops themselves).
+func newStaticPool(bs []*backend) *backendPool {
+	p := &backendPool{}
+	p.snap.Store(&poolSnapshot{bs: bs, hasContextLimits: anyContextLimits(bs)})
+	return p
+}
+
+func anyContextLimits(bs []*backend) bool {
+	for _, b := range bs {
+		if b.maxContext > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *backendPool) current() *poolSnapshot { return p.snap.Load() }
+
+// desiredBackends flattens either config form into (url, maxContext) pairs
+// in config order (order matters: hashPick indexes into it).
+func desiredBackends(cfg lbConfig) []backendConfigEntry {
+	if len(cfg.BackendConfigs) > 0 {
+		return cfg.BackendConfigs
+	}
+	out := make([]backendConfigEntry, 0, len(cfg.Backends))
+	for _, raw := range cfg.Backends {
+		out = append(out, backendConfigEntry{URL: raw})
+	}
+	return out
+}
+
+// reload swaps the pool to cfg's backend set (see backendPool doc for the
+// rules). Returns (added, removed, kept) URL counts for logging.
+func (p *backendPool) reload(cfg lbConfig) (added, removed, kept int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	old := p.current()
+	oldByURL := make(map[string]*backend, len(old.bs))
+	for _, b := range old.bs {
+		oldByURL[b.url.String()] = b
+	}
+	want := desiredBackends(cfg)
+	next := make([]*backend, 0, len(want))
+	keptSet := make(map[*backend]bool, len(want))
+	for _, w := range want {
+		u, err := url.Parse(w.URL)
+		if err != nil {
+			log.Printf("oaicalb: reload: skipping bad backend url %q: %v", w.URL, err)
+			continue
+		}
+		if b, ok := oldByURL[u.String()]; ok && b.maxContext == w.MaxContext && !keptSet[b] {
+			next = append(next, b)
+			keptSet[b] = true
+			kept++
+			continue
+		}
+		b := newBackendWithContext(w.URL, w.MaxContext)
+		ctx, cancel := context.WithCancel(context.Background())
+		b.cancelHealth = cancel
+		go b.healthCheck(ctx, p.opts)
+		next = append(next, b)
+		added++
+	}
+	for _, b := range old.bs {
+		if !keptSet[b] {
+			if b.cancelHealth != nil {
+				b.cancelHealth()
+			}
+			b.healthy.Store(false) // belt-and-braces: never picked even via a stale reference
+			removed++
+		}
+	}
+	p.snap.Store(&poolSnapshot{bs: next, hasContextLimits: anyContextLimits(next)})
+	return added, removed, kept
 }
 
 func newBackend(raw string) *backend {
@@ -802,17 +923,15 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 // passed to pick. When no backend declares a MaxContext, the body is never
 // touched here -- zero behavior change for every deployment that hasn't
 // configured context tiering.
-func serveWith(bs []*backend, pick func([]*backend, int) *backend) http.HandlerFunc {
-	hasContextLimits := false
-	for _, b := range bs {
-		if b.maxContext > 0 {
-			hasContextLimits = true
-			break
-		}
-	}
+func serveWith(pool *backendPool, pick func([]*backend, int) *backend) http.HandlerFunc {
 	return meterAndServe(func(w http.ResponseWriter, r *http.Request) {
+		// One snapshot per request: a reload mid-request cannot change the
+		// slice under pick(), and a backend dropped by that reload still
+		// finishes this request (drain).
+		snap := pool.current()
+		bs := snap.bs
 		estTokens := 0
-		if hasContextLimits && r.Method == http.MethodPost {
+		if snap.hasContextLimits && r.Method == http.MethodPost {
 			if body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20)); err == nil {
 				r.Body.Close()
 				r.Body = io.NopCloser(bytes.NewReader(body))
@@ -835,13 +954,13 @@ func serveWith(bs []*backend, pick func([]*backend, int) *backend) http.HandlerF
 // (per-client address when absent), degrading to leastconn when that
 // backend is DOWN, too small for this request (see hashPick's ratchet-up
 // doc), or (if overflowFactor > 0) disproportionately loaded.
-func sessionHandler(bs []*backend, overflowFactor float64) http.HandlerFunc {
+func sessionHandler(pool *backendPool, overflowFactor float64) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Session-Id")
 		if key == "" {
 			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
 		}
-		serveWith(bs, func(bs []*backend, estTokens int) *backend { return hashPick(bs, key, overflowFactor, estTokens) })(w, r)
+		serveWith(pool, func(bs []*backend, estTokens int) *backend { return hashPick(bs, key, overflowFactor, estTokens) })(w, r)
 	}
 }
 
@@ -877,34 +996,42 @@ func main() {
 		stallMin:   cfg.StallMinInflight,
 	}
 
-	var bs []*backend
+	pool := newBackendPool(opts)
+	added, _, _ := pool.reload(cfg)
 	if len(cfg.BackendConfigs) > 0 {
-		bs = make([]*backend, 0, len(cfg.BackendConfigs))
-		for _, bc := range cfg.BackendConfigs {
-			b := newBackendWithContext(bc.URL, bc.MaxContext)
-			go b.healthCheck(context.Background(), opts)
-			bs = append(bs, b)
-		}
-		log.Printf("oaicalb: %d backends from backend_configs (context-size tiering active)", len(bs))
-	} else {
-		bs = make([]*backend, 0, len(cfg.Backends))
-		for _, raw := range cfg.Backends {
-			b := newBackend(raw)
-			go b.healthCheck(context.Background(), opts)
-			bs = append(bs, b)
-		}
+		log.Printf("oaicalb: %d backends from backend_configs (context-size tiering active)", added)
 	}
 	time.Sleep(1 * time.Second) // let first health check land before serving
 
+	// SIGHUP: re-read the config file and swap the backend set without
+	// restarting (see backendPool). Only the backend list is reloadable --
+	// listen addresses, probe settings and metering are fixed at start.
+	// Usage: kill -HUP $(pid of oaicalb). A bad file changes nothing.
+	if *configPath != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				ncfg, err := loadConfig(*configPath)
+				if err != nil {
+					log.Printf("oaicalb: SIGHUP: config rejected, keeping current backends: %v", err)
+					continue
+				}
+				a, r, k := pool.reload(ncfg)
+				log.Printf("oaicalb: SIGHUP: backends reloaded from %s: %d added, %d removed, %d kept (%d total)", *configPath, a, r, k, len(pool.current().bs))
+			}
+		}()
+	}
+
 	leastconnMux := http.NewServeMux()
-	leastconnMux.HandleFunc("/", serveWith(bs, leastConnPick))
+	leastconnMux.HandleFunc("/", serveWith(pool, leastConnPick))
 
 	hashMux := http.NewServeMux()
-	hashMux.HandleFunc("/", sessionHandler(bs, cfg.SessionOverflowFactor))
+	hashMux.HandleFunc("/", sessionHandler(pool, cfg.SessionOverflowFactor))
 
 	statusMux := http.NewServeMux()
 	statusMux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		for _, b := range bs {
+		for _, b := range pool.current().bs {
 			healthy := "UP"
 			if !b.healthy.Load() {
 				healthy = "DOWN"
@@ -920,8 +1047,8 @@ func main() {
 
 	go func() { log.Fatal(http.ListenAndServe(cfg.LeastConnAddr, leastconnMux)) }()
 	go func() { log.Fatal(http.ListenAndServe(cfg.SessionAddr, hashMux)) }()
-	log.Printf("oaicalb: %d backends, leastconn on %s, session-hash on %s, status on %s/status",
-		len(bs), cfg.LeastConnAddr, cfg.SessionAddr, cfg.StatusAddr)
+	log.Printf("oaicalb: %d backends, leastconn on %s, session-hash on %s, status on %s/status (SIGHUP reloads backends)",
+		len(pool.current().bs), cfg.LeastConnAddr, cfg.SessionAddr, cfg.StatusAddr)
 	log.Fatal(http.ListenAndServe(cfg.StatusAddr, statusMux))
 }
 

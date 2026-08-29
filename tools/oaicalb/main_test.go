@@ -109,7 +109,7 @@ func TestMeter_DisabledByDefault(t *testing.T) {
 	metered = nil // explicit: no test before this one may have left it set
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	w := httptest.NewRecorder()
@@ -126,7 +126,7 @@ func TestMeter_ReportsRequestWithoutXOaicaMeteredHeader(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	w := httptest.NewRecorder()
@@ -160,7 +160,7 @@ func TestMeter_SkipsRequestAlreadyMeteredByGateway(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("X-Oaica-Metered", "1")
@@ -183,7 +183,7 @@ func TestMeter_AuthenticatedRequestLabelledDifferently(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-something")
@@ -203,7 +203,7 @@ func TestMeter_NonCompletionPathNeverReported(t *testing.T) {
 
 	srv := vLLMWithUsage(t)
 	b := newBackend(srv.URL)
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	w := httptest.NewRecorder()
@@ -443,7 +443,7 @@ func TestStall_HungBackendIsDrainedThenReadmitted(t *testing.T) {
 	go hb.healthCheck(ctx, opts)
 	go ok.healthCheck(ctx, opts)
 
-	lb := httptest.NewServer(sessionHandler(bs, 0))
+	lb := httptest.NewServer(sessionHandler(newStaticPool(bs), 0))
 	defer lb.Close()
 	key := sessionKeyFor(t, bs, hb)
 
@@ -758,7 +758,7 @@ func TestServeWith_NoContextLimitsNeverReadsBodyTwice(t *testing.T) {
 	}))
 	defer srv.Close()
 	b := newBackend(srv.URL) // maxContext=0, unbounded
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"probe":"body"}`))
 	w := httptest.NewRecorder()
@@ -781,7 +781,7 @@ func TestServeWith_ContextLimitsRestoreBodyForProxying(t *testing.T) {
 	}))
 	defer srv.Close()
 	b := newBackendWithContext(srv.URL, 999999) // declares a max_context -> triggers body read
-	h := serveWith([]*backend{b}, func(bs []*backend, _ int) *backend { return bs[0] })
+	h := serveWith(newStaticPool([]*backend{b}), func(bs []*backend, _ int) *backend { return bs[0] })
 
 	body := `{"model":"x","messages":[{"role":"user","content":"hello"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -790,5 +790,137 @@ func TestServeWith_ContextLimitsRestoreBodyForProxying(t *testing.T) {
 
 	if gotBody != body {
 		t.Errorf("expected the full original body to reach the backend after the estimate read, got %q", gotBody)
+	}
+}
+
+// -- backend hot reload (SIGHUP) --
+
+func reloadTestOpts() probeOpts {
+	return probeOpts{interval: 10 * time.Millisecond, timeout: time.Second}
+}
+
+func TestPoolReload_KeepsUnchangedAddsNewDropsRemoved(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer b.Close()
+	c := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer c.Close()
+
+	p := newBackendPool(reloadTestOpts())
+	if added, removed, kept := p.reload(lbConfig{Backends: []string{a.URL, b.URL}}); added != 2 || removed != 0 || kept != 0 {
+		t.Fatalf("initial reload = (%d,%d,%d), want (2,0,0)", added, removed, kept)
+	}
+	oldB := p.current().bs[1]
+	oldA := p.current().bs[0]
+	// mark A healthy so we can observe the drop flipping it
+	oldA.healthy.Store(true)
+
+	added, removed, kept := p.reload(lbConfig{Backends: []string{b.URL, c.URL}})
+	if added != 1 || removed != 1 || kept != 1 {
+		t.Fatalf("reload = (%d,%d,%d), want (1,1,1)", added, removed, kept)
+	}
+	snap := p.current()
+	if len(snap.bs) != 2 || snap.bs[0] != oldB || snap.bs[1].url.String() != c.URL {
+		t.Fatalf("snapshot after reload = %v, want [same B object, new C]", snap.bs)
+	}
+	if oldA.healthy.Load() {
+		t.Error("removed backend must be marked unhealthy so no stale reference can pick it")
+	}
+	if snap.bs[0] != oldB {
+		t.Error("unchanged backend must keep its object (health/in-flight state preserved)")
+	}
+	if snap.hasContextLimits {
+		t.Error("plain backends must not enable context tiering")
+	}
+}
+
+func TestPoolReload_ChangedMaxContextReplacesBackend(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer a.Close()
+	p := newBackendPool(reloadTestOpts())
+	p.reload(lbConfig{BackendConfigs: []backendConfigEntry{{URL: a.URL, MaxContext: 1000}}})
+	first := p.current().bs[0]
+	added, removed, kept := p.reload(lbConfig{BackendConfigs: []backendConfigEntry{{URL: a.URL, MaxContext: 5000}}})
+	if added != 1 || removed != 1 || kept != 0 {
+		t.Fatalf("reload with changed max_context = (%d,%d,%d), want (1,1,0)", added, removed, kept)
+	}
+	if got := p.current().bs[0]; got == first || got.maxContext != 5000 {
+		t.Fatalf("expected a fresh backend with max_context 5000, got same=%v max=%d", got == first, got.maxContext)
+	}
+	if !p.current().hasContextLimits {
+		t.Error("backend_configs with max_context must enable context tiering")
+	}
+}
+
+func TestPoolReload_RemovedBackendHealthLoopStops(t *testing.T) {
+	var probes atomic.Int64
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { probes.Add(1); w.WriteHeader(200) }))
+	defer a.Close()
+	p := newBackendPool(reloadTestOpts())
+	p.reload(lbConfig{Backends: []string{a.URL}})
+	deadline := time.Now().Add(time.Second)
+	for probes.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if probes.Load() < 2 {
+		t.Fatal("health loop never probed the backend")
+	}
+	p.reload(lbConfig{Backends: []string{}}) // drop it
+	time.Sleep(50 * time.Millisecond)        // let an in-flight probe finish
+	n := probes.Load()
+	time.Sleep(100 * time.Millisecond) // ten intervals: a live loop would add ~10 probes
+	if probes.Load() != n {
+		t.Fatalf("health loop kept probing after the backend was removed (%d -> %d)", n, probes.Load())
+	}
+}
+
+func TestServeWith_RoutesToBackendAddedByReload(t *testing.T) {
+	// Count only requests routed by the handler under test (marked with
+	// X-Test); the pool's health probes hit the same servers and must not
+	// be counted.
+	var hitA, hitB atomic.Int64
+	counted := func(c *atomic.Int64) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("X-Test") == "1" {
+				c.Add(1)
+			}
+			w.WriteHeader(200)
+		}
+	}
+	a := httptest.NewServer(counted(&hitA))
+	defer a.Close()
+	b := httptest.NewServer(counted(&hitB))
+	defer b.Close()
+	routed := func() *http.Request {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("X-Test", "1")
+		return r
+	}
+
+	p := newBackendPool(reloadTestOpts())
+	p.reload(lbConfig{Backends: []string{a.URL}})
+	h := serveWith(p, leastConnPick)
+	// Requests are proxied to whichever backend the live snapshot holds;
+	// force "healthy" so the test does not depend on probe timing.
+	p.current().bs[0].healthy.Store(true)
+	h(httptest.NewRecorder(), routed())
+	if hitA.Load() != 1 {
+		t.Fatalf("expected A to serve the first request, hits A=%d B=%d", hitA.Load(), hitB.Load())
+	}
+	p.reload(lbConfig{Backends: []string{b.URL}}) // A out, B in -- no restart, same handler
+	p.current().bs[0].healthy.Store(true)
+	h(httptest.NewRecorder(), routed())
+	if hitB.Load() != 1 || hitA.Load() != 1 {
+		t.Fatalf("expected B to serve after reload, hits A=%d B=%d", hitA.Load(), hitB.Load())
+	}
+}
+
+func TestLoadConfig_BadFileRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oaicalb.json")
+	os.WriteFile(path, []byte(`{"backends": [`), 0o644)
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("expected an error for a truncated config -- a SIGHUP reload must keep the old backends on such input")
 	}
 }
