@@ -205,7 +205,8 @@ def build_messages(rng, system_prompt, is_long, min_history_chars, max_history_c
 
 
 class Stats:
-    def __init__(self):
+    def __init__(self, port=None):
+        self.port = port
         self.lock = threading.Lock()
         self.requests = 0
         self.status_200 = 0
@@ -239,7 +240,12 @@ class Stats:
                 return
             if conn_error:
                 self.conn_errors += 1
-                if had_success_before:
+                # A lone connection error is not proof of engine death (a
+                # long turn can exceed the client read timeout while the
+                # server is fine -- seen as 2 false "deaths" with the
+                # api_server alive the whole time). Only count it when the
+                # server is actually unreachable right now.
+                if had_success_before and not self._server_reachable():
                     self.engine_dead_signals += 1
             elif status == 200:
                 self.status_200 += 1
@@ -252,6 +258,18 @@ class Stats:
     def record_image(self):
         with self.lock:
             self.with_images += 1
+
+    def _server_reachable(self):
+        # Cheap liveness probe used only to qualify a connection error as an
+        # engine death: TCP connect + GET /v1/models with a short timeout.
+        if not self.port:
+            return True
+        try:
+            with socket.create_connection(("127.0.0.1", int(self.port)), timeout=3):
+                pass
+            return True
+        except OSError:
+            return False
 
     def snapshot(self):
         with self.lock:
@@ -550,7 +568,7 @@ def main():
         file=sys.stderr,
     )
 
-    stats = Stats()
+    stats = Stats(port=args.port)
     stop_at = time.time() + args.minutes * 60
 
     threads = []
