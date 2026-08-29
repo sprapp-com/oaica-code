@@ -45,6 +45,7 @@ func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
 	// Every builtin is env-gated; clear the others too or a key in the
 	// developer's shell makes builtinRemotes() non-nil here.
 	t.Setenv(openrouterEnvKey, "")
+	t.Setenv(ollamaCloudEnvKey, "")
 
 	if got := builtinRemotes(); got != nil {
 		t.Fatalf("builtinRemotes() = %v, want nil when %s unset", got, zaiEnvKey)
@@ -73,6 +74,42 @@ func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
 	}
 	if got, want := z.openAIBase(), "https://api.z.ai/api/paas/v4"; got != want {
 		t.Fatalf("builtin openAIBase() = %q, want %q", got, want)
+	}
+}
+
+func TestBuiltinRemotes_OllamaCloudKeyGate(t *testing.T) {
+	t.Setenv(zaiEnvKey, "")
+	t.Setenv(openrouterEnvKey, "")
+	t.Setenv(ollamaCloudEnvKey, "")
+	if got := builtinRemotes(); got != nil {
+		t.Fatalf("builtinRemotes() = %v, want nil when %s unset", got, ollamaCloudEnvKey)
+	}
+
+	t.Setenv(ollamaCloudEnvKey, "ollama-secret")
+	got := builtinRemotes()
+	if len(got) != 1 {
+		t.Fatalf("builtinRemotes() len = %d, want 1", len(got))
+	}
+	o := got[0]
+	if o.Name != ollamaCloudName {
+		t.Fatalf("builtin name = %q, want %q", o.Name, ollamaCloudName)
+	}
+	// Must not collide with the "ollama/" source prefix that selects the
+	// local daemon in resolveLaunchEndpoint.
+	if hasSourcePrefix(o.Name + "/x") {
+		t.Fatalf("builtin name %q collides with a source prefix", o.Name)
+	}
+	if o.APIKeyEnv != ollamaCloudEnvKey {
+		t.Fatalf("builtin api_key_env = %q, want %q", o.APIKeyEnv, ollamaCloudEnvKey)
+	}
+	if got := o.key(); got != "ollama-secret" {
+		t.Fatalf("builtin key() = %q, want ollama-secret", got)
+	}
+	if got, want := o.openAIBase(), "https://ollama.com/v1"; got != want {
+		t.Fatalf("builtin openAIBase() = %q, want %q", got, want)
+	}
+	if o.ToolFormat != "tool_calls" {
+		t.Fatalf("builtin tool_format = %q, want tool_calls", o.ToolFormat)
 	}
 }
 

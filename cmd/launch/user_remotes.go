@@ -184,6 +184,20 @@ const (
 	openrouterEnvKey  = "OPENROUTER_API_KEY"
 )
 
+// Built-in Ollama Cloud provider (ollama.com's hosted models over its
+// OpenAI-compatible API, https://ollama.com/v1). Exporting OLLAMA_API_KEY is
+// enough to list every cloud model in the picker as "ollama-cloud/<id>" --
+// no local Ollama daemon and no `ollama signin` needed, unlike the
+// daemon-proxied ":cloud" aliases. Named "ollama-cloud", NOT "ollama": the
+// bare "ollama/" prefix already selects the LOCAL daemon in
+// resolveLaunchEndpoint (see hasSourcePrefix), and a remote of that name
+// would be unreachable behind it.
+const (
+	ollamaCloudName    = "ollama-cloud"
+	ollamaCloudBaseURL = "https://ollama.com"
+	ollamaCloudEnvKey  = "OLLAMA_API_KEY"
+)
+
 // builtinRemotes returns remotes that oaica knows about without config, active
 // only while their credential env var is set. A user-defined remote of the
 // same name in remotes.json wins (see loadUserRemotes).
@@ -202,6 +216,14 @@ func builtinRemotes() []userRemote {
 			Name:       openrouterName,
 			BaseURL:    openrouterBaseURL,
 			APIKeyEnv:  openrouterEnvKey,
+			ToolFormat: "tool_calls",
+		})
+	}
+	if os.Getenv(ollamaCloudEnvKey) != "" {
+		out = append(out, userRemote{
+			Name:       ollamaCloudName,
+			BaseURL:    ollamaCloudBaseURL,
+			APIKeyEnv:  ollamaCloudEnvKey,
 			ToolFormat: "tool_calls",
 		})
 	}
