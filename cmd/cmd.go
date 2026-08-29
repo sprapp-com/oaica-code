@@ -2070,6 +2070,12 @@ func NewCLI() *cobra.Command {
 		CompletionOptions: cobra.CompletionOptions{
 			DisableDefaultCmd: true,
 		},
+		// Best-effort "a newer oaica is available" notice -- see
+		// updatecheck.go. Runs before every subcommand; cached and
+		// short-timeout so it never meaningfully slows down real usage.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			checkForUpdate()
+		},
 		Run: func(cmd *cobra.Command, args []string) {
 			if version, _ := cmd.Flags().GetBool("version"); version {
 				versionHandler(cmd, args)
