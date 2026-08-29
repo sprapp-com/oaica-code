@@ -132,6 +132,13 @@ type usageRecord struct {
 	// sessions under the SAME api key be told apart without issuing
 	// separate keys — see tools/gateway's ledgerEntry.SessionID doc.
 	SessionID string `json:"session_id,omitempty"`
+	// CostUSD/Overage: see tools/gateway's ledgerEntry doc for both --
+	// computed cache-aware cost and whether this request was allowed only
+	// via overage billing (over a plan's rolling-window cap, let through
+	// and flagged rather than blocked). Informational, same as everything
+	// else pricing-related here: no invoicing enforcement exists yet.
+	CostUSD float64 `json:"cost_usd,omitempty"`
+	Overage bool    `json:"overage,omitempty"`
 }
 
 type meterHub struct {
@@ -163,7 +170,9 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 			aborted INTEGER NOT NULL,
 			received_at TEXT NOT NULL,
 			backend TEXT NOT NULL DEFAULT '',
-			session_id TEXT NOT NULL DEFAULT ''
+			session_id TEXT NOT NULL DEFAULT '',
+			cost_usd REAL NOT NULL DEFAULT 0,
+			overage INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_usage_key ON usage(key_label);
 		CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model);
@@ -217,6 +226,15 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id)`); err != nil {
 		return nil, fmt.Errorf("migrate idx_usage_session: %w", err)
+	}
+	// Same pattern for cost_usd/overage (added 2026-08-29).
+	if _, err := db.Exec(`ALTER TABLE usage ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, fmt.Errorf("migrate cost_usd: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE usage ADD COLUMN overage INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, fmt.Errorf("migrate overage: %w", err)
 	}
 
 	tokens := make(map[string]string, len(cfg.ReportTokens))
@@ -275,12 +293,13 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 		INSERT OR IGNORE INTO usage
 			(request_id, ts, region, key_label, model, upstream_model, path,
 			 stream, status, prompt_tokens, completion_tokens, cached_tokens,
-			 latency_ms, usage_seen, aborted, received_at, backend, session_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 latency_ms, usage_seen, aborted, received_at, backend, session_id,
+			 cost_usd, overage)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.RequestID, rec.TS, rec.Region, rec.KeyLabel, rec.Model, rec.UpstreamModel,
 		rec.Path, rec.Stream, rec.Status, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens,
 		rec.LatencyMS, rec.UsageSeen, rec.Aborted, time.Now().UTC().Format(time.RFC3339),
-		rec.Backend, rec.SessionID,
+		rec.Backend, rec.SessionID, rec.CostUSD, rec.Overage,
 	)
 	if err != nil {
 		log.Printf("meterhub: insert failed: %v", err)
@@ -291,18 +310,20 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type usageRow struct {
-	RequestID        string `json:"request_id"`
-	TS               string `json:"ts"`
-	Region           string `json:"region"`
-	KeyLabel         string `json:"key"`
-	Model            string `json:"model"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	CachedTokens     int    `json:"cached_tokens"`
-	Status           int    `json:"status"`
-	LatencyMS        int64  `json:"latency_ms"`
-	Backend          string `json:"backend,omitempty"`
-	SessionID        string `json:"session_id,omitempty"`
+	RequestID        string  `json:"request_id"`
+	TS               string  `json:"ts"`
+	Region           string  `json:"region"`
+	KeyLabel         string  `json:"key"`
+	Model            string  `json:"model"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	CachedTokens     int     `json:"cached_tokens"`
+	Status           int     `json:"status"`
+	LatencyMS        int64   `json:"latency_ms"`
+	Backend          string  `json:"backend,omitempty"`
+	SessionID        string  `json:"session_id,omitempty"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	Overage          bool    `json:"overage,omitempty"`
 }
 
 func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +364,7 @@ func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	query := fmt.Sprintf(`SELECT request_id, ts, region, key_label, model, prompt_tokens, completion_tokens, cached_tokens, status, latency_ms, backend, session_id
+	query := fmt.Sprintf(`SELECT request_id, ts, region, key_label, model, prompt_tokens, completion_tokens, cached_tokens, status, latency_ms, backend, session_id, cost_usd, overage
 		FROM usage WHERE %s ORDER BY ts DESC LIMIT ?`, strings.Join(where, " AND "))
 	args = append(args, limit)
 
@@ -357,7 +378,8 @@ func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
 	out := make([]usageRow, 0, limit)
 	for rows.Next() {
 		var u usageRow
-		if err := rows.Scan(&u.RequestID, &u.TS, &u.Region, &u.KeyLabel, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.CachedTokens, &u.Status, &u.LatencyMS, &u.Backend, &u.SessionID); err != nil {
+		if err := rows.Scan(&u.RequestID, &u.TS, &u.Region, &u.KeyLabel, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.CachedTokens, &u.Status, &u.LatencyMS, &u.Backend, &u.SessionID, &u.CostUSD, &u.Overage); err != nil {
+			log.Printf("meterhub: usage row scan failed: %v", err)
 			continue
 		}
 		out = append(out, u)
@@ -374,6 +396,11 @@ type summaryRow struct {
 	CompletionTokens int64  `json:"completion_tokens"`
 	CachedTokens     int64  `json:"cached_tokens"`
 	Errors           int    `json:"errors"`
+	// CostUSD/OverageRequests: see tools/gateway's ledgerEntry doc.
+	// Informational -- no invoicing enforcement exists, this is what a
+	// billing job would read.
+	CostUSD         float64 `json:"cost_usd"`
+	OverageRequests int     `json:"overage_requests"`
 }
 
 // summaryHandler answers "global usage right now" -- every key x model
@@ -396,7 +423,9 @@ func (h *meterHub) summaryHandler(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
 		       COALESCE(SUM(completion_tokens), 0) as completion_tokens,
 		       COALESCE(SUM(cached_tokens), 0) as cached_tokens,
-		       SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as errors
+		       SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as errors,
+		       COALESCE(SUM(cost_usd), 0) as cost_usd,
+		       SUM(CASE WHEN overage != 0 THEN 1 ELSE 0 END) as overage_requests
 		FROM usage WHERE %s
 		GROUP BY key_label, model
 		ORDER BY key_label, model`, strings.Join(where, " AND "))
@@ -411,7 +440,8 @@ func (h *meterHub) summaryHandler(w http.ResponseWriter, r *http.Request) {
 	out := []summaryRow{}
 	for rows.Next() {
 		var s summaryRow
-		if err := rows.Scan(&s.KeyLabel, &s.Model, &s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.CachedTokens, &s.Errors); err != nil {
+		if err := rows.Scan(&s.KeyLabel, &s.Model, &s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.CachedTokens, &s.Errors, &s.CostUSD, &s.OverageRequests); err != nil {
+			log.Printf("meterhub: summary row scan failed: %v", err)
 			continue
 		}
 		out = append(out, s)

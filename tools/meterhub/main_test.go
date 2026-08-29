@@ -242,6 +242,61 @@ func TestSummaryHandler_AggregatesByKeyAndModel(t *testing.T) {
 	}
 }
 
+func TestIngest_CostUSDAndOverageRoundTripsThroughUsageAndSummary(t *testing.T) {
+	hub, token := testHub(t)
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "req_cost1", TS: "2026-08-29T00:00:00Z", Region: "a100b",
+		KeyLabel: "alice", Model: "m1", PromptTokens: 1000, CompletionTokens: 100,
+		CostUSD: 0.0000523, Overage: true,
+	})
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "req_cost2", TS: "2026-08-29T00:01:00Z", Region: "a100b",
+		KeyLabel: "alice", Model: "m1", PromptTokens: 500, CompletionTokens: 50,
+		CostUSD: 0.0000261, Overage: false,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/usage?key=alice", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.usageHandler(w, req)
+	var resp struct {
+		Records []usageRow `json:"records"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Records) != 2 {
+		t.Fatalf("records = %d, want 2", len(resp.Records))
+	}
+	overageCount := 0
+	for _, r := range resp.Records {
+		if r.Overage {
+			overageCount++
+		}
+	}
+	if overageCount != 1 {
+		t.Errorf("overage records = %d, want 1", overageCount)
+	}
+
+	sreq := httptest.NewRequest(http.MethodGet, "/usage/summary", nil)
+	sreq.Header.Set("Authorization", "Bearer "+token)
+	sw := httptest.NewRecorder()
+	hub.summaryHandler(sw, sreq)
+	var sresp struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	json.Unmarshal(sw.Body.Bytes(), &sresp)
+	if len(sresp.Summary) != 1 {
+		t.Fatalf("summary rows = %d, want 1", len(sresp.Summary))
+	}
+	s := sresp.Summary[0]
+	wantCost := 0.0000523 + 0.0000261
+	if diff := s.CostUSD - wantCost; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("summary cost_usd = %v, want %v", s.CostUSD, wantCost)
+	}
+	if s.OverageRequests != 1 {
+		t.Errorf("summary overage_requests = %d, want 1", s.OverageRequests)
+	}
+}
+
 func TestIngest_CachedTokensRoundTripsThroughUsageAndSummary(t *testing.T) {
 	hub, token := testHub(t)
 	rec := usageRecord{

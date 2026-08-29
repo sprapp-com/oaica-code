@@ -68,6 +68,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -113,6 +114,17 @@ const nonStreamMaxTokens = 4096
 type gwPricing struct {
 	Prompt     string `json:"prompt"`     // USD per token, decimal string (OpenRouter shape)
 	Completion string `json:"completion"` // USD per token, decimal string
+	// CachedPrompt: USD per prefix-cache-HIT prompt token, separate from
+	// (and normally cheaper than) Prompt -- the same asymmetric pricing
+	// every competitor checked in docs/PRICING.md uses (OpenAI, DeepSeek,
+	// MiniMax all charge less for cache-hit input, since it costs them
+	// near-nothing to serve). Empty = no discount, cached tokens bill at
+	// the same rate as fresh ones (today's behavior, unchanged unless
+	// this is explicitly set). Applies to ledgerEntry.CachedTokens, which
+	// depends on the upstream actually populating
+	// prompt_tokens_details.cached_tokens -- see that field's doc for why
+	// it currently reads 0 on this vLLM build.
+	CachedPrompt string `json:"cached_prompt,omitempty"`
 }
 
 type gwModel struct {
@@ -217,6 +229,16 @@ type gwConfig struct {
 	// reads an in-memory map, not a network call, on every request
 	// except the first (or first-after-expiry) for each key.
 	EntitlementCacheTTLSec int `json:"entitlement_cache_ttl_sec"`
+	// EntitlementOverageBilling: when true, a subscriber over their plan's
+	// rolling-window cap (docs/PRICING.md's "real throttle" column) is let
+	// through instead of blocked with 429 -- the request is served and
+	// flagged Overage=true on the ledger (ledgerEntry.Overage) for a
+	// billing job to charge at the overage rate. See
+	// entitlementCache.overageBilling's doc. Default false: a hard block
+	// stays the default behavior for anyone with EntitlementEnabled
+	// already on, since flipping this silently would let a canceled-cap
+	// key keep consuming without warning.
+	EntitlementOverageBilling bool `json:"entitlement_overage_billing"`
 
 	// LargeContextTokenThreshold / MaxConcurrentLargeContext: admission
 	// control for the failure mode found 2026-08-29 — several 140K-190K
@@ -464,7 +486,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 		if ttl <= 0 {
 			ttl = 60 * time.Second
 		}
-		g.entitlement = newEntitlementCache(cfg.MeterHubAddr, cfg.MeterHubToken, ttl, cfg.EntitlementFailOpen)
+		g.entitlement = newEntitlementCache(cfg.MeterHubAddr, cfg.MeterHubToken, ttl, cfg.EntitlementFailOpen, cfg.EntitlementOverageBilling)
 	} else {
 		g.entitlement = nil
 	}
@@ -755,6 +777,20 @@ type ledgerEntry struct {
 	// apart without issuing each one a separate key. Empty for callers
 	// that don't send one (older clients, direct API use).
 	SessionID string `json:"session_id,omitempty"`
+	// CostUSD: computed at write time from the model's pricing (including
+	// CachedPrompt's discount, when set) -- see gwPricing.CachedPrompt's
+	// doc. Informational only, same as the /models pricing fields
+	// themselves: oaica-code has no billing/invoicing enforcement, this is
+	// what a billing job would sum. 0 if the model's pricing couldn't be
+	// parsed (e.g. empty/malformed decimal strings).
+	CostUSD float64 `json:"cost_usd,omitempty"`
+	// Overage: true if this request was allowed specifically because
+	// EntitlementOverageBilling let it through despite exceeding the
+	// subscriber's plan rolling-window cap -- see entitlementCache.check's
+	// doc. A billing job should charge these at the (usually higher)
+	// overage rate rather than the plan's included rate. Always false
+	// when overage billing isn't enabled or the request was within cap.
+	Overage bool `json:"overage,omitempty"`
 }
 
 func (g *gateway) writeLedger(e ledgerEntry) {
@@ -921,8 +957,11 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return
 	}
+	var isOverage bool
 	if g.entitlement != nil {
-		if allowed, reason := g.entitlement.check(label); !allowed {
+		allowed, reason, overage := g.entitlement.check(label)
+		isOverage = overage
+		if !allowed {
 			if strings.HasPrefix(reason, "rate limit:") {
 				// 429: the key IS entitled, just over its plan's rolling
 				// window cap (checkWindowCap) — a distinct, temporary
@@ -1048,7 +1087,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		if p := recover(); p != nil {
 			aborted = true
 			rec.finish()
-			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID))
+			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
 			panic(p)
 		}
 	}()
@@ -1061,11 +1100,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("X-Oaica-Metered", "1")
 	proxy.ServeHTTP(rec, r)
 	rec.finish()
-	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID))
+	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
 }
 
 // entry builds the ledger row for one completion.
-func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string) ledgerEntry {
+func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string, overage bool) ledgerEntry {
+	cached := rec.usage.cachedTokens()
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,
@@ -1077,13 +1117,43 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		Status:           rec.status,
 		PromptTokens:     rec.usage.PromptTokens,
 		CompletionTokens: rec.usage.CompletionTokens,
-		CachedTokens:     rec.usage.cachedTokens(),
+		CachedTokens:     cached,
 		LatencyMS:        time.Since(start).Milliseconds(),
 		UsageSeen:        rec.seen,
 		Aborted:          aborted,
 		Backend:          backend,
 		SessionID:        sessionID,
+		CostUSD:          computeCostUSD(m.Pricing, rec.usage.PromptTokens, cached, rec.usage.CompletionTokens),
+		Overage:          overage,
 	}
+}
+
+// computeCostUSD applies cache-hit-aware pricing: cachedTokens bill at
+// CachedPrompt's rate (when set) instead of Prompt's, the rest of
+// promptTokens plus completionTokens bill at their normal rates. See
+// gwPricing.CachedPrompt's doc for why this split exists. Malformed or
+// empty price strings return 0 rather than erroring -- pricing here is
+// informational (no billing enforcement exists), a parse failure must
+// never affect the response the caller actually gets.
+func computeCostUSD(p gwPricing, promptTokens, cachedTokens, completionTokens int) float64 {
+	parse := func(s string) float64 {
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+	promptRate := parse(p.Prompt)
+	completionRate := parse(p.Completion)
+	cachedRate := promptRate
+	if p.CachedPrompt != "" {
+		cachedRate = parse(p.CachedPrompt)
+	}
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens // defensive: upstream data should never do this, but never bill negative fresh tokens if it does
+	}
+	freshPromptTokens := promptTokens - cachedTokens
+	return float64(freshPromptTokens)*promptRate + float64(cachedTokens)*cachedRate + float64(completionTokens)*completionRate
 }
 
 // entitlementCache is the fast local read-through cache in front of
@@ -1096,7 +1166,19 @@ type entitlementCache struct {
 	token    string
 	ttl      time.Duration
 	failOpen bool
-	client   *http.Client
+	// overageBilling: when true, exceeding a plan's rolling-window cap
+	// (checkWindowCap) no longer blocks the request -- it's let through
+	// and flagged Overage=true on the ledger row (see ledgerEntry.Overage
+	// and computeCostUSD's caller) for a billing job to charge at the
+	// overage rate, same pattern MiniMax's $5-100 credit top-ups use.
+	// Canceled/suspended subscription status (the OTHER half of check())
+	// is unaffected by this flag -- overage billing only ever applies to
+	// an otherwise-active subscriber going over their window, never to
+	// someone who isn't entitled at all. Default false: flipping this
+	// silently would change existing 429-blocking behavior for anyone
+	// who already has EntitlementEnabled on.
+	overageBilling bool
+	client         *http.Client
 
 	mu      sync.Mutex
 	entries map[string]entitlementCacheEntry
@@ -1105,44 +1187,47 @@ type entitlementCache struct {
 type entitlementCacheEntry struct {
 	allowed   bool
 	reason    string
+	overage   bool
 	fetchedAt time.Time
 }
 
-func newEntitlementCache(addr, token string, ttl time.Duration, failOpen bool) *entitlementCache {
+func newEntitlementCache(addr, token string, ttl time.Duration, failOpen, overageBilling bool) *entitlementCache {
 	return &entitlementCache{
-		addr: strings.TrimRight(addr, "/"), token: token, ttl: ttl, failOpen: failOpen,
+		addr: strings.TrimRight(addr, "/"), token: token, ttl: ttl, failOpen: failOpen, overageBilling: overageBilling,
 		client:  &http.Client{Timeout: 3 * time.Second},
 		entries: make(map[string]entitlementCacheEntry),
 	}
 }
 
-// check returns whether label may proceed, and a human-readable reason
-// when it may not. Reads the cache first; only reaches meterhub when the
-// entry is missing or older than ttl, so a hot key never pays a network
-// round trip on the request path.
-func (c *entitlementCache) check(label string) (allowed bool, reason string) {
+// check returns whether label may proceed, a human-readable reason when
+// it may not (or when it may but as billed overage), and whether this was
+// an overage admission (see entitlementCache.overageBilling's doc). Reads
+// the cache first; only reaches meterhub when the entry is missing or
+// older than ttl, so a hot key never pays a network round trip on the
+// request path.
+func (c *entitlementCache) check(label string) (allowed bool, reason string, overage bool) {
 	c.mu.Lock()
 	e, ok := c.entries[label]
 	c.mu.Unlock()
 	if ok && time.Since(e.fetchedAt) < c.ttl {
-		return e.allowed, e.reason
+		return e.allowed, e.reason, e.overage
 	}
 
-	allowed, reason = c.fetchAndDecide(label)
+	allowed, reason, overage = c.fetchAndDecide(label)
 	c.mu.Lock()
-	c.entries[label] = entitlementCacheEntry{allowed: allowed, reason: reason, fetchedAt: time.Now()}
+	c.entries[label] = entitlementCacheEntry{allowed: allowed, reason: reason, overage: overage, fetchedAt: time.Now()}
 	c.mu.Unlock()
-	return allowed, reason
+	return allowed, reason, overage
 }
 
 // fetchAndDecide queries meterhub for label's subscriber status and
 // applies the fail-open/fail-closed policy. Never blocks longer than the
 // client's 3s timeout — a slow or unreachable meterhub degrades to
 // whatever failOpen says, it never hangs the request.
-func (c *entitlementCache) fetchAndDecide(label string) (bool, string) {
+func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool) {
 	req, err := http.NewRequest(http.MethodGet, c.addr+"/subscribers/get?key="+url.QueryEscape(label), nil)
 	if err != nil {
-		return c.failOpen, "entitlement check unavailable"
+		return c.failOpen, "entitlement check unavailable", false
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -1150,38 +1235,48 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "entitlement service unreachable"
+		return false, "entitlement service unreachable", false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "entitlement check failed"
+		return false, "entitlement check failed", false
 	}
 	var s struct {
 		Status string `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "entitlement check failed"
+		return false, "entitlement check failed", false
 	}
 	switch s.Status {
 	case "active", "past_due":
-		return c.checkWindowCap(label)
+		allowed, reason := c.checkWindowCap(label)
+		// allowed=false with overageBilling on can only happen here if
+		// checkWindowCap itself failed open/closed on an unreachable
+		// meterhub (reason won't have the "rate limit:" prefix in that
+		// case) -- overage is specifically "was over cap but let through
+		// anyway", never "was blocked for an unrelated reason".
+		overage := c.overageBilling && strings.HasPrefix(reason, "rate limit:")
+		if overage {
+			return true, reason, true
+		}
+		return allowed, reason, false
 	case "canceled":
-		return false, "subscription canceled"
+		return false, "subscription canceled", false
 	case "suspended":
-		return false, "account suspended"
+		return false, "account suspended", false
 	default: // "unknown" — no subscriber record at all
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "no active subscription for this key"
+		return false, "no active subscription for this key", false
 	}
 }
 

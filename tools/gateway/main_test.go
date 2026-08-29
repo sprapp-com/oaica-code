@@ -985,6 +985,26 @@ func newTestGatewayWithEntitlement(t *testing.T, upstream, meterhubAddr string, 
 	return g
 }
 
+func newTestGatewayWithOverageBilling(t *testing.T, upstream, meterhubAddr string) (*gateway, string) {
+	t.Helper()
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-active"), Label: "alice"}},
+		Models: []gwModel{{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}}},
+		MeterHubAddr: meterhubAddr, Region: "a100b",
+		EntitlementEnabled: true, EntitlementFailOpen: false, EntitlementCacheTTLSec: 60,
+		EntitlementOverageBilling: true,
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	return g, ledger
+}
+
 func postCompletion(t *testing.T, g *gateway, apiKey string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -1329,5 +1349,132 @@ func TestLedger_CapturesSessionID(t *testing.T) {
 	}
 	if entry.SessionID != "oaica-session-abc123" {
 		t.Errorf("ledger session_id = %q, want oaica-session-abc123", entry.SessionID)
+	}
+}
+
+func TestComputeCostUSD_FreshTokensOnlyWithNoCachedPrice(t *testing.T) {
+	p := gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}
+	got := computeCostUSD(p, 1000, 0, 100)
+	want := 1000*0.00000005 + 100*0.00000012
+	if diff := got - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("cost = %v, want %v", got, want)
+	}
+}
+
+func TestComputeCostUSD_CachedTokensBillAtDiscountedRate(t *testing.T) {
+	p := gwPricing{Prompt: "0.00000005", Completion: "0.00000012", CachedPrompt: "0.00000001"}
+	// 1000 prompt tokens, 600 of them cache hits: 400 fresh @ 0.00000005 +
+	// 600 cached @ 0.00000001 + 100 completion @ 0.00000012.
+	got := computeCostUSD(p, 1000, 600, 100)
+	want := 400*0.00000005 + 600*0.00000001 + 100*0.00000012
+	if diff := got - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("cost = %v, want %v (cached discount not applied correctly)", got, want)
+	}
+	// Sanity: must be cheaper than if none of it were a cache hit.
+	uncached := computeCostUSD(gwPricing{Prompt: p.Prompt, Completion: p.Completion}, 1000, 0, 100)
+	if got >= uncached {
+		t.Errorf("cached-discounted cost %v should be less than uncached cost %v", got, uncached)
+	}
+}
+
+func TestComputeCostUSD_MalformedPriceReturnsZeroNotError(t *testing.T) {
+	p := gwPricing{Prompt: "not-a-number", Completion: ""}
+	got := computeCostUSD(p, 1000, 0, 100)
+	if got != 0 {
+		t.Errorf("cost with malformed pricing = %v, want 0 (pricing is informational, must never break the response)", got)
+	}
+}
+
+func TestLedger_CachedPricingAppliedToRealCompletion(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"message":{"content":"4"}}],"usage":{"prompt_tokens":1000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":800}}}`)
+	}))
+	defer upstream.Close()
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream.URL, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012", CachedPrompt: "0.00000001"}}},
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	w := postCompletionWithMessages(t, g, "sk-new", []map[string]any{{"role": "user", "content": "hi"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	entries := waitLedger(t, ledger, 1)
+	if len(entries) != 1 {
+		t.Fatalf("ledger entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.CachedTokens != 800 {
+		t.Fatalf("cached_tokens = %d, want 800", e.CachedTokens)
+	}
+	want := 200*0.00000005 + 800*0.00000001 + 50*0.00000012
+	if diff := e.CostUSD - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("ledger cost_usd = %v, want %v", e.CostUSD, want)
+	}
+}
+
+func TestEntitlement_OverCapBlockedByDefault_OverageBillingOff(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberServiceOverCap(t, true, false)
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false) // overage billing NOT enabled
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("overage billing off, over cap: status = %d, want 429 (unchanged default behavior)", w.Code)
+	}
+}
+
+func TestEntitlement_OverCapAllowedAndFlaggedAsOverageWhenBillingEnabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"message":{"content":"4"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	meterhub := fakeSubscriberServiceOverCap(t, true, false) // alice active, over 5h cap
+	g, ledgerPath := newTestGatewayWithOverageBilling(t, upstream.URL, meterhub.URL)
+
+	w := postCompletionWithMessages(t, g, "sk-active", []map[string]any{{"role": "user", "content": "hi"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("overage billing on, over cap: status = %d, want 200 (allowed, billed as overage)", w.Code)
+	}
+
+	entries := waitLedger(t, ledgerPath, 1)
+	if len(entries) != 1 {
+		t.Fatalf("ledger entries = %d, want 1", len(entries))
+	}
+	if !entries[0].Overage {
+		t.Error("ledger entry.Overage = false, want true (request was over the 5h cap and only let through via overage billing)")
+	}
+}
+
+func TestEntitlement_UnderCapNeverFlaggedAsOverage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"x","choices":[{"message":{"content":"4"}}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	meterhub := fakeSubscriberServiceOverCap(t, false, false) // under cap
+	g, ledgerPath := newTestGatewayWithOverageBilling(t, upstream.URL, meterhub.URL)
+
+	w := postCompletionWithMessages(t, g, "sk-active", []map[string]any{{"role": "user", "content": "hi"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	entries := waitLedger(t, ledgerPath, 1)
+	if len(entries) != 1 {
+		t.Fatalf("ledger entries = %d, want 1", len(entries))
+	}
+	if entries[0].Overage {
+		t.Error("ledger entry.Overage = true for a request under cap, want false")
 	}
 }
