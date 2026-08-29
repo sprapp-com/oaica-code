@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNormalizeSystemFirst verifies the proxy folds every system message into a
@@ -332,5 +333,119 @@ func TestNewProxySessionID(t *testing.T) {
 	}
 	if !strings.HasPrefix(a, "oaica-session-") {
 		t.Errorf("newProxySessionID() = %q, want oaica-session- prefix", a)
+	}
+}
+
+// TestContextFitClamp_ClientProxy_ReproducesRealIncident verifies the
+// client-side translation proxy (RunAnthropicOpenAIProxyRoutes) clamps
+// max_tokens the same way tools/gateway does server-side. Real 2026-08-29
+// incident: this exact codepath (not the server-side gateway) forwarded a
+// request with ~230145 estimated prompt tokens + max_tokens=32000 against a
+// route with ContextWindow=262144 straight to the upstream, which 400'd
+// with "one token over the ceiling" and no recovery path except /clear.
+func TestContextFitClamp_ClientProxy_ReproducesRealIncident(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	var gotMaxTokens int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &req)
+		gotMaxTokens = req.MaxTokens
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "kat-awq",
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", ContextWindow: 262144},
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	// ~230145 tokens at chars/4 -> ~920580 chars of message content.
+	bigContent := strings.Repeat("x", 920580)
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"max_tokens": 32000,
+		"messages":   []map[string]any{{"role": "user", "content": bigContent}},
+	})
+	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected the proxy to clamp and forward successfully, got %d", resp.StatusCode)
+	}
+	if gotMaxTokens >= 32000 {
+		t.Fatalf("expected max_tokens clamped below the original 32000, got %d", gotMaxTokens)
+	}
+	if gotMaxTokens <= 0 {
+		t.Fatalf("expected a positive, still-useful max_tokens after clamping, got %d", gotMaxTokens)
+	}
+}
+
+// TestContextFitClamp_ClientProxy_SmallPromptUnaffected mirrors the
+// server-side test: a normal small request must not have max_tokens
+// touched, and a route with ContextWindow=0 (unknown) must never clamp.
+func TestContextFitClamp_ClientProxy_SmallPromptUnaffected(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	var gotMaxTokens int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &req)
+		gotMaxTokens = req.MaxTokens
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "model": "kat-awq",
+			"choices": []map[string]any{{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+			}},
+		})
+	}))
+	defer upstream.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", ContextWindow: 262144},
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"max_tokens": 2000,
+		"messages":   []map[string]any{{"role": "user", "content": "hello"}},
+	})
+	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if gotMaxTokens != 2000 {
+		t.Errorf("expected max_tokens to pass through unclamped for a small request, got %d", gotMaxTokens)
 	}
 }

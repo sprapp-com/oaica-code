@@ -114,6 +114,42 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 	return p
 }
 
+// applyContextWindowsToRoutes copies PrimaryContext/SecondaryContext (once
+// known -- call after withContextWindows) onto the matching entries in
+// p.Routes, so the proxy's own context-fit clamp (see the /v1/messages
+// handler in anthropic_openai_proxy.go) has a real ceiling to enforce
+// per request, not just the CLAUDE_CODE_AUTO_COMPACT_WINDOW env var hint
+// below -- that hint is advisory (Claude Code's own token counting can
+// drift a few tokens from ours, and the auto-compaction call itself is
+// exactly the request most likely to land right on the edge, since it
+// fires BECAUSE the session is already near the limit). The env var
+// reduces how often this happens; the clamp guarantees it can't produce
+// an outgoing request that's already doomed to fail, regardless.
+func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
+	if p.PrimaryContext > 0 {
+		p.Routes.Default.ContextWindow = p.PrimaryContext
+		if r, ok := p.Routes.ByModel[p.PrimaryName]; ok {
+			r.ContextWindow = p.PrimaryContext
+			p.Routes.ByModel[p.PrimaryName] = r
+		}
+		if r, ok := p.Routes.ByModel[p.Primary.UpstreamModel]; ok && r.ContextWindow == 0 {
+			r.ContextWindow = p.PrimaryContext
+			p.Routes.ByModel[p.Primary.UpstreamModel] = r
+		}
+	}
+	if p.SecondaryContext > 0 {
+		if r, ok := p.Routes.ByModel[p.SecondaryName]; ok {
+			r.ContextWindow = p.SecondaryContext
+			p.Routes.ByModel[p.SecondaryName] = r
+		}
+		if r, ok := p.Routes.ByModel[p.Secondary.UpstreamModel]; ok && r.ContextWindow == 0 {
+			r.ContextWindow = p.SecondaryContext
+			p.Routes.ByModel[p.Secondary.UpstreamModel] = r
+		}
+	}
+	return p
+}
+
 // maxOutputTokensReserve is Claude Code's fixed max_tokens request (32000,
 // unaffected by how much input is already used). vLLM enforces
 // input+output <= max_model_len, so advertising the raw window lets Claude

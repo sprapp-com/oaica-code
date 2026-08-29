@@ -30,8 +30,8 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,10 +75,10 @@ func (m openAIMessage) MarshalJSON() ([]byte, error) {
 		return json.Marshal(alias(m))
 	}
 	type alias struct {
-		Role       string             `json:"role"`
+		Role       string              `json:"role"`
 		Content    []openAIContentPart `json:"content"`
-		ToolCalls  []openAIToolCall   `json:"tool_calls,omitempty"`
-		ToolCallID string             `json:"tool_call_id,omitempty"`
+		ToolCalls  []openAIToolCall    `json:"tool_calls,omitempty"`
+		ToolCallID string              `json:"tool_call_id,omitempty"`
 	}
 	parts := make([]openAIContentPart, 0, len(m.Images)+1)
 	if strings.TrimSpace(m.Content) != "" {
@@ -452,6 +452,11 @@ type proxyRoute struct {
 	KeyEnv        string
 	UpstreamModel string // model id the upstream expects
 	Label         string // for the request log / diagnostics
+	// ContextWindow is this route's real max context in tokens (probed via
+	// context_window_remote.go / the model manifest), 0 = unknown. Used to
+	// clamp an outgoing request's max_tokens so prompt+max_tokens never
+	// exceeds it -- see the context-fit clamp in the /v1/messages handler.
+	ContextWindow int
 }
 
 // resolveKey returns the bearer to send upstream, live: KeyEnv wins whenever
@@ -643,6 +648,31 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		started := time.Now()
 
 		oaiReq := chatRequestToOpenAI(chatReq, anthReq, reqModel)
+		// Context-length-fit clamp -- real 2026-08-29 incident: Claude
+		// Code's own automatic-context-compaction call failed outright
+		// with "maximum context length is 262144 tokens... requested
+		// 230145 input + 32000 output = 262145" -- one token over, with no
+		// recovery path except /clear. CLAUDE_CODE_AUTO_COMPACT_WINDOW
+		// (contextEnvVars, context_window_remote.go) already reserves
+		// 32000 tokens as a soft advisory, but Claude Code's own token
+		// counting can drift a few tokens from ours -- and the compaction
+		// call is exactly the request most likely to land right on the
+		// edge, since it fires BECAUSE the session is already near the
+		// limit. This clamp is the hard guarantee: whatever Claude Code
+		// asked for, never forward a request already doomed to 400. len
+		// (body)/4 is the same coarse chars/4 estimate tools/gateway uses
+		// server-side for the identical purpose -- consistent, not exact
+		// by design.
+		if route.ContextWindow > 0 {
+			const contextFitMargin = 2048
+			fitBudget := route.ContextWindow - len(body)/4 - contextFitMargin
+			if fitBudget < 256 {
+				fitBudget = 256
+			}
+			if oaiReq.MaxTokens > fitBudget {
+				oaiReq.MaxTokens = fitBudget
+			}
+		}
 		oaiBody, err := json.Marshal(oaiReq)
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "marshal openai request: "+err.Error())

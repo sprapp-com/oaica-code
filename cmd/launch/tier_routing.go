@@ -379,7 +379,7 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	// router). Probed here, not in buildTierPlan: unit tests build plans
 	// against fake/unroutable URLs and must not wait on network.
 	if s := plan.Primary.Source; s == sourceUserRemote || s == sourceRouter {
-		plan.withContextWindows()
+		plan.withContextWindows().applyContextWindowsToRoutes()
 	}
 	clientToken, err := newProxyClientToken()
 	if err != nil {
