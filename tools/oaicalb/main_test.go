@@ -56,6 +56,165 @@ func healthyVLLM(t *testing.T, got *map[string]any) *httptest.Server {
 	}))
 }
 
+// fakeMeterHub is a minimal /ingest recorder for the metering tests below.
+func fakeMeterHub(t *testing.T) (*httptest.Server, *[]usageRecord) {
+	t.Helper()
+	var mu sync.Mutex
+	var records []usageRecord
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rec usageRecord
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &rec)
+		mu.Lock()
+		records = append(records, rec)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &records
+}
+
+// vLLMWithUsage is a fake backend that returns a real usage object, so the
+// metering tests can verify token counts actually get parsed and reported.
+func vLLMWithUsage(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.WriteHeader(200)
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":11,"completion_tokens":5}}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func waitForRecords(t *testing.T, records *[]usageRecord, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(*records) >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("meterhub never received %d record(s), got %d", n, len(*records))
+}
+
+func TestMeter_DisabledByDefault(t *testing.T) {
+	metered = nil // explicit: no test before this one may have left it set
+	srv := vLLMWithUsage(t)
+	b := newBackend(srv.URL)
+	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (metering disabled must never break a request)", w.Code)
+	}
+}
+
+func TestMeter_ReportsRequestWithoutXOaicaMeteredHeader(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+
+	srv := vLLMWithUsage(t)
+	b := newBackend(srv.URL)
+	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	waitForRecords(t, records, 1)
+	rec := (*records)[0]
+	if rec.PromptTokens != 11 || rec.CompletionTokens != 5 {
+		t.Errorf("tokens = (%d,%d), want (11,5)", rec.PromptTokens, rec.CompletionTokens)
+	}
+	if rec.KeyLabel != "direct" {
+		t.Errorf("key_label = %q, want \"direct\" (no Authorization header on the request)", rec.KeyLabel)
+	}
+	if rec.Region != "test-region" || rec.Model != "kat-awq" || rec.Status != 200 {
+		t.Errorf("record = %+v, unexpected region/model/status", rec)
+	}
+}
+
+// TestMeter_SkipsRequestAlreadyMeteredByGateway is the double-counting
+// regression: a request the gateway already billed (and forwards through
+// gatekeeper to oaicalb, carrying X-Oaica-Metered) must NOT be reported a
+// second time here, or every gateway-routed completion would be counted
+// twice between gateway's own ledger/meterhub report and this one.
+func TestMeter_SkipsRequestAlreadyMeteredByGateway(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+
+	srv := vLLMWithUsage(t)
+	b := newBackend(srv.URL)
+	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Oaica-Metered", "1")
+	w := httptest.NewRecorder()
+	h(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	time.Sleep(150 * time.Millisecond) // give an (incorrect) report a chance to land
+	if len(*records) != 0 {
+		t.Fatalf("meterhub got %d record(s) for an already-metered request, want 0 (double-counting)", len(*records))
+	}
+}
+
+func TestMeter_AuthenticatedRequestLabelledDifferently(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+
+	srv := vLLMWithUsage(t)
+	b := newBackend(srv.URL)
+	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-something")
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	waitForRecords(t, records, 1)
+	if (*records)[0].KeyLabel != "direct:authenticated" {
+		t.Errorf("key_label = %q, want \"direct:authenticated\"", (*records)[0].KeyLabel)
+	}
+}
+
+func TestMeter_NonCompletionPathNeverReported(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+
+	srv := vLLMWithUsage(t)
+	b := newBackend(srv.URL)
+	h := serveWith([]*backend{b}, func(bs []*backend) *backend { return bs[0] })
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	time.Sleep(150 * time.Millisecond)
+	if len(*records) != 0 {
+		t.Fatalf("meterhub got %d record(s) for GET /v1/models, want 0", len(*records))
+	}
+}
+
 func TestProbe_GETMissesChat400_ChatProbeCatchesIt(t *testing.T) {
 	srv := brokenVLLM(t)
 	defer srv.Close()

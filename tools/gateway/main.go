@@ -897,6 +897,13 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			panic(p)
 		}
 	}()
+	// X-Oaica-Metered tells oaicalb (downstream through gatekeeper) that
+	// this request is already being billed here -- see oaicalb's
+	// meterAndServe/requestAlreadyMetered. Without this, a request routed
+	// through both the gateway and oaicalb's own usage reporter (added
+	// 2026-08-29 to catch traffic that bypasses the gateway entirely)
+	// would be counted twice.
+	r.Header.Set("X-Oaica-Metered", "1")
 	proxy.ServeHTTP(rec, r)
 	rec.finish()
 	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted))

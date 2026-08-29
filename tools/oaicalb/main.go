@@ -18,7 +18,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -94,6 +97,30 @@ type lbConfig struct {
 	// check entirely -- session affinity stays sticky no matter the load
 	// skew, matching pre-2026-08-29 behavior.
 	SessionOverflowFactor float64 `json:"session_overflow_factor"`
+
+	// MeterHubAddr/MeterHubToken/Region: report usage for every completion
+	// this LB proxies, straight to meterhub, the same shape oaica-gateway
+	// reports (see tools/meterhub, tools/gateway's writeLedger/reportUsage).
+	// This closes a real gap found 2026-08-29: a client's local translation
+	// proxy resolves its target address ONCE at `oaica launch claude` time,
+	// so ANY session started before a remotes.json repoint (or anyone
+	// pointed straight at oaicalb instead of the gateway, by config or by
+	// mistake) bypasses the gateway's metering entirely -- 761 real
+	// completions were served with only 40 ledger rows to show for it. The
+	// gateway is still the RIGHT place for auth, entitlement, and per-key
+	// billing; oaicalb is the one point every request passes through
+	// regardless of entry path, so it is the right backstop for "did this
+	// get counted at all" even when it can't attribute the request to a
+	// specific customer key (oaicalb has no auth of its own). Requests that
+	// already carry X-Oaica-Metered (set by the gateway before it forwards
+	// through gatekeeper to here) are NOT reported again here -- see
+	// requestAlreadyMetered -- so gateway-routed traffic is never
+	// double-counted between the two reporters. Empty MeterHubAddr disables
+	// this entirely (default; matches every existing deployment until this
+	// is explicitly configured).
+	MeterHubAddr  string `json:"meterhub_addr"`
+	MeterHubToken string `json:"meterhub_token"`
+	Region        string `json:"region"`
 }
 
 // stallThreshold returns the effective hung-replica threshold, 0 if disabled.
@@ -417,8 +444,249 @@ func hashPick(bs []*backend, key string, overflowFactor float64) *backend {
 	return target
 }
 
-func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
+// metered is set from lbConfig.MeterHubAddr in main(); nil means metering
+// is off (the default) and meterAndServe is a no-op wrapper.
+var metered *meterHub
+
+// meterHub is the fire-and-forget usage reporter to a central meterhub
+// instance (tools/meterhub). Same shape/pattern as tools/gateway's
+// runMeterReporter/reportUsage: a bounded channel, a background goroutine
+// with capped retries, never on the request's critical path -- an
+// unreachable meterhub cannot slow or fail a real completion here either.
+type meterHub struct {
+	ch     chan usageRecord
+	addr   string
+	token  string
+	region string
+}
+
+type usageRecord struct {
+	RequestID        string `json:"request_id"`
+	TS               string `json:"ts"`
+	Region           string `json:"region"`
+	KeyLabel         string `json:"key"`
+	Model            string `json:"model"`
+	UpstreamModel    string `json:"upstream_model"`
+	Path             string `json:"path"`
+	Stream           bool   `json:"stream"`
+	Status           int    `json:"status"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	LatencyMS        int64  `json:"latency_ms"`
+	UsageSeen        bool   `json:"usage_seen"`
+	Aborted          bool   `json:"aborted"`
+}
+
+var meterReporterBackoff = func(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
+
+func newMeterHub(addr, token, region string) *meterHub {
+	m := &meterHub{ch: make(chan usageRecord, 256), addr: strings.TrimRight(addr, "/"), token: token, region: region}
+	go m.run()
+	return m
+}
+
+func (m *meterHub) run() {
+	client := &http.Client{Timeout: 5 * time.Second}
+	for rec := range m.ch {
+		body, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		var ok bool
+		for attempt := 0; attempt < 3 && !ok; attempt++ {
+			if attempt > 0 {
+				time.Sleep(meterReporterBackoff(attempt))
+			}
+			req, err := http.NewRequest(http.MethodPost, m.addr+"/ingest", bytes.NewReader(body))
+			if err != nil {
+				break
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if m.token != "" {
+				req.Header.Set("Authorization", "Bearer "+m.token)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			resp.Body.Close()
+			ok = resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK
+		}
+		if !ok {
+			log.Printf("oaicalb: meterhub report dropped after retries (request_id=%s)", rec.RequestID)
+		}
+	}
+}
+
+// report is non-blocking: a full channel (meterhub unreachable/slow for a
+// long stretch) drops the record and logs, it never blocks a real request.
+func (m *meterHub) report(rec usageRecord) {
+	select {
+	case m.ch <- rec:
+	default:
+		log.Printf("oaicalb: meterhub channel full, dropping report (request_id=%s)", rec.RequestID)
+	}
+}
+
+func newRequestID() string {
+	var b [12]byte
+	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+		return fmt.Sprintf("oaicalb_req_%d", time.Now().UnixNano())
+	}
+	return "oaicalb_req_" + hex.EncodeToString(b[:])
+}
+
+// usageRecorder wraps the ResponseWriter to forward bytes immediately
+// (streaming must not be buffered) while scanning them for the usage
+// object -- same approach as tools/gateway's usageRecorder. For SSE each
+// "data: {...}" line is a chunk and only the last one carries usage; for a
+// non-streaming response the whole body is one JSON document.
+type usageRecorder struct {
+	http.ResponseWriter
+	status           int
+	stream           bool
+	promptTokens     int
+	completionTokens int
+	seen             bool
+	tail             bytes.Buffer
+	body             bytes.Buffer
+}
+
+func (u *usageRecorder) WriteHeader(code int) {
+	u.status = code
+	u.ResponseWriter.WriteHeader(code)
+}
+
+func (u *usageRecorder) Write(p []byte) (int, error) {
+	n, err := u.ResponseWriter.Write(p)
+	if u.stream {
+		u.scanSSE(p)
+	} else if u.body.Len() < 4<<20 {
+		u.body.Write(p)
+	}
+	return n, err
+}
+
+func (u *usageRecorder) Flush() {
+	if f, ok := u.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (u *usageRecorder) scanSSE(p []byte) {
+	u.tail.Write(p)
+	for {
+		raw := u.tail.Bytes()
+		i := bytes.IndexByte(raw, '\n')
+		if i < 0 {
+			return
+		}
+		line := bytes.TrimSpace(raw[:i])
+		u.tail.Next(i + 1)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var chunk struct {
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
+			u.promptTokens = chunk.Usage.PromptTokens
+			u.completionTokens = chunk.Usage.CompletionTokens
+			u.seen = true
+		}
+	}
+}
+
+func (u *usageRecorder) finish() {
+	if u.stream || u.seen {
+		return
+	}
+	var doc struct {
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(u.body.Bytes(), &doc) == nil && doc.Usage != nil {
+		u.promptTokens = doc.Usage.PromptTokens
+		u.completionTokens = doc.Usage.CompletionTokens
+		u.seen = true
+	}
+}
+
+// requestAlreadyMetered reports whether the gateway already billed this
+// request before forwarding it through gatekeeper to here -- see
+// lbConfig.MeterHubAddr's doc for why this header, not the request's
+// presence on this LB at all, decides whether oaicalb reports it too.
+func requestAlreadyMetered(r *http.Request) bool {
+	return r.Header.Get("X-Oaica-Metered") != ""
+}
+
+// meterableCompletionPath: the same two paths tools/gateway meters.
+func meterableCompletionPath(path string) bool {
+	return path == "/v1/chat/completions" || path == "/v1/completions"
+}
+
+// keyLabelFor is best-effort: oaicalb has no auth of its own (that is the
+// gateway's job), so a request that reaches oaicalb directly carries
+// whatever Authorization header its own client happened to send -- often
+// none. "direct" makes clear in meterhub that this traffic was NOT
+// attributed to a specific customer key, which is still strictly better
+// than the request being invisible to metering entirely.
+func keyLabelFor(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); h != "" {
+		return "direct:authenticated"
+	}
+	return "direct"
+}
+
+func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
+	if metered == nil {
+		return next
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !meterableCompletionPath(r.URL.Path) || requestAlreadyMetered(r) {
+			next(w, r)
+			return
+		}
+		start := time.Now()
+		rawBody, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+		r.Body.Close()
+		if err != nil {
+			next(w, r)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(rawBody))
+		var reqDoc struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		json.Unmarshal(rawBody, &reqDoc)
+
+		rec := &usageRecorder{ResponseWriter: w, stream: reqDoc.Stream}
+		next(rec, r)
+		rec.finish()
+
+		metered.report(usageRecord{
+			RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
+			Region: metered.region, KeyLabel: keyLabelFor(r),
+			Model: reqDoc.Model, UpstreamModel: reqDoc.Model, Path: r.URL.Path,
+			Stream: reqDoc.Stream, Status: rec.status,
+			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens,
+			LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen,
+		})
+	}
+}
+
+func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
+	return meterAndServe(func(w http.ResponseWriter, r *http.Request) {
 		b := pick(bs)
 		if b == nil {
 			http.Error(w, "no healthy backend", http.StatusServiceUnavailable)
@@ -428,7 +696,7 @@ func serveWith(bs []*backend, pick func([]*backend) *backend) http.HandlerFunc {
 		defer b.end(id)
 		w.Header().Set("X-Katlb-Backend", b.url.String())
 		b.proxy.ServeHTTP(w, r)
-	}
+	})
 }
 
 // sessionHandler pins a request to the backend hashed from its X-Session-Id
@@ -451,6 +719,10 @@ func main() {
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if cfg.MeterHubAddr != "" {
+		metered = newMeterHub(cfg.MeterHubAddr, cfg.MeterHubToken, cfg.Region)
+		log.Printf("oaicalb: reporting usage to meterhub at %s (region=%q, skips requests already metered upstream via X-Oaica-Metered)", cfg.MeterHubAddr, cfg.Region)
 	}
 	if cfg.ProbeModel != "" {
 		log.Printf("oaicalb: health probe = 1-token chat on %q (timeout %ds)", cfg.ProbeModel, cfg.ProbeTimeoutSec)

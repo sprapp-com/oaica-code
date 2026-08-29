@@ -107,9 +107,17 @@ launch() {
   disown
 }
 
+# REPLICAS: single source of truth, set once here (was previously two
+# independent ${REPLICAS:-...} defaults that had drifted out of sync --
+# this array-init loop used a stale "0:30199 2:30105" while the main loop
+# below used the real "0:30106 1:30108 2:30110". Harmless in practice
+# (bash auto-vivifies unset array elements to 0 in arithmetic context) but
+# confusing and a real trap for the next port change.
+REPLICAS="${REPLICAS:-0:30106 1:30108 2:30110}"
+
 # per-port backoff state: last launch epoch + current delay
 declare -A LAST DELAY STALLFAILS
-for r in ${REPLICAS:-0:30199 2:30105}; do p=${r##*:}; LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0; done
+for r in $REPLICAS; do p=${r##*:}; LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0; done
 
 listening() { ss -ltn 2>/dev/null | grep -q ":$1 "; }
 # booting: an api_server for this port exists but is not listening yet.
@@ -256,8 +264,10 @@ tick() {
 # replaces plain kat-awq; served model name is oaica-35b-a3b-vision
 # (renamed 2026-08-28, was kat-awq). GPU5 is NOT usable: another session's
 # 52 GB job plus the malay35b-offload server leave 5.9/79 GiB, and vLLM
-# refuses to start below gpu_memory_utilization * total (~73 GiB).
-REPLICAS="${REPLICAS:-0:30106 1:30108}"
+# refuses to start below gpu_memory_utilization * total (~73 GiB). GPU2
+# added 2026-08-29 as a 3rd replica (:30110) per explicit user request,
+# reversing an earlier same-day "reserved for the user" note -- see
+# /dev/shm/gpus.md for the full history.
 
 log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s"
 while true; do
