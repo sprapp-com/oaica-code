@@ -1478,3 +1478,114 @@ func TestEntitlement_UnderCapNeverFlaggedAsOverage(t *testing.T) {
 		t.Error("ledger entry.Overage = true for a request under cap, want false")
 	}
 }
+
+// -- upstream error logging (2026-08-29) --
+
+func newTestGatewayWithErrorLog(t *testing.T, upstream string) (*gateway, string) {
+	t.Helper()
+	errLog := filepath.Join(t.TempDir(), "upstream-errors.jsonl")
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr:         upstream,
+		ListenAddr:           ":0",
+		LedgerPath:           ledger,
+		UpstreamErrorLogPath: errLog,
+		APIKeys:              []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{
+			ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"},
+		}},
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	return g, errLog
+}
+
+func TestUpstreamErrorLog_CapturesRealErrorMessageAndCorrelationInfo(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"This model's maximum context length is 262144 tokens. However, you requested 270000 tokens (238000 in the messages, 32000 in the completion).","type":"invalid_request_error"}}`)
+	}))
+	defer upstream.Close()
+
+	g, errLogPath := newTestGatewayWithErrorLog(t, upstream.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}],"max_tokens":32000}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	req.Header.Set("X-Session-Id", "sess-overflow-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("expected 400 from the gateway, got %d", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lines []string
+	for {
+		b, _ := os.ReadFile(errLogPath)
+		lines = strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) >= 1 && lines[0] != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("expected at least one line in the upstream error log")
+	}
+	var got upstreamErrorLogLine
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &got); err != nil {
+		t.Fatalf("bad JSON line: %v (%s)", err, lines[len(lines)-1])
+	}
+	if !strings.Contains(got.Message, "maximum context length is 262144") {
+		t.Errorf("expected the real upstream error message preserved, got %q", got.Message)
+	}
+	if got.SessionID != "sess-overflow-test" {
+		t.Errorf("expected session_id correlation, got %q", got.SessionID)
+	}
+	// The request asked for max_tokens=32000, but this is a non-streaming
+	// completion, so the gateway's own clamp (nonStreamMaxTokens=4096)
+	// rewrites it before the request ever reaches upstream -- the captured
+	// value should reflect what was ACTUALLY sent, not what the client
+	// originally asked for.
+	if got.MaxTokens != 4096 {
+		t.Errorf("expected the clamped max_tokens=4096 (non-stream cap) captured, got %d", got.MaxTokens)
+	}
+	if got.Status != 400 {
+		t.Errorf("expected status=400, got %d", got.Status)
+	}
+}
+
+func TestUpstreamErrorLog_DisabledWhenPathEmpty(t *testing.T) {
+	// newTestGateway (the default helper used by every other test) leaves
+	// UpstreamErrorLogPath empty -- must not create a file or panic on a
+	// nil g.errLog.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"bad request"}}`)
+	}))
+	defer upstream.Close()
+	g, _ := newTestGateway(t, upstream.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"kat-awq","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if g.errLog != nil {
+		t.Error("expected errLog to stay nil when UpstreamErrorLogPath is empty")
+	}
+}

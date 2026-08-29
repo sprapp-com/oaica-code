@@ -194,6 +194,22 @@ type gwConfig struct {
 	APIKeys      []gwKey   `json:"api_keys"`
 	Models       []gwModel `json:"models"`
 
+	// UpstreamErrorLogPath: every non-2xx response from upstream (excluding
+	// SSE streams, which already 200 by the time an error could occur mid-
+	// stream) gets one JSONL line here: the real upstream error message
+	// (previously only ever surfaced to the client, normalized, then
+	// discarded), plus request_id/session_id/estimated prompt tokens/
+	// max_tokens/model/backend for correlation. Built 2026-08-29 after a
+	// real incident needed manual packet-capture surgery on a100b to find
+	// out WHY a session's large agentic requests kept 400ing (root cause:
+	// prompt_tokens + max_tokens exceeding max_model_len is invisible
+	// anywhere else — the client gets a generic normalized message, the
+	// local ledger only has prompt_tokens=0 since the request never
+	// reached generation). Empty disables (default via defaultConfig()'s
+	// non-empty value matches every other *Path field's "safe by default"
+	// convention — this is meant to always be on in production).
+	UpstreamErrorLogPath string `json:"upstream_error_log_path,omitempty"`
+
 	// MeterHubAddr, when set, makes this gateway ALSO report every ledger
 	// entry to a central meterhub instance (tools/meterhub) — async,
 	// best-effort, never on the request's critical path. The local JSONL
@@ -266,9 +282,10 @@ type gwConfig struct {
 
 func defaultConfig() gwConfig {
 	return gwConfig{
-		UpstreamAddr: "http://127.0.0.1:30098",
-		ListenAddr:   ":8081",
-		LedgerPath:   "/workspace/oaica-gateway-ledger.jsonl",
+		UpstreamAddr:         "http://127.0.0.1:30098",
+		ListenAddr:           ":8081",
+		LedgerPath:           "/workspace/oaica-gateway-ledger.jsonl",
+		UpstreamErrorLogPath: "/workspace/oaica-gateway-upstream-errors.jsonl",
 	}
 }
 
@@ -294,6 +311,9 @@ func loadConfig(path string) (gwConfig, error) {
 	}
 	if cfg.LedgerPath == "" {
 		cfg.LedgerPath = defaultConfig().LedgerPath
+	}
+	if cfg.UpstreamErrorLogPath == "" {
+		cfg.UpstreamErrorLogPath = defaultConfig().UpstreamErrorLogPath
 	}
 	if len(cfg.APIKeys) == 0 {
 		return cfg, errors.New("api_keys is empty: refusing a config that would accept nobody")
@@ -321,11 +341,38 @@ func loadConfig(path string) (gwConfig, error) {
 // *http.Response, not the ledger-building code in completionHandler).
 type ctxKeyBackend struct{}
 
+// ctxKeyErrCapture carries the request-side context an upstream error gets
+// logged with (see gwConfig.UpstreamErrorLogPath) -- same indirection
+// reason as ctxKeyBackend: ModifyResponse only sees *http.Response.
+type ctxKeyErrCapture struct{}
+
+// errCaptureInfo is deliberately NOT the full request body -- storing every
+// large agentic prompt verbatim on every 400 would be its own liability
+// (disk, secrets in tool args). What actually answers "why did this fail"
+// is the upstream's own error message (captured separately, see
+// onUpstreamError) correlated against these cheap, already-computed
+// numbers -- e.g. prompt_tokens + max_tokens exceeding max_model_len shows
+// up immediately as EstTokens+MaxTokens close to or past the model's
+// context_length, without needing the message content at all.
+type errCaptureInfo struct {
+	RequestID string
+	SessionID string
+	Model     string
+	EstTokens int
+	MaxTokens int
+	ReqBytes  int
+}
+
 // newProxy builds a reverse proxy with its own transport and explicit
 // timeouts. ResponseHeaderTimeout returns a clean 504 before Cloudflare's
 // 100s edge timeout would turn it into an opaque 524. No overall client
 // timeout: streamed completions legitimately run for minutes.
-func newProxy(upstream string) (*httputil.ReverseProxy, error) {
+// onUpstreamError is called for every non-2xx, non-SSE upstream response,
+// with the real (untruncated-by-normalization) error message and the
+// errCaptureInfo stashed in the request's context, if any (nil when the
+// request never reached the point where completionHandler sets it, e.g. a
+// request rejected before that point). nil disables logging entirely.
+func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status int, code, msg string)) (*httputil.ReverseProxy, error) {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
@@ -384,6 +431,13 @@ func newProxy(upstream string) (*httputil.ReverseProxy, error) {
 			case http.StatusBadRequest:
 				code = "invalid_request_error"
 			}
+			if onUpstreamError != nil {
+				var info *errCaptureInfo
+				if v, ok := resp.Request.Context().Value(ctxKeyErrCapture{}).(*errCaptureInfo); ok {
+					info = v
+				}
+				onUpstreamError(info, resp.StatusCode, code, msg)
+			}
 			b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": code, "code": code}})
 			resp.Body = io.NopCloser(bytes.NewReader(b))
 			resp.ContentLength = int64(len(b))
@@ -414,6 +468,12 @@ type gateway struct {
 	ledgerMu sync.Mutex
 	ledger   *os.File
 
+	// errLog is the upstream-error JSONL sink -- see
+	// gwConfig.UpstreamErrorLogPath's doc. nil (path empty) disables it,
+	// though defaultConfig() always fills a path in practice.
+	errLogMu sync.Mutex
+	errLog   *os.File
+
 	// largeContextThreshold / largeContextSem: see gwConfig's doc on the
 	// same fields. -1 threshold means admission control is disabled
 	// (largeContextSem is nil in that case too). Guarded by mu since
@@ -440,7 +500,7 @@ type gateway struct {
 }
 
 func (g *gateway) apply(cfg gwConfig) error {
-	p, err := newProxy(cfg.UpstreamAddr)
+	p, err := newProxy(cfg.UpstreamAddr, g.logUpstreamError)
 	if err != nil {
 		return err
 	}
@@ -455,6 +515,13 @@ func (g *gateway) apply(cfg gwConfig) error {
 	if err != nil {
 		return fmt.Errorf("open ledger %s: %w", cfg.LedgerPath, err)
 	}
+	var ef *os.File
+	if cfg.UpstreamErrorLogPath != "" {
+		ef, err = os.OpenFile(cfg.UpstreamErrorLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("open upstream error log %s: %w", cfg.UpstreamErrorLogPath, err)
+		}
+	}
 	g.mu.Lock()
 	g.cfg = cfg
 	g.proxy = p
@@ -466,6 +533,12 @@ func (g *gateway) apply(cfg gwConfig) error {
 	}
 	g.ledger = f
 	g.ledgerMu.Unlock()
+	g.errLogMu.Lock()
+	if g.errLog != nil {
+		g.errLog.Close()
+	}
+	g.errLog = ef
+	g.errLogMu.Unlock()
 
 	// (Re)start the meter reporter on every apply — a reload that changes
 	// MeterHubAddr must take effect without a process restart, same as
@@ -809,6 +882,53 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 	g.reportUsage(e)
 }
 
+// upstreamErrorLogLine is one JSONL row in gwConfig.UpstreamErrorLogPath.
+type upstreamErrorLogLine struct {
+	TS              string `json:"ts"`
+	RequestID       string `json:"request_id,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Status          int    `json:"status"`
+	Code            string `json:"code"`
+	Message         string `json:"message"`
+	EstimatedPrompt int    `json:"estimated_prompt_tokens,omitempty"`
+	MaxTokens       int    `json:"max_tokens,omitempty"`
+	RequestBytes    int    `json:"request_bytes,omitempty"`
+}
+
+// logUpstreamError is newProxy's onUpstreamError callback -- see
+// gwConfig.UpstreamErrorLogPath's doc for why this exists. info is nil when
+// the request never reached the point in completionHandler that fills it
+// (rejected earlier, or something outside the normal completion path).
+func (g *gateway) logUpstreamError(info *errCaptureInfo, status int, code, msg string) {
+	g.errLogMu.Lock()
+	f := g.errLog
+	g.errLogMu.Unlock()
+	if f == nil {
+		return
+	}
+	line := upstreamErrorLogLine{
+		TS: time.Now().UTC().Format(time.RFC3339Nano), Status: status, Code: code, Message: msg,
+	}
+	if info != nil {
+		line.RequestID = info.RequestID
+		line.SessionID = info.SessionID
+		line.Model = info.Model
+		line.EstimatedPrompt = info.EstTokens
+		line.MaxTokens = info.MaxTokens
+		line.RequestBytes = info.ReqBytes
+	}
+	b, err := json.Marshal(line)
+	if err != nil {
+		return
+	}
+	g.errLogMu.Lock()
+	if g.errLog != nil {
+		g.errLog.Write(append(b, '\n'))
+	}
+	g.errLogMu.Unlock()
+}
+
 type usage struct {
 	PromptTokens        int `json:"prompt_tokens"`
 	CompletionTokens    int `json:"completion_tokens"`
@@ -1076,7 +1196,24 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// reached a backend (blocked earlier, or the error path never set
 	// oaicalb's header).
 	backend := new(string)
-	r = r.WithContext(context.WithValue(r.Context(), ctxKeyBackend{}, backend))
+	// req["max_tokens"] may be a float64 (as unmarshaled from client JSON) or
+	// a plain int (if the non-stream clamp above rewrote it -- see that
+	// loop's req[k] = limit) -- handle both rather than silently reading 0
+	// for every clamped non-streaming request.
+	maxTokens := 0
+	switch mt := req["max_tokens"].(type) {
+	case float64:
+		maxTokens = int(mt)
+	case int:
+		maxTokens = mt
+	}
+	errInfo := &errCaptureInfo{
+		RequestID: rid, SessionID: sessionID, Model: modelID,
+		EstTokens: estimateMessageTokens(req), MaxTokens: maxTokens, ReqBytes: len(body),
+	}
+	ctx := context.WithValue(r.Context(), ctxKeyBackend{}, backend)
+	ctx = context.WithValue(ctx, ctxKeyErrCapture{}, errInfo)
+	r = r.WithContext(ctx)
 	// The ledger write is DEFERRED so it runs on every exit path: normal
 	// completion, a client that disconnects mid-stream (ReverseProxy panics
 	// with http.ErrAbortHandler), or an upstream failure. Before this, an
