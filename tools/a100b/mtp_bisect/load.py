@@ -24,17 +24,22 @@ and a final JSON summary. Exit code 2 if any engine-death signal was seen,
 0 otherwise.
 """
 import argparse
+import base64
 import json
 import random
+import socket
 import string
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 MODEL = "oaica-35b-a3b-vision"
 MAX_EST_TOKENS = 200_000  # chars/4 estimate ceiling per request
+IMAGE_TOKEN_EST = 1500  # rough chars/4-equivalent budget cost per image
 
 CODE_WORDS = [
     "function", "return", "const", "let", "import", "export", "async", "await",
@@ -78,6 +83,46 @@ def gen_text_block(rng, target_chars, code_ratio=0.5):
     return "\n".join(out)[:target_chars]
 
 
+def gen_png_bytes(rng, width, height):
+    """Generate a valid 8-bit RGB PNG filled with a deterministic
+    gradient/stripe pattern, using only zlib+struct (pure stdlib)."""
+    xf = rng.randint(1, 5)
+    yf = rng.randint(1, 5)
+    stripe = rng.randint(8, 32)
+    ro = rng.randint(0, 255)
+    go = rng.randint(0, 255)
+    bo = rng.randint(0, 255)
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type 0 (None) for this scanline
+        for x in range(width):
+            r = (x * xf + ro) % 256
+            g = (y * yf + go) % 256
+            b = (((x + y) // stripe) * 37 + bo) % 256
+            raw += bytes((r, g, b))
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    idat = zlib.compress(bytes(raw), 6)
+    png = sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+    return png
+
+
+def gen_image_data_url(rng):
+    size = rng.choice([(256, 256), (512, 384), (1024, 768)])
+    png = gen_png_bytes(rng, *size)
+    b64 = base64.b64encode(png).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
 def build_shared_system_prompt(seed):
     """~25k-token (~100KB) deterministic system prompt, built once and reused
     verbatim by every request (prefix caching)."""
@@ -112,16 +157,22 @@ def build_shared_tools(seed):
     return tools
 
 
-def build_messages(rng, system_prompt, is_long):
+def build_messages(rng, system_prompt, is_long, min_history_chars, max_history_chars,
+                    attach_image=False):
     messages = [{"role": "system", "content": system_prompt}]
     if is_long:
-        target = rng.randint(120_000, 180_000)
+        target = rng.randint(min_history_chars, max_history_chars)
     else:
         target = rng.randint(2_000, 8_000)
 
+    n_images = rng.choice([1, 2]) if attach_image else 0
+
     # cap so total estimated tokens (chars/4) stays under MAX_EST_TOKENS,
-    # leaving headroom for the system prompt + tool defs + response.
-    budget_chars = MAX_EST_TOKENS * 4 - len(system_prompt) - 20_000
+    # leaving headroom for the system prompt + tool defs + response, and
+    # for any attached images (charged at IMAGE_TOKEN_EST*4 chars-equiv each).
+    budget_chars = (
+        MAX_EST_TOKENS * 4 - len(system_prompt) - 20_000 - n_images * IMAGE_TOKEN_EST * 4
+    )
     if target > budget_chars:
         target = max(1000, budget_chars)
 
@@ -138,7 +189,19 @@ def build_messages(rng, system_prompt, is_long):
 
     if messages[-1]["role"] != "user":
         messages.append({"role": "user", "content": gen_text_block(rng, 200, code_ratio=0.3)})
-    return messages
+
+    if n_images:
+        last = messages[-1]
+        text = last["content"]
+        content_list = [{"type": "text", "text": text}]
+        for _ in range(n_images):
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": gen_image_data_url(rng)},
+            })
+        last["content"] = content_list
+
+    return messages, n_images
 
 
 class Stats:
@@ -150,11 +213,20 @@ class Stats:
         self.conn_errors = 0
         self.engine_dead_signals = 0
         self.worker_had_success = {}
+        self.aborted = 0
+        self.with_images = 0
 
-    def record(self, worker_id, status, conn_error):
+    def record(self, worker_id, status, conn_error, aborted=False):
         with self.lock:
             self.requests += 1
             had_success_before = self.worker_had_success.get(worker_id, False)
+            if aborted:
+                self.aborted += 1
+                # aborts are intentional client-side disconnects: not errors,
+                # not engine-death signals, but still count as a "success"
+                # for engine-death tracking purposes on this worker.
+                self.worker_had_success[worker_id] = True
+                return
             if conn_error:
                 self.conn_errors += 1
                 if had_success_before:
@@ -167,6 +239,10 @@ class Stats:
                 if status == 500:
                     self.engine_dead_signals += 1
 
+    def record_image(self):
+        with self.lock:
+            self.with_images += 1
+
     def snapshot(self):
         with self.lock:
             return {
@@ -175,10 +251,21 @@ class Stats:
                 "status_other": dict(self.status_other),
                 "conn_errors": self.conn_errors,
                 "engine_dead_signals": self.engine_dead_signals,
+                "aborted": self.aborted,
+                "with_images": self.with_images,
             }
 
 
-def do_request(port, messages, tools, max_tokens, stream):
+def do_request(port, messages, tools, max_tokens, stream, abort_plan=None):
+    """abort_plan is None for normal requests, or a dict describing how to
+    abort a streaming request early:
+      {"mode": "chunks", "n": <int>}          -- close after n SSE chunks
+      {"mode": "delay", "seconds": <float>}    -- close after a delay
+      {"mode": "prefill", "timeout": <float>}  -- close if no data arrives
+                                                    within `timeout` (client
+                                                    gives up during prefill)
+    Returns (status, conn_error, aborted).
+    """
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     payload = {
         "model": MODEL,
@@ -194,6 +281,38 @@ def do_request(port, messages, tools, max_tokens, stream):
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
+        if abort_plan is not None and stream:
+            if abort_plan["mode"] == "prefill":
+                resp = urllib.request.urlopen(req, timeout=abort_plan["timeout"])
+                try:
+                    try:
+                        resp.fp.raw._sock.settimeout(abort_plan["timeout"])
+                    except Exception:
+                        pass
+                    try:
+                        next(iter(resp))
+                    except (socket.timeout, StopIteration, OSError):
+                        pass
+                finally:
+                    resp.close()
+                return None, False, True
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                if abort_plan["mode"] == "chunks":
+                    n = abort_plan["n"]
+                    count = 0
+                    for _ in resp:
+                        count += 1
+                        if count >= n:
+                            break
+                else:  # "delay"
+                    deadline = time.time() + abort_plan["seconds"]
+                    for _ in resp:
+                        if time.time() >= deadline:
+                            break
+                # deliberately do not drain the rest of the response;
+                # closing here (via context manager exit) aborts the conn.
+                return None, False, True
+
         with urllib.request.urlopen(req, timeout=300) as resp:
             if stream:
                 for line in resp:
@@ -201,26 +320,45 @@ def do_request(port, messages, tools, max_tokens, stream):
                         break
             else:
                 resp.read()
-            return resp.getcode(), False
+            return resp.getcode(), False, False
     except urllib.error.HTTPError as e:
         try:
             e.read()
         except Exception:
             pass
-        return e.code, False
+        return e.code, False, False
     except (urllib.error.URLError, ConnectionError, OSError, TimeoutError):
-        return None, True
+        return None, True, False
 
 
-def worker(worker_id, port, seed, system_prompt, tools, stop_at, stats):
+def worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
     rng = det_rng(seed, f"worker_{worker_id}_{time.time()}")
+    max_tokens_choices = args.max_tokens_choices
     while time.time() < stop_at:
-        is_long = rng.random() < 0.6
-        messages = build_messages(rng, system_prompt, is_long)
-        max_tokens = rng.choice([64, 256, 1024, 4096])
+        is_long = rng.random() < args.long_frac
+        attach_image = rng.random() < args.image_frac
+        messages, n_images = build_messages(
+            rng, system_prompt, is_long, args.min_history_chars, args.max_history_chars,
+            attach_image=attach_image,
+        )
+        max_tokens = rng.choice(max_tokens_choices)
         stream = rng.random() < 0.7
-        status, conn_error = do_request(port, messages, tools, max_tokens, stream)
-        stats.record(worker_id, status, conn_error)
+
+        abort_plan = None
+        if stream and rng.random() < args.abort_frac:
+            if rng.random() < (1.0 / 3.0):
+                abort_plan = {"mode": "prefill", "timeout": rng.uniform(0.05, 2.0)}
+            elif rng.random() < 0.5:
+                abort_plan = {"mode": "chunks", "n": rng.randint(1, 8)}
+            else:
+                abort_plan = {"mode": "delay", "seconds": rng.uniform(0.5, 6.0)}
+
+        status, conn_error, aborted = do_request(
+            port, messages, tools, max_tokens, stream, abort_plan=abort_plan
+        )
+        stats.record(worker_id, status, conn_error, aborted=aborted)
+        if n_images:
+            stats.record_image()
 
 
 def main():
@@ -229,7 +367,18 @@ def main():
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--minutes", type=float, default=6)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--abort-frac", type=float, default=0.0,
+                     help="fraction of streaming requests to abort early (close conn without draining)")
+    ap.add_argument("--image-frac", type=float, default=0.0,
+                     help="fraction of requests that attach 1-2 generated PNG images (OpenAI vision format)")
+    ap.add_argument("--max-tokens-choices", type=str, default="64,256,1024,4096",
+                     help="comma-separated max_tokens choices")
+    ap.add_argument("--long-frac", type=float, default=0.6,
+                     help="fraction of requests using the long history variant")
+    ap.add_argument("--min-history-chars", type=int, default=120_000)
+    ap.add_argument("--max-history-chars", type=int, default=180_000)
     args = ap.parse_args()
+    args.max_tokens_choices = [int(x) for x in args.max_tokens_choices.split(",") if x.strip()]
 
     print(f"building shared system prompt + tools (seed={args.seed})...", file=sys.stderr)
     system_prompt = build_shared_system_prompt(args.seed)
@@ -246,7 +395,7 @@ def main():
     for w in range(args.concurrency):
         t = threading.Thread(
             target=worker,
-            args=(w, args.port, args.seed, system_prompt, tools, stop_at, stats),
+            args=(w, args.port, args.seed, system_prompt, tools, stop_at, stats, args),
             daemon=True,
         )
         t.start()

@@ -305,11 +305,71 @@ tick() {
 # reversing an earlier same-day "reserved for the user" note -- see
 # /dev/shm/gpus.md for the full history.
 
-log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s"
+# oom_watch: attribute silent engine deaths to the container's memory cgroup.
+# 2026-08-29: three replicas died in the SAME second while completely idle
+# (Running: 0 reqs), no traceback, twice in one day -- and
+# /sys/fs/cgroup/memory.events showed oom_kill=15 with memory.peak ==
+# memory.max (2 TB, of which ~1 TB is other tenants' unreclaimable
+# /dev/shm). dmesg is capability-restricted in this container, so the
+# only way to prove an OOM kill is to watch the counter: any tick where
+# oom_kill moved is alerted with the delta, so the next death correlates
+# (or does not) conclusively. memory.current is logged with it.
+CG_EVENTS=/sys/fs/cgroup/memory.events
+OOM_KILLS_SEEN=$(awk '/^oom_kill /{print $2}' "$CG_EVENTS" 2>/dev/null || echo 0)
+oom_watch() {
+  local now cur
+  now=$(awk '/^oom_kill /{print $2}' "$CG_EVENTS" 2>/dev/null) || return 0
+  [ -z "$now" ] && return 0
+  if [ "$now" != "$OOM_KILLS_SEEN" ]; then
+    cur=$(awk '{printf "%.0f", $1/1e9}' /sys/fs/cgroup/memory.current 2>/dev/null)
+    alert "cgroup OOM killer fired: oom_kill $OOM_KILLS_SEEN -> $now (memory.current=${cur}GB, limit=$(awk '{printf "%.0f", $1/1e9}' /sys/fs/cgroup/memory.max)GB) -- check which replica died this tick"
+    OOM_KILLS_SEEN=$now
+  fi
+}
+
+# protect_oom: make our replicas the kernel's LAST choice when the cgroup
+# hits its limit. -900 (not -1000) keeps them killable as a true last
+# resort so the kernel always has a victim and never wedges; every other
+# tenant's process stays at the default 0 and is chosen first. Applied to
+# the api_server and its EngineCore child every tick (the child only exists
+# after boot, and both get replaced on relaunch), idempotent.
+#
+# Verified 2026-08-29: this container has NO CAP_SYS_RESOURCE (CapEff
+# a80425fb), so lowering oom_score_adj is EACCES for root too. The
+# function detects that on its first attempt, alerts once, and disables
+# itself -- kept in place because it becomes effective automatically on a
+# host/container that grants the capability. Until then the only real
+# protection is keeping the cgroup away from its limit: /dev/shm held
+# ~1 TB of model dumps (mostly other sessions') at the time.
+OOM_ADJ="${OOM_ADJ:--900}"
+OOM_ADJ_DISABLED=0
+protect_oom() {
+  local r port pid p
+  [ "$OOM_ADJ_DISABLED" = 1 ] && return 0
+  for r in $REPLICAS; do
+    port=${r##*:}
+    pid=$(pgrep -f "api_server.*--port $port " | head -1)
+    [ -n "$pid" ] || continue
+    for p in "$pid" $(pgrep -P "$pid"); do
+      [ "$(cat "/proc/$p/oom_score_adj" 2>/dev/null)" = "$OOM_ADJ" ] && continue
+      if echo "$OOM_ADJ" > "/proc/$p/oom_score_adj" 2>/dev/null; then
+        log ":${port} oom_score_adj=$OOM_ADJ on pid $p ($(cut -c1-24 /proc/$p/comm 2>/dev/null))"
+      else
+        alert "cannot lower oom_score_adj (no CAP_SYS_RESOURCE in this container) -- OOM protection disabled; replicas stay default-priority OOM victims"
+        OOM_ADJ_DISABLED=1
+        return 0
+      fi
+    done
+  done
+}
+
+log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s oom_kill_baseline=$OOM_KILLS_SEEN oom_adj=$OOM_ADJ"
 while true; do
+  oom_watch
   sweep_orphans "tick" 1
   for r in $REPLICAS; do
     tick "${r%%:*}" "${r##*:}" "/workspace/vllm_awq_gpu${r%%:*}.log"
   done
+  protect_oom
   sleep 15
 done
