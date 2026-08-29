@@ -934,17 +934,28 @@ func TestMeterHub_UnreachableNeverBlocksOrFailsTheRequest(t *testing.T) {
 func fakeSubscriberService(t *testing.T, statuses map[string]string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/subscribers/get" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		key := r.URL.Query().Get("key")
-		status, ok := statuses[key]
-		if !ok {
-			status = "unknown"
-		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"key_label": key, "status": status})
+		switch r.URL.Path {
+		case "/subscribers/get":
+			key := r.URL.Query().Get("key")
+			status, ok := statuses[key]
+			if !ok {
+				status = "unknown"
+			}
+			json.NewEncoder(w).Encode(map[string]string{"key_label": key, "status": status})
+		case "/subscribers/usage":
+			// Not-over-cap by default: tests that only care about
+			// subscription status shouldn't also need to stub usage.
+			// See fakeSubscriberServiceOverCap for the rate-limit path.
+			key := r.URL.Query().Get("key")
+			json.NewEncoder(w).Encode(map[string]any{
+				"key_label": key, "plan": "",
+				"window_5h": map[string]any{"tokens": 0, "over": false},
+				"window_7d": map[string]any{"tokens": 0, "over": false},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -1063,6 +1074,63 @@ func TestEntitlement_UnreachableMeterHubFailsClosedWhenConfigured(t *testing.T) 
 	w := postCompletion(t, g, "sk-active")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("unreachable meterhub, fail-closed: status = %d, want 403 (explicit operator choice: block when the check itself fails)", w.Code)
+	}
+}
+
+// fakeSubscriberServiceOverCap: active status, but /subscribers/usage
+// reports the given window as over -- the rate-limit path, distinct from
+// canceled/suspended.
+func fakeSubscriberServiceOverCap(t *testing.T, over5h, over7d bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/subscribers/get":
+			json.NewEncoder(w).Encode(map[string]string{"key_label": "alice", "status": "active"})
+		case "/subscribers/usage":
+			json.NewEncoder(w).Encode(map[string]any{
+				"key_label": "alice", "plan": "starter",
+				"window_5h": map[string]any{"tokens": 9_000_000, "cap": 8_000_000, "over": over5h},
+				"window_7d": map[string]any{"tokens": 9_000_000, "cap": 40_000_000, "over": over7d},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestEntitlement_OverWindowCapBlockedWith429(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberServiceOverCap(t, true, false)
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("over 5h cap: status = %d, want 429", w.Code)
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if body.Error.Code != "rate_limited" {
+		t.Errorf("error code = %q, want rate_limited", body.Error.Code)
+	}
+}
+
+func TestEntitlement_UnderWindowCapAllowed(t *testing.T) {
+	var got map[string]any
+	upstream := fakeUpstream(t, &got)
+	meterhub := fakeSubscriberServiceOverCap(t, false, false)
+	g := newTestGatewayWithEntitlement(t, upstream.URL, meterhub.URL, false)
+
+	w := postCompletion(t, g, "sk-active")
+	if w.Code != http.StatusOK {
+		t.Fatalf("under cap: status = %d, want 200", w.Code)
 	}
 }
 

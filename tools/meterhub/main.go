@@ -154,10 +154,19 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 			source TEXT NOT NULL DEFAULT 'manual',
 			external_id TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL,
-			note TEXT NOT NULL DEFAULT ''
+			note TEXT NOT NULL DEFAULT '',
+			reset_at TEXT NOT NULL DEFAULT ''
 		);
 	`); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	// Migration for pre-existing DBs from before reset_at existed: CREATE
+	// TABLE IF NOT EXISTS above only applies the column to a fresh table.
+	// "duplicate column name" (a fresh DB that already has it via the
+	// CREATE TABLE) is expected and ignored; any other error is real.
+	if _, err := db.Exec(`ALTER TABLE subscribers ADD COLUMN reset_at TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, fmt.Errorf("migrate reset_at: %w", err)
 	}
 
 	tokens := make(map[string]string, len(cfg.ReportTokens))
@@ -539,19 +548,29 @@ func (h *meterHub) subscriberUsageHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, `{"error":"key is required"}`, http.StatusBadRequest)
 		return
 	}
-	var plan string
-	err := h.db.QueryRow(`SELECT plan FROM subscribers WHERE key_label = ?`, key).Scan(&plan)
+	var plan, resetAt string
+	err := h.db.QueryRow(`SELECT plan, reset_at FROM subscribers WHERE key_label = ?`, key).Scan(&plan, &resetAt)
 	if err != nil && err != sql.ErrNoRows {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
 
 	now := time.Now().UTC()
+	// sum's actual cutoff is whichever is LATER: the window boundary, or an
+	// explicit reset (see subscriberResetHandler) — a reset only ever
+	// shrinks what counts, it can't extend a window back further than the
+	// window itself already reaches.
 	sum := func(since time.Time) (int64, error) {
+		cutoff := since
+		if resetAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, resetAt); err == nil && t.After(cutoff) {
+				cutoff = t
+			}
+		}
 		var tokens sql.NullInt64
 		err := h.db.QueryRow(
 			`SELECT SUM(prompt_tokens + completion_tokens) FROM usage WHERE key_label = ? AND ts >= ?`,
-			key, since.Format(time.RFC3339Nano),
+			key, cutoff.Format(time.RFC3339Nano),
 		).Scan(&tokens)
 		return tokens.Int64, err
 	}
@@ -579,6 +598,50 @@ func (h *meterHub) subscriberUsageHandler(w http.ResponseWriter, r *http.Request
 		"key_label": key, "plan": plan,
 		"window_5h": w5h, "window_7d": w7d,
 	})
+}
+
+// subscriberResetHandler zeroes a subscriber's rolling-window usage
+// without touching the underlying usage rows or restarting anything: it
+// sets reset_at to now, and subscriberUsageHandler's window sums treat
+// that as their effective start point going forward (never further back
+// than the window itself already reaches). The raw usage rows are left
+// alone deliberately — they're the billing/audit trail (see /usage,
+// /usage/summary), and this only affects the sliding-window view a plan
+// cap is checked against. A subscriber's cumulative totals are
+// unaffected by a reset.
+func (h *meterHub) subscriberResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		KeyLabel string `json:"key_label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.KeyLabel == "" {
+		http.Error(w, `{"error":"key_label is required"}`, http.StatusBadRequest)
+		return
+	}
+	res, err := h.db.Exec(
+		`UPDATE subscribers SET reset_at = ? WHERE key_label = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), req.KeyLabel,
+	)
+	if err != nil {
+		http.Error(w, `{"error":"reset failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		http.Error(w, `{"error":"no subscriber with that key_label"}`, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // stripeWebhookEvent is the minimal shape this endpoint understands from
@@ -708,6 +771,7 @@ func main() {
 	mux.HandleFunc("/subscribers/get", hub.subscriberGetHandler)
 	mux.HandleFunc("/subscribers/list", hub.subscriberListHandler)
 	mux.HandleFunc("/subscribers/usage", hub.subscriberUsageHandler)
+	mux.HandleFunc("/subscribers/reset", hub.subscriberResetHandler)
 	mux.HandleFunc("/subscribers/webhook", hub.subscriberWebhookHandler)
 
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))

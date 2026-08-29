@@ -480,6 +480,87 @@ func TestSubscriberUsage_AppliesPlanCapAndFlagsOver(t *testing.T) {
 	}
 }
 
+func TestReset_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/reset", bytes.NewReader([]byte(`{"key_label":"alice"}`)))
+	w := httptest.NewRecorder()
+	hub.subscriberResetHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestReset_RequiresKeyLabel(t *testing.T) {
+	hub, token := testHub(t)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/reset", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberResetHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestReset_UnknownSubscriberReturns404(t *testing.T) {
+	hub, token := testHub(t)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/reset", bytes.NewReader([]byte(`{"key_label":"nobody"}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberResetHandler(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+// TestReset_ZeroesWindowUsageWithoutTouchingCumulativeTotals is the core
+// guarantee: resetting a subscriber's rolling-window usage (for a live
+// meterhub process, no restart) must not delete or alter the underlying
+// billing rows -- /usage/summary must still show the same lifetime totals
+// after a reset that zeroed /subscribers/usage's windows.
+func TestReset_ZeroesWindowUsageWithoutTouchingCumulativeTotals(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "dave", Status: "active", Plan: "starter"})
+	now := time.Now().UTC()
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r1", TS: now.Add(-1 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "dave", Model: "m", PromptTokens: 9_000_000, CompletionTokens: 0,
+	})
+
+	before := getSubscriberUsage(t, hub, token, "dave")
+	if before["window_5h"].(map[string]any)["tokens"].(float64) != 9_000_000 {
+		t.Fatalf("pre-reset window_5h = %v, want 9000000", before["window_5h"])
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/reset", bytes.NewReader([]byte(`{"key_label":"dave"}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberResetHandler(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d, want 204", w.Code)
+	}
+
+	after := getSubscriberUsage(t, hub, token, "dave")
+	if got := after["window_5h"].(map[string]any)["tokens"].(float64); got != 0 {
+		t.Errorf("post-reset window_5h tokens = %v, want 0", got)
+	}
+	if got := after["window_7d"].(map[string]any)["tokens"].(float64); got != 0 {
+		t.Errorf("post-reset window_7d tokens = %v, want 0", got)
+	}
+
+	// The billing/audit trail must be untouched by a window reset.
+	sreq := httptest.NewRequest(http.MethodGet, "/usage/summary?key=dave", nil)
+	sreq.Header.Set("Authorization", "Bearer "+token)
+	sw := httptest.NewRecorder()
+	hub.summaryHandler(sw, sreq)
+	var summary struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	json.Unmarshal(sw.Body.Bytes(), &summary)
+	if len(summary.Summary) != 1 || summary.Summary[0].PromptTokens != 9_000_000 {
+		t.Errorf("cumulative summary after reset = %+v, want prompt_tokens=9000000 unchanged", summary.Summary)
+	}
+}
+
 func TestSubscriberUsage_UnknownPlanOmitsCap(t *testing.T) {
 	hub, token := testHub(t)
 	// No subscriber row at all for "carol" -- plan resolves to "".

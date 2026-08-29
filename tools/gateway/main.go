@@ -800,6 +800,13 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if g.entitlement != nil {
 		if allowed, reason := g.entitlement.check(label); !allowed {
+			if strings.HasPrefix(reason, "rate limit:") {
+				// 429: the key IS entitled, just over its plan's rolling
+				// window cap (checkWindowCap) — a distinct, temporary
+				// condition from not being entitled at all.
+				writeErr(w, http.StatusTooManyRequests, "rate_limited", reason)
+				return
+			}
 			// 403, not 401: the key itself authenticated fine — this
 			// is "who you are is known and not currently entitled",
 			// a distinct condition from "we don't know who you are".
@@ -1014,7 +1021,7 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string) {
 	}
 	switch s.Status {
 	case "active", "past_due":
-		return true, ""
+		return c.checkWindowCap(label)
 	case "canceled":
 		return false, "subscription canceled"
 	case "suspended":
@@ -1025,6 +1032,60 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string) {
 		}
 		return false, "no active subscription for this key"
 	}
+}
+
+// checkWindowCap is the enforcement side of meterhub's
+// /subscribers/usage instrumentation (tools/meterhub's planLimits): an
+// active/past_due subscriber can still be over their plan's rolling 5h or
+// 7d token cap (docs/PRICING.md's "real throttle" column), which is a
+// distinct condition from their subscription status. Only reached once
+// status is already known active/past_due — a canceled/suspended key
+// never gets this far. Same fail-open/fail-closed policy as the status
+// check: a meterhub hiccup here degrades to c.failOpen rather than
+// blocking (or silently admitting) every request while it's unreachable.
+func (c *entitlementCache) checkWindowCap(label string) (bool, string) {
+	req, err := http.NewRequest(http.MethodGet, c.addr+"/subscribers/usage?key="+url.QueryEscape(label), nil)
+	if err != nil {
+		return c.failOpen, "usage check unavailable"
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "usage check unreachable"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "usage check failed"
+	}
+	var u struct {
+		Window5h struct {
+			Over bool `json:"over"`
+		} `json:"window_5h"`
+		Window7d struct {
+			Over bool `json:"over"`
+		} `json:"window_7d"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		if c.failOpen {
+			return true, ""
+		}
+		return false, "usage check failed"
+	}
+	if u.Window5h.Over {
+		return false, "rate limit: 5-hour token cap exceeded, resets on a rolling window"
+	}
+	if u.Window7d.Over {
+		return false, "rate limit: weekly token cap exceeded, resets on a rolling window"
+	}
+	return true, ""
 }
 
 func main() {
