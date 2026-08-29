@@ -31,7 +31,7 @@
 |---|---|---|
 | **kat-awq** | **$0.05** | **$0.12** |
 
-- Undercuts DeepSeek V4 Flash on both legs (0.065→0.05 in, 0.14→0.12 out).
+- Undercuts DeepSeek V4 Flash on both legs (0.065→0.05 in, 0.14→0.12 out) **as of 2026-08-20 — no longer true, see the 2026-08-29 refresh below: DeepSeek has since dropped to $0.03/$0.10.**
 - Blended margin @ typical coding-agent traffic mix (~1:4 in:out) ≈ 0.05×0.2+0.12×0.8 = $0.106/M vs $0.0652/M cost → **~63% margin**, healthy buffer for burst/idle GPU time not counted in the $6.34/hr denominator.
 - Not the theoretical floor — floor is ~$0.065/M raw compute. Pushing rates lower means either thinner margin or scaling to denser GPUs (H200/B200) or more replicas to spread fixed costs; not done today, tracked as future work.
 
@@ -255,6 +255,62 @@ overage billing — all live). Request count is fine as a secondary
 abuse/rate-limit signal, never as the primary billing unit for this
 workload.
 
+## Single-GPU (1x A100) subscription plan — proposal, not yet deployed (2026-08-29)
+
+The multi-GPU plan above assumes a fleet; this sizes a plan for the
+minimum viable deployment, 1x A100, using real measured numbers instead
+of the original 6-GPU synthetic benchmark.
+
+**Real inputs:**
+- Cost: RunPod on-demand A100 80GB, $1.39/hr → **$1,014.70/mo** (730hr).
+- Measured real throughput: **~17M tokens/hr per replica** under
+  sustained heavy load (2026-08-29, prefill-dominated — this workload's
+  real traffic runs p50≈120K/p90≈185K prompt tokens per request, not
+  casual chat; see the per-token vs per-request analysis above for the
+  full distribution).
+- Cost basis: ~$0.055/M tokens blended (real traffic's actual
+  prompt:completion mix, ~216:1 — heavily prefill-weighted, not the
+  1:4 in:out ratio assumed in the multi-GPU section's margin calc).
+
+**Recommended tiers (single A100, two tiers only — a third/Team tier is
+not safe to offer on one GPU with no failover):**
+
+| Tier | Price/mo | 5h rolling cap | Weekly cap | Max tokens/mo if maxed |
+|---|---|---|---|---|
+| Starter | $12 | 1.5M tokens | 6M tokens | ~26M |
+| Pro | $29 | 5M tokens | 20M tokens | ~87M |
+
+Caps sized against real request size, not arbitrary: a real request
+here averages ~120K tokens, so Pro's 5M/5h cap covers roughly 40 real
+requests in a 5-hour session — a genuine long agentic coding session,
+not a toy limit. Bigger than this and one subscriber alone can saturate
+the whole GPU (17M tok/hr capacity, zero redundancy on a single
+replica).
+
+**Cost to serve one fully-maxed Pro subscriber**: 87M tokens/mo ×
+~$0.055/M ≈ **$4.80/mo** — well under the $29 price even at worst case,
+before accounting for the near-certainty that most subscribers never
+actually max out every rolling window every month.
+
+**Breakeven (mixed cohort, 70% Starter / 30% Pro — a realistic mix, not
+all-Pro):**
+- Weighted avg revenue/subscriber: 0.7×$12 + 0.3×$29 = $17.10/mo
+- Subscribers needed to cover $1,014.70/mo: **≈60 subscribers**
+
+**Capacity check** (the real constraint on one GPU, not revenue): if
+all 60 subscribers maxed their caps simultaneously → 60 × weighted-avg
+44.3M tokens ≈ **2.66B tokens/mo**, vs. the GPU's theoretical ceiling of
+17M×730 ≈ **12.4B tokens/mo** — safe at ~21% of max capacity even in
+the worst case. Real subscribers never all max out simultaneously, so
+this has room to grow past 60 before GPU throughput (not margin)
+becomes the binding constraint.
+
+**Bottom line**: ~60 subscribers on this Starter/Pro mix covers the
+1x-A100 GPU cost with healthy margin, and the rolling-window token caps
+(already built and enforced — see `tools/meterhub`'s `checkWindowCap`)
+are what make this safe: they bound worst-case cost per subscriber
+regardless of how heavy any individual user's real usage gets.
+
 ## Deploy
 
 This file is the rate card of record; the deployed pricing lives in
@@ -262,3 +318,69 @@ This file is the rate card of record; the deployed pricing lives in
 `GET /models` on `api.oaica.com`. Any rate change here must be propagated
 to that file by hand and reloaded (see "Rotating the OpenRouter key" in
 `docs/OPENROUTER_PROVIDER.md` for the SIGHUP reload mechanism).
+
+## Competitor refresh + how to actually compete (2026-08-29)
+
+The 2026-08-20 table above is stale — DeepSeek in particular has dropped
+price since. Refreshed live:
+
+| | Input $/M | Output $/M | vs. oaica ($0.05 / $0.12) |
+|---|---|---|---|
+| **oaica (current)** | $0.05 | $0.12 | — |
+| DeepSeek V4 Flash 0731 | $0.03 | $0.10 | **they're cheaper, both legs** |
+| GLM-5.3-Flash | $0.075 (promo, expires 2026-09-09) | $0.25 (promo) | we're 1.5-2x cheaper |
+| MiniMax M3 | $0.30 ($0.23 via OpenRouter) | $1.20 ($0.96 via OpenRouter) | we're 4.6-6x cheaper |
+
+**We already beat MiniMax and GLM on raw metered rate.** DeepSeek V4
+Flash is the one real competitor undercutting us on sticker price —
+and they're a much larger operation (fleet-scale, cache/peak-tiered
+pricing we can't structurally replicate on 1-2 GPUs).
+
+**Don't chase DeepSeek's raw rate down** — $0.03/M input is close to or
+below our own $0.0652/M raw compute floor once blended; matching it
+outright risks trading margin for a race we can't win against a bigger
+fleet. The floor doesn't move by wanting it to; it moves by adding
+GPUs or denser hardware (H200/B200), neither done today.
+
+**How to actually be more competitive, without cutting the headline
+rate below cost:**
+
+1. **Ship the cache-hit discount that's already built.** `gwPricing.CachedPrompt`
+   exists in code (`tools/gateway`) but isn't populated in the deployed
+   config — cached prefix tokens still bill at the full $0.05 rate today
+   despite costing us near-zero additional GPU compute (prefill is
+   skipped on a cache hit; **measured 9.5x TTFT speedup** on repeated
+   system prompts, see the stress-test section above). Setting
+   `CachedPrompt` to something like **$0.01/M** costs us almost nothing
+   (the compute was already saved) and directly beats DeepSeek's own
+   cache-hit tier ($0.007-0.014) on a workload we're structurally suited
+   for: Claude Code sessions reuse the same huge system prompt + tool
+   schema on every turn, which is exactly what prefix caching rewards.
+   This is the single highest-leverage, lowest-risk lever available —
+   pure upside, no cost-floor risk, code already exists.
+2. **Keep the fresh (non-cached) rate at $0.05/$0.12** — margin-safe
+   against the $0.0652/M floor, don't compete with DeepSeek there.
+3. **Lead the pitch with "flat committed rate, no cache-miss penalty,
+   no peak/off-peak markup."** DeepSeek's real pricing is a 4-way split
+   (cache-hit/miss × peak/off-peak, $0.007-0.44 range) and GLM halves
+   credits off-peak — both cheaper on paper but genuinely harder for a
+   customer to predict their bill from. A flat, simple rate is a real
+   differentiator even when it isn't the lowest number on the page.
+4. **Use the effective blended rate, not the sticker rate, once cache
+   pricing ships.** A real Claude Code session (huge shared system
+   prompt + tool schema reused every turn) with even 50% cache-hit rate
+   nets ~$0.03/M effective input — competitive with DeepSeek's *raw*
+   rate while DeepSeek's own cache-hit pricing needs a cache HIT to get
+   there too, so this isn't an unfair comparison.
+5. **Overage billing + rolling-window caps (both already built and
+   live) let subscription headline numbers stay generous-sounding
+   without oversell risk** — the mechanism, not the sticker price, is
+   what makes MiniMax/GLM's big advertised numbers safe at their scale;
+   we can use the same mechanism honestly at ours (see the single-GPU
+   plan above).
+
+**Bottom line**: don't try to out-discount DeepSeek's headline number.
+Ship the cache-hit pricing that's already coded but not deployed — it's
+free margin today (compute already saved by prefix caching) and turns
+into a genuine competitive edge against DeepSeek specifically for the
+repeat-heavy-context workload this product actually serves.
