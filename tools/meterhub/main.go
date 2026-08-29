@@ -110,14 +110,23 @@ type usageRecord struct {
 	Status           int    `json:"status"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
-	LatencyMS        int64  `json:"latency_ms"`
-	UsageSeen        bool   `json:"usage_seen"`
-	Aborted          bool   `json:"aborted"`
+	// CachedTokens: prefix-cache-hit portion of PromptTokens, threaded
+	// through from the upstream's OpenAI-shaped
+	// prompt_tokens_details.cached_tokens by both reporters (tools/gateway,
+	// tools/oaicalb). Usually 0 today, not because caching is off (it's
+	// on, verified ~50-60% hit rate via vLLM's own /metrics endpoint,
+	// vllm:prefix_cache_hits_total/queries_total) but because this vLLM
+	// build doesn't populate the per-request field yet (2026-08-29). Column
+	// exists so the value starts flowing the moment an upstream does.
+	CachedTokens int   `json:"cached_tokens"`
+	LatencyMS    int64 `json:"latency_ms"`
+	UsageSeen    bool  `json:"usage_seen"`
+	Aborted      bool  `json:"aborted"`
 }
 
 type meterHub struct {
-	db      *sql.DB
-	tokens  map[string]string // sha256 hex -> label
+	db     *sql.DB
+	tokens map[string]string // sha256 hex -> label
 }
 
 func newMeterHub(cfg meterConfig) (*meterHub, error) {
@@ -138,6 +147,7 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 			status INTEGER NOT NULL,
 			prompt_tokens INTEGER NOT NULL,
 			completion_tokens INTEGER NOT NULL,
+			cached_tokens INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL,
 			usage_seen INTEGER NOT NULL,
 			aborted INTEGER NOT NULL,
@@ -167,6 +177,11 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 	if _, err := db.Exec(`ALTER TABLE subscribers ADD COLUMN reset_at TEXT NOT NULL DEFAULT ''`); err != nil &&
 		!strings.Contains(err.Error(), "duplicate column") {
 		return nil, fmt.Errorf("migrate reset_at: %w", err)
+	}
+	// Same pattern for cached_tokens on usage (added 2026-08-29).
+	if _, err := db.Exec(`ALTER TABLE usage ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, fmt.Errorf("migrate cached_tokens: %w", err)
 	}
 
 	tokens := make(map[string]string, len(cfg.ReportTokens))
@@ -224,11 +239,11 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := h.db.Exec(`
 		INSERT OR IGNORE INTO usage
 			(request_id, ts, region, key_label, model, upstream_model, path,
-			 stream, status, prompt_tokens, completion_tokens, latency_ms,
-			 usage_seen, aborted, received_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 stream, status, prompt_tokens, completion_tokens, cached_tokens,
+			 latency_ms, usage_seen, aborted, received_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.RequestID, rec.TS, rec.Region, rec.KeyLabel, rec.Model, rec.UpstreamModel,
-		rec.Path, rec.Stream, rec.Status, rec.PromptTokens, rec.CompletionTokens,
+		rec.Path, rec.Stream, rec.Status, rec.PromptTokens, rec.CompletionTokens, rec.CachedTokens,
 		rec.LatencyMS, rec.UsageSeen, rec.Aborted, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
@@ -247,6 +262,7 @@ type usageRow struct {
 	Model            string `json:"model"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
+	CachedTokens     int    `json:"cached_tokens"`
 	Status           int    `json:"status"`
 	LatencyMS        int64  `json:"latency_ms"`
 }
@@ -281,7 +297,7 @@ func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	query := fmt.Sprintf(`SELECT request_id, ts, region, key_label, model, prompt_tokens, completion_tokens, status, latency_ms
+	query := fmt.Sprintf(`SELECT request_id, ts, region, key_label, model, prompt_tokens, completion_tokens, cached_tokens, status, latency_ms
 		FROM usage WHERE %s ORDER BY ts DESC LIMIT ?`, strings.Join(where, " AND "))
 	args = append(args, limit)
 
@@ -295,7 +311,7 @@ func (h *meterHub) usageHandler(w http.ResponseWriter, r *http.Request) {
 	out := make([]usageRow, 0, limit)
 	for rows.Next() {
 		var u usageRow
-		if err := rows.Scan(&u.RequestID, &u.TS, &u.Region, &u.KeyLabel, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.Status, &u.LatencyMS); err != nil {
+		if err := rows.Scan(&u.RequestID, &u.TS, &u.Region, &u.KeyLabel, &u.Model, &u.PromptTokens, &u.CompletionTokens, &u.CachedTokens, &u.Status, &u.LatencyMS); err != nil {
 			continue
 		}
 		out = append(out, u)
@@ -310,6 +326,7 @@ type summaryRow struct {
 	Requests         int    `json:"requests"`
 	PromptTokens     int64  `json:"prompt_tokens"`
 	CompletionTokens int64  `json:"completion_tokens"`
+	CachedTokens     int64  `json:"cached_tokens"`
 	Errors           int    `json:"errors"`
 }
 
@@ -332,6 +349,7 @@ func (h *meterHub) summaryHandler(w http.ResponseWriter, r *http.Request) {
 		       COUNT(*) as requests,
 		       COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
 		       COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+		       COALESCE(SUM(cached_tokens), 0) as cached_tokens,
 		       SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) as errors
 		FROM usage WHERE %s
 		GROUP BY key_label, model
@@ -347,7 +365,7 @@ func (h *meterHub) summaryHandler(w http.ResponseWriter, r *http.Request) {
 	out := []summaryRow{}
 	for rows.Next() {
 		var s summaryRow
-		if err := rows.Scan(&s.KeyLabel, &s.Model, &s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.Errors); err != nil {
+		if err := rows.Scan(&s.KeyLabel, &s.Model, &s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.CachedTokens, &s.Errors); err != nil {
 			continue
 		}
 		out = append(out, s)

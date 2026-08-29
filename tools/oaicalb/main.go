@@ -472,9 +472,13 @@ type usageRecord struct {
 	Status           int    `json:"status"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
-	LatencyMS        int64  `json:"latency_ms"`
-	UsageSeen        bool   `json:"usage_seen"`
-	Aborted          bool   `json:"aborted"`
+	// CachedTokens: see tools/gateway's ledgerEntry.CachedTokens doc for
+	// what this is and why it's usually 0 today (vLLM doesn't populate
+	// prompt_tokens_details.cached_tokens on responses as of 2026-08-29).
+	CachedTokens int   `json:"cached_tokens"`
+	LatencyMS    int64 `json:"latency_ms"`
+	UsageSeen    bool  `json:"usage_seen"`
+	Aborted      bool  `json:"aborted"`
 }
 
 var meterReporterBackoff = func(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
@@ -547,6 +551,7 @@ type usageRecorder struct {
 	stream           bool
 	promptTokens     int
 	completionTokens int
+	cachedTokens     int
 	seen             bool
 	tail             bytes.Buffer
 	body             bytes.Buffer
@@ -592,13 +597,19 @@ func (u *usageRecorder) scanSSE(p []byte) {
 		}
 		var chunk struct {
 			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
+				PromptTokens        int `json:"prompt_tokens"`
+				CompletionTokens    int `json:"completion_tokens"`
+				PromptTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 		}
 		if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
 			u.promptTokens = chunk.Usage.PromptTokens
 			u.completionTokens = chunk.Usage.CompletionTokens
+			if chunk.Usage.PromptTokensDetails != nil {
+				u.cachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			}
 			u.seen = true
 		}
 	}
@@ -610,13 +621,19 @@ func (u *usageRecorder) finish() {
 	}
 	var doc struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(u.body.Bytes(), &doc) == nil && doc.Usage != nil {
 		u.promptTokens = doc.Usage.PromptTokens
 		u.completionTokens = doc.Usage.CompletionTokens
+		if doc.Usage.PromptTokensDetails != nil {
+			u.cachedTokens = doc.Usage.PromptTokensDetails.CachedTokens
+		}
 		u.seen = true
 	}
 }
@@ -679,7 +696,7 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 			Region: metered.region, KeyLabel: keyLabelFor(r),
 			Model: reqDoc.Model, UpstreamModel: reqDoc.Model, Path: r.URL.Path,
 			Stream: reqDoc.Stream, Status: rec.status,
-			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens,
+			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,
 			LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen,
 		})
 	}

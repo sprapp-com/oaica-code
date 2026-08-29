@@ -659,9 +659,19 @@ type ledgerEntry struct {
 	Status           int    `json:"status"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
-	LatencyMS        int64  `json:"latency_ms"`
-	UsageSeen        bool   `json:"usage_seen"` // false = upstream sent no usage; do not trust zeros
-	Aborted          bool   `json:"aborted"`    // client disconnected / upstream died mid-response
+	// CachedTokens is the prefix-cache-hit portion of PromptTokens, from the
+	// upstream's OpenAI-shaped prompt_tokens_details.cached_tokens. Zero
+	// does not mean "no cache hit" -- it also means "upstream didn't
+	// populate this field" (as of 2026-08-29, this vLLM build returns it
+	// null on every response; the field is wired through end-to-end and
+	// ready the moment an upstream starts sending real values, no further
+	// code change needed). Cross-check against vLLM's own /metrics
+	// (vllm:prefix_cache_hits_total/queries_total, token-level, aggregate
+	// not per-request) if this stays zero and cache hits are suspected.
+	CachedTokens int   `json:"cached_tokens"`
+	LatencyMS    int64 `json:"latency_ms"`
+	UsageSeen    bool  `json:"usage_seen"` // false = upstream sent no usage; do not trust zeros
+	Aborted      bool  `json:"aborted"`    // client disconnected / upstream died mid-response
 }
 
 func (g *gateway) writeLedger(e ledgerEntry) {
@@ -681,8 +691,20 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 }
 
 type usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// cachedTokens is nil-safe: PromptTokensDetails is only present once an
+// upstream actually populates it (see ledgerEntry.CachedTokens's doc).
+func (u usage) cachedTokens() int {
+	if u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
 }
 
 // usageRecorder wraps the ResponseWriter to (a) forward bytes immediately
@@ -929,6 +951,7 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		Status:           rec.status,
 		PromptTokens:     rec.usage.PromptTokens,
 		CompletionTokens: rec.usage.CompletionTokens,
+		CachedTokens:     rec.usage.cachedTokens(),
 		LatencyMS:        time.Since(start).Milliseconds(),
 		UsageSeen:        rec.seen,
 		Aborted:          aborted,

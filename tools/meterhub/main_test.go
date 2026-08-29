@@ -187,6 +187,42 @@ func TestSummaryHandler_AggregatesByKeyAndModel(t *testing.T) {
 	}
 }
 
+func TestIngest_CachedTokensRoundTripsThroughUsageAndSummary(t *testing.T) {
+	hub, token := testHub(t)
+	rec := usageRecord{
+		RequestID: "req_cache1", TS: "2026-08-29T00:00:00Z", Region: "a100b",
+		KeyLabel: "alice", Model: "m1", PromptTokens: 1000, CompletionTokens: 100, CachedTokens: 600,
+	}
+	w := postIngest(t, hub, token, rec)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("ingest status = %d, want 204", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/usage?key=alice", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w2 := httptest.NewRecorder()
+	hub.usageHandler(w2, req)
+	var resp struct {
+		Records []usageRow `json:"records"`
+	}
+	json.Unmarshal(w2.Body.Bytes(), &resp)
+	if len(resp.Records) != 1 || resp.Records[0].CachedTokens != 600 {
+		t.Fatalf("usage record cached_tokens = %+v, want 600", resp.Records)
+	}
+
+	sreq := httptest.NewRequest(http.MethodGet, "/usage/summary", nil)
+	sreq.Header.Set("Authorization", "Bearer "+token)
+	sw := httptest.NewRecorder()
+	hub.summaryHandler(sw, sreq)
+	var sresp struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	json.Unmarshal(sw.Body.Bytes(), &sresp)
+	if len(sresp.Summary) != 1 || sresp.Summary[0].CachedTokens != 600 {
+		t.Fatalf("summary cached_tokens = %+v, want 600", sresp.Summary)
+	}
+}
+
 func TestUsageHandler_RequiresAuth(t *testing.T) {
 	hub, _ := testHub(t)
 	req := httptest.NewRequest(http.MethodGet, "/usage", nil)
