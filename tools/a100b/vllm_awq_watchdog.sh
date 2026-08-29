@@ -185,6 +185,32 @@ sweep_orphans() {
   done
 }
 
+# making_progress: true only if logfile was written to recently (engine
+# process is alive and actively logging, not wedged) AND its most recent
+# "Avg generation throughput" line is nonzero (real tokens are coming out,
+# not zero forever). A real 1-token chat-completion probe (chat_probe_ok)
+# competes for the SAME scheduler queue as genuine traffic, so under heavy
+# concurrent load from real clients the probe can time out while the
+# engine is honestly still working -- 2026-08-28: killing in that case
+# only makes things worse, dropping capacity exactly when more is needed
+# and dumping double load on the surviving replica, cascading into a
+# thrash loop across both GPUs. Stale or missing log, or throughput
+# genuinely at 0, still means kill -- this only protects a BUSY replica,
+# never a truly wedged one.
+making_progress() {
+  local logfile=$1
+  [ -f "$logfile" ] || return 1
+  local age
+  age=$(( $(date +%s) - $(stat -c %Y "$logfile" 2>/dev/null || echo 0) ))
+  (( age > 60 )) && return 1
+  local line tps
+  line=$(grep 'Avg generation throughput' "$logfile" 2>/dev/null | tail -1)
+  [ -z "$line" ] && return 1
+  tps=$(echo "$line" | grep -oE 'generation throughput: [0-9.]+' | grep -oE '[0-9.]+$')
+  [ -z "$tps" ] && return 1
+  awk -v t="$tps" 'BEGIN{exit !(t>0)}'
+}
+
 tick() {
   local gpu=$1 port=$2 logfile=$3 now
   now=$(date +%s)
@@ -196,10 +222,15 @@ tick() {
       STALLFAILS[$port]=$(( STALLFAILS[$port] + 1 ))
       log ":${port} chat probe failed (streak ${STALLFAILS[$port]}/${STALL_FAIL_THRESHOLD})"
       if (( STALLFAILS[$port] >= STALL_FAIL_THRESHOLD )); then
-        force_kill_replica "$port"
-        STALLFAILS[$port]=0
-        LAST[$port]=$now
-        DELAY[$port]=15
+        if making_progress "$logfile"; then
+          alert ":${port} probe failed ${STALL_FAIL_THRESHOLD}x but engine is still producing tokens (busy under real load, not wedged) -- NOT killing, extending grace"
+          STALLFAILS[$port]=$(( STALL_FAIL_THRESHOLD - 1 ))
+        else
+          force_kill_replica "$port"
+          STALLFAILS[$port]=0
+          LAST[$port]=$now
+          DELAY[$port]=15
+        fi
       fi
     fi
     return
