@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func testHub(t *testing.T) (*meterHub, string) {
@@ -386,5 +387,111 @@ func TestWebhook_RequiresAuth(t *testing.T) {
 	hub.subscriberWebhookHandler(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func getSubscriberUsage(t *testing.T, hub *meterHub, token, key string) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/usage?key="+key, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberUsageHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestSubscriberUsage_RequiresAuth(t *testing.T) {
+	hub, _ := testHub(t)
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/usage?key=alice", nil)
+	w := httptest.NewRecorder()
+	hub.subscriberUsageHandler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestSubscriberUsage_RequiresKey(t *testing.T) {
+	hub, token := testHub(t)
+	req := httptest.NewRequest(http.MethodGet, "/subscribers/usage", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	hub.subscriberUsageHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestSubscriberUsage_SumsWithinWindow(t *testing.T) {
+	hub, token := testHub(t)
+	now := time.Now().UTC()
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r1", TS: now.Add(-1 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "alice", Model: "m", PromptTokens: 1_000_000, CompletionTokens: 500_000,
+	})
+	postIngest(t, hub, token, usageRecord{
+		// Outside the 5h window but inside the 7d window.
+		RequestID: "r2", TS: now.Add(-6 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "alice", Model: "m", PromptTokens: 2_000_000, CompletionTokens: 0,
+	})
+	postIngest(t, hub, token, usageRecord{
+		// Outside both windows entirely.
+		RequestID: "r3", TS: now.Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "alice", Model: "m", PromptTokens: 9_000_000, CompletionTokens: 0,
+	})
+
+	out := getSubscriberUsage(t, hub, token, "alice")
+	w5h := out["window_5h"].(map[string]any)
+	w7d := out["window_7d"].(map[string]any)
+
+	if got := w5h["tokens"].(float64); got != 1_500_000 {
+		t.Errorf("window_5h tokens = %v, want 1500000 (only r1 is within 5h)", got)
+	}
+	if got := w7d["tokens"].(float64); got != 3_500_000 {
+		t.Errorf("window_7d tokens = %v, want 3500000 (r1+r2, not r3)", got)
+	}
+}
+
+func TestSubscriberUsage_AppliesPlanCapAndFlagsOver(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "bob", Status: "active", Plan: "starter"})
+	now := time.Now().UTC()
+	// starter cap is 8_000_000 in the 5h window -- push it over.
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "r1", TS: now.Add(-1 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "bob", Model: "m", PromptTokens: 9_000_000, CompletionTokens: 0,
+	})
+
+	out := getSubscriberUsage(t, hub, token, "bob")
+	if out["plan"] != "starter" {
+		t.Errorf("plan = %v, want starter", out["plan"])
+	}
+	w5h := out["window_5h"].(map[string]any)
+	if got := w5h["cap"].(float64); got != 8_000_000 {
+		t.Errorf("window_5h cap = %v, want 8000000", got)
+	}
+	if over, _ := w5h["over"].(bool); !over {
+		t.Error("window_5h.over = false, want true (9M used against 8M cap)")
+	}
+}
+
+func TestSubscriberUsage_UnknownPlanOmitsCap(t *testing.T) {
+	hub, token := testHub(t)
+	// No subscriber row at all for "carol" -- plan resolves to "".
+	out := getSubscriberUsage(t, hub, token, "carol")
+	if out["plan"] != "" {
+		t.Errorf("plan = %v, want empty", out["plan"])
+	}
+	w5h := out["window_5h"].(map[string]any)
+	if _, hasCap := w5h["cap"]; hasCap {
+		t.Errorf("window_5h has a cap for an unknown plan, want none: %v", w5h)
+	}
+	if over, _ := w5h["over"].(bool); over {
+		t.Error("window_5h.over = true with no cap set, want false")
 	}
 }

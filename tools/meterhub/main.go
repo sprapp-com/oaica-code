@@ -493,6 +493,94 @@ func (h *meterHub) subscriberListHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]any{"subscribers": out})
 }
 
+// planLimit is one tier's rolling-window token caps, matching the plans
+// proposed in docs/PRICING.md ("Real throttle (5hr / weekly)" column).
+// These are the load-bearing limits: the monthly headline number in that
+// doc is marketing, this is what actually protects the fleet from one
+// subscriber consuming more than a shared 2-GPU box can serve.
+type planLimit struct {
+	Window5h int64
+	Window7d int64
+}
+
+// planLimits is deliberately a Go map, not a DB table: these are business
+// decisions that change with a pricing doc edit + deploy, not per-tenant
+// data. Empty/unknown plan = no cap (subscriberUsageHandler reports usage
+// with caps omitted rather than guessing a limit that was never set).
+var planLimits = map[string]planLimit{
+	"starter": {Window5h: 8_000_000, Window7d: 40_000_000},
+	"pro":     {Window5h: 25_000_000, Window7d: 130_000_000},
+	"team":    {Window5h: 60_000_000, Window7d: 320_000_000},
+}
+
+type usageWindow struct {
+	Tokens int64 `json:"tokens"`
+	Cap    int64 `json:"cap,omitempty"`
+	Over   bool  `json:"over"`
+}
+
+// subscriberUsageHandler is the per-subscriber rolling-window instrument:
+// how many tokens has this key actually used in the trailing 5 hours and
+// trailing 7 days, against its plan's cap — the read side of the
+// throttling docs/PRICING.md's tiers depend on. Nothing in the request
+// path enforces this yet (see gateway's entitlementCache for the
+// active/canceled/suspended enforcement point this could extend); this
+// endpoint is the visibility a human or a future enforcement check needs
+// before that gets wired up. Cumulative totals were already available via
+// /usage and /usage/summary — this is specifically the sliding-window
+// view those don't provide.
+func (h *meterHub) subscriberUsageHandler(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.authed(r); !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		http.Error(w, `{"error":"key is required"}`, http.StatusBadRequest)
+		return
+	}
+	var plan string
+	err := h.db.QueryRow(`SELECT plan FROM subscribers WHERE key_label = ?`, key).Scan(&plan)
+	if err != nil && err != sql.ErrNoRows {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	now := time.Now().UTC()
+	sum := func(since time.Time) (int64, error) {
+		var tokens sql.NullInt64
+		err := h.db.QueryRow(
+			`SELECT SUM(prompt_tokens + completion_tokens) FROM usage WHERE key_label = ? AND ts >= ?`,
+			key, since.Format(time.RFC3339Nano),
+		).Scan(&tokens)
+		return tokens.Int64, err
+	}
+
+	tok5h, err := sum(now.Add(-5 * time.Hour))
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	tok7d, err := sum(now.Add(-7 * 24 * time.Hour))
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w5h := usageWindow{Tokens: tok5h}
+	w7d := usageWindow{Tokens: tok7d}
+	if limit, ok := planLimits[plan]; ok {
+		w5h.Cap, w5h.Over = limit.Window5h, tok5h > limit.Window5h
+		w7d.Cap, w7d.Over = limit.Window7d, tok7d > limit.Window7d
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"key_label": key, "plan": plan,
+		"window_5h": w5h, "window_7d": w7d,
+	})
+}
+
 // stripeWebhookEvent is the minimal shape this endpoint understands from
 // Stripe's event envelope — just enough to map a subscription lifecycle
 // event to a subscriber status write. NOT a full Stripe SDK integration
@@ -619,6 +707,7 @@ func main() {
 	mux.HandleFunc("/subscribers/set", hub.subscriberSetHandler)
 	mux.HandleFunc("/subscribers/get", hub.subscriberGetHandler)
 	mux.HandleFunc("/subscribers/list", hub.subscriberListHandler)
+	mux.HandleFunc("/subscribers/usage", hub.subscriberUsageHandler)
 	mux.HandleFunc("/subscribers/webhook", hub.subscriberWebhookHandler)
 
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
