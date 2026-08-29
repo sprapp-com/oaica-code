@@ -466,10 +466,21 @@ def session_worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, 
             stats.record(worker_id, status, conn_error, aborted=aborted)
             stats.record_turn()
 
+            # Images are only sent on the turn they were attached to: the
+            # server caps images per request (--limit-mm-per-prompt image=2),
+            # so leaving them in the growing history 400s every later turn of
+            # the session (seen: 2516 x HTTP 400 in one run). Keep the text.
+            last = messages[-1]
+            if isinstance(last.get("content"), list):
+                last["content"] = " ".join(
+                    p.get("text", "") for p in last["content"] if p.get("type") == "text"
+                )
+
             if aborted or conn_error or status != 200:
-                # drop this turn (don't append it to history) and continue
-                # the session with a fresh follow-up turn.
-                pass
+                # Keep user/assistant alternation intact even when the turn
+                # failed or was aborted (Claude Code does the same: the
+                # partial/failed reply still occupies the assistant slot).
+                messages.append({"role": "assistant", "content": "(turn aborted)"})
             else:
                 assistant_text = content if content else "(no response captured)"
                 messages.append({"role": "assistant", "content": assistant_text})
