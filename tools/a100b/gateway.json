@@ -35,6 +35,30 @@
         "response_format"
       ],
       "created": 1787690759
+    },
+    {
+      "id": "oaica-nemotron-30b-a3b",
+      "upstream_id": "oaica-nemotron-30b-a3b",
+      "owned_by": "oaica",
+      "upstream_addr": "http://127.0.0.1:30120",
+      "context_length": 262144,
+      "max_completion_tokens": 32768,
+      "pricing": {
+        "prompt": "0.00000005",
+        "completion": "0.00000012",
+        "cached_prompt": "0.00000001"
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "stream",
+        "tools",
+        "tool_choice",
+        "stop",
+        "seed",
+        "response_format"
+      ]
     }
   ]
 }

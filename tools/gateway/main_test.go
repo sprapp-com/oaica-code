@@ -1881,3 +1881,135 @@ func TestContextFitClamp_ProportionalMarginCatchesUnderestimatedDenseContent(t *
 		t.Fatalf("expected the proportional margin to clamp max_tokens below 32000 for this dense-content-sized request, got %v (old flat-margin bug would leave it unclamped)", gotMaxTokens)
 	}
 }
+
+func TestModelUpstreamAddrFallback(t *testing.T) {
+	const def = "http://default:1"
+	for _, tc := range []struct {
+		name string
+		m    gwModel
+		want string
+	}{
+		{"inherits default when unset", gwModel{ID: "a"}, def},
+		{"own address wins", gwModel{ID: "b", UpstreamAddr: "http://other:2"}, "http://other:2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.m.upstreamAddr(def); got != tc.want {
+				t.Fatalf("upstreamAddr = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPerModelUpstreamRouting is the whole point of per-model upstream_addr:
+// two models in one catalog, two different backends, each request landing on
+// its own -- with the model name rewritten to that model's upstream_id.
+func TestPerModelUpstreamRouting(t *testing.T) {
+	var gotA, gotB map[string]any
+	upA := fakeUpstream(t, &gotA)
+	defer upA.Close()
+	upB := fakeUpstream(t, &gotB)
+	defer upB.Close()
+
+	cfg := gwConfig{
+		UpstreamAddr: upA.URL,
+		ListenAddr:   ":0",
+		LedgerPath:   filepath.Join(t.TempDir(), "ledger.jsonl"),
+		APIKeys:      []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{
+			{ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+				Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"}},
+			{ID: "glm-awq", UpstreamID: "glm-4.6-awq", OwnedBy: "oaica",
+				UpstreamAddr: upB.URL,
+				Pricing:      gwPricing{Prompt: "0.0000001", Completion: "0.0000003"}},
+		},
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if n := len(g.proxies); n != 2 {
+		t.Fatalf("expected 2 distinct upstream proxies, got %d", n)
+	}
+	if got := distinctUpstreams(cfg); got != 2 {
+		t.Fatalf("distinctUpstreams = %d, want 2", got)
+	}
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		id           string
+		wantUpstream string
+		got          *map[string]any
+		other        *map[string]any
+	}{
+		{"kat-awq", "kat-awq-served", &gotA, &gotB},
+		{"glm-awq", "glm-4.6-awq", &gotB, &gotA},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			gotA, gotB = nil, nil
+			body := `{"model":"` + tc.id + `","messages":[{"role":"user","content":"2+2"}]}`
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer sk-new")
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if *tc.other != nil {
+				t.Fatalf("%s landed on the WRONG upstream", tc.id)
+			}
+			if *tc.got == nil {
+				t.Fatalf("%s never reached its upstream", tc.id)
+			}
+			if m := (*tc.got)["model"]; m != tc.wantUpstream {
+				t.Fatalf("upstream saw model=%v, want %q", m, tc.wantUpstream)
+			}
+		})
+	}
+}
+
+func TestLoadConfigModelUpstreamAddr(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		addr    string
+		wantErr bool
+	}{
+		{"valid", "http://127.0.0.1:30099", false},
+		{"unparseable", "http://[::1", true},
+		{"absent means inherit", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := ""
+			if tc.addr != "" {
+				extra = `,"upstream_addr":"` + tc.addr + `"`
+			}
+			p := filepath.Join(t.TempDir(), "cfg.json")
+			js := `{"upstream_addr":"http://127.0.0.1:30098","ledger_path":"/tmp/l.jsonl",
+			 "api_keys":[{"sha256":"` + keyHash("sk") + `","label":"x"}],
+			 "models":[{"id":"a","owned_by":"oaica"},{"id":"b","owned_by":"oaica"` + extra + `}]}`
+			if err := os.WriteFile(p, []byte(js), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(p)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected load to reject upstream_addr %q", tc.addr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if got := cfg.Models[1].upstreamAddr(cfg.UpstreamAddr); tc.addr != "" && got != tc.addr {
+				t.Fatalf("models[1] upstream = %q, want %q", got, tc.addr)
+			} else if tc.addr == "" && got != cfg.UpstreamAddr {
+				t.Fatalf("models[1] upstream = %q, want inherited %q", got, cfg.UpstreamAddr)
+			}
+		})
+	}
+}

@@ -6,7 +6,7 @@
   "leastconn_addr": ":30120",
   "session_hash_addr": ":8191",
   "status_addr": ":8192",
-  "probe_model": "nvidia-nemotron-3.5-lightning-30b-a3b",
+  "probe_model": "oaica-nemotron-30b-a3b",
   "probe_timeout_sec": 25,
   "stall_sec": 300,
   "stall_min_inflight": 2,

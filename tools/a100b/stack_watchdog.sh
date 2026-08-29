@@ -27,6 +27,15 @@ start_oaicalb() {
   log "starting oaicalb on :30099"
   nohup /workspace/oaicalb-linux-amd64 -config /workspace/oaicalb.json >> /workspace/oaicalb.log 2>&1 < /dev/null &
 }
+# Second model pool (Nemotron on GPU7, replica :30107) has its own oaicalb
+# so a hung Nemotron replica can never be picked for an oaica-35b request
+# and vice versa. The gateway reaches it directly via the model's own
+# upstream_addr (no gatekeeper hop: the gateway already authenticates the
+# caller, and :30120 binds loopback only).
+start_nemotron_lb() {
+  log "starting nemotron oaicalb on :30120"
+  nohup /workspace/oaicalb-linux-amd64 -config /workspace/nemotron-oaicalb.json >> /workspace/nemotron-oaicalb.log 2>&1 < /dev/null &
+}
 start_gatekeeper() {
   # Since 2026-08-26 gatekeeper lives under /workspace like everything else
   # (binary 0700, config 0600 with plaintext keys -- gatekeeper does not
@@ -60,6 +69,7 @@ start_tunnel() {
 log "stack watchdog start"
 while true; do
   listening 30099 || start_oaicalb
+  listening 30120 || start_nemotron_lb
   listening 30098 || start_gatekeeper
   listening 8081  || start_gateway
   tunnel_running  || start_tunnel

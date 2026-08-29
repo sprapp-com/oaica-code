@@ -42,8 +42,15 @@
 //	    "id": "kat-awq", "upstream_id": "kat-awq", "owned_by": "oaica",
 //	    "context_length": 262144, "max_completion_tokens": 32768,
 //	    "pricing": {"prompt": "0.00000005", "completion": "0.00000012"}
+//	  }, {
+//	    "id": "glm-awq", "upstream_id": "glm-4.6-awq", "owned_by": "oaica",
+//	    "upstream_addr": "http://127.0.0.1:30099",
+//	    "pricing": {"prompt": "0.0000001", "completion": "0.0000003"}
 //	  } ]
 //	}
+//
+// A model may carry its own "upstream_addr" when it lives behind a different
+// vLLM/gatekeeper than the rest; omitted, it inherits the top-level one.
 //
 // Hash a key for the config with: printf '%s' "$KEY" | sha256sum
 package main
@@ -143,6 +150,32 @@ type gwModel struct {
 	// customer for noise.
 	InputModalities []string `json:"input_modalities,omitempty"`
 	Created         int64    `json:"created,omitempty"`
+	// UpstreamAddr lets one gateway front models that live behind DIFFERENT
+	// backends (a second vLLM on another port/host, a third-party OpenAI
+	// endpoint) while keeping a single public catalog, key set and ledger.
+	// Empty inherits gwConfig.UpstreamAddr, which is what every existing
+	// config does -- this field is purely additive.
+	UpstreamAddr string `json:"upstream_addr,omitempty"`
+}
+
+// distinctUpstreams counts the backends this config actually fans out to --
+// logged at startup/reload so a config typo that silently splits traffic
+// across two upstreams is visible without diffing the JSON.
+func distinctUpstreams(cfg gwConfig) int {
+	seen := map[string]bool{cfg.UpstreamAddr: true}
+	for _, m := range cfg.Models {
+		seen[m.upstreamAddr(cfg.UpstreamAddr)] = true
+	}
+	return len(seen)
+}
+
+// upstreamAddr resolves the backend this model is served from, falling back
+// to the gateway-wide default.
+func (m gwModel) upstreamAddr(defaultAddr string) string {
+	if m.UpstreamAddr != "" {
+		return m.UpstreamAddr
+	}
+	return defaultAddr
 }
 
 func (m gwModel) acceptsImages() bool {
@@ -332,6 +365,14 @@ func loadConfig(path string) (gwConfig, error) {
 	if _, err := url.Parse(cfg.UpstreamAddr); err != nil {
 		return cfg, fmt.Errorf("upstream_addr %q: %w", cfg.UpstreamAddr, err)
 	}
+	for i, m := range cfg.Models {
+		if m.UpstreamAddr == "" {
+			continue
+		}
+		if _, err := url.Parse(m.UpstreamAddr); err != nil {
+			return cfg, fmt.Errorf("models[%d].upstream_addr %q: %w", i, m.UpstreamAddr, err)
+		}
+	}
 	return cfg, nil
 }
 
@@ -474,7 +515,12 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 type gateway struct {
 	mu    sync.RWMutex
 	cfg   gwConfig
-	proxy *httputil.ReverseProxy
+	proxy *httputil.ReverseProxy // the default (top-level upstream_addr) proxy
+	// proxies holds one reverse proxy per DISTINCT upstream address, so a
+	// model with its own upstream_addr reuses connections/transport state
+	// per backend instead of getting a fresh proxy per request. Always
+	// contains the default address; rebuilt wholesale on every apply().
+	proxies map[string]*httputil.ReverseProxy
 	// byID indexes models by public id AND by "<owned_by>/<id>" so callers
 	// may use either "kat-awq" or "oaica/kat-awq".
 	byID map[string]gwModel
@@ -514,10 +560,29 @@ type gateway struct {
 }
 
 func (g *gateway) apply(cfg gwConfig) error {
-	p, err := newProxy(cfg.UpstreamAddr, g.logUpstreamError)
-	if err != nil {
+	// Build every distinct upstream up front: a reload that names a bad
+	// address must be rejected as a whole, not discovered per-request.
+	proxies := make(map[string]*httputil.ReverseProxy, 1+len(cfg.Models))
+	newFor := func(addr string) error {
+		if _, ok := proxies[addr]; ok {
+			return nil
+		}
+		p, err := newProxy(addr, g.logUpstreamError)
+		if err != nil {
+			return err
+		}
+		proxies[addr] = p
+		return nil
+	}
+	if err := newFor(cfg.UpstreamAddr); err != nil {
 		return err
 	}
+	for _, m := range cfg.Models {
+		if err := newFor(m.upstreamAddr(cfg.UpstreamAddr)); err != nil {
+			return err
+		}
+	}
+	p := proxies[cfg.UpstreamAddr]
 	byID := make(map[string]gwModel, len(cfg.Models)*2)
 	for _, m := range cfg.Models {
 		byID[m.ID] = m
@@ -539,6 +604,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 	g.mu.Lock()
 	g.cfg = cfg
 	g.proxy = p
+	g.proxies = proxies
 	g.byID = byID
 	g.mu.Unlock()
 	g.ledgerMu.Lock()
@@ -682,8 +748,8 @@ func (g *gateway) reload(path string) {
 		log.Printf("oaica-gateway: reload REJECTED, keeping previous config: %v", err)
 		return
 	}
-	log.Printf("oaica-gateway: config reloaded: %d models, %d keys, upstream=%s",
-		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr)
+	log.Printf("oaica-gateway: config reloaded: %d models, %d keys, upstream=%s (%d distinct upstreams)",
+		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr, distinctUpstreams(cfg))
 }
 
 // keyLabel returns the label for a valid Bearer key, or "" if unauthenticated.
@@ -804,8 +870,13 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	// "ok" with every replica dead (audit 2026-08-25).
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
+	// Deliberately still ONE probe, of models[0] on its own upstream: the
+	// gateway is "up" if the primary model serves. Probing every backend
+	// would let a secondary model's dead upstream 503 the whole gateway
+	// (and cost one real completion per backend per cache window).
+	probeUp := models[0].upstreamAddr(up)
 	body := `{"model":` + fmt.Sprintf("%q", models[0].upstreamID()) + `,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}`
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(up, "/")+"/v1/chat/completions", strings.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(probeUp, "/")+"/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if k := os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY"); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
@@ -819,7 +890,10 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	if resp.StatusCode != http.StatusOK {
 		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode)}}
 	}
-	return healthResult{http.StatusOK, map[string]any{"status": "ok"}}
+	// upstreams is a topology hint only (how many distinct backends this
+	// gateway fronts), not a reachability report -- see probeUp above for
+	// why the secondary backends are not probed.
+	return healthResult{http.StatusOK, map[string]any{"status": "ok", "upstreams": distinctUpstreams(gwConfig{UpstreamAddr: up, Models: models})}}
 }
 
 // ledgerEntry is one metered completion. Appended as a JSON line so it can
@@ -1123,7 +1197,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	modelID, _ := req["model"].(string)
 	g.mu.RLock()
 	m, ok := g.byID[modelID]
-	proxy := g.proxy
+	// Route to the model's own backend when it declares one; models
+	// without upstream_addr keep hitting the default proxy.
+	proxy := g.proxies[m.upstreamAddr(g.cfg.UpstreamAddr)]
+	if proxy == nil {
+		proxy = g.proxy
+	}
 	threshold := g.largeContextThreshold
 	sem := g.largeContextSem
 	g.mu.RUnlock()
@@ -1557,8 +1636,8 @@ func main() {
 	if err := g.apply(cfg); err != nil {
 		log.Fatalf("oaica-gateway: %v", err)
 	}
-	log.Printf("oaica-gateway: %d models, %d keys, upstream=%s, listen=%s, ledger=%s",
-		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr, cfg.ListenAddr, cfg.LedgerPath)
+	log.Printf("oaica-gateway: %d models, %d keys, upstream=%s (%d distinct upstreams), listen=%s, ledger=%s",
+		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr, distinctUpstreams(cfg), cfg.ListenAddr, cfg.LedgerPath)
 
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)

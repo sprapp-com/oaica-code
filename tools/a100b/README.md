@@ -102,9 +102,12 @@ Cloudflare (api.oaica.com) -> cloudflared ON a100b (/workspace/cf/run.sh) -> :80
   :30106 vLLM oaica-35b-a3b-vision  GPU0    :30108 vLLM oaica-35b-a3b-vision  GPU1
 ```
 
-GPU7 (`:30107`, `nvidia-nemotron-3.5-lightning-30b-a3b`) is NOT behind
-oaicalb or the gateway — standalone, reached directly. See "Watchdog
-behaviour" below for why.
+GPU7 (`:30107`, `oaica-nemotron-30b-a3b`) sits behind its own oaicalb
+(`:30120`) and IS in the gateway (`oaica-gateway.json` model entry with a
+per-model `upstream_addr`), but bypasses gatekeeper on purpose — the gateway
+already authenticates the caller and `:30120` binds loopback only. See
+"Watchdog behaviour" below for the replica, and "Second model pool" for the
+gateway/LB wiring.
 
 The tunnel is the `oaica-api` tunnel in the Cloudflare account that owns
 oaica.com (unisqu, `125f3856…`), run directly on the box with a tunnel token
@@ -183,38 +186,76 @@ without reintroducing this, and `--enable-prefix-caching` must NOT be
 disabled to "fix" this — that was explicitly ruled out; the actual fix is
 the async-scheduling flag.
 
-`REPLICAS` defaults to `0:30106 1:30108` (GPU0 + GPU1, 2026-08-29 — GPU2
-released for other work, GPU1 added with explicit user override of the
-standing "never touch GPU1" rule). GPU5 is held by the malay35b-offload
-`prism_server` plus another session's 52 GB job, so an oaica-35b-a3b-vision
-replica OOMs at startup there. A `booting()` guard skips a port whose
-api_server exists but is not yet listening (vLLM takes ~100 s to load), so
-a slow start is not treated as a crash.
+`REPLICAS` defaults to `0:30106 1:30108` (GPU0 + GPU1). GPU2 was released
+back to other tenants 2026-08-29 22:42Z. GPU5 is held by the
+malay35b-offload `prism_server` plus another session's 52 GB job, so an
+oaica-35b-a3b-vision replica OOMs at startup there. A `booting()` guard
+skips a port whose api_server exists but is not yet listening (vLLM takes
+~100 s to load), so a slow start is not treated as a crash.
 
-GPU7 runs a second, unrelated model standalone (no watchdog):
-`nvidia-nemotron-3.5-lightning-30b-a3b`
-(useful-quants/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-W4A16), port `:30107`,
-1M context (`--max-model-len 1048576`, well past the model's native 262144
-— see `nemotron_gpu7_launch.sh`'s doc comment for the tradeoffs accepted).
-`--enforce-eager` because `/dev/shm` is noexec and `/workspace` lacked
-compile-cache headroom when this was set up — a real gap, not fixed yet.
+## Second model pool: oaica-nemotron-30b-a3b (GPU7)
 
-**Metered since 2026-08-29** via a second, single-backend oaicalb
-instance (`nemotron-oaicalb.json`, binary `/workspace/oaicalb-linux-amd64`
-— same binary as the main fleet's, just a different `-config`): leastconn
-`:30120`, session-hash `:8191`, status `:8192/status`, reports to meterhub
-the same way the main fleet does. Before this, GPU7 traffic went straight
-to `:30107` and was completely invisible to metering (found via the same
-class of gap fixed for the main fleet's stale client sessions — see
-oaicalb's own file header comment: "any future multi-replica model...
-gets the same leastconn + session-hash load balancing by running a second
-oaicalb with its own `-config`, not by touching this code" — this is that
-extension point in use). All 3 client boxes' `remotes.json` repointed from
-direct `:30107` to `:30120` (tunneled 1:1, added to each box's
-`apex_tunloop.sh` `PORTS` list). Launch:
-`nohup /workspace/oaicalb-linux-amd64 -config /workspace/nemotron-oaicalb.json > /workspace/nemotron-oaicalb.log 2>&1 &`
-— not yet under `stack_watchdog.sh` supervision (tracked as a gap, same
-as the rest of GPU7's setup).
+GPU7 was swapped 2026-08-29 from a third oaica-35b-a3b-vision replica to a
+new, unrelated pool: `oaica-nemotron-30b-a3b`
+(NVIDIA-Nemotron-3.5-Lightning-30B-A3B, W4A16 compressed-tensors, HF
+`useful-quants/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-W4A16`, arch
+`NemotronHForCausalLM`, hybrid Mamba/MoE, ~3B active, native
+`max_position_embeddings` 262144). One vLLM 0.24.0 replica on GPU7 `:30107`
+(GPU7 is shared with a ~6 GB co-tenant; the replica uses ~67 GB at
+`--gpu-memory-utilization 0.82`, KV cache 1.63M tokens).
+
+Launch flags: `--quantization compressed-tensors --dtype bfloat16
+--max-model-len 262144 --max-num-batched-tokens 8192 --max-num-seqs 8
+--gpu-memory-utilization 0.82 --enforce-eager --enable-prefix-caching
+--enable-chunked-prefill --enable-auto-tool-choice --tool-call-parser
+qwen3_xml --reasoning-parser nemotron_v3 --enable-prompt-tokens-details
+--trust-remote-code`. Why `qwen3_xml`/`nemotron_v3`: the model's chat
+template emits `<think>…</think>` reasoning (thinking ON by default via
+`enable_thinking=True`) and Qwen3-Coder-style XML tool calls
+(`<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`);
+with the `hermes` parser, tool_calls came back null and reasoning leaked
+into content — verified fixed with this pair (content clean, reasoning in
+`reasoning_content`, tool_calls parsed). Thinking is on by default, so a
+short `max_tokens` can be consumed entirely by reasoning (a 120-token
+stream test produced 0 content chars, 366 reasoning chars); clients can
+pass `chat_template_kwargs: {"enable_thinking": false}` to suppress it.
+
+`--enforce-eager` is kept because torch.compile's cache needs an
+exec-capable filesystem with room and `/workspace` is 96% full (2.2 GB
+free) / the root overlay has 528 MB free — the vendor's example says not
+to use enforce-eager; single-stream decode measured ~18 tok/s with it on.
+Fix: free `/workspace` space, then drop the flag.
+
+Supervised by `/workspace/nemotron_watchdog.sh` (source
+`tools/a100b/nemotron_watchdog.sh`, log `/workspace/nemotron_watchdog.log`,
+replica log `/workspace/vllm_nemotron_gpu7.log`) — a sibling of
+`vllm_awq_watchdog.sh` with the same OOM attribution / orphan sweep /
+backoff. Since the watchdog persists crash-backoff state, killing the
+replica right after restarting its watchdog delays the relaunch (observed
+7 min) — to change launch flags: edit the script, kill the watchdog AND
+the replica, then start the watchdog.
+
+**Its own load balancer**, same reasoning as the main fleet's chat-aware
+probe: `oaicalb` on `:30120` (leastconn) / `:8191` (session-hash) /
+`:8192` (status), config `/workspace/nemotron-oaicalb.json` (repo copy
+`tools/a100b/nemotron-oaicalb.json`, `probe_model
+oaica-nemotron-30b-a3b`), same binary as the main fleet's — see oaicalb's
+own file header comment: "any future multi-replica model... gets the same
+leastconn + session-hash load balancing by running a second oaicalb with
+its own `-config`, not by touching this code". A separate LB means a hung
+Nemotron replica can never be picked for an oaica-35b request and vice
+versa. Reports to meterhub the same way the main fleet does. Now
+supervised by `stack_watchdog.sh` (`listening 30120 || start_nemotron_lb`).
+Launch: `nohup /workspace/oaicalb-linux-amd64 -config
+/workspace/nemotron-oaicalb.json > /workspace/nemotron-oaicalb.log 2>&1 &`.
+
+**In the gateway** via a per-model `upstream_addr`
+(`http://127.0.0.1:30120`) pointing at its own LB instead of the shared
+`upstream_addr` gatekeeper path — see "Layout on the box" / `gateway.json`
+for the model entry shape. Verified end-to-end: `POST
+https://api.oaica.com/v1/chat/completions` with model
+`oaica-nemotron-30b-a3b` → 200, ledger row carries model/upstream_model,
+gateway log "2 models … (2 distinct upstreams)".
 
 ## Control-plane supervisor + reboot
 
@@ -277,3 +318,19 @@ restore faster from the lenovo mirror.
   (default 0.9-0.92 -> ~73 GiB). A "free" GPU with 20 GB used is not free.
 - Ledger rows with `usage_seen=false` on a 200 mean vLLM sent no usage; do
   not invoice from those zeros.
+- `scp` with more than one "src dst" pair silently does a remote→remote
+  copy and hangs — pass one pair per invocation.
+- `ps | grep <script path>` self-matches the invoking ssh shell; kill
+  supervisors by argv-exact match instead, e.g.
+  `ps -eo pid,args | awk '$2=="/bin/bash" && $3=="/workspace/stack_watchdog.sh"{print $1}'`.
+
+## Gateway: per-model upstream_addr (2026-08-29)
+
+Each entry in `models[]` may set its own `upstream_addr`, overriding the
+top-level one; entries that omit it still inherit the top-level default.
+The gateway runs one reverse proxy per distinct upstream, but its health
+probe only checks `models[0]` — `/health`'s body is now `{"status":"ok",
+"upstreams":N}` and the startup/reload log says "(N distinct upstreams)".
+This is what lets `oaica-nemotron-30b-a3b` point at its own oaicalb
+(`:30120`) while `oaica-35b-a3b-vision` keeps going through gatekeeper —
+see "Second model pool" above for why that model bypasses gatekeeper.

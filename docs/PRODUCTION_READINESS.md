@@ -167,3 +167,30 @@ arc was live:
   not implemented — the source doc itself states its thresholds are
   uncalibrated placeholders; would swap one uncalibrated heuristic
   (current admission-control gate) for a more complex uncalibrated one.
+
+## Addendum — 2026-08-29: second model pool (oaica-nemotron-30b-a3b) + gateway multi-upstream
+
+GPU7 moved from a third oaica-35b-a3b-vision replica to a new, unrelated
+model pool: `oaica-nemotron-30b-a3b` (NVIDIA-Nemotron-3.5-Lightning-30B-A3B,
+W4A16, hybrid Mamba/MoE, ~3B active), one vLLM 0.24.0 replica on `:30107`,
+supervised by a new sibling watchdog (`nemotron_watchdog.sh`) with the same
+OOM-attribution/orphan-sweep/backoff behavior as the main fleet's. Correct
+tool/reasoning parsing required `qwen3_xml` + `nemotron_v3` (the default
+`hermes` parser returned null tool_calls and leaked reasoning into
+content) — verified fixed. `--enforce-eager` remains a known gap
+(`/workspace` and the root overlay lack torch.compile cache headroom);
+measured ~18 tok/s single-stream decode with it on.
+
+The gateway (`tools/gateway`) gained per-model `upstream_addr`, letting one
+gateway front multiple distinct upstreams (one reverse proxy each; health
+probe still checks only `models[0]`). This model has its own oaicalb
+(`:30120`) and gets its own gateway model entry pointing at it directly —
+gatekeeper is bypassed on purpose since the gateway already authenticates
+callers and `:30120` binds loopback only. Verified end-to-end on
+`api.oaica.com`: 200 response, ledger row with correct model/upstream_model,
+gateway log confirms "2 distinct upstreams". Pricing on the new model entry
+is a placeholder (copied from oaica-35b-a3b-vision), not a business
+decision.
+
+See `tools/a100b/README.md` ("Second model pool: oaica-nemotron-30b-a3b")
+for full operational detail.
