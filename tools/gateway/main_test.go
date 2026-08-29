@@ -1589,3 +1589,109 @@ func TestUpstreamErrorLog_DisabledWhenPathEmpty(t *testing.T) {
 		t.Error("expected errLog to stay nil when UpstreamErrorLogPath is empty")
 	}
 }
+
+// -- context-length-fit clamp (2026-08-29) --
+
+func TestContextFitClamp_ReproducesRealIncident_PromptPlusMaxTokensOverContextLength(t *testing.T) {
+	// Real 2026-08-29 incident: a Claude Code auto-compaction call itself
+	// failed with "maximum context length is 262144 tokens... requested
+	// 230145 input + 32000 output = 262145" -- one token over. This test
+	// builds a request whose messages estimate to roughly that many
+	// tokens (estimateMessageTokens is chars/4) with max_tokens=32000,
+	// against a model with ContextLength=262144, and asserts the gateway
+	// clamps max_tokens down so the forwarded request actually fits,
+	// instead of forwarding one guaranteed to 400 upstream.
+	var gotMaxTokens float64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		json.Unmarshal(b, &req)
+		gotMaxTokens, _ = req["max_tokens"].(float64)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	cfg := gwConfig{
+		UpstreamAddr: upstream.URL, ListenAddr: ":0", LedgerPath: ledger,
+		APIKeys: []gwKey{{SHA256: keyHash("sk-new"), Label: "openrouter"}},
+		Models: []gwModel{{
+			ID: "kat-awq", UpstreamID: "kat-awq-served", OwnedBy: "oaica",
+			ContextLength: 262144, MaxCompletionTokens: 32768,
+			Pricing: gwPricing{Prompt: "0.00000005", Completion: "0.00000012"},
+		}},
+	}
+	g := &gateway{}
+	if err := g.apply(cfg); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	// ~230145 tokens at chars/4 -> ~920580 chars of message content.
+	bigContent := strings.Repeat("x", 920580)
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"messages":   []map[string]any{{"role": "user", "content": bigContent}},
+		"max_tokens": 32000,
+		"stream":     true,
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected the gateway to clamp and forward successfully, got %d", resp.StatusCode)
+	}
+	if gotMaxTokens >= 32000 {
+		t.Fatalf("expected max_tokens to be clamped below the original 32000 (prompt was near context_length), got %v", gotMaxTokens)
+	}
+	if gotMaxTokens <= 0 {
+		t.Fatalf("expected a positive, still-useful max_tokens after clamping, got %v", gotMaxTokens)
+	}
+}
+
+func TestContextFitClamp_SmallPromptUnaffected(t *testing.T) {
+	// A normal small request must not have its max_tokens touched by the
+	// context-fit clamp -- only large-context requests near the ceiling
+	// should be affected.
+	var gotMaxTokens float64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		json.Unmarshal(b, &req)
+		gotMaxTokens, _ = req["max_tokens"].(float64)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	g, _ := newTestGateway(t, upstream.URL)
+	srv := httptest.NewServer(mux(g))
+	defer srv.Close()
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "kat-awq",
+		"messages":   []map[string]any{{"role": "user", "content": "hello"}},
+		"max_tokens": 2000,
+		"stream":     true,
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-new")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if gotMaxTokens != 2000 {
+		t.Errorf("expected max_tokens to pass through unclamped for a small request, got %v", gotMaxTokens)
+	}
+}

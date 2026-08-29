@@ -1122,12 +1122,15 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q does not accept image input (text only)", m.ID))
 		return
 	}
+	// estTokens is computed once and reused below: admission control, the
+	// context-length-fit clamp, and error-log correlation all need it.
+	estTokens := estimateMessageTokens(req)
 	// Admission control for large-context requests — see
 	// gwConfig.LargeContextTokenThreshold's doc for the incident this
 	// closes. estimateMessageTokens is coarse on purpose (chars/4, no real
 	// tokenizer call) — it only needs to catch "this is huge", not be
 	// exact. threshold < 0 disables the check entirely.
-	if threshold >= 0 && sem != nil && estimateMessageTokens(req) >= threshold {
+	if threshold >= 0 && sem != nil && estTokens >= threshold {
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
@@ -1155,6 +1158,34 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
 			if v, ok := req[k].(float64); ok && int(v) > limit {
 				req[k] = limit
+			}
+		}
+	}
+	// Context-length-fit clamp — real 2026-08-29 incident: a Claude Code
+	// session's own auto-compaction call itself failed with "maximum
+	// context length is 262144 tokens... requested 230145 input + 32000
+	// output = 262145" -- prompt_tokens + max_tokens exceeded the model's
+	// context_length by exactly ONE token, a hard 400 from upstream with
+	// no way for the client to recover except /clear (losing the whole
+	// session). The client has no way to know the model's real
+	// context_length or its own coarse prompt-size estimate the way we
+	// do; the gateway does, and can just... not send a request doomed to
+	// fail. Clamp max_tokens down to whatever fits instead of forwarding
+	// a request that's already guaranteed to 400 -- a shorter real
+	// completion beats a hard failure every time, especially for an
+	// automatic compaction call the client can't retry with a smaller ask
+	// on its own. estTokens is the same coarse chars/4 estimate used for
+	// admission control -- a margin absorbs its inaccuracy so this clamp
+	// undershoots slightly rather than still barely exceeding the limit.
+	const contextFitMargin = 2048
+	if m.ContextLength > 0 {
+		fitBudget := m.ContextLength - estTokens - contextFitMargin
+		if fitBudget < 256 {
+			fitBudget = 256 // never clamp to something too small to be a useful reply
+		}
+		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+			if v, ok := req[k].(float64); ok && int(v) > fitBudget {
+				req[k] = fitBudget
 			}
 		}
 	}
@@ -1209,7 +1240,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	errInfo := &errCaptureInfo{
 		RequestID: rid, SessionID: sessionID, Model: modelID,
-		EstTokens: estimateMessageTokens(req), MaxTokens: maxTokens, ReqBytes: len(body),
+		EstTokens: estTokens, MaxTokens: maxTokens, ReqBytes: len(body),
 	}
 	ctx := context.WithValue(r.Context(), ctxKeyBackend{}, backend)
 	ctx = context.WithValue(ctx, ctxKeyErrCapture{}, errInfo)
