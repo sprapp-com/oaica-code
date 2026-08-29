@@ -577,6 +577,12 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
 	baseURL := table.Default.BaseURL
 
+	// Per-session prompt-size calibration for the context-fit clamp below --
+	// see context_calibration.go for the 2026-08-29 incident that made a
+	// pure chars/4 estimate untenable. Scoped to this proxy instance (one
+	// per launch) so nothing leaks between runs or between tests.
+	calib := newPromptCalibrator(maxCalibratedSessions)
+
 	mux := http.NewServeMux()
 
 	// GET /v1/models — proxy straight to the remote's /models endpoint so
@@ -663,6 +669,17 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// (body)/4 is the same coarse chars/4 estimate tools/gateway uses
 		// server-side for the identical purpose -- consistent, not exact
 		// by design.
+		//
+		// 2026-08-30: chars/4 is no longer the only estimator. calibKey
+		// identifies the conversation; once one successful response has
+		// reported its REAL usage.prompt_tokens we scale by the measured
+		// tokens-per-byte for THIS session instead (context_calibration.go).
+		// table.SessionID is the same value we send upstream as X-Session-Id
+		// just below, so client and server calibrate on the same key.
+		calibKey := table.SessionID
+		if calibKey == "" {
+			calibKey = route.Label
+		}
 		if route.ContextWindow > 0 {
 			// contextFitMarginRatio is NOT a flat token count -- a real
 			// 2026-08-29 recurrence (same incident class, 22x in one
@@ -676,11 +693,18 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// error, not a guess -- still a heuristic, not a hard
 			// guarantee, but matches the server-side gateway's identical
 			// fix for consistency.
-			estTokens := len(body) / 4
-			margin := int(float64(estTokens) * 0.30)
-			if margin < 4096 {
-				margin = 4096
-			}
+			//
+			// 2026-08-30 UPDATE: that 30%-of-chars/4 pair is now only the
+			// UNCALIBRATED path (first request of a session). It is kept
+			// exactly as it was because it is the well-tested safe default,
+			// but it is also what rejected an ~806 KB compaction call whose
+			// real prompt was ~243,000 tokens against a 262,144 window --
+			// est 201,670 x 1.30 = 262,171, over by a rounding error, while
+			// ~19,000 tokens of real headroom sat unused. Once we have a
+			// measured tokens-per-byte for this session, contextFitPlan uses
+			// it with a 3% margin instead, and that whole failure mode goes
+			// away.
+			estTokens, margin, _ := contextFitPlan(calib, calibKey, len(body))
 			fitBudget := route.ContextWindow - estTokens - margin
 			// minViableCompletion: a real 2026-08-30 recurrence proved the
 			// OLD unconditional "floor fitBudget at 256" rule was itself
@@ -692,8 +716,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// clear reason instead of forwarding one still doomed to fail.
 			const minViableCompletion = 16
 			if fitBudget < minViableCompletion {
+				// Anthropic's own wording -- see promptTooLongMessage for
+				// why the exact phrasing is load-bearing for Claude Code's
+				// recovery path.
 				writeAnthropicError(w, http.StatusBadRequest,
-					fmt.Sprintf("prompt is too large to fit this model's %d-token context window with any output budget; please reduce the prompt length", route.ContextWindow))
+					promptTooLongMessage(estTokens, route.ContextWindow-minViableCompletion))
 				return
 			}
 			if oaiReq.MaxTokens > fitBudget {
@@ -744,14 +771,37 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		if resp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(resp.Body)
-			writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
+			text := strings.TrimSpace(string(respBody))
+			// An upstream context overflow is not an opaque backend failure:
+			// it is the SAME condition the clamp above tries to predict, and
+			// vLLM states the real numbers. Two things follow. (1) Re-emit it
+			// as Anthropic's "prompt is too long: N tokens > M maximum" 400
+			// so Claude Code takes its context-recovery path instead of
+			// retrying the identical request forever (the 2026-08-29
+			// compaction loop). (2) The reported in-the-messages count is
+			// ground truth for this session's tokens-per-byte -- better than
+			// anything we can estimate -- so seed the calibration with it and
+			// the very next request gets a measured budget.
+			if resp.StatusCode == http.StatusBadRequest {
+				if promptTokens, maxTokens, ok := parseUpstreamContextOverflow(text); ok {
+					calib.record(calibKey, len(body), promptTokens)
+					writeAnthropicError(w, http.StatusBadRequest, promptTooLongMessage(promptTokens, maxTokens))
+					return
+				}
+			}
+			writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, text))
 			return
 		}
 
+		// Record the REAL prompt size for this session -- only from a usage
+		// object the upstream actually sent on a 200 (see
+		// context_calibration.go). Never from an error, never a guess.
+		recordUsage := func(promptTokens int) { calib.record(calibKey, len(body), promptTokens) }
+
 		if anthReq.Stream {
-			handleStreamResponse(w, resp.Body, reqModel)
+			handleStreamResponse(w, resp.Body, reqModel, recordUsage)
 		} else {
-			handleNonStreamResponse(w, resp.Body, reqModel)
+			handleNonStreamResponse(w, resp.Body, reqModel, recordUsage)
 		}
 	})
 
@@ -761,7 +811,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 // handleNonStreamResponse reads one complete OpenAI JSON response, builds an
 // api.ChatResponse, and emits an Anthropic MessagesResponse as JSON.
-func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string) {
+// onUsage, when non-nil, is called with the upstream's real
+// usage.prompt_tokens so the caller can calibrate its prompt-size estimate.
+func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int)) {
 	respBody, err := io.ReadAll(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+err.Error())
@@ -771,6 +823,9 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "decode upstream response: "+err.Error())
 		return
+	}
+	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
+		onUsage(oaiResp.Usage.PromptTokens)
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
@@ -783,7 +838,10 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // handleStreamResponse reads OpenAI SSE chunks from body, feeds incremental
 // api.ChatResponse values through a single anthropic.StreamConverter, and
 // writes each returned StreamEvent as an Anthropic SSE event.
-func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string) {
+// onUsage, when non-nil, is called with the real usage.prompt_tokens from
+// the stream's final usage-only chunk (stream_options.include_usage) so the
+// caller can calibrate its prompt-size estimate.
+func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, http.StatusInternalServerError, "streaming not supported by response writer")
@@ -925,6 +983,13 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// carrying only metrics; Process emits nothing for an empty
 			// non-final ChatResponse, but it does store inputTokens on the
 			// first call. We instead fold usage into the final done event below.
+			//
+			// It IS the ground truth for prompt size, though: this chunk is
+			// the only place a streaming response reports prompt_tokens, so
+			// it is what feeds the per-session context-fit calibration.
+			if onUsage != nil && chunk.Usage.PromptTokens > 0 {
+				onUsage(chunk.Usage.PromptTokens)
+			}
 		}
 	}
 

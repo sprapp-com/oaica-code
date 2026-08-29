@@ -1707,8 +1707,9 @@ func TestContextFitClamp_RejectsWhenPromptLeavesNoSafeRoom(t *testing.T) {
 	if upstreamCalled {
 		t.Error("expected the gateway to reject client-side WITHOUT ever calling upstream")
 	}
-	if !strings.Contains(string(respBody), "too large") {
-		t.Errorf("expected a clear 'prompt too large' reason in the response, got %s", respBody)
+	// Anthropic's own wording (2026-08-30) -- see promptTooLongMessage.
+	if !strings.Contains(string(respBody), "prompt is too long: ") {
+		t.Errorf("expected Anthropic's 'prompt is too long: ' wording in the response, got %s", respBody)
 	}
 }
 

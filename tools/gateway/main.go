@@ -402,6 +402,13 @@ type errCaptureInfo struct {
 	EstTokens int
 	MaxTokens int
 	ReqBytes  int
+	// Calibrate, when non-nil, records a REAL prompt-token count for this
+	// request's session (see context_calibration.go). An upstream
+	// context-overflow 400 states the true message-token count, which is
+	// better ground truth than any estimate we can compute -- feeding it
+	// back means the very next request of that session gets a measured
+	// budget instead of a chars/4 guess.
+	Calibrate func(promptTokens int)
 }
 
 // newProxy builds a reverse proxy with its own transport and explicit
@@ -472,14 +479,35 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 			case http.StatusBadRequest:
 				code = "invalid_request_error"
 			}
-			if onUpstreamError != nil {
-				var info *errCaptureInfo
-				if v, ok := resp.Request.Context().Value(ctxKeyErrCapture{}).(*errCaptureInfo); ok {
-					info = v
+			var info *errCaptureInfo
+			if v, ok := resp.Request.Context().Value(ctxKeyErrCapture{}).(*errCaptureInfo); ok {
+				info = v
+			}
+			// An upstream context overflow ("This model's maximum context
+			// length is N tokens. However, you requested M tokens (K in the
+			// messages, ...)") is not an opaque backend failure -- it is the
+			// exact condition the context-fit clamp tries to predict, and it
+			// arrives with the REAL numbers. Rewrite it into Anthropic's
+			// "prompt is too long: K tokens > N maximum" so an Anthropic-
+			// shaped client (Claude Code, through cmd/launch's proxy) takes
+			// its context-recovery path instead of retrying the identical
+			// doomed request -- the 2026-08-29 compaction loop -- and feed K
+			// back into this session's calibration. The error LOG keeps the
+			// verbatim upstream text -- that sink exists for diagnosis, and
+			// the raw numbers are the whole point of it.
+			clientMsg := msg
+			if resp.StatusCode == http.StatusBadRequest {
+				if promptTokens, maxTokens, ok := parseUpstreamContextOverflow(msg); ok {
+					if info != nil && info.Calibrate != nil {
+						info.Calibrate(promptTokens)
+					}
+					clientMsg = promptTooLongMessage(promptTokens, maxTokens)
 				}
+			}
+			if onUpstreamError != nil {
 				onUpstreamError(info, resp.StatusCode, code, msg)
 			}
-			b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": code, "code": code}})
+			b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": clientMsg, "type": code, "code": code}})
 			resp.Body = io.NopCloser(bytes.NewReader(b))
 			resp.ContentLength = int64(len(b))
 			resp.Header.Set("Content-Type", "application/json")
@@ -540,6 +568,13 @@ type gateway struct {
 	// apply() can rebuild them on a config reload.
 	largeContextThreshold int
 	largeContextSem       chan struct{}
+
+	// calib holds per-session (request bytes -> real prompt_tokens) pairs
+	// for the context-fit clamp; see context_calibration.go. Lazily built
+	// via calibrator() because &gateway{} is constructed directly in a few
+	// places (main, tests) with no constructor to hook.
+	calibOnce sync.Once
+	calib     *promptCalibrator
 
 	// /health probe cache; see healthCacheTTL.
 	healthMu   sync.Mutex
@@ -723,6 +758,14 @@ func runMeterReporter(ch <-chan usageReport, addr, token string) {
 // reportUsage sends e to the meter reporter's channel, non-blocking. A full
 // channel (meterhub down/slow for a while) drops the report rather than
 // stalling the request that triggered it — see meterCh's doc.
+// calibrator returns the per-session prompt-size calibrator, building it on
+// first use. Bounded at maxCalibratedSessions -- the gateway sees every
+// client's sessions, so this map must never grow without limit.
+func (g *gateway) calibrator() *promptCalibrator {
+	g.calibOnce.Do(func() { g.calib = newPromptCalibrator(maxCalibratedSessions) })
+	return g.calib
+}
+
 func (g *gateway) reportUsage(e ledgerEntry) {
 	g.mu.RLock()
 	ch := g.meterCh
@@ -1143,6 +1186,14 @@ func mustRand() io.Reader {
 // either direction doesn't change that classification for the threshold
 // this gates at (see gwConfig.LargeContextTokenThreshold, default 50000).
 func estimateMessageTokens(req map[string]any) int {
+	return messagesBytes(req) / 4
+}
+
+// messagesBytes is the serialized size of req["messages"]. It is the unit
+// BOTH the chars/4 estimate and the per-session calibration
+// (context_calibration.go) are expressed in, so a calibrated
+// tokens-per-byte ratio measured on one turn applies directly to the next.
+func messagesBytes(req map[string]any) int {
 	msgs, ok := req["messages"]
 	if !ok {
 		return 0
@@ -1151,7 +1202,7 @@ func estimateMessageTokens(req map[string]any) int {
 	if err != nil {
 		return 0
 	}
-	return len(b) / 4
+	return len(b)
 }
 
 func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
@@ -1217,7 +1268,20 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// estTokens is computed once and reused below: admission control, the
 	// context-length-fit clamp, and error-log correlation all need it.
-	estTokens := estimateMessageTokens(req)
+	msgBytes := messagesBytes(req)
+	estTokens := msgBytes / 4
+	// calibKey identifies the conversation for the per-session prompt-size
+	// calibration used by the context-fit clamp below. X-Session-Id is what
+	// cmd/launch's proxy sends (newProxySessionID) and what already lands in
+	// the ledger's session_id, so both layers calibrate the same thing.
+	// Without one we key by API-key label + model: coarser than a session
+	// (several conversations from one key share a bucket) but still far
+	// closer to reality than chars/4, and the sanity bounds in
+	// promptCalibrator.record catch a mismatched pairing.
+	calibKey := r.Header.Get("X-Session-Id")
+	if calibKey == "" {
+		calibKey = label + "\x00" + modelID
+	}
 	// Admission control for large-context requests — see
 	// gwConfig.LargeContextTokenThreshold's doc for the incident this
 	// closes. estimateMessageTokens is coarse on purpose (chars/4, no real
@@ -1291,18 +1355,31 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// this, there is no safe positive max_tokens to force -- reject the
 	// request client-side with a clear reason instead of forwarding one
 	// still guaranteed to 400 upstream.
+	//
+	// 2026-08-30 UPDATE: the 30%/4096 pair below is now only the
+	// UNCALIBRATED path -- the first request of a session, where we have
+	// nothing better. It is unchanged because it is the well-tested safe
+	// default, but the same day proved it also errs the OTHER way: on the
+	// client proxy's identical clamp, an ~806 KB Claude Code body estimated
+	// at 201,670 tokens x 1.30 = 262,171 tripped this rejection against a
+	// 262,144 window, while the REAL prompt was ~243,000 -- ~19,000 tokens
+	// of headroom thrown away. And the request rejected was Claude Code's
+	// own auto-compaction call, the one request that would have shrunk the
+	// session, so the session could not recover on its own.
+	// contextFitPlan therefore prefers a per-session tokens-per-byte ratio
+	// measured from a real usage.prompt_tokens (context_calibration.go),
+	// with a 3%/512 margin, and only falls back to these constants.
 	const minViableCompletion = 16
-	const contextFitMarginRatio = 0.30
-	const contextFitMarginFloor = 4096
+	const contextFitMarginRatio = uncalibratedMarginRatio
+	const contextFitMarginFloor = uncalibratedMarginFloor
 	if m.ContextLength > 0 {
-		margin := int(float64(estTokens) * contextFitMarginRatio)
-		if margin < contextFitMarginFloor {
-			margin = contextFitMarginFloor
-		}
-		fitBudget := m.ContextLength - estTokens - margin
+		estFit, margin, _ := contextFitPlan(g.calibrator(), calibKey, msgBytes)
+		fitBudget := m.ContextLength - estFit - margin
 		if fitBudget < minViableCompletion {
+			// Anthropic's exact "prompt is too long: N tokens > M maximum"
+			// wording -- see promptTooLongMessage for why it is load-bearing.
 			writeErr(w, http.StatusBadRequest, "invalid_request_error",
-				fmt.Sprintf("prompt is too large to fit this model's %d-token context window with any output budget; please reduce the prompt length", m.ContextLength))
+				promptTooLongMessage(estFit, m.ContextLength-minViableCompletion))
 			return
 		}
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
@@ -1363,6 +1440,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	errInfo := &errCaptureInfo{
 		RequestID: rid, SessionID: sessionID, Model: modelID,
 		EstTokens: estTokens, MaxTokens: maxTokens, ReqBytes: len(body),
+		Calibrate: func(promptTokens int) { g.calibrator().record(calibKey, msgBytes, promptTokens) },
 	}
 	ctx := context.WithValue(r.Context(), ctxKeyBackend{}, backend)
 	ctx = context.WithValue(ctx, ctxKeyErrCapture{}, errInfo)
@@ -1390,6 +1468,13 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("X-Oaica-Metered", "1")
 	proxy.ServeHTTP(rec, r)
 	rec.finish()
+	// Ground truth for the next request of this session: only a 200 whose
+	// usage was actually seen (rec.seen covers the stream's final usage-only
+	// chunk as well as a non-stream usage object) -- never an error, never a
+	// zero. See context_calibration.go for the incident.
+	if rec.status == http.StatusOK && rec.seen && rec.usage.PromptTokens > 0 {
+		g.calibrator().record(calibKey, msgBytes, rec.usage.PromptTokens)
+	}
 	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
 }
 
