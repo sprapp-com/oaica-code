@@ -30,11 +30,20 @@
 # Usage: nohup /workspace/vllm_awq_watchdog.sh >/workspace/vllm_awq_watchdog.log 2>&1 &
 set -u
 
-MODEL_DIR=/dev/shm/kat_vision_awq
-HF_REPO=Ar4ikov/KAT-Coder-V2.5-Dev-AWQ-W4A16-ASYM
-HF_REV=446ea8c64909baff9a94c627b25765915b2c211d   # pinned; do not float
-TOK_PATCH=/workspace/kat_awq.tokenizer_config.json   # vendored from tools/a100b/
-TOK_SHA=3af7344522ce9496a14b7e701ecf14bb0aeeb067583a0c90681ccc3b75b49eea
+# 2026-08-29: swapped to the MTP (multi-token-prediction, speculative
+# decoding) variant -- KAT-Coder-V2.5-Dev-MTP, int4 AutoRound quant (NOT
+# the same quant method as the old AWQ model this replaced). Served model
+# name is unchanged (oaica-35b-a3b-vision) so no client-side change is
+# needed. TOK_SHA is this model's OWN tokenizer_config.json hash (it ships
+# a complete, working chat_template -- no external patch needed, unlike
+# the old model); restore_tokenizer() below is effectively a no-op for
+# this model (TOK_PATCH is stale/irrelevant to it) since tokenizer_ok()
+# will match TOK_SHA directly on every normal boot.
+MODEL_DIR=/dev/shm/oaica-35b-a3b-mtp-vision
+HF_REPO=slopops/KAT-Coder-V2.5-Dev-MTP-int4-AutoRound-SAR
+HF_REV=main
+TOK_PATCH=/workspace/kat_awq.tokenizer_config.json   # vendored from tools/a100b/ (stale for this model, kept as last-resort restore target only)
+TOK_SHA=5f7aa0d810000c4a0940b35c8f16e56c3439260fccc13a321826ebc3ccf2501f
 LOG=/workspace/vllm_awq_watchdog.log
 ALERT=/workspace/vllm_awq_watchdog.ALERT           # touched on any restore/backoff/stall-kill; poll it
 
@@ -104,7 +113,17 @@ launch() {
   # unbounded) -- enough to diagnose "why did the last boot die" without
   # accumulating logs forever.
   [ -s "$logfile" ] && mv -f "$logfile" "${logfile}.prev_crash"
-  log "launching oaica-35b-a3b-vision on GPU${gpu} :${port}"
+  log "launching oaica-35b-a3b-vision (MTP) on GPU${gpu} :${port}"
+  # --speculative-config is the model's own required recipe (its README)
+  # for the MTP head to do anything -- without it the MTP layers are just
+  # unused weight, no speedup, but not a crash risk either.
+  # --gpu-memory-utilization/--max-num-seqs deliberately do NOT match the
+  # model card's own example (0.55 / 8): that recipe was sized for a
+  # GB10's 128GB unified memory, not this box's 80GB-per-GPU A100s. Kept
+  # at our own already-validated A100 numbers instead -- the memory
+  # profile difference between AWQ and this int4-AutoRound quant is in
+  # the weights only (~21GB either way), not the KV-cache budget, so
+  # reusing our proven values is the safer bet for real concurrency here.
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
@@ -112,6 +131,7 @@ launch() {
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
     > "$logfile" 2>&1 &
   disown
 }
