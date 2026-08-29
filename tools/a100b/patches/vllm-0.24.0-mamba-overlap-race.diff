@@ -1,0 +1,71 @@
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -141,6 +141,16 @@
+         bias_bytes = accept_token_bias.to(tl.int64) * state_elem_size
+         src_block_addr = state_base_addr + src_block_id * state_block_stride
+         dst_block_addr = state_base_addr + dest_block_id * state_block_stride
++        # oaica backport of vllm PR #50729 ("Fix overlapping state copy race").
++        # When the spec-decode boundary crossing stays in the same block
++        # (src == dst block, bias > 0) this is a LEFT SHIFT inside one row:
++        # dst = src - bias_bytes. Lanes of one chunk store over bytes that
++        # other lanes of the same chunk still have to load whenever
++        # bias_bytes < COPY_BLOCK_SIZE, so the load of the whole chunk must
++        # complete before any lane stores. Chunks are walked low->high, which
++        # is already memmove-safe across chunks for a left shift. The
++        # condition is uniform within the program.
++        is_left_overlap = (src_block_id == dest_block_id) and (bias_bytes < COPY_BLOCK_SIZE)
+         offsets = tl.arange(0, COPY_BLOCK_SIZE)
+         for d in range(0, dim_rows):
+             row_src = src_block_addr + d * row_stride + bias_bytes
+@@ -150,6 +160,8 @@
+                 curr_src = (row_src + i + offsets).to(tl.pointer_type(tl.uint8))
+                 curr_dst = (row_dst + i + offsets).to(tl.pointer_type(tl.uint8))
+                 data = tl.load(curr_src, mask=mask)
++                if is_left_overlap:
++                    tl.debug_barrier()
+                 tl.store(curr_dst, data, mask=mask)
+         return
+ 
+@@ -183,12 +195,23 @@
+         # actual data when the state tensor uses as_strided page padding.
+         copy_size = state_inner_size * state_elem_size
+ 
++    # oaica backport of vllm PR #50729 ("Fix overlapping state copy race").
++    # Same-block SD-conv shifts have dst_addr < src_addr with overlapping
++    # ranges (a left shift by accept_token_bias tokens). Lanes of one chunk
++    # can store over bytes other lanes of that chunk still have to load, so
++    # complete the chunk's load before any lane stores. Low->high chunk order
++    # is already memmove-safe across chunks. Temporal-state copies are between
++    # distinct blocks (or exact self-copies) and never take the barrier.
++    # The condition is uniform within the program.
++    is_left_overlap = dst_addr < src_addr and dst_addr + copy_size > src_addr
+     offsets = tl.arange(0, COPY_BLOCK_SIZE)
+     for i in range(0, copy_size, COPY_BLOCK_SIZE):
+         mask = (i + offsets) < copy_size
+         curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+         curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+         data = tl.load(curr_src, mask=mask)
++        if is_left_overlap:
++            tl.debug_barrier()
+         tl.store(curr_dst, data, mask=mask)
+ 
+ 
+@@ -199,6 +222,7 @@
+     src_ptr = tl.load(src_ptrs + pid)
+     dst_ptr = tl.load(dst_ptrs + pid)
+     size = tl.load(sizes + pid)
++    is_left_overlap = dst_ptr < src_ptr and dst_ptr + size > src_ptr
+ 
+     offsets = tl.arange(0, BLOCK_SIZE)
+     for i in range(0, size, BLOCK_SIZE):
+@@ -208,6 +232,10 @@
+         curr_dst_ptr = (dst_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
+ 
+         data = tl.load(curr_src_ptr, mask=mask)
++        if is_left_overlap:
++            # Preserve each lane's source before a lower-address lane stores
++            # over it. The condition is uniform within the program.
++            tl.debug_barrier()
+         tl.store(curr_dst_ptr, data, mask=mask)
+ 
+ 
