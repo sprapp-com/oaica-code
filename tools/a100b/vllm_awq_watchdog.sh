@@ -145,6 +145,15 @@ launch() {
   # cache size. Could not reproduce the crash on demand in ~60 min of
   # load, so this is a mitigation with upstream evidence, not a proven
   # fix; the OOM/crash instrumentation below attributes any recurrence.
+  #
+  # --enable-prompt-tokens-details: vLLM 0.24.0 defaults this to OFF
+  # (cli_args.py: enable_prompt_tokens_details = False), so every
+  # response carried "prompt_tokens_details": null even at a live 38%
+  # prefix-cache hit rate -- the gateway's cached_tokens was 0 on all
+  # 3,134 ledger rows of 2026-08-29 and the cached_prompt price never
+  # applied (metering audit, same day). With the flag, usage carries
+  # prompt_tokens_details.cached_tokens and cache hits bill at the
+  # discounted rate as the rate card says.
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
@@ -153,6 +162,7 @@ launch() {
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":true}' \
+    --enable-prompt-tokens-details \
     > "$logfile" 2>&1 &
   disown
 }
