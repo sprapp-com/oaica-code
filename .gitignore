@@ -29,3 +29,4 @@ tools/katlb/katlb-linux-amd64
 /graphify-out/
 tools/gateway/gateway
 tools/meterhub/meterhub
+tools/gateway/oaica-gateway-linux-amd64
