@@ -215,6 +215,16 @@ class Stats:
         self.worker_had_success = {}
         self.aborted = 0
         self.with_images = 0
+        self.sessions_started = 0
+        self.turns = 0
+
+    def record_session_started(self):
+        with self.lock:
+            self.sessions_started += 1
+
+    def record_turn(self):
+        with self.lock:
+            self.turns += 1
 
     def record(self, worker_id, status, conn_error, aborted=False):
         with self.lock:
@@ -253,10 +263,12 @@ class Stats:
                 "engine_dead_signals": self.engine_dead_signals,
                 "aborted": self.aborted,
                 "with_images": self.with_images,
+                "sessions_started": self.sessions_started,
+                "turns": self.turns,
             }
 
 
-def do_request(port, messages, tools, max_tokens, stream, abort_plan=None):
+def do_request(port, messages, tools, max_tokens, stream, abort_plan=None, extra_headers=None):
     """abort_plan is None for normal requests, or a dict describing how to
     abort a streaming request early:
       {"mode": "chunks", "n": <int>}          -- close after n SSE chunks
@@ -264,7 +276,9 @@ def do_request(port, messages, tools, max_tokens, stream, abort_plan=None):
       {"mode": "prefill", "timeout": <float>}  -- close if no data arrives
                                                     within `timeout` (client
                                                     gives up during prefill)
-    Returns (status, conn_error, aborted).
+    Returns (status, conn_error, aborted, content) where content is the
+    concatenated assistant reply text actually received (best-effort; may be
+    partial for aborted requests, empty string if none was captured).
     """
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     payload = {
@@ -277,61 +291,91 @@ def do_request(port, messages, tools, max_tokens, stream, abort_plan=None):
         "stream": stream,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    def extract_stream_content(line):
+        try:
+            raw = line.strip()
+            if not raw.startswith(b"data:"):
+                return ""
+            raw = raw[len(b"data:"):].strip()
+            if raw == b"[DONE]" or not raw:
+                return ""
+            obj = json.loads(raw)
+            delta = obj.get("choices", [{}])[0].get("delta", {})
+            return delta.get("content") or ""
+        except Exception:
+            return ""
+
     try:
         if abort_plan is not None and stream:
             if abort_plan["mode"] == "prefill":
                 resp = urllib.request.urlopen(req, timeout=abort_plan["timeout"])
+                content_parts = []
                 try:
                     try:
                         resp.fp.raw._sock.settimeout(abort_plan["timeout"])
                     except Exception:
                         pass
                     try:
-                        next(iter(resp))
+                        line = next(iter(resp))
+                        content_parts.append(extract_stream_content(line))
                     except (socket.timeout, StopIteration, OSError):
                         pass
                 finally:
                     resp.close()
-                return None, False, True
+                return None, False, True, "".join(content_parts)
             with urllib.request.urlopen(req, timeout=300) as resp:
+                content_parts = []
                 if abort_plan["mode"] == "chunks":
                     n = abort_plan["n"]
                     count = 0
-                    for _ in resp:
+                    for line in resp:
+                        content_parts.append(extract_stream_content(line))
                         count += 1
                         if count >= n:
                             break
                 else:  # "delay"
                     deadline = time.time() + abort_plan["seconds"]
-                    for _ in resp:
+                    for line in resp:
+                        content_parts.append(extract_stream_content(line))
                         if time.time() >= deadline:
                             break
                 # deliberately do not drain the rest of the response;
                 # closing here (via context manager exit) aborts the conn.
-                return None, False, True
+                return None, False, True, "".join(content_parts)
 
         with urllib.request.urlopen(req, timeout=300) as resp:
             if stream:
+                content_parts = []
                 for line in resp:
                     if line.strip() == b"data: [DONE]":
                         break
+                    content_parts.append(extract_stream_content(line))
+                return resp.getcode(), False, False, "".join(content_parts)
             else:
-                resp.read()
-            return resp.getcode(), False, False
+                body = resp.read()
+                content = ""
+                try:
+                    obj = json.loads(body)
+                    content = obj.get("choices", [{}])[0].get("message", {}).get("content") or ""
+                except Exception:
+                    pass
+                return resp.getcode(), False, False, content
     except urllib.error.HTTPError as e:
         try:
             e.read()
         except Exception:
             pass
-        return e.code, False, False
+        return e.code, False, False, ""
     except (urllib.error.URLError, ConnectionError, OSError, TimeoutError):
-        return None, True, False
+        return None, True, False, ""
 
 
-def worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
+def _independent_worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
     rng = det_rng(seed, f"worker_{worker_id}_{time.time()}")
     max_tokens_choices = args.max_tokens_choices
     while time.time() < stop_at:
@@ -353,12 +397,107 @@ def worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
             else:
                 abort_plan = {"mode": "delay", "seconds": rng.uniform(0.5, 6.0)}
 
-        status, conn_error, aborted = do_request(
+        status, conn_error, aborted, _content = do_request(
             port, messages, tools, max_tokens, stream, abort_plan=abort_plan
         )
         stats.record(worker_id, status, conn_error, aborted=aborted)
         if n_images:
             stats.record_image()
+
+
+def session_turn_chars(rng, base_chars):
+    """~base_chars, jittered +/-50%; 20% of the time a tiny quick-followup."""
+    if rng.random() < 0.2:
+        return rng.randint(50, 200)
+    lo = max(1, int(base_chars * 0.5))
+    hi = int(base_chars * 1.5)
+    return rng.randint(lo, hi)
+
+
+def estimated_tokens(system_prompt, tools, messages):
+    body_chars = len(system_prompt) + len(json.dumps(tools))
+    for m in messages[1:]:
+        content = m.get("content")
+        if isinstance(content, str):
+            body_chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    body_chars += len(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    body_chars += IMAGE_TOKEN_EST * 4
+    return body_chars // 4
+
+
+def session_worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
+    max_tokens_choices = args.max_tokens_choices
+    session_n = 0
+    session_seed_offset = 0
+    while time.time() < stop_at:
+        session_n += 1
+        stats.record_session_started()
+        rng = det_rng(seed, f"session_worker_{worker_id}_{session_seed_offset}_{time.time()}")
+        session_seed_offset += 1
+
+        start_text = gen_text_block(rng, args.session_start_chars, code_ratio=rng.choice([0.2, 0.5, 0.8]))
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": start_text},
+        ]
+
+        while time.time() < stop_at:
+            max_tokens = rng.choice(max_tokens_choices)
+            stream = rng.random() < 0.7
+
+            abort_plan = None
+            if stream and rng.random() < args.abort_frac:
+                if rng.random() < (1.0 / 3.0):
+                    abort_plan = {"mode": "prefill", "timeout": rng.uniform(0.05, 2.0)}
+                elif rng.random() < 0.5:
+                    abort_plan = {"mode": "chunks", "n": rng.randint(1, 8)}
+                else:
+                    abort_plan = {"mode": "delay", "seconds": rng.uniform(0.5, 6.0)}
+
+            headers = {"X-Session-Id": f"sess-{worker_id}-{session_n}"}
+            status, conn_error, aborted, content = do_request(
+                port, messages, tools, max_tokens, stream,
+                abort_plan=abort_plan, extra_headers=headers,
+            )
+            stats.record(worker_id, status, conn_error, aborted=aborted)
+            stats.record_turn()
+
+            if aborted or conn_error or status != 200:
+                # drop this turn (don't append it to history) and continue
+                # the session with a fresh follow-up turn.
+                pass
+            else:
+                assistant_text = content if content else "(no response captured)"
+                messages.append({"role": "assistant", "content": assistant_text})
+
+            turn_chars = session_turn_chars(rng, args.session_turn_chars)
+            attach_image = rng.random() < args.image_frac
+            new_user = {"role": "user", "content": gen_text_block(rng, turn_chars, code_ratio=rng.choice([0.2, 0.5, 0.8]))}
+            if attach_image:
+                n_images = rng.choice([1, 2])
+                content_list = [{"type": "text", "text": new_user["content"]}]
+                for _ in range(n_images):
+                    content_list.append({
+                        "type": "image_url",
+                        "image_url": {"url": gen_image_data_url(rng)},
+                    })
+                new_user["content"] = content_list
+                stats.record_image()
+            messages.append(new_user)
+
+            if estimated_tokens(system_prompt, tools, messages) > args.session_max_tokens:
+                break
+
+
+def worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args):
+    if args.session_mode:
+        session_worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args)
+        return
+    _independent_worker(worker_id, port, seed, system_prompt, tools, stop_at, stats, args)
 
 
 def main():
@@ -377,6 +516,18 @@ def main():
                      help="fraction of requests using the long history variant")
     ap.add_argument("--min-history-chars", type=int, default=120_000)
     ap.add_argument("--max-history-chars", type=int, default=180_000)
+    ap.add_argument("--session-mode", action="store_true",
+                     help="each worker simulates one long-lived Claude-Code-style "
+                          "session (full history resent each turn) instead of "
+                          "independent requests")
+    ap.add_argument("--session-start-chars", type=int, default=40_000,
+                     help="approx chars of the initial user turn in session mode")
+    ap.add_argument("--session-turn-chars", type=int, default=6_000,
+                     help="approx chars of each new user turn in session mode "
+                          "(jittered +/-50%%, occasionally tiny)")
+    ap.add_argument("--session-max-tokens", type=int, default=190_000,
+                     help="estimated total tokens (chars/4) at which a session "
+                          "worker starts a fresh session")
     args = ap.parse_args()
     args.max_tokens_choices = [int(x) for x in args.max_tokens_choices.split(",") if x.strip()]
 
