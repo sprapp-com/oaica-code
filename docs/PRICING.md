@@ -219,6 +219,42 @@ the codebase today (see `tools/gateway`'s entitlement check for the
 active/canceled/suspended primitive this could build on — it currently
 gates access, not usage against a token allowance).
 
+## Per-token vs. per-request billing (2026-08-29)
+
+Question: for the subscription/API tiers above, bill by token or by
+request count? Answer, grounded in real meterhub data (991 real
+completions, `internal-91` key, 2026-08-29):
+
+- **Prompt-size spread is wide and skewed**: p10=50,270 tokens,
+  p50=123,448, p90=186,903, max=229,718 — **~3.7x spread p10→p90**, and
+  this traffic is dominated by long-context agentic sessions, not short
+  chat turns (median request alone is bigger than most competitors'
+  entire context window).
+- **Compute cost scales with tokens, not requests**: prefill cost is
+  ~linear in prompt length. A 230K-token request does meaningfully more
+  GPU work than a 50K-token one; a flat per-request price cannot track
+  that without either overcharging light users or undercharging (and
+  losing money on) heavy ones — and with a spread this wide, that
+  mispricing compounds fast at volume.
+- **`CostUSD` (see `tools/gateway`'s `computeCostUSD`) already reflects
+  the real cost driver** — per-token, split fresh vs. cache-hit prompt
+  tokens, plus completion tokens. A per-request meter would need an
+  entirely separate cost model that diverges from measured infra spend
+  the moment request sizes vary this much, which they do.
+- **Every real competitor referenced in this doc bills per-token**
+  (OpenRouter, DeepSeek, MiniMax, GLM). Per-request pricing is a chat-app
+  pattern for roughly-uniform request sizes, not agentic/long-context
+  inference.
+
+**Recommendation, already the current architecture**: keep the
+**subscription** layer flat-monthly (Starter/Pro/Team), gated by
+**token-based** rolling-window caps (5h/weekly — see `checkWindowCap` in
+`tools/meterhub`), not request-count caps. Bill the **metered/API** tier
+strictly per-token (`gwPricing`, `computeCostUSD`, cache-hit pricing,
+overage billing — all live). Request count is fine as a secondary
+abuse/rate-limit signal, never as the primary billing unit for this
+workload.
+
 ## Deploy
 
 This file is the rate card of record; the deployed pricing lives in
