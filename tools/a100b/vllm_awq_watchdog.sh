@@ -142,7 +142,7 @@ launch() {
 # below used the real "0:30106 1:30108 2:30110". Harmless in practice
 # (bash auto-vivifies unset array elements to 0 in arithmetic context) but
 # confusing and a real trap for the next port change.
-REPLICAS="${REPLICAS:-0:30106 1:30108}"
+REPLICAS="${REPLICAS:-0:30106 1:30108 2:30110}"
 
 # per-port backoff state: last launch epoch + current delay
 declare -A LAST DELAY STALLFAILS
