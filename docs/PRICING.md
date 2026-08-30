@@ -436,3 +436,22 @@ repeat-heavy-context workload this product actually serves.
   of USD 200–400 / node / year commercial, USD 0 personal. Exact number
   is a business decision; leave it open until the local first-run path
   is clean (see PRODUCTION_READINESS.md, local-use audit 2026-08-30).
+
+## Rate-card proposal (2026-08-31) — priced off real traffic shape
+
+Measured (past hour, 2026-08-30 18:18-19:18Z): 388 req, 37.13M prompt
+(29.8% cached), 252.7k completion — input is 99.3% of token volume.
+
+| per M tokens | current | proposed | reference points |
+|---|---|---|---|
+| input (miss) | $0.05 | **$0.06** | DSv4 Flash via aggregator $0.065; KAT-Air $0.15; DeepSeek official $0.22–0.44 |
+| cache-hit | $0.01 | **$0.008** | DeepSeek hit/miss ratio ~1:8; cheap cache retains agent workloads |
+| output | $0.12 | **$0.28** | <1% of our volume — invisible to users, stops underpricing decode; ½ of KAT-Air |
+
+That hour: $1.79 vs $1.44 today (+24%), headline still "cheaper than
+DeepSeek V4 Flash input". Break-even (3×A100 ≈ $4.2/h at RunPod rates)
+needs ~2.3× current load at this card — per-token is the margin on
+strangers; the subscription plans above are the revenue base. Follow-on
+lever: ~50% off-peak discount (00–08 UTC) to fill idle capacity instead
+of cutting the base card. Not deployed — gateway pricing is one line per
+rate in /workspace/oaica-gateway.json when approved.
