@@ -14,6 +14,6 @@
     "<sha-or-key-4>": "pro",
     "<sha-or-key-5>": "openrouter"
   },
-  "upstream_addr": "http://127.0.0.1:30099",
+  "upstream_addr": "http://127.0.0.1:8091",
   "listen_addr": ":30098"
 }
