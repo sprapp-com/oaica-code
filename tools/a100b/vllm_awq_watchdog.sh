@@ -26,6 +26,17 @@
 #               ignored), then SIGKILL both api_server and the orphaned
 #               VLLM::EngineCore child before it recovered. stall_check()
 #               below automates exactly that sequence.
+#   conf        2026-08-30: changing the replica set meant editing this
+#               script and kill+restarting the watchdog, and that restart
+#               caused two incidents in one day (a pgrep kill loop matched
+#               the invoking ssh shell's own argv and killed the deploy
+#               session, leaving NO watchdog; and a deploy shell's argv
+#               matched booting()'s pattern, blocking a relaunch for 8
+#               minutes). The set is now read from REPLICAS_CONF at the top
+#               of every tick, so it is changed by editing one file --
+#               never by restarting this process. /workspace/fleetctl.sh
+#               owns the conf plus the LB ordering and the stopping of
+#               removed replicas; this watchdog only ever LAUNCHES.
 #
 # Usage: nohup /workspace/vllm_awq_watchdog.sh >/workspace/vllm_awq_watchdog.log 2>&1 &
 set -u
@@ -194,9 +205,49 @@ launch() {
 # confusing and a real trap for the next port change.
 REPLICAS="${REPLICAS:-0:30106 1:30108 2:30110 7:30112}"
 
+# REPLICAS_CONF: the live, hot-reloaded replica set. Read at the top of
+# every main-loop tick; when absent or empty the env/default above is used
+# unchanged (backward compatible with an older deploy that has no conf).
+REPLICAS_CONF="${REPLICAS_CONF:-/workspace/vllm_awq_replicas.conf}"
+BAD_CONF_SEEN=""   # last invalid conf content already alerted on (alert once, not every tick)
+
 # per-port backoff state: last launch epoch + current delay
 declare -A LAST DELAY STALLFAILS
-for r in $REPLICAS; do p=${r##*:}; LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0; done
+init_replica_state() {
+  local r p
+  for r in $REPLICAS; do
+    p=${r##*:}
+    [ -n "${LAST[$p]:-}" ] && continue
+    LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0
+  done
+}
+init_replica_state
+
+# load_replicas: adopt the conf file's set if it is present, non-empty and
+# well-formed. An invalid conf NEVER changes the running set -- the previous
+# good value keeps being served, and the alert fires once per distinct bad
+# content so a typo does not spam the log every 15s. A port that disappears
+# from the conf simply stops being ticked: this watchdog does not kill it
+# (fleetctl.sh owns draining and stopping), it only stops relaunching it.
+load_replicas() {
+  local raw trimmed
+  [ -r "$REPLICAS_CONF" ] || return 0
+  raw=$(cat "$REPLICAS_CONF" 2>/dev/null) || return 0
+  trimmed=$(echo "$raw" | tr '\n\t' '  ' | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//')
+  [ -z "$trimmed" ] && return 0
+  if ! [[ $trimmed =~ ^[0-7]:[0-9]+( [0-7]:[0-9]+)*$ ]]; then
+    if [ "$trimmed" != "$BAD_CONF_SEEN" ]; then
+      BAD_CONF_SEEN=$trimmed
+      alert "$REPLICAS_CONF is malformed ('$trimmed'); expected 'GPU:PORT ...' -- keeping previous set: $REPLICAS"
+    fi
+    return 0
+  fi
+  BAD_CONF_SEEN=""
+  [ "$trimmed" = "$REPLICAS" ] && return 0
+  log "replicas set now: $trimmed (was: $REPLICAS, from $REPLICAS_CONF)"
+  REPLICAS=$trimmed
+  init_replica_state
+}
 
 listening() { ss -ltn 2>/dev/null | grep -q ":$1 "; }
 # booting: an api_server for this port exists but is not listening yet.
@@ -406,8 +457,9 @@ protect_oom() {
   done
 }
 
-log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s oom_kill_baseline=$OOM_KILLS_SEEN oom_adj=$OOM_ADJ"
+log "watchdog start (pinned $HF_REPO@$HF_REV) replicas=$REPLICAS (hot-reloaded every tick from $REPLICAS_CONF if present; edit it via /workspace/fleetctl.sh add|remove -- no watchdog restart needed) stall_probe=${STALL_PROBE_MODEL} stall_threshold=${STALL_FAIL_THRESHOLD}x${STALL_PROBE_TIMEOUT_SEC}s oom_kill_baseline=$OOM_KILLS_SEEN oom_adj=$OOM_ADJ"
 while true; do
+  load_replicas
   oom_watch
   sweep_orphans "tick" 1
   for r in $REPLICAS; do

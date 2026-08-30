@@ -402,3 +402,67 @@ and 1.6× aggregate at 256k; Blackwell NVFP4 pending a native bench.
 Not an HF snapshot on the box: the dir is a symlink graft (`SHASUMS` inside
 verifies it), so the watchdog's `HF_REPO` is empty and a missing-weights
 preflight alerts instead of downloading anything over it.
+
+## Dynamic replica add/remove (fleetctl)
+
+The replica set lives in **`/workspace/vllm_awq_replicas.conf`** (repo:
+`tools/a100b/vllm_awq_replicas.conf`) — one line, space-separated
+`GPU:PORT` entries, e.g. `0:30106 1:30108 2:30110 7:30112`. The watchdog
+re-reads it at the top of **every 15 s tick**, so **changing the replica set
+no longer requires restarting the watchdog** (if the file is missing or
+empty the `REPLICAS` env/default is used, so an older deploy keeps working).
+Malformed content is alerted once and ignored — the last good set keeps
+running. A port that disappears from the conf just stops being ticked; the
+watchdog never kills it. Stopping replicas is `fleetctl.sh`'s job.
+
+```bash
+/workspace/fleetctl.sh status            # conf, pids, LB backends, /status, GPU memory
+/workspace/fleetctl.sh add    3:30114    # bring a replica up, then put it in the LB
+/workspace/fleetctl.sh remove 3:30114    # take it out of the LB, drain, then stop it
+/workspace/fleetctl.sh drain  3:30114    # LB-out + drain only, replica stays up for debugging
+```
+
+### Ordering guarantees (why nothing is dropped)
+
+**add — UP before LB.** Refuse if GPU is busy (>2 GiB used by others per
+`nvidia-smi`) or the port already listens → append to the conf (deduped,
+sorted by GPU) → the watchdog launches it on its next tick → wait for
+`GET /v1/models` 200 (up to 400 s) → run `/workspace/validate_replica.sh
+PORT` if present → **only then** add `http://127.0.0.1:PORT` to
+`oaicalb.json` and `oaicalb_reload.sh` (SIGHUP). A cold, still-loading
+backend therefore never receives traffic; if it fails to come up it stays
+out of the LB and the watchdog keeps retrying it.
+
+**remove — LB-drain before kill.** Remove the backend from `oaicalb.json` +
+SIGHUP reload (the LB stops routing *new* requests; existing ones finish) →
+poll `ss -tn state established "( sport = :PORT )"` until zero, up to
+`DRAIN_TIMEOUT=600 s`, progress printed every 15 s → remove the entry from
+the conf so the watchdog will not relaunch it → **only then** SIGTERM the
+`api_server`, escalating to SIGKILL after 30 s → one orphan sweep
+(`VLLM::EngineCore` with `ppid == 1`, which otherwise holds ~74 GB of GPU
+memory forever) → print the GPU's memory. Net effect of the two orderings:
+**zero dropped requests** on either side of a set change.
+
+### Why the process matching is paranoid (two incidents, 2026-08-30)
+
+Both came from restarting the watchdog to change the replica set — the exact
+thing the conf file now makes unnecessary:
+
+* a `pgrep`/`ps | grep` kill loop matched the **invoking ssh shell's own
+  argv** (the pattern was sitting in that shell's command line) and killed
+  the deploy session mid-deploy, leaving **no watchdog running at all**;
+* a long-lived deploy shell's argv matched the watchdog's `booting()`
+  pattern (`api_server.*--port $port `), so the watchdog believed the
+  replica was still booting and refused to relaunch it for **8 minutes**.
+
+So `fleetctl.sh` never uses `pkill -f`. It identifies a replica by the PID
+that **owns the listening socket** (`ss -ltnp`) and confirms it by reading
+`/proc/<pid>/cmdline`; where a pattern is unavoidable it is **composed** at
+runtime (`A=api_; pat="${A}server.*--port $port "`) so this script's own argv
+contains `${A}server`, never the literal being matched. Same rule applies to
+anything new added here.
+
+> Editing `vllm_awq_watchdog.sh`: never put a comment inside the
+> backslash-continued `CUDA_VISIBLE_DEVICES=$gpu nohup ... disown` launch
+> block — a comment silently truncates the command. Check with
+> `awk '/CUDA_VISIBLE_DEVICES=\$gpu nohup/,/disown/' vllm_awq_watchdog.sh | grep -c '^\s*#'` (must print 0).

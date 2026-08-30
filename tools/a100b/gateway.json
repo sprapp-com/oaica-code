@@ -5,11 +5,13 @@
   "api_keys": [
     {
       "sha256": "<sha256 hex of key>",
-      "label": "openrouter"
+      "label": "openrouter",
+      "priority": true
     },
     {
       "sha256": "<sha256 hex of key>",
-      "label": "internal-91"
+      "label": "internal-91",
+      "max_completion_tokens": 8192
     }
   ],
   "models": [
@@ -24,6 +26,11 @@
         "completion": "0.00000028",
         "cached_prompt": "0.000000008"
       },
+      "pricing_tiers": [
+        { "up_to_prompt_tokens": 32000, "prompt": "0.00000005" },
+        { "up_to_prompt_tokens": 128000, "prompt": "0.00000006" },
+        { "prompt": "0.0000001" }
+      ],
       "supported_parameters": [
         "max_tokens",
         "temperature",
@@ -49,6 +56,11 @@
         "completion": "0.00000028",
         "cached_prompt": "0.000000008"
       },
+      "pricing_tiers": [
+        { "up_to_prompt_tokens": 32000, "prompt": "0.00000005" },
+        { "up_to_prompt_tokens": 128000, "prompt": "0.00000006" },
+        { "prompt": "0.0000001" }
+      ],
       "supported_parameters": [
         "max_tokens",
         "temperature",

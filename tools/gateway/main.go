@@ -135,6 +135,71 @@ type gwPricing struct {
 	CachedPrompt string `json:"cached_prompt,omitempty"`
 }
 
+// gwPricingTier is one bracket of context-tiered INPUT pricing (see
+// gwModel.PricingTiers). UpToPromptTokens is the inclusive upper bound of
+// the bracket in real prompt tokens; the final entry omits it (0) and is the
+// catch-all for everything above the last bound.
+type gwPricingTier struct {
+	UpToPromptTokens int    `json:"up_to_prompt_tokens,omitempty"`
+	Prompt           string `json:"prompt"` // USD per UNCACHED prompt token, decimal string
+}
+
+// selectPricingTier returns the bracket a request of promptTokens falls in,
+// plus that bracket's upper bound (0 = the unbounded catch-all), which is
+// what lands in ledgerEntry.PriceTier. tiers must already have passed
+// validatePricingTiers (ascending bounds, exactly one unbounded final
+// entry), so the catch-all is guaranteed to be reachable and the loop always
+// returns.
+func selectPricingTier(tiers []gwPricingTier, promptTokens int) (gwPricingTier, int, bool) {
+	for _, t := range tiers {
+		// Bound is INCLUSIVE: a 32000-token prompt is still "up to 32000".
+		if t.UpToPromptTokens == 0 || promptTokens <= t.UpToPromptTokens {
+			return t, t.UpToPromptTokens, true
+		}
+	}
+	return gwPricingTier{}, 0, false
+}
+
+// validatePricingTiers enforces the shape the billing split depends on:
+// every rate a positive decimal, bounds strictly ascending, and exactly one
+// unbounded entry which must be last. A config that violates any of these
+// would silently misprice real traffic (an unreachable bracket, or a prompt
+// size no bracket covers), so it is rejected at load rather than papered
+// over at request time -- consistent with loadConfig refusing any other
+// config that would produce wrong-but-plausible behavior.
+func validatePricingTiers(tiers []gwPricingTier) error {
+	if len(tiers) == 0 {
+		return nil
+	}
+	prevBound := 0
+	for i, t := range tiers {
+		v, err := strconv.ParseFloat(t.Prompt, 64)
+		if err != nil {
+			return fmt.Errorf("pricing_tiers[%d].prompt %q is not a decimal number", i, t.Prompt)
+		}
+		if !(v > 0) {
+			return fmt.Errorf("pricing_tiers[%d].prompt %q must be positive", i, t.Prompt)
+		}
+		if t.UpToPromptTokens == 0 {
+			if i != len(tiers)-1 {
+				return fmt.Errorf("pricing_tiers[%d]: only the LAST entry may omit up_to_prompt_tokens (it is the catch-all)", i)
+			}
+			continue
+		}
+		if t.UpToPromptTokens < 0 {
+			return fmt.Errorf("pricing_tiers[%d].up_to_prompt_tokens must be positive", i)
+		}
+		if t.UpToPromptTokens <= prevBound {
+			return fmt.Errorf("pricing_tiers[%d].up_to_prompt_tokens %d must be strictly greater than the previous bound %d", i, t.UpToPromptTokens, prevBound)
+		}
+		prevBound = t.UpToPromptTokens
+	}
+	if tiers[len(tiers)-1].UpToPromptTokens != 0 {
+		return errors.New("pricing_tiers: the last entry must omit up_to_prompt_tokens (catch-all for prompts above the highest bound)")
+	}
+	return nil
+}
+
 type gwModel struct {
 	ID                  string    `json:"id"`
 	UpstreamID          string    `json:"upstream_id,omitempty"` // vLLM --served-model-name; defaults to ID
@@ -142,7 +207,25 @@ type gwModel struct {
 	ContextLength       int       `json:"context_length,omitempty"`
 	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"`
 	Pricing             gwPricing `json:"pricing"`
-	SupportedParameters []string  `json:"supported_parameters,omitempty"`
+	// PricingTiers: optional context-tiered INPUT pricing. The real cost
+	// driver on this fleet is UNCACHED PREFILL GPU-seconds, and prefill is
+	// superlinear in context: a >128k-token prompt monopolizes chunked
+	// prefill slots for many seconds and pushes everyone else's p95 out
+	// (658 of 1429 requests on 2026-08-31 were >128k, p95 172 s). A single
+	// flat per-token input rate therefore has short prompts subsidizing
+	// long ones. When set, the bracket is chosen by the request's REAL
+	// total prompt_tokens and its rate applies to that request's UNCACHED
+	// prompt tokens as a WHOLE-REQUEST rate (not marginal/progressive
+	// brackets -- the customer-facing statement is "a 200k-token request
+	// costs $X/M input", which is what an agentic client can actually
+	// reason about). Cached prompt tokens keep Pricing.CachedPrompt's flat
+	// rate (a cache hit skips prefill entirely, so context size does not
+	// change what it costs us) and completion keeps Pricing.Completion.
+	// Empty = today's behavior: Pricing.Prompt flat for all sizes. When
+	// present it takes precedence over Pricing.Prompt; Pricing stays
+	// required because cached_prompt/completion still come from it.
+	PricingTiers        []gwPricingTier `json:"pricing_tiers,omitempty"`
+	SupportedParameters []string        `json:"supported_parameters,omitempty"`
 	// InputModalities is what the model can actually consume: "text" and
 	// optionally "image". Empty means text only. kat-awq's config claims a
 	// vision tower, but under AWQ an image request produces garbage
@@ -219,6 +302,34 @@ func (m gwModel) upstreamID() string {
 type gwKey struct {
 	SHA256 string `json:"sha256"` // hex digest of the plaintext key
 	Label  string `json:"label"`  // written to the ledger; never the key itself
+	// Priority: this key's requests bypass large-context admission control
+	// entirely (never queued behind or rejected by the semaphore -- see
+	// gwConfig.LargeContextTokenThreshold). Admission control exists to stop
+	// a pile of >128k prompts from taking the replica down, and it works,
+	// but it does so by making SOMEBODY wait; latency is the thing worth
+	// selling, so priority is the product: a priority key is the one that
+	// never waits, and the non-priority pool absorbs the queueing. Default
+	// false = today's behavior for every existing key.
+	Priority bool `json:"priority,omitempty"`
+	// MaxCompletionTokens: optional per-key ceiling on output tokens,
+	// applied AFTER the model-level clamp and only ever downward (a key can
+	// never raise the published model limit). Lets a cheap/free tier be
+	// sold with a smaller output budget without minting a separate model
+	// entry. 0 = unset = no per-key clamp (today's behavior).
+	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
+}
+
+// priorityKeyCount is logged on load/reload so a config that accidentally
+// marks everyone (or nobody) priority is visible without diffing the JSON --
+// same reasoning as distinctUpstreams.
+func priorityKeyCount(cfg gwConfig) int {
+	n := 0
+	for _, k := range cfg.APIKeys {
+		if k.Priority {
+			n++
+		}
+	}
+	return n
 }
 
 type gwConfig struct {
@@ -380,6 +491,11 @@ func loadConfig(path string) (gwConfig, error) {
 		}
 		if _, err := url.Parse(m.UpstreamAddr); err != nil {
 			return cfg, fmt.Errorf("models[%d].upstream_addr %q: %w", i, m.UpstreamAddr, err)
+		}
+	}
+	for i, m := range cfg.Models {
+		if err := validatePricingTiers(m.PricingTiers); err != nil {
+			return cfg, fmt.Errorf("models[%d] (%s): %w", i, m.ID, err)
 		}
 	}
 	if err := validatePullConfig(cfg); err != nil {
@@ -820,30 +936,41 @@ func (g *gateway) reload(path string) {
 		log.Printf("oaica-gateway: reload REJECTED, keeping previous config: %v", err)
 		return
 	}
-	log.Printf("oaica-gateway: config reloaded: %d models, %d keys, upstream=%s (%d distinct upstreams)",
-		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr, distinctUpstreams(cfg))
+	log.Printf("oaica-gateway: config reloaded: %d models, %d keys (%d priority), upstream=%s (%d distinct upstreams)",
+		len(cfg.Models), len(cfg.APIKeys), priorityKeyCount(cfg), cfg.UpstreamAddr, distinctUpstreams(cfg))
 }
 
 // keyLabel returns the label for a valid Bearer key, or "" if unauthenticated.
 // Constant-time compare of the presented key's digest against every stored
 // digest so timing does not leak which key was closest.
 func (g *gateway) keyLabel(r *http.Request) string {
+	k, _ := g.lookupKey(r)
+	return k.Label
+}
+
+// lookupKey resolves the presented Bearer key to its whole config entry (not
+// just the label) so per-key policy -- Priority, MaxCompletionTokens -- is
+// available on the request path. Same constant-time scan of every stored
+// digest as before, and it deliberately does NOT break early on a match so
+// the comparison count stays independent of which key was presented.
+func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
 	auth := r.Header.Get("Authorization")
 	key := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 	if key == "" {
-		return ""
+		return gwKey{}, false
 	}
 	sum := sha256.Sum256([]byte(key))
 	presented := []byte(hex.EncodeToString(sum[:]))
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	label := ""
+	var found gwKey
+	ok := false
 	for _, k := range g.cfg.APIKeys {
 		if subtle.ConstantTimeCompare(presented, []byte(k.SHA256)) == 1 {
-			label = k.Label
+			found, ok = k, true
 		}
 	}
-	return label
+	return found, ok
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
@@ -1024,6 +1151,15 @@ type ledgerEntry struct {
 	// overage rate rather than the plan's included rate. Always false
 	// when overage billing isn't enabled or the request was within cap.
 	Overage bool `json:"overage,omitempty"`
+	// PriceTier: the upper bound (in prompt tokens) of the context pricing
+	// bracket this request billed at, or 0 for the unbounded catch-all --
+	// and 0 too when the model has no pricing_tiers at all. Recorded so
+	// revenue can be split by tier after the fact: the whole point of
+	// tiering is to find out how much of the bill comes from the >128k
+	// traffic that drives p95, and that question needs the bracket on the
+	// row, not a re-derivation from prompt_tokens against a config that may
+	// since have changed.
+	PriceTier int `json:"price_tier,omitempty"`
 }
 
 func (g *gateway) writeLedger(e ledgerEntry) {
@@ -1240,7 +1376,8 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
 		return
 	}
-	label := g.keyLabel(r)
+	apiKey, _ := g.lookupKey(r)
+	label := apiKey.Label
 	if label == "" {
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return
@@ -1316,7 +1453,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// closes. estimateMessageTokens is coarse on purpose (chars/4, no real
 	// tokenizer call) — it only needs to catch "this is huge", not be
 	// exact. threshold < 0 disables the check entirely.
-	if threshold >= 0 && sem != nil && estTokens >= threshold {
+	// Priority keys skip the gate entirely (see gwKey.Priority): the pool is
+	// a latency tax, and not paying it is what a priority key buys. They
+	// stay unbounded on purpose -- the pool still bounds everyone else, so
+	// the pathological all-large-at-once shape from the 2026-08-29 incident
+	// cannot be reproduced by the non-priority majority.
+	if threshold >= 0 && sem != nil && estTokens >= threshold && !apiKey.Priority {
 		select {
 		case sem <- struct{}{}:
 			defer func() { <-sem }()
@@ -1339,6 +1481,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	limit := m.MaxCompletionTokens
 	if !stream && limit > nonStreamMaxTokens {
 		limit = nonStreamMaxTokens
+	}
+	// Per-key output ceiling on top of the model-level clamp (see
+	// gwKey.MaxCompletionTokens). Strictly downward: min() so a key can
+	// tighten its own budget but never raise the published model limit.
+	if apiKey.MaxCompletionTokens > 0 && (limit <= 0 || apiKey.MaxCompletionTokens < limit) {
+		limit = apiKey.MaxCompletionTokens
 	}
 	if limit > 0 {
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
@@ -1510,6 +1658,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 // entry builds the ledger row for one completion.
 func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string, overage bool) ledgerEntry {
 	cached := rec.usage.cachedTokens()
+	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, rec.usage.PromptTokens, cached, rec.usage.CompletionTokens)
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,
@@ -1527,8 +1676,9 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		Aborted:          aborted,
 		Backend:          backend,
 		SessionID:        sessionID,
-		CostUSD:          computeCostUSD(m.Pricing, rec.usage.PromptTokens, cached, rec.usage.CompletionTokens),
+		CostUSD:          cost,
 		Overage:          overage,
+		PriceTier:        tier,
 	}
 }
 
@@ -1540,6 +1690,20 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 // informational (no billing enforcement exists), a parse failure must
 // never affect the response the caller actually gets.
 func computeCostUSD(p gwPricing, promptTokens, cachedTokens, completionTokens int) float64 {
+	cost, _ := computeCostUSDTiered(p, nil, promptTokens, cachedTokens, completionTokens)
+	return cost
+}
+
+// computeCostUSDTiered is computeCostUSD plus optional context-tiered input
+// pricing (see gwModel.PricingTiers). The bracket is chosen by the REAL
+// total prompt_tokens reported by upstream -- including the cached ones,
+// because what makes a request expensive to schedule is how long the context
+// is, not how much of it happened to hit the prefix cache -- and the
+// bracket's rate then applies to the UNCACHED tokens only, since the cached
+// ones cost us near-nothing to serve and keep CachedPrompt's flat rate.
+// Returns the cost and the bracket's upper bound for ledgerEntry.PriceTier
+// (0 = the catch-all, or no tiers configured).
+func computeCostUSDTiered(p gwPricing, tiers []gwPricingTier, promptTokens, cachedTokens, completionTokens int) (float64, int) {
 	parse := func(s string) float64 {
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
@@ -1549,15 +1713,26 @@ func computeCostUSD(p gwPricing, promptTokens, cachedTokens, completionTokens in
 	}
 	promptRate := parse(p.Prompt)
 	completionRate := parse(p.Completion)
+	// cachedRate is resolved BEFORE the tier override on purpose: when a
+	// model has no cached_prompt set, cached tokens fall back to the flat
+	// Prompt rate (today's behavior), never to the tiered one -- otherwise
+	// enabling tiers would silently reprice cache hits too.
 	cachedRate := promptRate
 	if p.CachedPrompt != "" {
 		cachedRate = parse(p.CachedPrompt)
+	}
+	tier := 0
+	if len(tiers) > 0 {
+		if t, bound, ok := selectPricingTier(tiers, promptTokens); ok {
+			promptRate = parse(t.Prompt)
+			tier = bound
+		}
 	}
 	if cachedTokens > promptTokens {
 		cachedTokens = promptTokens // defensive: upstream data should never do this, but never bill negative fresh tokens if it does
 	}
 	freshPromptTokens := promptTokens - cachedTokens
-	return float64(freshPromptTokens)*promptRate + float64(cachedTokens)*cachedRate + float64(completionTokens)*completionRate
+	return float64(freshPromptTokens)*promptRate + float64(cachedTokens)*cachedRate + float64(completionTokens)*completionRate, tier
 }
 
 // entitlementCache is the fast local read-through cache in front of
@@ -1782,8 +1957,8 @@ func main() {
 	if err := g.apply(cfg); err != nil {
 		log.Fatalf("oaica-gateway: %v", err)
 	}
-	log.Printf("oaica-gateway: %d models, %d keys, upstream=%s (%d distinct upstreams), listen=%s, ledger=%s",
-		len(cfg.Models), len(cfg.APIKeys), cfg.UpstreamAddr, distinctUpstreams(cfg), cfg.ListenAddr, cfg.LedgerPath)
+	log.Printf("oaica-gateway: %d models, %d keys (%d priority), upstream=%s (%d distinct upstreams), listen=%s, ledger=%s",
+		len(cfg.Models), len(cfg.APIKeys), priorityKeyCount(cfg), cfg.UpstreamAddr, distinctUpstreams(cfg), cfg.ListenAddr, cfg.LedgerPath)
 
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
