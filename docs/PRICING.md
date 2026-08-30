@@ -25,11 +25,11 @@
 | KAT-Coder-Pro V2.5 | 0.74 | 2.96 |
 | Ollama cloud | flat sub, not metered | — |
 
-## New rates (effective 2026-08-21)
+## New rates (effective 2026-08-31; prior card 2026-08-21: $0.05 in / $0.01 cache / $0.12 out)
 
 | | In $/M | Out $/M |
 |---|---|---|
-| **kat-awq** | **$0.05** | **$0.12** |
+| **oaica-35b-a3b-vision / oaica-nemotron-30b-a3b** | **$0.06** (cache-hit **$0.008**) | **$0.28** |
 
 - Undercuts DeepSeek V4 Flash on both legs (0.065→0.05 in, 0.14→0.12 out) **as of 2026-08-20 — no longer true, see the 2026-08-29 refresh below: DeepSeek has since dropped to $0.03/$0.10.**
 - Blended margin @ typical coding-agent traffic mix (~1:4 in:out) ≈ 0.05×0.2+0.12×0.8 = $0.106/M vs $0.0652/M cost → **~63% margin**, healthy buffer for burst/idle GPU time not counted in the $6.34/hr denominator.

@@ -20,8 +20,9 @@
       "context_length": 262144,
       "max_completion_tokens": 32768,
       "pricing": {
-        "prompt": "0.00000005",
-        "completion": "0.00000012"
+        "prompt": "0.00000006",
+        "completion": "0.00000028",
+        "cached_prompt": "0.000000008"
       },
       "supported_parameters": [
         "max_tokens",
@@ -44,9 +45,9 @@
       "context_length": 262144,
       "max_completion_tokens": 32768,
       "pricing": {
-        "prompt": "0.00000005",
-        "completion": "0.00000012",
-        "cached_prompt": "0.00000001"
+        "prompt": "0.00000006",
+        "completion": "0.00000028",
+        "cached_prompt": "0.000000008"
       },
       "supported_parameters": [
         "max_tokens",
