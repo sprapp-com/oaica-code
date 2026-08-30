@@ -43,7 +43,7 @@ VALIDATE=${VALIDATE:-/workspace/validate_replica.sh}
 UP_TIMEOUT=${UP_TIMEOUT:-400}
 DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-600}
 TERM_GRACE=${TERM_GRACE:-30}
-GPU_BUSY_MIB=${GPU_BUSY_MIB:-2048}
+GPU_BUSY_MIB=${GPU_BUSY_MIB:-8192}
 
 say() { echo "$(date -Is) $*"; }
 die() { echo "$(date -Is) ERROR: $*" >&2; exit 1; }
