@@ -151,11 +151,37 @@ type openAIChatResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage,omitempty"`
+	Usage *openAIUsage `json:"usage,omitempty"`
+}
+
+// openAIUsage is the usage object of a chat completion (and of the final
+// usage-only chunk of a stream with stream_options.include_usage).
+// prompt_tokens_details.cached_tokens is populated by vLLM only with
+// --enable-prompt-tokens-details (on in our fleet since 2026-08-29); it is
+// the prefix-cache hit count and maps to Anthropic's cache_read_input_tokens.
+type openAIUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+// cachedTokens returns the prefix-cache hit count, clamped to the prompt
+// size so a malformed upstream can never yield a negative input_tokens.
+func (u *openAIUsage) cachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	c := u.PromptTokensDetails.CachedTokens
+	if c < 0 {
+		return 0
+	}
+	if c > u.PromptTokens {
+		return u.PromptTokens
+	}
+	return c
 }
 
 // openAIStreamChunk is one SSE data: payload from a streaming response.
@@ -178,11 +204,7 @@ type openAIStreamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage,omitempty"`
+	Usage *openAIUsage `json:"usage,omitempty"`
 }
 
 // mapToolChoice converts an Anthropic ToolChoice to an OpenAI tool_choice value.
@@ -407,7 +429,11 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 		chatResp.DoneReason = mapFinishReason(c.FinishReason)
 	}
 	if resp.Usage != nil {
-		chatResp.Metrics.PromptEvalCount = resp.Usage.PromptTokens
+		// Anthropic semantics: input_tokens is the UNCACHED part; the cached
+		// prefix is reported separately as cache_read_input_tokens (see
+		// anthropic.Usage) so a client's input+cache_read sum is the real
+		// prompt length -- neither double-counted nor missing.
+		chatResp.Metrics.PromptEvalCount = resp.Usage.PromptTokens - resp.Usage.cachedTokens()
 		chatResp.Metrics.EvalCount = resp.Usage.CompletionTokens
 	}
 	return chatResp
@@ -829,6 +855,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
+	anthResp.Usage.CacheReadInputTokens = oaiResp.Usage.cachedTokens()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
@@ -868,6 +895,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	}
 	toolAccums := map[int]*toolAccum{}
 	finishReason := ""
+	var finalUsage *openAIUsage
 
 	emit := func(events []anthropic.StreamEvent) {
 		for _, e := range events {
@@ -979,14 +1007,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 		// Some remotes send a final chunk with usage but no choices.
 		if chunk.Usage != nil {
-			// Update the converter's token counts via a no-content ChatResponse
-			// carrying only metrics; Process emits nothing for an empty
-			// non-final ChatResponse, but it does store inputTokens on the
-			// first call. We instead fold usage into the final done event below.
-			//
-			// It IS the ground truth for prompt size, though: this chunk is
-			// the only place a streaming response reports prompt_tokens, so
-			// it is what feeds the per-session context-fit calibration.
+			// The usage-only final chunk (stream_options.include_usage) is
+			// the only place a streaming response reports prompt_tokens. It
+			// feeds the per-session context-fit calibration AND the usage we
+			// report to the client on the done event below. Before
+			// 2026-08-30 it was only used for calibration: streamed
+			// responses then carried input_tokens=0/output_tokens=0, so
+			// Claude Code -- which always streams and sizes auto-compaction
+			// on the reported usage -- never saw its context grow, never
+			// compacted, and ran straight into the 262k wall (real .46
+			// session at 253,958 tokens, 2026-08-30 16:13 UTC).
+			finalUsage = chunk.Usage
 			if onUsage != nil && chunk.Usage.PromptTokens > 0 {
 				onUsage(chunk.Usage.PromptTokens)
 			}
@@ -997,13 +1028,31 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// emits their content blocks first and sets stop_reason=tool_use.
 	flushToolCalls()
 
-	// Final done event.
+	// Final done event, carrying the stream's real usage (see finalUsage
+	// above). The converter turns Metrics into message_delta.usage; the
+	// cache-read count has no Metrics field, so it is patched onto that
+	// event after conversion.
 	doneResp := api.ChatResponse{
 		Model:      upstreamModel,
 		Done:       true,
 		DoneReason: mapFinishReason(finishReason),
 	}
-	emit(conv.Process(doneResp))
+	cached := 0
+	if finalUsage != nil {
+		cached = finalUsage.cachedTokens()
+		doneResp.Metrics.PromptEvalCount = finalUsage.PromptTokens - cached
+		doneResp.Metrics.EvalCount = finalUsage.CompletionTokens
+	}
+	events := conv.Process(doneResp)
+	if cached > 0 {
+		for i := range events {
+			if d, ok := events[i].Data.(anthropic.MessageDeltaEvent); ok {
+				d.Usage.CacheReadInputTokens = cached
+				events[i].Data = d
+			}
+		}
+	}
+	emit(events)
 }
 
 // proxyPassThrough forwards a request verbatim to the target URL, streaming

@@ -29,19 +29,38 @@ import (
 // prompt_tokens for a body whose byte size we know. Consecutive turns of one
 // conversation share almost all of their content, so tokens-per-byte for a
 // given session is extremely stable -- calibrating on the previous turn
-// turns the estimate from a heuristic into near-measurement, which is why
-// the calibrated path can afford a 3% margin instead of 30%.
+// turns the estimate from a heuristic into near-measurement.
+//
+// WHY the calibrated margin is a fraction of the DELTA, not of the total
+// (real 2026-08-30 16:13-16:17 UTC incident, client ".46" on oaica 0.4.7):
+// a session sat at 253,958 real prompt tokens (vLLM usage) of a 262,144
+// window, prefix-cached. Claude Code's auto-compaction call was 714,483
+// body bytes, only ~2.5 KB more than the previous turn, and the calibrated
+// estimate was ~254.8k -- correct. But the margin was then 3% of that WHOLE
+// estimate, ~7.6k tokens, so 262,144 - 254.8k - 7.6k came out under the
+// 16-token minimum and the clamp rejected the request with "prompt is too
+// long" eleven times running. The session died with "Context limit reached"
+// while holding ~7k tokens of genuine headroom -- again on the one request
+// that would have shrunk it.
+//
+// The fix is to size the margin to what is actually uncertain. When a
+// calibration exists, the shared prefix of the two turns is MEASURED, not
+// estimated: the only part carrying tokenizer-model error is the
+// turn-to-turn delta (a new user message plus tool results). So the margin
+// is uncalibratedMarginRatio (30% -- the same fraction we trust to bound a
+// fully unmeasured prompt) applied to the delta alone, floored at
+// calibratedMarginFloor. On the incident above that is 30% of ~900 delta
+// tokens = ~265, floored to 512, leaving a ~6.8k budget: the compaction
+// call (which needs ~2k of output) would have been forwarded with
+// max_tokens clamped to that budget, and would have succeeded.
 //
 // Falling back to the old chars/4 + 30% behaviour is deliberate: the first
 // request of a session has nothing to calibrate against, and being coarse
 // but safe there is exactly the old (well-tested) trade-off.
 
-// calibratedMarginRatio / calibratedMarginFloor apply only when a real
-// per-session tokens-per-byte ratio is known. The estimate is then derived
-// from a measured count on nearly the same content, so the margin only has
-// to cover the turn-to-turn delta (a new user message plus tool results),
-// not tokenizer-model error.
-const calibratedMarginRatio = 0.03
+// calibratedMarginFloor is the smallest margin the calibrated path will
+// use, so that a delta of zero bytes (a retry of the identical body) still
+// leaves a little slack for anything the byte ratio cannot see.
 const calibratedMarginFloor = 512
 
 // uncalibratedMarginRatio / uncalibratedMarginFloor are the ORIGINAL
@@ -122,25 +141,28 @@ func (c *promptCalibrator) evictOldestLocked() {
 }
 
 // estimate returns the calibrated prompt-token estimate for a body of
-// bodyBytes on this session, and whether a calibration was available.
-func (c *promptCalibrator) estimate(key string, bodyBytes int) (int, bool) {
+// bodyBytes on this session, the byte size of the SAMPLE that estimate was
+// derived from, and whether a calibration was available. Callers need the
+// sample size to size their safety margin: see contextFitPlan.
+func (c *promptCalibrator) estimate(key string, bodyBytes int) (est, sampleBytes int, ok bool) {
 	if c == nil || key == "" || bodyBytes <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	c.mu.Lock()
 	s, ok := c.samples[key]
 	c.mu.Unlock()
 	if !ok || s.bodyBytes <= 0 || s.promptTokens <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	// Integer math (widened to int64 so the product cannot overflow on a
 	// ~1 MB body): float rounding would make the common "same body size as
-	// last turn" case land one token off its own measured count.
-	est := int(int64(bodyBytes) * int64(s.promptTokens) / int64(s.bodyBytes))
+	// last turn" case land one token off its own measured count, which is
+	// confusing in the error message for no benefit.
+	est = int(int64(bodyBytes) * int64(s.promptTokens) / int64(s.bodyBytes))
 	if est <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return est, true
+	return est, s.bodyBytes, true
 }
 
 // contextFitPlan returns the prompt-token estimate and the safety margin to
@@ -148,8 +170,17 @@ func (c *promptCalibrator) estimate(key string, bodyBytes int) (int, bool) {
 // calibration, coarse-and-generous (the pre-2026-08-30 behaviour, byte for
 // byte) when it does not.
 func contextFitPlan(c *promptCalibrator, key string, bodyBytes int) (est, margin int, calibrated bool) {
-	if e, ok := c.estimate(key, bodyBytes); ok {
-		margin = int(float64(e) * calibratedMarginRatio)
+	if e, sampleBytes, ok := c.estimate(key, bodyBytes); ok {
+		// Only the turn-to-turn delta is unmeasured, so only the delta gets
+		// a tokenizer-error margin -- see the 2026-08-30 incident at the top
+		// of this file. deltaTokens uses the session's own measured ratio
+		// (e/bodyBytes is exactly sample.promptTokens/sample.bodyBytes).
+		deltaBytes := bodyBytes - sampleBytes
+		if deltaBytes < 0 {
+			deltaBytes = -deltaBytes
+		}
+		deltaTokens := int(int64(deltaBytes) * int64(e) / int64(bodyBytes))
+		margin = int(float64(deltaTokens) * uncalibratedMarginRatio)
 		if margin < calibratedMarginFloor {
 			margin = calibratedMarginFloor
 		}

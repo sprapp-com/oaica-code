@@ -16,15 +16,15 @@ import (
 
 func TestPromptCalibrator_SessionIsolationAndSanityBounds(t *testing.T) {
 	c := newPromptCalibrator(4)
-	if _, ok := c.estimate("s1", 1000); ok {
+	if _, _, ok := c.estimate("s1", 1000); ok {
 		t.Error("expected no calibration before any record")
 	}
 	c.record("s1", 10_000, 3_000)
-	if est, ok := c.estimate("s1", 20_000); !ok || est != 6_000 {
+	if est, _, ok := c.estimate("s1", 20_000); !ok || est != 6_000 {
 		t.Errorf("expected 6000, got %d (ok=%v)", est, ok)
 	}
 	// (c) session keys must not bleed into one another.
-	if _, ok := c.estimate("s2", 20_000); ok {
+	if _, _, ok := c.estimate("s2", 20_000); ok {
 		t.Error("expected s2 to have no calibration")
 	}
 	for _, bad := range []struct {
@@ -38,7 +38,7 @@ func TestPromptCalibrator_SessionIsolationAndSanityBounds(t *testing.T) {
 		{"", 10_000, 3_000},    // no session key
 	} {
 		c.record(bad.key, bad.bytes, bad.promptTokens)
-		if _, ok := c.estimate(bad.key, 10_000); ok {
+		if _, _, ok := c.estimate(bad.key, 10_000); ok {
 			t.Errorf("expected %q to be rejected as a calibration source", bad.key)
 		}
 	}
@@ -60,11 +60,11 @@ func TestPromptCalibrator_BoundedMapEviction(t *testing.T) {
 	}
 	// Eviction is oldest-last-seen-first: the most recent max survive.
 	for i := 200 - max; i < 200; i++ {
-		if _, ok := c.estimate(fmt.Sprintf("sess-%d", i), 10_000); !ok {
+		if _, _, ok := c.estimate(fmt.Sprintf("sess-%d", i), 10_000); !ok {
 			t.Errorf("expected recent session sess-%d to survive", i)
 		}
 	}
-	if _, ok := c.estimate("sess-0", 10_000); ok {
+	if _, _, ok := c.estimate("sess-0", 10_000); ok {
 		t.Error("expected the oldest session to have been evicted")
 	}
 }
@@ -211,11 +211,14 @@ func TestContextFitClamp_Gateway_CalibratedEstimateSavesTheIncident(t *testing.T
 		t.Errorf("expected invalid_request_error, got %q", errResp.Error.Type)
 	}
 
-	// One successful turn of the SAME session reports its real prompt size
-	// (in the stream's final usage-only chunk).
-	smallBody, smallMsgBytes := calibGatewayBody(t, 20_000, 1024)
-	promptTokensToReport = int(float64(smallMsgBytes) * realRatio)
-	if status, respBody = calibGatewayPost(t, srv.URL, "sess-gw-incident", smallBody); status != 200 {
+	// The PREVIOUS turn of the SAME conversation -- just under the size at
+	// which the uncalibrated rule rejects -- reports its real prompt size in
+	// the stream's final usage-only chunk. Calibrating off a turn of nearly
+	// the same size is what happens in a real session, and it is what keeps
+	// the delta (and so the margin) small.
+	prevBody, prevMsgBytes := calibGatewayBody(t, 778_000, 1024)
+	promptTokensToReport = int(float64(prevMsgBytes) * realRatio)
+	if status, respBody = calibGatewayPost(t, srv.URL, "sess-gw-incident", prevBody); status != 200 {
 		t.Fatalf("calibration turn: expected 200, got %d: %s", status, respBody)
 	}
 
@@ -228,11 +231,8 @@ func TestContextFitClamp_Gateway_CalibratedEstimateSavesTheIncident(t *testing.T
 	if upstreamCalls != 1 {
 		t.Fatalf("calibrated: expected one upstream call, got %d", upstreamCalls)
 	}
-	estCal := int(int64(bigMsgBytes) * int64(promptTokensToReport) / int64(smallMsgBytes))
-	margin := int(float64(estCal) * calibratedMarginRatio)
-	if margin < calibratedMarginFloor {
-		margin = calibratedMarginFloor
-	}
+	estCal := int(int64(bigMsgBytes) * int64(promptTokensToReport) / int64(prevMsgBytes))
+	margin := wantCalibratedMargin(bigMsgBytes, prevMsgBytes, estCal)
 	if want := float64(262144 - estCal - margin); gotMaxTokens != want {
 		t.Errorf("expected max_tokens clamped to the calibrated budget %v, got %v", want, gotMaxTokens)
 	}
@@ -284,5 +284,97 @@ func TestContextFitClamp_Gateway_TranslatesUpstreamOverflow(t *testing.T) {
 	if !strings.HasPrefix(errResp.Error.Message, "prompt is too long: 260000 tokens > 262144 maximum") {
 		t.Errorf("expected the translated Anthropic wording with the upstream's real numbers, got %q",
 			errResp.Error.Message)
+	}
+}
+
+// wantCalibratedMargin recomputes contextFitPlan's calibrated margin
+// independently of the implementation: 30% of the turn-to-turn DELTA (the
+// only unmeasured part of the prompt), floored at calibratedMarginFloor.
+func wantCalibratedMargin(bodyBytes, sampleBytes, est int) int {
+	delta := bodyBytes - sampleBytes
+	if delta < 0 {
+		delta = -delta
+	}
+	deltaTokens := int(int64(delta) * int64(est) / int64(bodyBytes))
+	margin := int(float64(deltaTokens) * uncalibratedMarginRatio)
+	if margin < calibratedMarginFloor {
+		margin = calibratedMarginFloor
+	}
+	return margin
+}
+
+// TestContextFitPlan_CalibratedMarginScalesWithTheDelta is the 2026-08-30
+// incident in arithmetic form, plus the case that justifies not simply
+// pinning the margin to the floor.
+func TestGatewayContextFitPlan_CalibratedMarginScalesWithTheDelta(t *testing.T) {
+	const window = 262_144
+	cases := []struct {
+		name          string
+		sampleBytes   int
+		samplePrompt  int
+		bodyBytes     int
+		wantMargin    int
+		wantForwarded bool
+		wantMinBudget int
+	}{
+		{
+			// The incident: 253,958 real tokens of a 262,144 window, and a
+			// compaction call only ~2.5 KB larger than the measured turn.
+			// The old 3%-of-total margin (~7.6k) drove the budget under 16
+			// and killed the session; 30% of the ~900-token delta is ~265,
+			// floored to 512, which leaves ~6.8k -- ample for a compaction
+			// response.
+			name:        "incident: tiny delta on a nearly-full window",
+			sampleBytes: 712_000, samplePrompt: 253_958, bodyBytes: 714_483,
+			wantMargin: calibratedMarginFloor, wantForwarded: true, wantMinBudget: 5_000,
+		},
+		{
+			// A body twice the measured one is half unmeasured, so the
+			// margin must be a real 30% of that half, not the floor.
+			name:        "large delta earns a large margin",
+			sampleBytes: 100_000, samplePrompt: 30_000, bodyBytes: 200_000,
+			wantMargin: 9_000, wantForwarded: true, wantMinBudget: 0,
+		},
+		{
+			// A SHRINKING turn is just as unmeasured as a growing one: the
+			// margin keys on |delta|, not on growth.
+			name:        "shrinking body: margin keys on the absolute delta",
+			sampleBytes: 200_000, samplePrompt: 60_000, bodyBytes: 100_000,
+			wantMargin: 9_000, wantForwarded: true, wantMinBudget: 0,
+		},
+		{
+			// Identical body: nothing is unmeasured, so only the floor.
+			name:        "identical body: floor only",
+			sampleBytes: 712_000, samplePrompt: 253_958, bodyBytes: 712_000,
+			wantMargin: calibratedMarginFloor, wantForwarded: true, wantMinBudget: 7_000,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newPromptCalibrator(8)
+			c.record("s", tc.sampleBytes, tc.samplePrompt)
+			est, margin, calibrated := contextFitPlan(c, "s", tc.bodyBytes)
+			if !calibrated {
+				t.Fatal("expected the calibrated path")
+			}
+			wantEst := int(int64(tc.bodyBytes) * int64(tc.samplePrompt) / int64(tc.sampleBytes))
+			if est != wantEst {
+				t.Errorf("est = %d, want %d", est, wantEst)
+			}
+			if margin != tc.wantMargin {
+				t.Errorf("margin = %d, want %d", margin, tc.wantMargin)
+			}
+			if margin != wantCalibratedMargin(tc.bodyBytes, tc.sampleBytes, est) {
+				t.Errorf("margin = %d disagrees with the delta formula", margin)
+			}
+			budget := window - est - margin
+			if got := budget >= 16; got != tc.wantForwarded {
+				t.Fatalf("budget %d: forwarded = %v, want %v", budget, got, tc.wantForwarded)
+			}
+			if budget < tc.wantMinBudget {
+				t.Errorf("budget = %d, want at least %d", budget, tc.wantMinBudget)
+			}
+			t.Logf("est=%d margin=%d fitBudget=%d", est, margin, budget)
+		})
 	}
 }

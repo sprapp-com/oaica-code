@@ -215,10 +215,20 @@ type MessagesResponse struct {
 	Usage        Usage          `json:"usage"`
 }
 
-// Usage contains token usage information
+// Usage contains token usage information.
+//
+// CacheReadInputTokens follows Anthropic's semantics: input_tokens counts
+// the UNCACHED prompt tokens and cache_read_input_tokens the prefix served
+// from cache, so a client's context-size arithmetic (input + cache_read)
+// lands on the real prompt length. Claude Code sizes its auto-compaction on
+// exactly that sum -- reporting the full prompt in input_tokens AND the
+// cached part here would double-count and compact far too early;
+// reporting 0 (what the streaming path did before 2026-08-30) never
+// compacts at all and the session runs into the context wall.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens          int `json:"input_tokens"`
+	OutputTokens         int `json:"output_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // Streaming event types
@@ -271,10 +281,13 @@ type MessageDelta struct {
 	StopSequence string `json:"stop_sequence,omitempty"`
 }
 
-// DeltaUsage contains cumulative token usage
+// DeltaUsage contains cumulative token usage (same field semantics as Usage;
+// the Anthropic SDKs merge these into the final message's usage, which is
+// where streaming clients read the prompt size from).
 type DeltaUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens          int `json:"input_tokens"`
+	OutputTokens         int `json:"output_tokens"`
+	CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // MessageStopEvent signals the end of the message

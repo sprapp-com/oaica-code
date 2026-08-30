@@ -51,36 +51,36 @@ func calibMessagesBody(t *testing.T, contentLen, maxTokens int, stream bool) []b
 func TestPromptCalibrator_RecordAndEstimate(t *testing.T) {
 	c := newPromptCalibrator(4)
 
-	if _, ok := c.estimate("s1", 1000); ok {
+	if _, _, ok := c.estimate("s1", 1000); ok {
 		t.Error("expected no calibration before any record")
 	}
 	c.record("s1", 10_000, 3_000) // 0.30 tokens/byte
-	est, ok := c.estimate("s1", 20_000)
+	est, _, ok := c.estimate("s1", 20_000)
 	if !ok || est != 6_000 {
 		t.Errorf("expected a calibrated 6000, got %d (ok=%v)", est, ok)
 	}
 	// (c) A different session must NOT inherit another session's ratio.
-	if _, ok := c.estimate("s2", 20_000); ok {
+	if _, _, ok := c.estimate("s2", 20_000); ok {
 		t.Error("expected session s2 to have no calibration of its own")
 	}
 
 	// Absurd ratios are ignored rather than trusted: a bogus pairing that
 	// clamped every future request to nothing would be worse than chars/4.
 	c.record("bad-high", 100, 100_000) // 1000 tokens/byte
-	if _, ok := c.estimate("bad-high", 100); ok {
+	if _, _, ok := c.estimate("bad-high", 100); ok {
 		t.Error("expected an absurdly high ratio to be rejected")
 	}
 	c.record("bad-low", 100_000, 10) // 0.0001 tokens/byte
-	if _, ok := c.estimate("bad-low", 100_000); ok {
+	if _, _, ok := c.estimate("bad-low", 100_000); ok {
 		t.Error("expected an absurdly low ratio to be rejected")
 	}
 	// Never calibrate off a zero/absent usage count.
 	c.record("zero", 10_000, 0)
-	if _, ok := c.estimate("zero", 10_000); ok {
+	if _, _, ok := c.estimate("zero", 10_000); ok {
 		t.Error("expected a zero prompt_tokens to be ignored")
 	}
 	c.record("", 10_000, 3_000)
-	if _, ok := c.estimate("", 10_000); ok {
+	if _, _, ok := c.estimate("", 10_000); ok {
 		t.Error("expected an empty session key to be ignored")
 	}
 }
@@ -98,11 +98,11 @@ func TestPromptCalibrator_BoundedEviction(t *testing.T) {
 	}
 	// Oldest-last-seen-first: s0..s6 evicted, the newest three survive.
 	for _, k := range []string{"s7", "s8", "s9"} {
-		if _, ok := c.estimate(k, 10_000); !ok {
+		if _, _, ok := c.estimate(k, 10_000); !ok {
 			t.Errorf("expected the recent session %q to survive eviction", k)
 		}
 	}
-	if _, ok := c.estimate("s0", 10_000); ok {
+	if _, _, ok := c.estimate("s0", 10_000); ok {
 		t.Error("expected the oldest session to have been evicted")
 	}
 	// Re-recording an existing key must refresh it, not grow the map.
@@ -261,10 +261,14 @@ func TestContextFitClamp_ClientProxy_CalibratedEstimateSavesTheIncident(t *testi
 		t.Errorf("expected invalid_request_error, got %q", errResp.Error.Type)
 	}
 
-	// One successful small turn of the SAME session reports the real count.
-	smallBody := calibMessagesBody(t, 20_000, 1024, false)
-	promptTokensToReport = int(float64(len(smallBody)) * realRatio)
-	resp, err = http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(smallBody))
+	// The PREVIOUS turn of the SAME conversation: just under the size at
+	// which the uncalibrated rule rejects, so it is forwarded and its real
+	// prompt_tokens come back. Calibrating off a turn of nearly the same
+	// size is what actually happens in a session, and it is what keeps the
+	// margin small -- see contextFitPlan's delta rationale.
+	prevBody := calibMessagesBody(t, 778_000, 1024, false)
+	promptTokensToReport = int(float64(len(prevBody)) * realRatio)
+	resp, err = http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(prevBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,11 +295,8 @@ func TestContextFitClamp_ClientProxy_CalibratedEstimateSavesTheIncident(t *testi
 		t.Fatalf("calibrated: expected exactly one upstream call, got %d", upstreamCalls)
 	}
 	// Same integer math the calibrator uses, from the pair it actually saw.
-	estCal := int(int64(len(bigBody)) * int64(promptTokensToReport) / int64(len(smallBody)))
-	margin := int(float64(estCal) * calibratedMarginRatio)
-	if margin < calibratedMarginFloor {
-		margin = calibratedMarginFloor
-	}
+	estCal := int(int64(len(bigBody)) * int64(promptTokensToReport) / int64(len(prevBody)))
+	margin := wantCalibratedMargin(len(bigBody), len(prevBody), estCal)
 	wantMax := 262144 - estCal - margin
 	if lastMaxTokens != wantMax {
 		t.Errorf("expected max_tokens clamped to the calibrated budget %d, got %d", wantMax, lastMaxTokens)
@@ -351,9 +352,12 @@ func TestContextFitClamp_ClientProxy_StreamCalibratesFromFinalUsageChunk(t *test
 
 	proxyURL := startCalibProxy(t, upstream.URL, "sess-stream")
 
-	smallBody := calibMessagesBody(t, 20_000, 1024, true)
-	promptTokensToReport = int(float64(len(smallBody)) * realRatio)
-	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(smallBody))
+	// The previous turn of the same conversation: just under the size the
+	// uncalibrated rule rejects, so it is forwarded and its usage chunk
+	// seeds the calibration with a body close in size to the next one.
+	prevBody := calibMessagesBody(t, 778_000, 1024, true)
+	promptTokensToReport = int(float64(len(prevBody)) * realRatio)
+	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(prevBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,8 +392,15 @@ func TestContextFitClamp_ClientProxy_TranslatesUpstreamOverflow(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 
 	var upstreamCalls int
+	var lastMaxTokens int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
+		var req struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		rb, _ := io.ReadAll(r.Body)
+		json.Unmarshal(rb, &req)
+		lastMaxTokens = req.MaxTokens
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, `{"object":"error","message":"This model's maximum context length is 262144 tokens. However, you requested 392144 tokens (260000 in the messages, 132144 in the completion). Please reduce the length of the messages or completion.","type":"BadRequestError","code":400}`)
@@ -435,10 +446,34 @@ func TestContextFitClamp_ClientProxy_TranslatesUpstreamOverflow(t *testing.T) {
 	}
 
 	// The upstream's 260,000-in-the-messages is ground truth for this
-	// session: the same body must now be rejected CLIENT-side (est 260,000
-	// + 3% margin leaves no room), without touching upstream again.
+	// session. Re-sending the IDENTICAL body has a zero delta, so the margin
+	// is only the 512-token floor: 262,144 - 260,000 - 512 leaves a real
+	// 1,632 tokens, and the request is forwarded with max_tokens clamped to
+	// exactly that instead of the 32,000 it asked for. (Under the old
+	// 3%-of-total margin this was rejected outright -- the 2026-08-30
+	// failure mode: a measured prompt refused over an imaginary 7.8k.)
 	upstreamCalls = 0
+	lastMaxTokens = 0
 	resp, err = http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if upstreamCalls != 1 {
+		t.Fatalf("expected the seeded 260,000-token estimate to still FIT (1,632 tokens spare), got %d upstream calls", upstreamCalls)
+	}
+	if want := 262144 - 260_000 - calibratedMarginFloor; lastMaxTokens != want {
+		t.Errorf("expected max_tokens clamped to the seeded budget %d, got %d", want, lastMaxTokens)
+	}
+
+	// A body 20 KB larger than the measured one genuinely does not fit:
+	// est ~273k > the 262,144 window. That must be rejected CLIENT-side,
+	// which is only possible because the overflow seeded the calibration
+	// (chars/4 would have estimated ~105k and forwarded it).
+	upstreamCalls = 0
+	bigger := calibMessagesBody(t, 420_000, 32000, false)
+	resp, err = http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(bigger))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +489,99 @@ func TestContextFitClamp_ClientProxy_TranslatesUpstreamOverflow(t *testing.T) {
 	if err := json.Unmarshal(respBody, &errResp); err != nil {
 		t.Fatalf("bad error JSON: %v (%s)", err, respBody)
 	}
-	if !strings.HasPrefix(errResp.Error.Message, "prompt is too long: 260000 tokens > ") {
-		t.Errorf("expected the calibrated estimate in the rejection, got %q", errResp.Error.Message)
+	if !strings.HasPrefix(errResp.Error.Message, "prompt is too long: 27") {
+		t.Errorf("expected the calibrated (~273k) estimate in the rejection, got %q", errResp.Error.Message)
+	}
+}
+
+// wantCalibratedMargin recomputes contextFitPlan's calibrated margin
+// independently of the implementation: 30% of the turn-to-turn DELTA (the
+// only unmeasured part of the prompt), floored at calibratedMarginFloor.
+func wantCalibratedMargin(bodyBytes, sampleBytes, est int) int {
+	delta := bodyBytes - sampleBytes
+	if delta < 0 {
+		delta = -delta
+	}
+	deltaTokens := int(int64(delta) * int64(est) / int64(bodyBytes))
+	margin := int(float64(deltaTokens) * uncalibratedMarginRatio)
+	if margin < calibratedMarginFloor {
+		margin = calibratedMarginFloor
+	}
+	return margin
+}
+
+// TestContextFitPlan_CalibratedMarginScalesWithTheDelta is the 2026-08-30
+// incident in arithmetic form, plus the case that justifies not simply
+// pinning the margin to the floor.
+func TestContextFitPlan_CalibratedMarginScalesWithTheDelta(t *testing.T) {
+	const window = 262_144
+	cases := []struct {
+		name          string
+		sampleBytes   int
+		samplePrompt  int
+		bodyBytes     int
+		wantMargin    int
+		wantForwarded bool
+		wantMinBudget int
+	}{
+		{
+			// The incident: 253,958 real tokens of a 262,144 window, and a
+			// compaction call only ~2.5 KB larger than the measured turn.
+			// The old 3%-of-total margin (~7.6k) drove the budget under 16
+			// and killed the session; 30% of the ~900-token delta is ~265,
+			// floored to 512, which leaves ~6.8k -- ample for a compaction
+			// response.
+			name:        "incident: tiny delta on a nearly-full window",
+			sampleBytes: 712_000, samplePrompt: 253_958, bodyBytes: 714_483,
+			wantMargin: calibratedMarginFloor, wantForwarded: true, wantMinBudget: 5_000,
+		},
+		{
+			// A body twice the measured one is half unmeasured, so the
+			// margin must be a real 30% of that half, not the floor.
+			name:        "large delta earns a large margin",
+			sampleBytes: 100_000, samplePrompt: 30_000, bodyBytes: 200_000,
+			wantMargin: 9_000, wantForwarded: true, wantMinBudget: 0,
+		},
+		{
+			// A SHRINKING turn is just as unmeasured as a growing one: the
+			// margin keys on |delta|, not on growth.
+			name:        "shrinking body: margin keys on the absolute delta",
+			sampleBytes: 200_000, samplePrompt: 60_000, bodyBytes: 100_000,
+			wantMargin: 9_000, wantForwarded: true, wantMinBudget: 0,
+		},
+		{
+			// Identical body: nothing is unmeasured, so only the floor.
+			name:        "identical body: floor only",
+			sampleBytes: 712_000, samplePrompt: 253_958, bodyBytes: 712_000,
+			wantMargin: calibratedMarginFloor, wantForwarded: true, wantMinBudget: 7_000,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newPromptCalibrator(8)
+			c.record("s", tc.sampleBytes, tc.samplePrompt)
+			est, margin, calibrated := contextFitPlan(c, "s", tc.bodyBytes)
+			if !calibrated {
+				t.Fatal("expected the calibrated path")
+			}
+			wantEst := int(int64(tc.bodyBytes) * int64(tc.samplePrompt) / int64(tc.sampleBytes))
+			if est != wantEst {
+				t.Errorf("est = %d, want %d", est, wantEst)
+			}
+			if margin != tc.wantMargin {
+				t.Errorf("margin = %d, want %d", margin, tc.wantMargin)
+			}
+			if margin != wantCalibratedMargin(tc.bodyBytes, tc.sampleBytes, est) {
+				t.Errorf("margin = %d disagrees with the delta formula", margin)
+			}
+			budget := window - est - margin
+			if got := budget >= 16; got != tc.wantForwarded {
+				t.Fatalf("budget %d: forwarded = %v, want %v", budget, got, tc.wantForwarded)
+			}
+			if budget < tc.wantMinBudget {
+				t.Errorf("budget = %d, want at least %d", budget, tc.wantMinBudget)
+			}
+			t.Logf("est=%d margin=%d fitBudget=%d", est, margin, budget)
+		})
 	}
 }

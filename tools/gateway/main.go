@@ -109,9 +109,10 @@ func legalHandler(name string) http.HandlerFunc {
 const maxBodyBytes = 16 << 20
 
 // nonStreamMaxTokens bounds max_tokens on NON-streaming completions so the
-// response can complete inside the proxy's 90 s ResponseHeaderTimeout (and
-// Cloudflare's 100 s TTFB limit behind it). Streaming is not bounded by
-// this (only by the model's max_completion_tokens).
+// response can complete inside Cloudflare's ~100 s time-to-first-byte limit
+// (the proxy's own ResponseHeaderTimeout is now 600 s, so the edge is the
+// binding constraint). Streaming is not bounded by this (only by the
+// model's max_completion_tokens).
 //
 // 8192 was wrong: at the ~80 tok/s a stream gets under the 32-way cap that
 // is ~102 s, and the ledger showed eight real 504s, every one non-stream at
@@ -423,9 +424,26 @@ type errCaptureInfo struct {
 }
 
 // newProxy builds a reverse proxy with its own transport and explicit
-// timeouts. ResponseHeaderTimeout returns a clean 504 before Cloudflare's
-// 100s edge timeout would turn it into an opaque 524. No overall client
-// timeout: streamed completions legitimately run for minutes.
+// timeouts. No overall client timeout: streamed completions legitimately
+// run for minutes.
+//
+// ResponseHeaderTimeout is 600 s, raised from 90 s after a real incident
+// (2026-08-30 13:46-14:04 UTC): twelve consecutive 504s at ~90.6 s each on
+// one 424 KB conversation. Nothing was wedged -- prefill of ~110k uncached
+// tokens under load simply took longer than 90 s, and because every Claude
+// Code retry re-prefilled from scratch, each retry timed out identically.
+// The arithmetic makes 90 s indefensible as an upstream budget: prefill of
+// a full 262k-token prompt at ~2k tok/s is ~130 s on its own, and queueing
+// behind other replicas' prefills multiplies that. 600 s still bounds a
+// genuinely stuck upstream, because it sits above the replica watchdog's
+// own 300 s stall threshold -- the watchdog kills the wedged replica first,
+// which closes the connection and fails the request well before 600 s.
+//
+// This does NOT help the public Cloudflare path, which imposes its own
+// ~100 s time-to-first-byte limit that no server-side timeout can raise;
+// LAN and tunnel clients hitting :8081 directly are the ones this fixes.
+// Surviving the edge limit needs early SSE headers plus keepalive comments,
+// which is a separate change.
 // onUpstreamError is called for every non-2xx, non-SSE upstream response,
 // with the real (untruncated-by-normalization) error message and the
 // errCaptureInfo stashed in the request's context, if any (nil when the
@@ -439,7 +457,7 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 	p := httputil.NewSingleHostReverseProxy(u)
 	p.Transport = &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ResponseHeaderTimeout: 90 * time.Second,
+		ResponseHeaderTimeout: 600 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   64,
 	}

@@ -639,9 +639,9 @@ func TestCompletion_ClampsMaxTokens(t *testing.T) {
 		t.Errorf("non-stream 200000 -> upstream %v, want %d (nonStreamMaxTokens)", v, nonStreamMaxTokens)
 	}
 	if nonStreamMaxTokens > 4096 {
-		// ~80 tok/s per stream under the 32-way cap; the proxy's
-		// ResponseHeaderTimeout is 90 s. 8192 produced real 504s.
-		t.Errorf("nonStreamMaxTokens = %d cannot finish inside the 90 s upstream timeout", nonStreamMaxTokens)
+		// ~80 tok/s per stream under the 32-way cap; Cloudflare cuts the
+		// edge off at ~100 s TTFB. 8192 produced real 504s.
+		t.Errorf("nonStreamMaxTokens = %d cannot finish inside the ~100 s edge timeout", nonStreamMaxTokens)
 	}
 	if v := send(`{"model":"kat-awq","stream":true,"max_tokens":200000,"messages":[]}`); v != 32768 {
 		t.Errorf("stream 200000 -> upstream %v, want 32768 (published max_completion_tokens)", v)
