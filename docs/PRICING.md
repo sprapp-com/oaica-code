@@ -393,3 +393,46 @@ Ship the cache-hit pricing that's already coded but not deployed — it's
 free margin today (compute already saved by prefix caching) and turns
 into a genuine competitive edge against DeepSeek specifically for the
 repeat-heavy-context workload this product actually serves.
+
+## Billing provider + what to charge for the local engine (2026-08-30)
+
+### Provider: Stripe, direct
+
+- Our billing is usage-metered (tokens, cache-hit discount, overage) plus
+  subscriptions. Stripe Billing has native usage **meters**; a gateway
+  ledger row maps 1:1 onto a meter event (`key`, `prompt_tokens −
+  cached_tokens`, `cached_tokens`, `completion_tokens`). Lemon Squeezy and
+  Paddle do subscriptions well but usage billing is coarse/bolted-on.
+- Malaysia: Stripe supports MY entities with MYR payouts; Stripe Tax can
+  compute SST/VAT when cross-border volume warrants registering.
+- Lemon Squeezy was acquired by Stripe (2024) and is being folded into
+  Stripe's merchant-of-record product — starting on LS today means a
+  migration later regardless.
+- Merchant-of-record (Paddle, Stripe's MoR) only earns its ~5% + $0.50
+  per transaction when you sell to consumers across many tax
+  jurisdictions and want no tax registrations. Our buyers are developers
+  and teams (B2B), so direct Stripe (~3–4%; verify the current MY rate
+  card) wins until tax admin becomes the bottleneck.
+- Build order: Checkout + Customer Portal for plans → Billing Meters fed
+  from the ledger (batch per key per hour) → webhooks flip key status in
+  meterhub → `entitlement.go` (already scaffolded, off by default) reads
+  that status. No card data ever touches our boxes.
+
+### Local engine (sprapp-prism, `.pqm`) — license, not metering
+
+- Do **not** meter local/self-hosted engine use: unenforceable offline,
+  invites cracking, and kills the adoption funnel (Ollama's whole growth
+  was "free locally"). Local = free: engine binary + open `.pqm`/GGUF.
+- Charge for what only we have:
+  1. hosted API per token (live, metered);
+  2. a **Pro / commercial self-host license** — annual, per node, offline
+     signed license key with a grace period — unlocking what the free
+     tier caps: commercial use, > N context, multi-GPU + CPU-expert
+     offload tuning, priority builds, support;
+  3. our own tuned models shipped as `.pqm` behind the pull license
+     (`/v1/manifest` gating; the engine itself stays free).
+- Price anchor: the CPU-offload engine runs a 35B MoE on a small GPU; the
+  license is worth a fraction of the hardware it saves per year — order
+  of USD 200–400 / node / year commercial, USD 0 personal. Exact number
+  is a business decision; leave it open until the local first-run path
+  is clean (see PRODUCTION_READINESS.md, local-use audit 2026-08-30).
