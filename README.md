@@ -18,7 +18,7 @@ archive extracts to `bin/oaica`, so either extract into `~/.local`
 (`tar -C ~/.local -xzf oaica-*.tar.gz`) or move `bin/oaica` onto your `PATH`
 yourself (e.g. `/usr/local/bin`).
 
-**Current release:** 0.4.7 — see https://oaica.com/download/VERSION.txt for
+**Current release:** 0.4.8 — see https://oaica.com/download/VERSION.txt for
 the live pointer.
 
 **API base URL:** `https://api.oaica.com` (`OAICA_HOST` defaults here;
