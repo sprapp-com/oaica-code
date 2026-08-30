@@ -445,3 +445,31 @@ func TestClaudeModelEnvVars(t *testing.T) {
 		}
 	})
 }
+
+// Audit 0.4.6 P2-2/P1-2: with claude absent and no way to ask (non-interactive,
+// no --yes), the error must be a statement naming the fix — not ConfirmPrompt's
+// generic "<question>? requires confirmation" splice — and must be an error at
+// all, so the launch exits non-zero.
+func TestEnsureClaudeInstalled_NonInteractiveMessage(t *testing.T) {
+	// A PATH with the installer's dependencies (curl/bash) but no claude, and
+	// a HOME without the ~/.local/bin fallbacks, so we reach the confirm gate.
+	bin := t.TempDir()
+	for _, dep := range []string{"curl", "bash"} {
+		if err := os.WriteFile(filepath.Join(bin, dep), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	t.Setenv("HOME", t.TempDir())
+	restore := withLaunchConfirmPolicy(launchConfirmPolicy{requireYesMessage: true})
+	defer restore()
+
+	_, err := ensureClaudeInstalled()
+	if err == nil {
+		t.Fatal("missing claude must be an error")
+	}
+	want := "Claude Code is not installed; re-run with --yes to install it"
+	if err.Error() != want {
+		t.Fatalf("err = %q, want %q", err.Error(), want)
+	}
+}

@@ -469,7 +469,8 @@ func TestRunHandler_OaicaKnownModelOneShotChat(t *testing.T) {
 }
 
 // Fork run path: an unknown model is refused with the router's model list
-// and exits cleanly (no pull, no local server).
+// and a NON-NIL error, so the process exits 1 (audit 0.4.6, P0-4/P1-2 — it
+// used to exit 0, making a typo look like success). No pull, no local server.
 func TestRunHandler_OaicaUnknownModelListsAvailable(t *testing.T) {
 	oaicaListModelsDetailed = func() ([]oaicaModelListEntry, error) {
 		return []oaicaModelListEntry{{ID: "kat-awq"}, {ID: "malay35b"}}, nil
@@ -480,11 +481,13 @@ func TestRunHandler_OaicaUnknownModelListsAvailable(t *testing.T) {
 	t.Cleanup(func() { oaicaChat = oaicaChatLive })
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
 
+	var runErr error
 	out := captureStdout(t, func() {
-		if err := RunHandler(oaicaRunCmd(t), []string{"nope", "hi"}); err != nil {
-			t.Fatalf("unknown model must not error, got %v", err)
-		}
+		runErr = RunHandler(oaicaRunCmd(t), []string{"nope", "hi"})
 	})
+	if runErr == nil {
+		t.Fatal("unknown model must return an error so the CLI exits non-zero")
+	}
 	if !strings.Contains(out, "Unknown model 'nope'") || !strings.Contains(out, "kat-awq") || !strings.Contains(out, "malay35b") {
 		t.Fatalf("expected refusal listing available models, got %q", out)
 	}

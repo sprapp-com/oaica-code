@@ -15,6 +15,7 @@ package cmd
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -333,12 +334,19 @@ func oaicaPullModel(model string) (string, error) {
 // of our own infra; the file is encrypted at rest so being on a public
 // repo doesn't leak the weights — only a valid license gets the key.
 func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (string, error) {
-	if manifest.HFURL == nil || manifest.DecryptKeyHex == nil {
-		return "", fmt.Errorf("router said source=hf but didn't include hf_url/decrypt_key")
+	if manifest.HFURL == nil {
+		return "", fmt.Errorf("router said source=hf but didn't include hf_url")
 	}
-	key, err := hex.DecodeString(*manifest.DecryptKeyHex)
-	if err != nil || len(key) != 32 {
-		return "", fmt.Errorf("bad decrypt key from router")
+	// decrypt_key is optional: the gateway catalog serves PUBLIC, plaintext
+	// GGUFs with decrypt_key: null (shipping a key for a plaintext blob would
+	// be meaningless). Only licensed/encrypted models carry one.
+	var key []byte
+	if manifest.DecryptKeyHex != nil {
+		var err error
+		key, err = hex.DecodeString(*manifest.DecryptKeyHex)
+		if err != nil || len(key) != 32 {
+			return "", fmt.Errorf("bad decrypt key from router")
+		}
 	}
 
 	req, err := http.NewRequest(http.MethodGet, *manifest.HFURL, nil)
@@ -370,6 +378,38 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 		return "", err
 	}
 	defer f.Close()
+
+	if key == nil {
+		// Plaintext blob: stream it straight through, verifying size and (when
+		// the manifest supplies one) sha256 — the integrity check GCM's auth
+		// tag provides on the encrypted path.
+		fmt.Fprintf(os.Stderr, "pulling %s from HuggingFace (%s)...\n", model, humanBytes(manifest.SizeBytes))
+		hasher := sha256.New()
+		written, err := io.Copy(io.MultiWriter(f, hasher), &progressReader{r: resp.Body, total: manifest.SizeBytes, label: model})
+		if err != nil {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("pull interrupted: %w", err)
+		}
+		f.Close()
+		fmt.Fprintln(os.Stderr)
+
+		if manifest.SizeBytes > 0 && written != manifest.SizeBytes {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("pull incomplete: got %d bytes, expected %d", written, manifest.SizeBytes)
+		}
+		if manifest.SHA256 != nil && *manifest.SHA256 != "" {
+			got := hex.EncodeToString(hasher.Sum(nil))
+			if !strings.EqualFold(got, strings.TrimSpace(*manifest.SHA256)) {
+				os.Remove(tmpPath)
+				return "", fmt.Errorf("sha256 mismatch: got %s, expected %s", got, *manifest.SHA256)
+			}
+		}
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			return "", err
+		}
+		fmt.Fprintf(os.Stderr, "%s saved to %s\n", model, destPath)
+		return destPath, nil
+	}
 
 	fmt.Fprintf(os.Stderr, "pulling %s from HuggingFace (%s encrypted, decrypting as it streams)...\n", model, humanBytes(manifest.SizeBytes))
 	// No exact-size verification here (unlike the R2/fallback path) —
@@ -486,6 +526,9 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	autoPopulateModelManifest(model, destPath)
+	// A pulled GGUF does nothing on its own — name the one command that turns
+	// it into something usable, so the next step isn't a docs lookup.
+	fmt.Fprintf(os.Stderr, "serve it with: oaica serve %s\n", model)
 	return nil
 }
 

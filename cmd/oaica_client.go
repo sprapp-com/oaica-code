@@ -9,6 +9,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,20 @@ func oaicaAuthorize(req *http.Request) {
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+}
+
+// oaicaAuthHint is appended to every router auth failure so the fix arrives
+// with the diagnosis instead of leaving a fresh user with a bare "missing or
+// invalid API key" from the gateway (audit 0.4.6, P1-3). One hint line, max.
+const oaicaAuthHint = "Run `oaica signin`, or set OAICA_API_KEY (get a key at https://oaica.com)"
+
+// oaicaWrapAuthError turns a router error payload into a CLI error, appending
+// oaicaAuthHint when the failure is about credentials.
+func oaicaWrapAuthError(msg string) error {
+	if strings.Contains(strings.ToLower(msg), "api key") {
+		return fmt.Errorf("%s\n%s", msg, oaicaAuthHint)
+	}
+	return errors.New(msg)
 }
 
 func oaicaConfigDir() (string, error) {
@@ -147,7 +162,7 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return nil, fmt.Errorf("%s rejected the API key (HTTP %d) — set OAICA_API_KEY or run `oaica signin`", oaicaHost(), resp.StatusCode)
+			return nil, fmt.Errorf("%s rejected the API key (HTTP %d)\n%s", oaicaHost(), resp.StatusCode, oaicaAuthHint)
 		}
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
@@ -289,7 +304,7 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf("%s", out.Error.Message)
+		return "", oaicaWrapAuthError(out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
@@ -409,7 +424,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf("%s", out.Error.Message)
+		return "", oaicaWrapAuthError(out.Error.Message)
 	}
 	return out.Model, nil
 }

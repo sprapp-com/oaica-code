@@ -145,6 +145,14 @@ func ensureClaudeInstalled() (string, error) {
 		return "", err
 	}
 
+	// Phrased here rather than through ConfirmPrompt's generic
+	// "<prompt> requires confirmation; re-run with --yes" so the
+	// non-interactive error reads as a statement, not a question with a
+	// suffix bolted on (audit 0.4.6, P2-2).
+	if currentLaunchConfirmPolicy.requireYesMessage && !currentLaunchConfirmPolicy.yes {
+		return "", fmt.Errorf("Claude Code is not installed; re-run with --yes to install it")
+	}
+
 	ok, err := ConfirmPrompt("Claude Code is not installed. Install now?")
 	if err != nil {
 		return "", err

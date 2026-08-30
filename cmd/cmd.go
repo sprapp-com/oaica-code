@@ -713,7 +713,12 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 			for _, n := range names {
 				fmt.Printf("  %s\n", n)
 			}
-			return nil
+			// Returning an error (not nil) so the shell sees exit 1 — a
+			// typo'd model used to look like success. Audit 0.4.6, P0-4/P1-2.
+			if hint := oaicaLocalModelHint(cmd, args[0]); hint != "" {
+				return errors.New(hint)
+			}
+			return fmt.Errorf("no router model named %q", args[0])
 		}
 		if interactive {
 			return generateInteractive(cmd, opts)
@@ -749,6 +754,39 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		}
 		return nil
 	}
+}
+
+// oaicaLocalModelHint points at the self-host path when a name the router
+// doesn't serve IS available locally — either as a GGUF pulled by `oaica
+// pull` or as a model in a reachable Ollama daemon. That's the single most
+// common fresh-user confusion behind "Unknown model" (audit 0.4.6, P0-4).
+// Returns "" when the name isn't local either, so the caller falls back to a
+// plain unknown-model error.
+func oaicaLocalModelHint(cmd *cobra.Command, name string) string {
+	local := false
+	if p, err := oaicaModelPath(name); err == nil {
+		if _, statErr := os.Stat(p); statErr == nil {
+			local = true
+		}
+	}
+	if !local {
+		// Best effort: no daemon is the normal case, so any error here just
+		// means "not a daemon model".
+		if client, err := api.ClientFromEnvironment(); err == nil {
+			if list, err := client.List(cmd.Context()); err == nil {
+				for _, m := range list.Models {
+					if m.Name == name || m.Model == name || strings.TrimSuffix(m.Name, ":latest") == name {
+						local = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !local {
+		return ""
+	}
+	return fmt.Sprintf("'%s' is a local model; use `oaica serve %s` (pulled GGUF) or `OLLAMA_HOST=... ollama run` (daemon)", name, name)
 }
 
 // SigninHandler prompts for an OAICA_API_KEY (the client-facing key the
@@ -1880,14 +1918,22 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		if err := startApp(cmd.Context(), client); err != nil {
-			return err
+			return errNoLocalDaemon()
 		}
 	}
 	return nil
 }
 
+// errNoLocalDaemon replaces upstream Ollama's "could not connect to ollama
+// server, run 'ollama serve' to start it", which is actively misleading here:
+// this fork ships no daemon and `oaica serve` means something else entirely
+// (self-host a pulled GGUF). Fresh-user audit of 0.4.6, P0-1.
+func errNoLocalDaemon() error {
+	return fmt.Errorf("no local Ollama daemon at %s. oaica is a thin client: use `oaica run <model>` (hosted), `oaica pull <model>` + `oaica serve <model>` (self-host), or point OLLAMA_HOST at a running Ollama if you have one", envconfig.Host())
+}
+
 func versionHandler(cmd *cobra.Command, _ []string) {
-	fmt.Printf("oaica version is %s\n", version.Version)
+	fmt.Printf("oaica %s\n", version.Version)
 }
 
 func appendEnvDocs(cmd *cobra.Command, envs []envconfig.EnvVar) {
@@ -1936,12 +1982,21 @@ func launchInteractiveModel(cmd *cobra.Command, modelName string) error {
 	return nil
 }
 
-// runInteractiveTUI runs the main interactive TUI menu.
+// runInteractiveTUI runs the main interactive TUI menu, printing (not
+// returning) failures. Kept for callers that have nowhere to return an error
+// to, e.g. launch.LaunchCmd's menu fallback.
 func runInteractiveTUI(cmd *cobra.Command) {
+	if err := runInteractiveTUIE(cmd); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	}
+}
+
+// runInteractiveTUIE is the error-returning form so the bare `oaica` root
+// command can exit non-zero when the menu can't run (audit 0.4.6 P0-3/P1-2).
+func runInteractiveTUIE(cmd *cobra.Command) error {
 	// Ensure the server is running via the shared checkServerHeartbeat path.
 	if err := checkServerHeartbeat(cmd, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
+		return err
 	}
 
 	accountPrefetch := launch.StartAccountStatePrefetch(cmd.Context())
@@ -1957,11 +2012,15 @@ func runInteractiveTUI(cmd *cobra.Command) {
 
 	for {
 		continueLoop, err := runInteractiveTUIStep(cmd, deps)
+		if !continueLoop {
+			// Fatal (menu couldn't build/run): hand the error up so the
+			// caller can exit non-zero. Per-action failures keep the old
+			// print-and-continue behaviour so one bad launch doesn't end
+			// the session.
+			return err
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-		if !continueLoop {
-			return
 		}
 	}
 }
@@ -1987,7 +2046,10 @@ func runInteractiveTUIStep(cmd *cobra.Command, deps launcherDeps) (bool, error) 
 
 	action, err := deps.runMenu(state)
 	if err != nil {
-		return false, fmt.Errorf("run launcher menu: %w", err)
+		// No "run launcher menu: ..." wrapper — the audit (0.4.6 P0-3)
+		// flagged the stacked prefixes as noise; the underlying error is
+		// already specific.
+		return false, err
 	}
 
 	return runLauncherAction(cmd, action, deps)
@@ -2063,7 +2125,7 @@ func NewCLI() *cobra.Command {
 	}
 
 	rootCmd := &cobra.Command{
-		Use:           "ollama",
+		Use:           "oaica",
 		Short:         "Large language model runner",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -2076,13 +2138,29 @@ func NewCLI() *cobra.Command {
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			checkForUpdate()
 		},
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			if version, _ := cmd.Flags().GetBool("version"); version {
 				versionHandler(cmd, args)
-				return
+				return nil
 			}
 
-			runInteractiveTUI(cmd)
+			// No terminal (CI, `oaica | less`, a container without a tty):
+			// the TUI would try to open /dev/tty and die. Print help and
+			// succeed instead — that's what a bare command with no args
+			// should do in a pipe. Audit 0.4.6, P0-3.
+			if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+				cmd.SetOut(os.Stdout)
+				return cmd.Help()
+			}
+
+			if err := runInteractiveTUIE(cmd); err != nil {
+				// Fall back to help so the user still sees what oaica can
+				// do, then exit non-zero (audit 0.4.6, P0-3/P1-2).
+				cmd.SetOut(os.Stdout)
+				_ = cmd.Help()
+				return err
+			}
+			return nil
 		},
 	}
 
@@ -2090,9 +2168,14 @@ func NewCLI() *cobra.Command {
 	rootCmd.Flags().Bool("verbose", false, "Show timings for response")
 	rootCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 
+	// create/push/cp need a local Ollama daemon this fork doesn't run, and
+	// have no thin-client meaning at all — hidden from the top-level help so
+	// a fresh user isn't offered commands that can only fail (audit 0.4.6,
+	// P2-4). Still invocable for anyone pointing OLLAMA_HOST at a real daemon.
 	createCmd := &cobra.Command{
 		Use:     "create MODEL",
 		Short:   "Create a model",
+		Hidden:  true,
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    CreateHandler,
@@ -2164,18 +2247,18 @@ func NewCLI() *cobra.Command {
 
 	serveCmd := &cobra.Command{
 		Use:   "serve MODEL",
-		Short: "Run a pulled model locally (true self-host, no cloud calls)",
+		Short: "Serve a pulled GGUF locally with llama-server (self-host; no cloud calls)",
 		Args:  cobra.ExactArgs(1),
 		RunE:  ServeHandler,
 	}
 	serveCmd.Flags().Int("port", 0, "Port to bind (default: auto-pick a free port)")
 	serveCmd.Flags().Int("ctx-size", 8192, "Context size")
 	serveCmd.Flags().Bool("no-cmoe", false, "Disable CPU-RAM MoE expert offload (needs much more VRAM without it)")
-	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU), overrides -cmoe. Tune per model/GPU — see oaica_pull_serve.go's ServeHandler doc for why the fastest N usually isn't 'as many GPU layers as fit'")
+	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU), overriding -cmoe; tune per model and GPU, as the fastest N is usually not the largest N that fits")
 	serveCmd.Flags().String("host", "127.0.0.1", "Address to bind the OpenAI-compatible API to. Use 0.0.0.0 to expose it on the network (requires --api-key)")
 	serveCmd.Flags().String("api-key", "", "Bearer token required on every request. Mandatory when --host is not loopback")
 	serveCmd.Flags().Bool("insecure", false, "Allow a non-loopback --host with no --api-key (trusted private networks only)")
-	serveCmd.Flags().Int("threads", 0, "CPU threads (default: logical CPU count / 2, i.e. physical cores — SMT measured WORSE for CPU-offloaded MoE, see ServeHandler doc)")
+	serveCmd.Flags().Int("threads", 0, "CPU threads (default: physical core count, i.e. logical CPUs / 2 — SMT measures slower for CPU-offloaded MoE)")
 
 	// serve-anthropic-proxy — hidden test harness for the Anthropic↔OpenAI
 	// translation proxy used by `oaica launch claude --model <remote>/<model>`.
@@ -2308,6 +2391,79 @@ just to see the picker list.`,
 		},
 	}
 	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd)
+
+	// remote — CRUD over ~/.oaica/remotes.json (see cmd/launch/user_remotes.go),
+	// the OpenAI/Anthropic-compatible boxes the launch picker offers alongside
+	// router models. Same verb shape as `oaica model`; before this the only
+	// supported way to add one was hand-editing JSON (audit 0.4.6, P1-4).
+	remoteCmd := &cobra.Command{
+		Use:   "remote",
+		Short: "Manage user-defined model endpoints (~/.oaica/remotes.json)",
+	}
+	remoteListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List configured remotes",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.WriteRemoteList(os.Stdout)
+		},
+	}
+	remoteAddCmd := &cobra.Command{
+		Use:   "add NAME",
+		Short: "Add or replace a remote endpoint",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			baseURL, _ := cmd.Flags().GetString("base-url")
+			apiKey, _ := cmd.Flags().GetString("api-key")
+			apiKeyEnv, _ := cmd.Flags().GetString("api-key-env")
+			wire, _ := cmd.Flags().GetString("wire")
+			toolFormat, _ := cmd.Flags().GetString("tool-format")
+			apiVersion, _ := cmd.Flags().GetString("api-version")
+			r, err := launch.RemoteAdd(launch.RemoteAddOptions{
+				Name: args[0], BaseURL: baseURL, APIKey: apiKey,
+				APIKeyEnv: apiKeyEnv, Wire: wire, ToolFormat: toolFormat,
+				Version: apiVersion,
+			})
+			if err != nil {
+				return err
+			}
+			d := r.Descriptor()
+			fmt.Printf("added %s (%s, wire=%s, tool_format=%s)\n", r.Name, r.BaseURL, d.Wire, d.ToolFormat)
+			return nil
+		},
+	}
+	remoteAddCmd.Flags().String("base-url", "", "Endpoint root, without the /v1 suffix (e.g. https://api.example.com)")
+	remoteAddCmd.Flags().String("api-key", "", "Bearer token, stored in remotes.json (prefer --api-key-env)")
+	remoteAddCmd.Flags().String("api-key-env", "", "Name of an environment variable holding the bearer token, read at use time")
+	remoteAddCmd.Flags().String("wire", "", "Protocol the endpoint speaks: openai (default) or anthropic")
+	remoteAddCmd.Flags().String("tool-format", "", "How the model emits tool calls: tool_calls (default for openai) or none")
+	remoteAddCmd.Flags().String("api-version", "", "API version path segment appended to base-url (default \"v1\"; z.ai uses \"v4\")")
+	remoteShowCmd := &cobra.Command{
+		Use:   "show NAME",
+		Short: "Show full detail for one remote",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.WriteRemoteShow(os.Stdout, args[0])
+		},
+	}
+	remoteRemoveCmd := &cobra.Command{
+		Use:     "rm NAME",
+		Aliases: []string{"remove"},
+		Short:   "Remove a remote",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			existed, err := launch.RemoteRemove(args[0])
+			if err != nil {
+				return err
+			}
+			if !existed {
+				return fmt.Errorf("no remote named %q", args[0])
+			}
+			fmt.Printf("removed %s\n", args[0])
+			return nil
+		},
+	}
+	remoteCmd.AddCommand(remoteAddCmd, remoteListCmd, remoteShowCmd, remoteRemoveCmd)
 
 	// model alias — user shortcuts (~/.oaica/aliases.json), resolved first
 	// in resolveLaunchEndpoint, entirely independent of discovery/refresh —
@@ -2496,6 +2652,7 @@ just to see the picker list.`,
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
+		Hidden:  true, // daemon-only, see createCmd
 		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PushHandler,
@@ -2645,6 +2802,7 @@ just to see the picker list.`,
 	copyCmd := &cobra.Command{
 		Use:     "cp SOURCE DESTINATION",
 		Short:   "Copy a model",
+		Hidden:  true, // daemon-only, see createCmd
 		Args:    cobra.ExactArgs(2),
 		PreRunE: checkServerHeartbeat,
 		RunE:    CopyHandler,
@@ -2699,6 +2857,7 @@ just to see the picker list.`,
 		serveCmd,
 		serveAnthropicProxyCmd,
 		modelCmd,
+		remoteCmd,
 		planCmd,
 		gpuCleanCmd(),
 		pushCmd,
