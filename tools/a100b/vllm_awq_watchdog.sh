@@ -39,11 +39,16 @@ set -u
 # the old model); restore_tokenizer() below is effectively a no-op for
 # this model (TOK_PATCH is stale/irrelevant to it) since tokenizer_ok()
 # will match TOK_SHA directly on every normal boot.
-MODEL_DIR=/dev/shm/oaica-35b-a3b-mtp-vision
-HF_REPO=slopops/KAT-Coder-V2.5-Dev-MTP-int4-AutoRound-SAR
+# 2026-08-30: switched to the AWQ W4A16 build (kat_awq shards + bf16 MTP
+# head + bf16 vision tower, symlink-grafted; see its README.md). It is a
+# LOCAL composite, not an HF snapshot -- HF_REPO is empty on purpose so a
+# missing-weights preflight alerts instead of downloading the old
+# AutoRound checkpoint over it.
+MODEL_DIR=/dev/shm/oaica-35b-a3b-awq-mtp-vision
+HF_REPO=
 HF_REV=main
 TOK_PATCH=/workspace/kat_awq.tokenizer_config.json   # vendored from tools/a100b/ (stale for this model, kept as last-resort restore target only)
-TOK_SHA=5f7aa0d810000c4a0940b35c8f16e56c3439260fccc13a321826ebc3ccf2501f
+TOK_SHA=3af7344522ce9496a14b7e701ecf14bb0aeeb067583a0c90681ccc3b75b49eea
 LOG=/workspace/vllm_awq_watchdog.log
 ALERT=/workspace/vllm_awq_watchdog.ALERT           # touched on any restore/backoff/stall-kill; poll it
 
@@ -79,6 +84,10 @@ tokenizer_ok() {
 }
 
 restore_weights() {
+  if [ -z "$HF_REPO" ]; then
+    alert "weights missing at $MODEL_DIR and no HF_REPO to restore from (composite build: check the symlink targets in $MODEL_DIR and its SHASUMS)"
+    return 1
+  fi
   alert "weights missing at $MODEL_DIR -- re-downloading $HF_REPO@$HF_REV"
   python3 - <<PY
 from huggingface_hub import snapshot_download
@@ -154,14 +163,22 @@ launch() {
   # applied (metering audit, same day). With the flag, usage carries
   # prompt_tokens_details.cached_tokens and cache hits bill at the
   # discounted rate as the rate card says.
+  # AWQ build requirements (its README.md, measured on A100): the Humming
+  # linear kernel must be disabled; --gdn-prefill-backend triton is
+  # mandatory (the FlashInfer GDN prefill path deadlocks); KV cache stays
+  # bf16 ("auto") because fp8 KV halves MTP verify throughput on Ampere
+  # (103 vs 171 tok/s single-stream at the 256k config); 2 speculative
+  # tokens measured at 2.26 accepted per step. The draft stays eager --
+  # that is our IMA mitigation and is independent of the checkpoint.
+  VLLM_DISABLED_KERNELS=HummingLinearKernel \
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
-    --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 \
+    --gpu-memory-utilization 0.9 --kv-cache-dtype auto --gdn-prefill-backend triton \
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
     --no-async-scheduling \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":1,"enforce_eager":true}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2,"enforce_eager":true}' \
     --enable-prompt-tokens-details \
     > "$logfile" 2>&1 &
   disown

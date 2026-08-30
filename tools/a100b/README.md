@@ -359,3 +359,16 @@ the per-source cap just stops it from starving everyone else. If it
 recurs from a new IP, the same three lines are the fix; a host-level
 firewall is not available from inside the container. Check with:
 `for p in $(pgrep -f "sshd: unknown|sshd: \[accepted\]"); do ss -tnp | grep "pid=$p," | awk '{print $5}'; done | sed 's/:[0-9]*$//' | sort | uniq -c`.
+
+### Gotcha: a long-lived shell can block the watchdog's relaunch (2026-08-30)
+
+`vllm_awq_watchdog.sh` decides "a replica for :PORT is already booting" with
+`pgrep -f "api_server.*--port $port "`. Any *other* long-lived process whose
+argv contains that text matches too — e.g. an `ssh box 'bash -c "...
+pgrep -f ... api_server.*--port 30108 ..."'` deploy shell that is still
+waiting on a rolling restart. Symptom: the old replica exits cleanly, the
+watchdog logs nothing for minutes, `:PORT` stays DOWN. Fix: kill the
+offending shell (it is yours); the next tick launches. Prevention: keep
+test/validation logic in a script file on the box (`validate_replica.sh`)
+instead of inline `bash -c` text, and never leave a shell whose argv
+mentions `api_server` + the port alive across a restart.
