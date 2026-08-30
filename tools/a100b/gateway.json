@@ -60,5 +60,24 @@
         "response_format"
       ]
     }
+  ],
+  "pull_license_keys": [],
+  "pull_catalog": [
+    {
+      "model": "qwen2.5-0.5b",
+      "source": "hf",
+      "hf_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "size_bytes": 491400032,
+      "license_required": false,
+      "description": "tiny smoke-test model"
+    },
+    {
+      "model": "oaica-nemotron-30b-a3b",
+      "source": "hf",
+      "hf_url": "https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf",
+      "size_bytes": 25266255936,
+      "license_required": false,
+      "description": "Nemotron-3.5-Lightning-30B-A3B Q4_K_M (same model as the hosted oaica-nemotron-30b-a3b)"
+    }
   ]
 }

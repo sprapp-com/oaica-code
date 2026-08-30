@@ -227,6 +227,14 @@ type gwConfig struct {
 	APIKeys      []gwKey   `json:"api_keys"`
 	Models       []gwModel `json:"models"`
 
+	// PullCatalog / PullLicenseKeys drive the weights-distribution routes
+	// (/v1/manifest, /v1/pull, /v1/catalog) used by `oaica pull` — see
+	// pull.go. They are independent of Models/APIKeys on purpose: what you
+	// can download locally is not what this gateway serves for inference,
+	// and a chat API key must never double as a weights-download license.
+	PullCatalog     []gwPullEntry `json:"pull_catalog,omitempty"`
+	PullLicenseKeys []gwKey       `json:"pull_license_keys,omitempty"`
+
 	// UpstreamErrorLogPath: every non-2xx response from upstream (excluding
 	// SSE streams, which already 200 by the time an error could occur mid-
 	// stream) gets one JSONL line here: the real upstream error message
@@ -372,6 +380,9 @@ func loadConfig(path string) (gwConfig, error) {
 		if _, err := url.Parse(m.UpstreamAddr); err != nil {
 			return cfg, fmt.Errorf("models[%d].upstream_addr %q: %w", i, m.UpstreamAddr, err)
 		}
+	}
+	if err := validatePullConfig(cfg); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
 }
@@ -1709,6 +1720,38 @@ func (c *entitlementCache) checkWindowCap(label string) (bool, string) {
 	return true, ""
 }
 
+// mux builds the routing table. It lives here rather than inline in main
+// so the tests exercise the exact same route set the binary serves -- the
+// two used to be separate copies and drifted.
+func mux(g *gateway) http.Handler {
+	m := http.NewServeMux()
+	m.HandleFunc("/health", g.healthHandler)
+	m.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
+	m.HandleFunc("/terms", legalHandler("TERMS.md"))
+	m.HandleFunc("/status", legalHandler("STATUS.md"))
+	// /models is public (2026-08-26): it is served from in-memory config
+	// (no upstream call) and contains only what the OpenRouter listing and
+	// oaica.com already publish -- ids, context, limits, pricing, modalities.
+	// Keeping it behind the key only risked OpenRouter's model poller not
+	// sending one and the listing silently never appearing. Completions
+	// stay authenticated; nothing about metering changes.
+	m.HandleFunc("/models", g.modelsHandler)
+	m.HandleFunc("/v1/models", g.modelsHandler)
+	// Weights distribution for `oaica pull` (pull.go). Restored 2026-08-30:
+	// the api.oaica.com cutover onto this gateway dropped these routes with
+	// the old TypeScript router, so every pull 404'd. Unmetered, unledgered,
+	// and independent of api_keys -- see pull.go's header comment.
+	m.HandleFunc("/v1/manifest/", g.manifestHandler)
+	m.HandleFunc("/v1/pull/", g.pullHandler)
+	m.HandleFunc("/v1/catalog", g.catalogHandler)
+	m.HandleFunc("/v1/chat/completions", g.completionHandler)
+	m.HandleFunc("/v1/completions", g.completionHandler)
+	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "not_found", "unknown route")
+	})
+	return m
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to oaica-gateway JSON config")
 	flag.Parse()
@@ -1732,28 +1775,9 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", g.healthHandler)
-	mux.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
-	mux.HandleFunc("/terms", legalHandler("TERMS.md"))
-	mux.HandleFunc("/status", legalHandler("STATUS.md"))
-	// /models is public (2026-08-26): it is served from in-memory config
-	// (no upstream call) and contains only what the OpenRouter listing and
-	// oaica.com already publish -- ids, context, limits, pricing, modalities.
-	// Keeping it behind the key only risked OpenRouter's model poller not
-	// sending one and the listing silently never appearing. Completions
-	// stay authenticated; nothing about metering changes.
-	mux.HandleFunc("/models", g.modelsHandler)
-	mux.HandleFunc("/v1/models", g.modelsHandler)
-	mux.HandleFunc("/v1/chat/completions", g.completionHandler)
-	mux.HandleFunc("/v1/completions", g.completionHandler)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeErr(w, http.StatusNotFound, "not_found", "unknown route")
-	})
-
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           mux,
+		Handler:           mux(g),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,

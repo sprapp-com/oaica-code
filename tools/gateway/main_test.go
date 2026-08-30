@@ -78,20 +78,6 @@ func newTestGateway(t *testing.T, upstream string) (*gateway, string) {
 	return g, ledger
 }
 
-func mux(g *gateway) http.Handler {
-	m := http.NewServeMux()
-	m.HandleFunc("/health", g.healthHandler)
-	m.HandleFunc("/privacy", legalHandler("PRIVACY.md"))
-	m.HandleFunc("/terms", legalHandler("TERMS.md"))
-	m.HandleFunc("/status", legalHandler("STATUS.md"))
-	m.HandleFunc("/models", g.modelsHandler)
-	m.HandleFunc("/v1/models", g.modelsHandler)
-	m.HandleFunc("/v1/chat/completions", g.completionHandler)
-	m.HandleFunc("/v1/completions", g.completionHandler)
-	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { writeErr(w, 404, "not_found", "unknown route") })
-	return m
-}
-
 // waitLedger polls until the ledger holds >= n entries. The handler meters
 // AFTER it has already streamed the full response, so a client can observe
 // the reply before the ledger line lands; production readers tail the file,
