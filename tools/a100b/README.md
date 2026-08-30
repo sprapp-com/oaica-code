@@ -334,3 +334,28 @@ probe only checks `models[0]` — `/health`'s body is now `{"status":"ok",
 This is what lets `oaica-nemotron-30b-a3b` point at its own oaicalb
 (`:30120`) while `oaica-35b-a3b-vision` keeps going through gatekeeper —
 see "Second model pool" above for why that model bypasses gatekeeper.
+
+## sshd MaxStartups exhaustion (2026-08-30)
+
+Symptom: every new ssh to the box died with `kex_exchange_identification:
+read: Connection reset by peer` (TCP connected, reset at the banner) while
+already-open sessions kept working. Cause: a scanner (`45.198.224.218`)
+held ~45 half-open sessions, exhausting sshd's default `MaxStartups
+10:30:100`, so new connections were randomly dropped — including ours (our
+NAT `60.50.88.231` legitimately holds ~50 tunnel/check sessions).
+
+Fix applied inside the container (`/etc/ssh/sshd_config`, backup
+`sshd_config.bak-20260830`, validated with `sshd -t`, applied with `kill
+-HUP <sshd pid>` — existing sessions survive a HUP):
+
+```
+MaxStartups 100:30:300
+PerSourceMaxStartups 15
+LoginGraceTime 20
+```
+
+Root login is key-only (password auth off), so the scanner cannot get in;
+the per-source cap just stops it from starving everyone else. If it
+recurs from a new IP, the same three lines are the fix; a host-level
+firewall is not available from inside the container. Check with:
+`for p in $(pgrep -f "sshd: unknown|sshd: \[accepted\]"); do ss -tnp | grep "pid=$p," | awk '{print $5}'; done | sed 's/:[0-9]*$//' | sort | uniq -c`.
