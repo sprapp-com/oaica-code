@@ -194,3 +194,15 @@ decision.
 
 See `tools/a100b/README.md` ("Second model pool: oaica-nemotron-30b-a3b")
 for full operational detail.
+
+## Addendum — 2026-08-30: fleet on the AWQ W4A16 checkpoint, 256k tier
+
+GPU0/1/2 now serve `sprappcom/oaica-35b-a3b-awq-mtp-vision-260830` with the
+checkpoint's 256k launch config (MTP off, `--kv-cache-dtype fp8`; bench:
+95 users @≥30 tok/s, 2110 tok/s aggregate on one A100) — replacing the
+third-party int4 AutoRound checkpoint that ran fp8 KV + MTP1. The 8k/16k
+tier (MTP2 + bf16 KV, 198 tok/s single-stream) is documented but not
+deployed; it is the config to use for a short-context/vision pool. Details
+and rationale: `tools/a100b/README.md` → "Production checkpoint + launch
+tiers". The draft-eager MTP crash mitigation is moot on this config (no
+draft); its 24-h soak on the previous config recorded 0 IMA crashes.

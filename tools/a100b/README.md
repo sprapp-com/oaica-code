@@ -372,3 +372,33 @@ offending shell (it is yours); the next tick launches. Prevention: keep
 test/validation logic in a script file on the box (`validate_replica.sh`)
 instead of inline `bash -c` text, and never leave a shell whose argv
 mentions `api_server` + the port alive across a restart.
+
+## Production checkpoint + launch tiers (2026-08-30)
+
+Fleet checkpoint: **`sprappcom/oaica-35b-a3b-awq-mtp-vision-260830`**
+(a100b: `/dev/shm/oaica-35b-a3b-awq-mtp-vision`) — KAT-Coder-V2.5 AWQ W4A16
+text backbone + bf16 vision tower + bf16 MTP head. One checkpoint, two
+launch configs (owner's A100 SXM4 80 GB bench, 8k ctx / 400 gen, greedy):
+
+| A100 tier         | Launch                        | Result                                   |
+|-------------------|-------------------------------|------------------------------------------|
+| 8k / 16k + vision | MTP2 on, `--kv-cache-dtype auto` | 198 tok/s single, 99/user @N=32, 166 users @≥30 tok/s |
+| **256k (prod)**   | **MTP off, `--kv-cache-dtype fp8`** | **95 users @≥30 tok/s, 2110 tok/s aggregate** |
+
+Production (GPU0/1/2, `vllm_awq_watchdog.sh`) runs the 256k row: no
+`--speculative-config`, fp8 KV, 262144 max-model-len, 18 seqs, async
+scheduling on (the `--no-async-scheduling` + eager-draft pair existed only
+for the MTP CUDA-graph race, which has no draft to race without MTP).
+Always: `VLLM_DISABLED_KERNELS=HummingLinearKernel` and
+`--gdn-prefill-backend triton` (FlashInfer GDN prefill deadlocks).
+
+Why this beats what ran before: the previous prod (slopops int4 AutoRound
++ fp8 KV + MTP1) sat in the worst quadrant — fp8 KV halves MTP verify
+speed on Ampere, MTP1 < MTP2, and int4 scales worse at N≥32. The AWQ file
+wins at every N≥32, carries vision, and is our own weights. Better exists
+only on other hardware: H100 FP8 (`…-fp8-mtp-vision-260830`) ≈ 2× per-user
+and 1.6× aggregate at 256k; Blackwell NVFP4 pending a native bench.
+
+Not an HF snapshot on the box: the dir is a symlink graft (`SHASUMS` inside
+verifies it), so the watchdog's `HF_REPO` is empty and a missing-weights
+preflight alerts instead of downloading anything over it.

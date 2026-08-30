@@ -164,21 +164,23 @@ launch() {
   # prompt_tokens_details.cached_tokens and cache hits bill at the
   # discounted rate as the rate card says.
   # AWQ build requirements (its README.md, measured on A100): the Humming
-  # linear kernel must be disabled; --gdn-prefill-backend triton is
-  # mandatory (the FlashInfer GDN prefill path deadlocks); KV cache stays
-  # bf16 ("auto") because fp8 KV halves MTP verify throughput on Ampere
-  # (103 vs 171 tok/s single-stream at the 256k config); 2 speculative
-  # tokens measured at 2.26 accepted per step. The draft stays eager --
-  # that is our IMA mitigation and is independent of the checkpoint.
+  # linear kernel must be disabled and --gdn-prefill-backend triton is
+  # mandatory (the FlashInfer GDN prefill path deadlocks).
+  #
+  # 256k production tier = the checkpoint's "MTP off, KV fp8" launch
+  # (owner's A100 bench, 2026-08-30): 95 users at >=30 tok/s, 2110 tok/s
+  # aggregate. MTP2 + bf16 KV is the 8k/16k tier (198 tok/s single-stream,
+  # 166 users) -- at 256k the fp8 KV doubles cache capacity and MTP's
+  # verify tax outweighs its per-user gain once N grows. No speculative
+  # config => no MTP draft => the IMA race that forced enforce_eager and
+  # --no-async-scheduling is gone, so async scheduling is back on.
   VLLM_DISABLED_KERNELS=HummingLinearKernel \
   CUDA_VISIBLE_DEVICES=$gpu nohup python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_DIR" --served-model-name oaica-35b-a3b-vision --port "$port" --host 0.0.0.0 \
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
-    --gpu-memory-utilization 0.9 --kv-cache-dtype auto --gdn-prefill-backend triton \
+    --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --gdn-prefill-backend triton \
     --limit-mm-per-prompt '{"image": 2}' --max-model-len 262144 \
     --max-num-batched-tokens 12288 --max-num-seqs 18 --enable-prefix-caching \
-    --no-async-scheduling \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":2,"enforce_eager":true}' \
     --enable-prompt-tokens-details \
     > "$logfile" 2>&1 &
   disown
@@ -190,7 +192,7 @@ launch() {
 # below used the real "0:30106 1:30108 2:30110". Harmless in practice
 # (bash auto-vivifies unset array elements to 0 in arithmetic context) but
 # confusing and a real trap for the next port change.
-REPLICAS="${REPLICAS:-0:30106 1:30108}"
+REPLICAS="${REPLICAS:-0:30106 1:30108 2:30110}"
 
 # per-port backoff state: last launch epoch + current delay
 declare -A LAST DELAY STALLFAILS
