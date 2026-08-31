@@ -52,6 +52,16 @@ oaica launch claude --model oaica-35b-a3b-vision    # run Claude Code against it
 Hosted models: `oaica-35b-a3b-vision` (262k context, vision, MTP) and
 `oaica-nemotron-30b-a3b` (262k context, reasoning + tools).
 
+Multi-model launches (v0.5.0+): a plain interactive
+`oaica launch claude` walks a wizard — primary, then Sonnet/execution
+tier, then a compaction/oversize model (only models with a probed LARGER
+context window are offered), then a route
+policy (`--route-policy local-first|remote-first|auto|local-only|remote-only`)
+with cross-leg failover via a health circuit breaker — and can save the
+whole setup as a named plan. Same knobs exist as flags
+(`--sonnet-model`, `--oversize`, `--route-policy`) and are validated by
+`oaica doctor`. Details: docs/CLAUDE_TIERS.md.
+
 ## Self-host quick start (free, offline)
 
 ```shell

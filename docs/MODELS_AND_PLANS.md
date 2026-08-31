@@ -75,13 +75,26 @@ own models:
 oaica plan set oaica-full \
   --model oaica-35b-a3b-vision \
   --sonnet-model oaica-35b-a3b-vision \
+  --oversize dsremote/deepseek-v4-flash \
+  --route-policy local-first \
   --description "Full-power vision model, 262k ctx"
 
 oaica launch claude --plan oaica-full
 ```
 
 `--sonnet-model` is optional — omit it and the plan's Sonnet-tier requests
-go to the same model as `--model`.
+go to the same model as `--model`. `--oversize` is the larger-context leg
+that serves requests the primary cannot hold (the auto-compaction call
+near the context ceiling: it must have a strictly larger probed context
+window); `--route-policy` is one of local-first (default), remote-first,
+auto (failover + failure escalation), local-only, remote-only. Policy
+precedence per launch: CLI flag > plan > the remote's `route_policy` in
+remotes.json > local-first.
+
+The same setup can be built interactively: a plain `oaica launch claude`
+(no flags) walks a wizard — primary, Sonnet tier, compaction model
+(offering only models with a probed-larger window), route policy — and
+offers to save the result as a plan.
 
 ```shell
 oaica plan list
@@ -174,6 +187,7 @@ tools/a100b/pull-ollama-cloud.sh glm-5.3-flash:cloud kimi-k2.7-code:cloud
 
 ## See also
 
-- [docs/CLAUDE_TIERS.md](CLAUDE_TIERS.md) — how tier resolution and
-  `--sonnet-model` work underneath `--plan`, including cross-remote
-  secondaries plans don't cover yet.
+- [docs/CLAUDE_TIERS.md](CLAUDE_TIERS.md) — how tier resolution,
+  `--sonnet-model`, `--oversize`, route policies, the circuit-breaker
+  failover and the interactive wizard work underneath `--plan` (plans
+  cover cross-remote secondaries + oversize since v0.5.1).
