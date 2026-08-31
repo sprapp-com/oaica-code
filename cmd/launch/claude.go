@@ -314,3 +314,8 @@ func (c *Claude) modelEnvVars(model string) []string {
 
 	return env
 }
+
+// WantsFullModelChoices: the launch-tier wizard picks the secondary and
+// compaction legs from the full inventory, so Run must receive every
+// selectable model, not just the resolved primary (see launch.go).
+func (c *Claude) WantsFullModelChoices() bool { return true }

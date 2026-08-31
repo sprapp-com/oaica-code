@@ -770,7 +770,46 @@ func (c *launcherClient) launchSingleIntegration(ctx context.Context, name strin
 		}
 	}
 
-	return launchAfterConfiguration(name, runner, target, c.resolveRunModels(ctx, []string{target}), req)
+	runModels := c.resolveRunModels(ctx, []string{target})
+	// Single-target resolution finds ONE model; the launch-tier wizard
+	// (tier_wizard.go) steps 2-3 need the whole inventory to offer a
+	// secondary/compaction leg — without this, a saved-config claude launch
+	// got a 1-model list and the wizard silently collapsed to primary-only.
+	if w, ok := runner.(fullModelChoicesRunner); ok && w.WantsFullModelChoices() {
+		if full, err := c.modelInventory().Load(ctx); err == nil && len(full) > 1 {
+			// Local daemon models load as picker names ("ollama/<id>") —
+			// strip to the launch vocabulary ("--sonnet-model" et al. take
+			// the bare id), then dedupe.
+			seenW := map[string]bool{}
+			stripped := full[:0:0]
+			for _, m := range full {
+				if m.Name == "" {
+					continue
+				}
+				if rest, ok := strings.CutPrefix(m.Name, ollamaPickerPrefix); ok {
+					if _, _, isRemote := findUserRemoteForModel(m.Name); !isRemote {
+						m.Name = rest
+					}
+				}
+				if seenW[m.Name] {
+					continue
+				}
+				seenW[m.Name] = true
+				stripped = append(stripped, m)
+			}
+			if len(stripped) > 1 {
+				runModels = stripped
+			}
+		}
+	}
+	return launchAfterConfiguration(name, runner, target, runModels, req)
+}
+
+// fullModelChoicesRunner marks integrations whose launcher (the tier wizard)
+// picks SECONDARY models from the inventory, so Run must see every
+// selectable model, not just the resolved target.
+type fullModelChoicesRunner interface {
+	WantsFullModelChoices() bool
 }
 
 func (c *launcherClient) launchEditorIntegration(ctx context.Context, name string, runner Runner, editor Editor, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {
