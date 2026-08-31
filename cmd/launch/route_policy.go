@@ -17,8 +17,11 @@ package launch
 //     healthy alternate. Existing single-remote launches are unaffected —
 //     with no Fallbacks there is nothing to fall back to.
 //   - remote-first: on failure, prefer a remote backend.
-//   - auto: currently an alias of local-first (per-request task escalation
-//     is the v1.1 follow-up; accepted now so configs don't churn then).
+//   - auto: like local-first for ordinary failover, PLUS tier escalation:
+//     autoEscalateAfterFails consecutive failures of a session's chosen leg
+//     escalate that session's new requests to the strongest healthy
+//     secondary leg without waiting for the breaker, resetting after
+//     autoEscalateHoldFor of no failures. See "auto escalation" below.
 //   - local-only / remote-only: never leave that locality; if its leg is
 //     down, fail the request rather than silently cross over (a user who
 //     says "local-only" has a reason — data residency, cost cap — and a
@@ -203,6 +206,130 @@ func (rb *routeBreakers) open(baseURL string) bool {
 	return b != nil && b.open()
 }
 
+// auto escalation (route policy `auto`, the v1.1 design): a proxy counts
+// per-session failures of the leg a session is currently being served on and
+// ESCALATES the tier when the primary accumulates autoEscalateAfterFails
+// consecutive failures — the same signals that feed the breaker (5xx after
+// the retry budget, or a transport error; 4xx/429 are the leg working and
+// never count). While escalated, that session's NEW requests go straight to
+// the strongest healthy secondary leg (largest ContextWindow among the
+// fallbacks, Oversize included when larger) instead of waiting for the
+// breaker to open. Escalation ends autoEscalateHoldFor after the last
+// failure — "minutes of healthy service", not one lucky 200: a single
+// success on the secondary while the primary is still flapping must not
+// bounce the session back onto the flapping leg, but a primary that has
+// been quiet-healthy for this long is considered recovered. Like the
+// breaker, escalation is only consulted in selectRoute — a response already
+// streaming is never re-routed mid-stream.
+const autoEscalateAfterFails = 2
+
+// autoEscalateHoldFor is a package var (like breakerOpenFor) so tests can
+// shorten the reset window instead of sleeping 10 minutes.
+var autoEscalateHoldFor = 10 * time.Minute
+
+// routeEscalation is the state for one SessionID: consecutive failures of
+// its currently chosen leg, and the instant escalation expires (stale, i.e.
+// zero or past, means "not escalated").
+type routeEscalation struct {
+	fails          atomic.Int32
+	escalatedUntil atomic.Int64
+}
+
+func (e *routeEscalation) recordFail() {
+	if e.fails.Add(1) >= autoEscalateAfterFails {
+		e.escalatedUntil.Store(time.Now().Add(autoEscalateHoldFor).UnixNano())
+	}
+}
+
+func (e *routeEscalation) recordOK() {
+	e.fails.Store(0)
+}
+
+func (e *routeEscalation) escalated() bool {
+	return time.Now().UnixNano() < e.escalatedUntil.Load()
+}
+
+// routeEscalations maps a SessionID to its escalation state, keyed by
+// proxyRouteTable.SessionID (one launched session per proxy process, so one
+// bucket per launch). Nil-safe like routeBreakers: tables without
+// fallbacks, or tests that never allocate one, simply never escalate.
+type routeEscalations struct {
+	mu sync.Mutex
+	m  map[string]*routeEscalation
+}
+
+func (re *routeEscalations) forSession(sessionID string) *routeEscalation {
+	if re == nil {
+		return nil
+	}
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	if re.m == nil {
+		re.m = map[string]*routeEscalation{}
+	}
+	if e, ok := re.m[sessionID]; ok {
+		return e
+	}
+	e := &routeEscalation{}
+	re.m[sessionID] = e
+	return e
+}
+
+func (re *routeEscalations) recordFail(sessionID string) {
+	if e := re.forSession(sessionID); e != nil {
+		e.recordFail()
+	}
+}
+
+func (re *routeEscalations) recordOK(sessionID string) {
+	if e := re.forSession(sessionID); e != nil {
+		e.recordOK()
+	}
+}
+
+func (re *routeEscalations) escalated(sessionID string) bool {
+	if re == nil {
+		return false
+	}
+	re.mu.Lock()
+	e := re.m[sessionID]
+	re.mu.Unlock()
+	return e != nil && e.escalated()
+}
+
+// escalationTarget picks the escalated-to leg: among the fallbacks plus the
+// Oversize leg (all on base URLs different from the failing primary's), the
+// largest-ContextWindow one that the breaker reports healthy and that a
+// pinned policy permits. An unprobed window (0) still qualifies — the plan
+// put the leg there as the stronger tier, and a 0 must not silently disable
+// escalation. No qualifying leg (all OPEN, or everything pinned away)
+// returns false and the caller keeps the base route, exactly like the
+// breaker's own graceful fallback.
+func (t proxyRouteTable) escalationTarget(base proxyRoute) (proxyRoute, bool) {
+	var best proxyRoute
+	seen := map[string]bool{base.BaseURL: true}
+	add := func(rs ...proxyRoute) {
+		for _, r := range rs {
+			if r.BaseURL == "" || seen[r.BaseURL] {
+				continue
+			}
+			seen[r.BaseURL] = true
+			if pin := t.Policy.pinned(); pin != "" && routeLocality(r.BaseURL) != pin {
+				continue
+			}
+			if t.breakers.open(r.BaseURL) {
+				continue
+			}
+			if best.BaseURL == "" || r.ContextWindow > best.ContextWindow {
+				best = r
+			}
+		}
+	}
+	add(t.Fallbacks...)
+	add(t.Oversize)
+	return best, best.BaseURL != ""
+}
+
 // selectRoute resolves the requested model id and applies the policy:
 // the ByModel/Default route is used whenever it has no OPEN breaker; only a
 // failing route is replaced, by the first policy-ordered healthy fallback on
@@ -213,6 +340,18 @@ func (rb *routeBreakers) open(baseURL string) bool {
 // served it.
 func (t proxyRouteTable) selectRoute(requested string) (proxyRoute, string, bool) {
 	base, model := t.resolve(requested)
+
+	// `auto` escalation: when this session's failures have accumulated past
+	// autoEscalateAfterFails, skip ahead to the strongest healthy secondary
+	// leg immediately (the breaker only speaks up at 3, and only for its own
+	// per-leg signal). Degrades to the normal path when no secondary
+	// qualifies.
+	if t.Policy == RouteAuto && t.escalations.escalated(t.SessionID) {
+		if r, ok := t.escalationTarget(base); ok {
+			return r, r.UpstreamModel, true
+		}
+	}
+
 	if len(t.Fallbacks) == 0 || !t.breakers.open(base.BaseURL) {
 		return base, model, false
 	}
