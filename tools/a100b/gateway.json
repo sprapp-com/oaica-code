@@ -27,9 +27,17 @@
         "cached_prompt": "0.000000008"
       },
       "pricing_tiers": [
-        { "up_to_prompt_tokens": 32000, "prompt": "0.00000005" },
-        { "up_to_prompt_tokens": 128000, "prompt": "0.00000006" },
-        { "prompt": "0.0000001" }
+        {
+          "up_to_prompt_tokens": 32000,
+          "prompt": "0.00000005"
+        },
+        {
+          "up_to_prompt_tokens": 128000,
+          "prompt": "0.00000006"
+        },
+        {
+          "prompt": "0.0000001"
+        }
       ],
       "supported_parameters": [
         "max_tokens",
@@ -42,7 +50,11 @@
         "seed",
         "response_format"
       ],
-      "created": 1787690759
+      "created": 1787690759,
+      "input_modalities": [
+        "text",
+        "image"
+      ]
     },
     {
       "id": "oaica-nemotron-30b-a3b",
@@ -57,9 +69,17 @@
         "cached_prompt": "0.000000008"
       },
       "pricing_tiers": [
-        { "up_to_prompt_tokens": 32000, "prompt": "0.00000005" },
-        { "up_to_prompt_tokens": 128000, "prompt": "0.00000006" },
-        { "prompt": "0.0000001" }
+        {
+          "up_to_prompt_tokens": 32000,
+          "prompt": "0.00000005"
+        },
+        {
+          "up_to_prompt_tokens": 128000,
+          "prompt": "0.00000006"
+        },
+        {
+          "prompt": "0.0000001"
+        }
       ],
       "supported_parameters": [
         "max_tokens",
