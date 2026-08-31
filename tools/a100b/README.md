@@ -505,7 +505,8 @@ the other half. Engines never crashed; both recovered UP on their own
 when the prefill wave passed. Lesson + pending tune: busy-generating
 replicas can still fail a timed chat probe; raise `probe_timeout_sec`
 25→60 in `/workspace/oaicalb.json` (+ SIGHUP `oaicalb_reload.sh`) in a
-quiet window — the watchdog's own STALL_PROBE got 15→25 for the same
+quiet window — **applied 2026-08-31 03:17Z** (SIGHUP reload, 4/4 UP
+within a minute, no drops) — the watchdog's own STALL_PROBE got 15→25 for the same
 reason. Do not treat `probe=fail` + rising `oldest_inflight_sec` +
 tokens flowing as a crash; check the engine log's throughput lines
 first.
