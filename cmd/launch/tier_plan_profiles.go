@@ -38,11 +38,17 @@ import (
 type TierPlanProfile struct {
 	Model       string `json:"model"`
 	SonnetModel string `json:"sonnet_model,omitempty"`
-	Description string `json:"description,omitempty"`
+	// OversizeModel and RoutePolicy extend the schema (2026-08-31) the same
+	// way the launch flags did: both optional, missing = empty = today's
+	// defaults (no oversize leg, local-first policy), so plan files written
+	// before this change load unchanged.
+	OversizeModel string `json:"oversize_model,omitempty"`
+	RoutePolicy   string `json:"route_policy,omitempty"`
+	Description   string `json:"description,omitempty"`
 }
 
 type tierPlanProfiles struct {
-	Version  int                         `json:"version"`
+	Version  int                        `json:"version"`
 	Profiles map[string]TierPlanProfile `json:"profiles"`
 }
 
@@ -114,6 +120,11 @@ func PlanSet(name string, profile TierPlanProfile) error {
 	}
 	if strings.TrimSpace(profile.Model) == "" {
 		return errors.New("--model is required")
+	}
+	if profile.RoutePolicy != "" {
+		if _, err := parseRoutePolicy(profile.RoutePolicy); err != nil {
+			return fmt.Errorf("route_policy %q is not one of local-first, remote-first, auto, local-only, remote-only", profile.RoutePolicy)
+		}
 	}
 	p, err := loadTierPlanProfiles()
 	if err != nil {
@@ -209,4 +220,30 @@ func resolvePlanModels(planName, model, sonnetModel string) (resolvedModel, reso
 		resolvedSonnet = prof.SonnetModel
 	}
 	return resolvedModel, resolvedSonnet, nil
+}
+
+// resolvePlanTier layers a plan's stored oversize model + route policy over
+// the launch flags, mirroring resolvePlanModels' precedence: an explicit
+// flag always wins, the plan only fills what the caller left empty. With no
+// --plan (or a plan stored before these fields existed) everything passes
+// through unchanged, so the downstream tierPlan wiring in tier_routing.go's
+// Run — which already applies flags > remotes.json route_policy >
+// local-first — behaves byte-identically for old plans.
+func resolvePlanTier(planName, policyArg, oversizeModel string) (resolvedPolicy, resolvedOversize string, err error) {
+	if planName == "" {
+		return policyArg, oversizeModel, nil
+	}
+	prof, err := PlanGet(planName)
+	if err != nil {
+		return "", "", err
+	}
+	resolvedPolicy = policyArg
+	if resolvedPolicy == "" {
+		resolvedPolicy = prof.RoutePolicy
+	}
+	resolvedOversize = oversizeModel
+	if resolvedOversize == "" {
+		resolvedOversize = prof.OversizeModel
+	}
+	return resolvedPolicy, resolvedOversize, nil
 }

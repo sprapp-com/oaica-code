@@ -141,3 +141,32 @@ local-only|remote-only"` per remote as the default for launches using it;
 the `--route-policy` flag wins. `oaica doctor` prints every remote's
 reachability + wire + route_policy and the daemon leg — exit 1 on any
 failing probe, so cron/scripts can grep.
+
+## Interactive launch wizard (2026-08-31)
+
+A plain interactive `oaica launch claude` (no explicit `--model`, no
+tier/policy/oversize/plan flags) now walks the remaining tiers after the
+picker:
+
+1. **Primary model** — the existing picker (unchanged).
+2. **Sonnet/subagent tier** — same picker list, `(same as primary)` first and
+   the default (Enter keeps the single-model launch).
+3. **Compaction/oversize model** — only models whose PROBED context window
+   (the same 2s `/models` probe the proxy uses) is strictly larger than the
+   primary's qualify; `(none — fail honestly at the ceiling)` is the default.
+   With no probe answer and no larger model, the step offers nothing.
+4. **Route policy** — the five `--route-policy` values, `local-first` default.
+
+A one-line preview prints (e.g. `fallback: a <-> b · oversize: c (256k) ·
+policy: remote-first`) and the choice can be saved as a named plan (blank
+skips): `oaica plan list` / `oaica plan show NAME` show the oversize +
+policy columns, `oaica plan set NAME --model a --sonnet-model b --oversize c
+--route-policy remote-first` builds one by hand.
+
+Precedence is unchanged and now covers the stored fields: **flag >
+plan > remotes.json `route_policy` > local-first**. Old plans.json files
+missing `oversize_model`/`route_policy` load unchanged (missing = empty =
+today's defaults).
+
+Flag-only and non-interactive launches (`--model`, `--yes`, scripts, cron)
+never see the wizard — their behavior is byte-identical.

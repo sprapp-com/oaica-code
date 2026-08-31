@@ -2567,9 +2567,12 @@ just to see the picker list.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			model, _ := cmd.Flags().GetString("model")
 			sonnetModel, _ := cmd.Flags().GetString("sonnet-model")
+			oversizeModel, _ := cmd.Flags().GetString("oversize")
+			policy, _ := cmd.Flags().GetString("route-policy")
 			desc, _ := cmd.Flags().GetString("description")
 			if err := launch.PlanSet(args[0], launch.TierPlanProfile{
-				Model: model, SonnetModel: sonnetModel, Description: desc,
+				Model: model, SonnetModel: sonnetModel, OversizeModel: oversizeModel,
+				RoutePolicy: policy, Description: desc,
 			}); err != nil {
 				return err
 			}
@@ -2577,12 +2580,20 @@ just to see the picker list.`,
 			if sonnetModel != "" {
 				fmt.Printf(", sonnet/subagents -> %s", sonnetModel)
 			}
+			if oversizeModel != "" {
+				fmt.Printf(", oversize -> %s", oversizeModel)
+			}
+			if policy != "" {
+				fmt.Printf(", policy %s", policy)
+			}
 			fmt.Println()
 			return nil
 		},
 	}
 	planSetCmd.Flags().String("model", "", "Model for Opus/Haiku-tier requests (required)")
 	planSetCmd.Flags().String("sonnet-model", "", "Model for Sonnet/subagent-tier requests (default: same as --model)")
+	planSetCmd.Flags().String("oversize", "", "Larger-context model for requests the current leg cannot hold")
+	planSetCmd.Flags().String("route-policy", "", "local-first|remote-first|auto|local-only|remote-only (default: local-first)")
 	planSetCmd.Flags().String("description", "", "Free-text description shown in `oaica plan list`")
 
 	planListCmd := &cobra.Command{
@@ -2599,7 +2610,7 @@ just to see the picker list.`,
 				fmt.Printf("No plans defined (%s).\nCreate one with `oaica plan set <name> --model <id>`\n", path)
 				return nil
 			}
-			fmt.Printf("%-20s %-24s %-24s %s\n", "NAME", "OPUS/HAIKU", "SONNET", "DESCRIPTION")
+			fmt.Printf("%-20s %-24s %-24s %-24s %-16s %s\n", "NAME", "OPUS/HAIKU", "SONNET", "OVERSIZE", "POLICY", "DESCRIPTION")
 			for _, n := range names {
 				prof, err := launch.PlanGet(n)
 				if err != nil {
@@ -2609,7 +2620,9 @@ just to see the picker list.`,
 				if sonnet == "" {
 					sonnet = "(same)"
 				}
-				fmt.Printf("%-20s %-24s %-24s %s\n", n, prof.Model, sonnet, prof.Description)
+				oversize := orDashStr(prof.OversizeModel, "-")
+				policy := orDashStr(prof.RoutePolicy, "-")
+				fmt.Printf("%-20s %-24s %-24s %-24s %-16s %s\n", n, prof.Model, sonnet, oversize, policy, prof.Description)
 			}
 			return nil
 		},
@@ -2626,6 +2639,8 @@ just to see the picker list.`,
 			fmt.Printf("name:         %s\n", args[0])
 			fmt.Printf("model:        %s\n", prof.Model)
 			fmt.Printf("sonnet_model: %s\n", orDashStr(prof.SonnetModel, "(same as model)"))
+			fmt.Printf("oversize_model: %s\n", orDashStr(prof.OversizeModel, "-"))
+			fmt.Printf("route_policy: %s\n", orDashStr(prof.RoutePolicy, "local-first (default)"))
 			fmt.Printf("description:  %s\n", orDashStr(prof.Description, "-"))
 			return nil
 		},

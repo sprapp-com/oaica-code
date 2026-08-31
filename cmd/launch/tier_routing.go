@@ -362,7 +362,7 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 
 // Run launches Claude Code against the plan: one local translation proxy,
 // routing per request model id.
-func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
+func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	planName, args := extractPlanFlag(args)
@@ -376,6 +376,20 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 			return fmt.Errorf("--plan: %w", err)
 		}
 		model, sonnetModel = resolvedModel, resolvedSonnet
+		// Flags > plan > remotes.json route_policy: the plan only fills what
+		// the flags left empty (tier_plan_profiles.go).
+		policyArg, oversizeModel, err = resolvePlanTier(planName, policyArg, oversizeModel)
+		if err != nil {
+			return fmt.Errorf("--plan: %w", err)
+		}
+	} else if tierWizardEligible(args) {
+		w, err := runTierWizard(models, model)
+		if err != nil {
+			return fmt.Errorf("launch wizard: %w", err)
+		}
+		sonnetModel = w.SonnetModel
+		oversizeModel = w.OversizeModel
+		policyArg = w.RoutePolicy
 	}
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
