@@ -422,6 +422,9 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--oversize: %w", err)
 		}
+		if over.BaseURL == plan.Primary.BaseURL {
+			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, over.BaseURL)
+		}
 		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
 			return fmt.Errorf("--oversize: %w", err)
 		}

@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -23,6 +24,22 @@ import (
 // doctorProbeTimeout: same reasoning as context_window_remote.go's probe —
 // a doctor run must stay fast.
 const doctorProbeTimeout = 2 * time.Second
+
+// redactBaseURL hides any userinfo embedded in a base URL. A launch remote
+// is configured as https://KEY@host/v1 in several wire setups; the key is a
+// secret and doctor output goes to terminals, CI logs and support tickets.
+func redactBaseURL(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.User == nil {
+		return baseURL
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		u.User = url.UserPassword(u.User.Username(), "REDACTED")
+	} else {
+		u.User = url.User("REDACTED")
+	}
+	return u.String()
+}
 
 // DoctorCmd builds the `oaica doctor` command. Read-only (GET /models).
 func DoctorCmd() *cobra.Command {
@@ -68,7 +85,9 @@ func DoctorCmd() *cobra.Command {
 				if r.RoutePolicy != "" {
 					suffix = "  (route_policy: " + r.RoutePolicy + ")"
 				}
-				fmt.Printf("  %-16s %-40s wire=%-8s %s%s\n", r.Name, r.BaseURL, r.Wire, status, suffix)
+				// Credential-embedded URLs (https://key@host/...) print
+				// redacted — doctor output lands in terminals and CI logs.
+				fmt.Printf("  %-16s %-40s wire=%-8s %s%s\n", r.Name, redactBaseURL(r.BaseURL), r.Wire, status, suffix)
 			}
 			if len(remotes) == 0 {
 				fmt.Println("  (none configured)")
@@ -85,8 +104,8 @@ func DoctorCmd() *cobra.Command {
 				fmt.Println("  unreachable (fine — launches that need it will say so)")
 			}
 
-			fmt.Printf("\ndefault route policy: %s (flag --route-policy > remote route_policy > %s)\n",
-				RouteLocalFirst, RouteLocalFirst)
+			fmt.Printf("\ndefault route policy (per launch: --route-policy flag > the primary remote's route_policy > %s)\n",
+				RouteLocalFirst)
 			fmt.Println("policies: local-first | remote-first | auto | local-only | remote-only")
 			fmt.Println("oversize: per-launch --oversize <model> (no remotes.json default yet)")
 

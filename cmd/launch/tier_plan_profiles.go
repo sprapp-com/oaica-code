@@ -31,6 +31,9 @@ import (
 	"strings"
 )
 
+// maxPlanNameLength bounds a plan name entering plans.json (see PlanSet).
+const maxPlanNameLength = 64
+
 // TierPlanProfile is one named plan: which model serves Opus/Haiku-tier
 // requests, and (optionally) which model serves Sonnet/subagent-tier
 // requests. Empty SonnetModel means "same as Model", matching
@@ -117,6 +120,13 @@ func PlanSet(name string, profile TierPlanProfile) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("plan name is required")
+	}
+	// Bound the name: it becomes a map key / CLI argument everywhere
+	// (`--plan <name>`), and the wizard prompt admits arbitrary length —
+	// unbounded into plans.json, one fat-fingered paste would corrupt
+	// every future plan listing.
+	if len(name) > maxPlanNameLength {
+		return fmt.Errorf("plan name %d chars exceeds the %d-char limit", len(name), maxPlanNameLength)
 	}
 	if strings.TrimSpace(profile.Model) == "" {
 		return errors.New("--model is required")

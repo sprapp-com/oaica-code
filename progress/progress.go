@@ -38,18 +38,29 @@ func NewProgress(w io.Writer) *Progress {
 }
 
 func (p *Progress) stop() bool {
-	for _, state := range p.states {
+	p.mu.Lock()
+	states := p.states
+	ticker := p.ticker
+	p.ticker = nil
+	p.mu.Unlock()
+
+	// stop() races start()'s ticker setup unless both go through p.mu;
+	// render() takes p.mu itself, so it must be called outside the lock.
+	for _, state := range states {
 		if spinner, ok := state.(*Spinner); ok {
 			spinner.Stop()
 		}
 	}
 
-	if p.ticker != nil {
-		p.ticker.Stop()
-		p.ticker = nil
+	if ticker != nil {
+		ticker.Stop()
 		p.render()
 		return true
 	}
+
+	p.mu.Lock()
+	p.pos = len(p.states)
+	p.mu.Unlock()
 
 	return false
 }
@@ -127,8 +138,18 @@ func (p *Progress) render() {
 }
 
 func (p *Progress) start() {
-	p.ticker = time.NewTicker(100 * time.Millisecond)
-	for range p.ticker.C {
+	p.mu.Lock()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	if p.ticker != nil {
+		// stop() already ran (or ran concurrently): do not race its nil-out.
+		ticker.Stop()
+		p.mu.Unlock()
+		return
+	}
+	p.ticker = ticker
+	p.mu.Unlock()
+
+	for range ticker.C {
 		p.render()
 	}
 }

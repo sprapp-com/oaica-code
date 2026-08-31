@@ -38,6 +38,7 @@ package launch
 // request (the handler only consults the breaker before forwarding).
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"os"
@@ -145,8 +146,23 @@ type routeBreaker struct {
 }
 
 func (b *routeBreaker) recordFail() {
-	if b.fails.Add(1) >= breakerFailsToOpen {
-		b.openUntil.Store(time.Now().Add(breakerOpenFor).UnixNano())
+	// While OPEN the count is parked (further failures don't accumulate).
+	// After expiry a stale count of breakerFailsToOpen lingers, so a fresh
+	// failure that pushes past it RESTARTS the budget at 1: after an OPEN
+	// cycle the leg needs its full budget of fresh failures to re-open — a
+	// lone blip right after expiry must not re-open it on its own.
+	// recordOK (probes or live traffic) resets the counter anyway.
+	if b.open() {
+		return
+	}
+	if n := b.fails.Add(1); n >= breakerFailsToOpen {
+		if n > breakerFailsToOpen {
+			b.fails.Store(1)
+			n = 1
+		}
+		if n >= breakerFailsToOpen {
+			b.openUntil.Store(time.Now().Add(breakerOpenFor).UnixNano())
+		}
 	}
 }
 
@@ -230,19 +246,47 @@ var autoEscalateHoldFor = 10 * time.Minute
 // routeEscalation is the state for one SessionID: consecutive failures of
 // its currently chosen leg, and the instant escalation expires (stale, i.e.
 // zero or past, means "not escalated").
+// routeEscalation is the state for one SessionID: consecutive failures of
+// its currently chosen leg, and the instant escalation expires (stale, i.e.
+// zero or past, means "not escalated"). The signal is PER-LEG: results from
+// the leg the session is actually being served on count; a success on some
+// other leg must not clear the primary's failure streak, and a failure on
+// a fallback must not feed the escalation counter toward it.
 type routeEscalation struct {
-	fails          atomic.Int32
+	mu             sync.Mutex
+	leg            string
+	fails          int
 	escalatedUntil atomic.Int64
 }
 
-func (e *routeEscalation) recordFail() {
-	if e.fails.Add(1) >= autoEscalateAfterFails {
+func (e *routeEscalation) noteLeg(baseURL string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.leg != baseURL {
+		e.leg = baseURL
+		e.fails = 0
+	}
+}
+
+func (e *routeEscalation) recordFail(baseURL string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.leg != baseURL {
+		return
+	}
+	e.fails++
+	if e.fails >= autoEscalateAfterFails {
 		e.escalatedUntil.Store(time.Now().Add(autoEscalateHoldFor).UnixNano())
 	}
 }
 
-func (e *routeEscalation) recordOK() {
-	e.fails.Store(0)
+func (e *routeEscalation) recordOK(baseURL string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.leg != baseURL {
+		return
+	}
+	e.fails = 0
 }
 
 func (e *routeEscalation) escalated() bool {
@@ -275,15 +319,21 @@ func (re *routeEscalations) forSession(sessionID string) *routeEscalation {
 	return e
 }
 
-func (re *routeEscalations) recordFail(sessionID string) {
+func (re *routeEscalations) noteLeg(sessionID, baseURL string) {
 	if e := re.forSession(sessionID); e != nil {
-		e.recordFail()
+		e.noteLeg(baseURL)
 	}
 }
 
-func (re *routeEscalations) recordOK(sessionID string) {
+func (re *routeEscalations) recordFail(sessionID, baseURL string) {
 	if e := re.forSession(sessionID); e != nil {
-		e.recordOK()
+		e.recordFail(baseURL)
+	}
+}
+
+func (re *routeEscalations) recordOK(sessionID, baseURL string) {
+	if e := re.forSession(sessionID); e != nil {
+		e.recordOK(baseURL)
 	}
 }
 
@@ -339,6 +389,14 @@ func (t proxyRouteTable) escalationTarget(base proxyRoute) (proxyRoute, bool) {
 // ledger, user dashboards) can attribute the spend to the leg that actually
 // served it.
 func (t proxyRouteTable) selectRoute(requested string) (proxyRoute, string, bool) {
+	route, model, usedFallback := t.resolveRoute(requested)
+	// Track which leg the session is being served on: the escalation signal
+	// only counts results from that leg (nil-safe — no state is a no-op).
+	t.escalations.noteLeg(t.SessionID, route.BaseURL)
+	return route, model, usedFallback
+}
+
+func (t proxyRouteTable) resolveRoute(requested string) (proxyRoute, string, bool) {
 	base, model := t.resolve(requested)
 
 	// `auto` escalation: when this session's failures have accumulated past
@@ -434,12 +492,12 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (
 }
 
 // startRouteHealthPoll probes every distinct fallback base URL every
-// pollInterval until ln closes, recording the outcome so breakers both OPEN
-// proactively and RECOVER without waiting for a real request to prove the
-// leg is back. GET /models: every OpenAI-compatible backend we route to
-// (vLLM, Ollama, gateways, aggregators) serves it, and unlike a TCP dial it
-// exercises the full HTTP path including any LB in front.
-func (t proxyRouteTable) startRouteHealthPoll(ln <-chan struct{}, pollInterval time.Duration) {
+// pollInterval until ctx is cancelled, recording the outcome so breakers
+// both OPEN proactively and RECOVER without waiting for a real request to
+// prove the leg is back. GET /models: every OpenAI-compatible backend we
+// route to (vLLM, Ollama, gateways, aggregators) serves it, and unlike a
+// TCP dial it exercises the full HTTP path including any LB in front.
+func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval time.Duration) {
 	seen := map[string]bool{}
 	var urls []string
 	legs := append([]proxyRoute{t.Default}, t.Fallbacks...)
@@ -457,8 +515,18 @@ func (t proxyRouteTable) startRouteHealthPoll(ln <-chan struct{}, pollInterval t
 	defer tick.Stop()
 	probe := func() {
 		for _, u := range urls {
-			resp, err := client.Get(strings.TrimRight(u, "/") + "/models")
+			// ctx-bound request: shutdown cancels an in-flight probe instead
+			// of letting shutdown lag behind it (up to the 5s client timeout
+			// per URL under the old channel-only signal).
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(u, "/")+"/models", nil)
 			if err != nil {
+				continue
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				if ctx.Err() != nil {
+					return // shutdown, not a leg failure
+				}
 				t.breakers.recordFail(u)
 				continue
 			}
@@ -473,7 +541,7 @@ func (t proxyRouteTable) startRouteHealthPoll(ln <-chan struct{}, pollInterval t
 	}
 	for {
 		select {
-		case <-ln:
+		case <-ctx.Done():
 			return
 		case <-tick.C:
 			probe()

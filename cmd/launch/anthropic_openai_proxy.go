@@ -28,6 +28,7 @@ package launch
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -738,9 +739,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		if table.escalations == nil {
 			table.escalations = &routeEscalations{}
 		}
-		pollDone := make(chan struct{})
-		defer close(pollDone)
-		go table.startRouteHealthPoll(pollDone, 30*time.Second)
+		pollCtx, cancelPoll := context.WithCancel(context.Background())
+		defer cancelPoll() // aborts in-flight probes' HTTP requests too
+		go table.startRouteHealthPoll(pollCtx, 30*time.Second)
 	}
 
 	// Per-session prompt-size calibration for the context-fit clamp below --
@@ -938,7 +939,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// Same signal feeds the `auto` policy's per-session escalation
 			// (route_policy.go): consecutive failures escalate the session to
 			// the stronger secondary leg.
-			table.escalations.recordFail(table.SessionID)
+			table.escalations.recordFail(table.SessionID, route.BaseURL)
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 			return
 		}
@@ -955,10 +956,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		switch {
 		case resp.StatusCode >= 500:
 			table.breakers.recordFail(route.BaseURL)
-			table.escalations.recordFail(table.SessionID)
+			table.escalations.recordFail(table.SessionID, route.BaseURL)
 		case resp.StatusCode < 300:
 			table.breakers.recordOK(route.BaseURL)
-			table.escalations.recordOK(table.SessionID)
+			table.escalations.recordOK(table.SessionID, route.BaseURL)
 		}
 
 		// Same local-only log the router path used to keep (request_log.go):

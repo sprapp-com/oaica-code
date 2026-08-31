@@ -383,24 +383,27 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks:   []proxyRoute{big},
-		breakers:    &routeBreakers{},
+			breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
+	table.escalations.noteLeg(table.SessionID, base.BaseURL)
 
 	for i := 0; i < autoEscalateAfterFails-1; i++ {
-		table.escalations.recordFail(table.SessionID)
+		table.escalations.recordFail(table.SessionID, base.BaseURL)
 	}
 	if _, _, fb := table.selectRoute("m"); fb {
 		t.Error("1 failure below the threshold must not escalate")
 	}
-	table.escalations.recordFail(table.SessionID)
+	table.escalations.recordFail(table.SessionID, base.BaseURL)
 	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
 		t.Errorf("consecutive failures at the threshold must escalate to the big leg (got %s, fallback=%v)", r.BaseURL, fb)
 	}
-	// A success clears the CONSECUTIVE counter, but an escalation already
-	// earned stands until the hold window decays (one lucky 200 on the
-	// secondary must not bounce the session back onto a flapping primary).
-	table.escalations.recordOK(table.SessionID)
+	// A success ON THE SERVING LEG clears the consecutive counter, but an
+	// escalation already earned stands until the hold window decays (one
+	// lucky 200 on the secondary must not bounce the session back onto a
+	// flapping primary — and per-leg signals mean it doesn't even clear the
+	// primary's failure streak).
+	table.escalations.recordOK(table.SessionID, big.BaseURL)
 	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
 		t.Errorf("active escalation must survive a success (got %s, fallback=%v)", r.BaseURL, fb)
 	}
@@ -410,7 +413,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	}
 	// After the reset, ONE failure alone can't re-escalate (the counter was
 	// cleared by the OK above).
-	table.escalations.recordFail(table.SessionID)
+	table.escalations.recordFail(table.SessionID, base.BaseURL)
 	if _, _, fb := table.selectRoute("m"); fb {
 		t.Error("single post-reset failure must not escalate")
 	}
@@ -419,11 +422,12 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table2 := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks:   []proxyRoute{big},
-		breakers:    &routeBreakers{},
+			breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
+	table.escalations.noteLeg(table.SessionID, base.BaseURL)
 	for i := 0; i < autoEscalateAfterFails; i++ {
-		table2.escalations.recordFail(table2.SessionID)
+		table2.escalations.recordFail(table2.SessionID, base.BaseURL)
 	}
 	for i := 0; i < breakerFailsToOpen; i++ {
 		table2.breakers.recordFail(big.BaseURL)
@@ -436,11 +440,12 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table3 := proxyRouteTable{
 		Policy: RouteLocalFirst, Default: base,
 		Fallbacks:   []proxyRoute{big},
-		breakers:    &routeBreakers{},
+			breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
+	table.escalations.noteLeg(table.SessionID, base.BaseURL)
 	for i := 0; i < autoEscalateAfterFails*3; i++ {
-		table3.escalations.recordFail(table3.SessionID)
+		table3.escalations.recordFail(table3.SessionID, base.BaseURL)
 	}
 	if r, _, fb := table3.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
 		t.Errorf("non-auto policy must not escalate (got %s, fallback=%v)", r.BaseURL, fb)
@@ -450,7 +455,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table4 := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks: []proxyRoute{big},
-		breakers:  &routeBreakers{},
+			breakers:  &routeBreakers{},
 	}
 	if r, _, fb := table4.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
 		t.Errorf("nil escalations must not escalate (got %s, fallback=%v)", r.BaseURL, fb)
