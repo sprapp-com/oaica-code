@@ -385,7 +385,9 @@ launch configs (owner's A100 SXM4 80 GB bench, 8k ctx / 400 gen, greedy):
 | 8k / 16k + vision | MTP2 on, `--kv-cache-dtype auto` | 198 tok/s single, 99/user @N=32, 166 users @≥30 tok/s |
 | **256k (prod)**   | **MTP off, `--kv-cache-dtype fp8`** | **95 users @≥30 tok/s, 2110 tok/s aggregate** |
 
-Production (GPU0/1/2, `vllm_awq_watchdog.sh`) runs the 256k row: no
+Production (GPU0/1/2/7 — homogeneous, all four identical 256k builds,
+replica set in `/workspace/vllm_awq_replicas.conf`, `vllm_awq_watchdog.sh`)
+runs the 256k row: no
 `--speculative-config`, fp8 KV, 262144 max-model-len, 18 seqs, async
 scheduling on (the `--no-async-scheduling` + eager-draft pair existed only
 for the MTP CUDA-graph race, which has no draft to race without MTP).
@@ -490,6 +492,23 @@ Verified sticky routing directly: 3/3 same-session requests landed on the
 same backend. `session_overflow_factor 1.5` spills a session to a second
 backend once it's carrying too much load, so one hot session can't starve
 a replica.
+
+**Probe timeout vs load (2026-08-31 ~03:00Z incident).** At ~3× the
+baseline request rate, prefill storms (6-13k tok/s per engine) starved
+decode to 0.2-2.7 tok/s and the oaicalb health probe (`probe_timeout_sec
+25`, timed chat completion) started timing out on busy replicas → LB
+flapped them DOWN although the engines were producing tokens (watchdog
+correctly logged "still producing tokens -- NOT killing, extending
+grace" and killed nothing). For ~20 min two of four replicas (30108,
+30112) were marked DOWN while actually healthy, concentrating traffic on
+the other half. Engines never crashed; both recovered UP on their own
+when the prefill wave passed. Lesson + pending tune: busy-generating
+replicas can still fail a timed chat probe; raise `probe_timeout_sec`
+25→60 in `/workspace/oaicalb.json` (+ SIGHUP `oaicalb_reload.sh`) in a
+quiet window — the watchdog's own STALL_PROBE got 15→25 for the same
+reason. Do not treat `probe=fail` + rising `oldest_inflight_sec` +
+tokens flowing as a crash; check the engine log's throughput lines
+first.
 
 **Prefill chunk 12288 → 8192** (`--max-num-batched-tokens`), fleet-wide.
 Decode no longer starves to ~1 tok/s under prefill storms. Combined with

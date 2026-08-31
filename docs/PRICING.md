@@ -464,3 +464,27 @@ uncached input; cache-hit $0.008; output $0.28. Past-hour tier split: 5 /
 53.7% (session-affinity effect, see `tools/a100b/README.md`). Revenue per
 request fell with the cache-hit discount, but GPU cost per request fell
 more (prefill-chunk + affinity latency work) — margin improved.
+
+### How the bracket is chosen (2026-08-31, mechanics)
+
+Fully automatic, server-side — the client does nothing and cannot
+influence it. The gateway reads the **real** `prompt_tokens` the engine
+returned (not client-declared, not estimated), bills cached prefix
+tokens at the flat $0.008 cache rate regardless of size, then bills the
+uncached remainder at the bracket rate selected by the whole-request
+prompt size (`tokens ≤ 32,768 → $0.05`, `≤ 131,072 → $0.06`,
+otherwise `$0.10`). One over-128k request pays $0.10/M on *all* its
+uncached input; a cache-heavy retry of the same prompt pays $0.008 on
+the hit and $0.10/M only on the fresh tail. Output bills at $0.28/M
+independent of bracket. `price_tier` in the meterhub ledger records the
+bracket per request — past-hour split under ~3× load: 49 / 690 / 261.
+
+The fleet is homogeneous: all four replicas (GPU0/1/2/7) are the same
+checkpoint, launch tier (256k) and capacity (262k ctx, 18 seqs), behind
+leastconn + session-hash LB. Brackets are per-request pricing, never
+per-GPU — no GPU, queue or routing difference exists between prompt
+sizes. Possible follow-up if cost data warrants: a >200k bracket
+(p95 latency rises steeply past ~130k prompts) and a >1000-records/hr
+meterhub aggregate query (the `/usage` list endpoint caps at 1000 rows,
+so heavy hours undercount in raw reads; sums via `/usage/summary` stay
+correct when a window param is wired).
