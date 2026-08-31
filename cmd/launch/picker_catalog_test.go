@@ -76,7 +76,7 @@ func TestPicker_NoRemotesNoKeys_ShowsOnlyLocalDaemonModels(t *testing.T) {
 	if model != "qwen3:8b" {
 		t.Fatalf("model = %q, want qwen3:8b", model)
 	}
-	if !slices.Equal(gotNames, []string{"qwen3:8b"}) {
+	if !slices.Equal(gotNames, []string{"ollama/qwen3:8b"}) {
 		t.Fatalf("picker items = %v, want exactly the local daemon model", gotNames)
 	}
 	for _, name := range ollamaCatalogNames() {
@@ -106,7 +106,7 @@ func TestPicker_RouterAuthError_StillNoCatalog(t *testing.T) {
 	if _, err := ResolveRunModel(context.Background(), RunModelRequest{ForcePicker: true}); err != nil {
 		t.Fatalf("ResolveRunModel returned error: %v", err)
 	}
-	if !slices.Equal(gotNames, []string{"qwen3:8b"}) {
+	if !slices.Equal(gotNames, []string{"ollama/qwen3:8b"}) {
 		t.Fatalf("picker items = %v, want exactly the local daemon model", gotNames)
 	}
 }

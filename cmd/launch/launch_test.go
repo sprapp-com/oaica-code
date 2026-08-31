@@ -421,10 +421,10 @@ func TestLoadSelectableModelsFiltersDeprecatedModels(t *testing.T) {
 			t.Fatalf("deprecated model %q should be filtered from selectable models: %v", deprecated, got)
 		}
 	}
-	if !slices.Contains(got, "qwen3.5") {
+	if !slices.Contains(got, "ollama/qwen3.5") {
 		t.Fatalf("expected newer recommendation to remain selectable, got %v", got)
 	}
-	if !slices.Contains(got, "custom-local") {
+	if !slices.Contains(got, "ollama/custom-local") {
 		t.Fatalf("expected custom local model to remain selectable, got %v", got)
 	}
 	if slices.Contains(orderedChecked, "qwen2.5:14b") {
@@ -1994,8 +1994,8 @@ func TestResolveRunModel_ForcePicker_DoesNotReorderByLastModel(t *testing.T) {
 		t.Fatal("expected selector to receive model items")
 	}
 
-	glmIdx := slices.Index(gotNames, "gemma4")
-	qwenIdx := slices.Index(gotNames, "qwen3.5")
+	glmIdx := slices.Index(gotNames, "ollama/gemma4")
+	qwenIdx := slices.Index(gotNames, "ollama/qwen3.5")
 	if glmIdx == -1 || qwenIdx == -1 {
 		t.Fatalf("expected recommended local models in selector items, got %v", gotNames)
 	}
@@ -2510,14 +2510,14 @@ func TestLaunchIntegration_EditorForceConfigure_FloatsCheckedModelsInPicker(t *t
 	// picker holds only the daemon's two models — upstream's built-in
 	// catalog (recommendedNames()) is never padded in. The saved default
 	// still sorts first among checked items.
-	wantItems := []string{"qwen3.5:cloud", "qwen3.5"}
+	wantItems := []string{"ollama/qwen3.5:cloud", "ollama/qwen3.5"}
 	if diff := cmp.Diff(wantItems, gotItems); diff != "" {
 		t.Fatalf("expected daemon models only, saved default first (-want +got):\n%s", diff)
 	}
 	if len(gotPreChecked) < 2 {
 		t.Fatalf("expected prechecked models to be preserved, got %v", gotPreChecked)
 	}
-	if gotPreChecked[0] != "qwen3.5:cloud" {
+	if gotPreChecked[0] != "ollama/qwen3.5:cloud" {
 		t.Fatalf("expected saved default to remain first in prechecked, got %v", gotPreChecked)
 	}
 }
@@ -3733,7 +3733,7 @@ func TestLaunchIntegration_SavedDeprecatedDeclineOpensPicker(t *testing.T) {
 		if slices.Contains(itemNames, "llama3.2") {
 			t.Fatalf("expected saved deprecated model to be hidden from picker, got %v", itemNames)
 		}
-		if !slices.Contains(itemNames, "best-local") {
+		if !slices.Contains(itemNames, "ollama/best-local") {
 			t.Fatalf("expected replacement model to remain selectable, got %v", itemNames)
 		}
 		return "best-local", nil

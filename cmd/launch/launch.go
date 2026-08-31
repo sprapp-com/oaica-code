@@ -1103,6 +1103,9 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		if selected == "" {
 			return "", ErrCancelled
 		}
+		// "ollama/<name>" is picker display only; the daemon and every
+		// saved config know the bare id.
+		selected = stripOllamaPickerNames([]string{selected})[0]
 		if ensureReady {
 			if err := c.ensureModelsReadyFor(ctx, []string{selected}, label, commandName); err != nil {
 				if errors.Is(err, errUpgradeCancelled) {
@@ -1142,6 +1145,9 @@ func (c *launcherClient) selectMultiModelsForIntegration(ctx context.Context, na
 		if err != nil {
 			return nil, err
 		}
+		// Strip the ollama/ picker prefix before readiness/config saving —
+		// display-level only (see stripOllamaPickerNames).
+		selected = stripOllamaPickerNames(selected)
 		accepted, skipped, err := c.selectReadyModelsForSave(ctx, selected, runner.String(), name)
 		if err != nil {
 			if errors.Is(err, errUpgradeCancelled) {
@@ -1499,7 +1505,10 @@ func hasLocalModel(inventory []LaunchModel, name string) bool {
 		if model.Remote {
 			continue
 		}
-		if model.Name == name || strings.HasPrefix(model.Name, name+":") {
+		// launchModelMatches covers tag suffixes AND the ollama/ picker
+		// prefix (daemon models list as "ollama/<name>"; a bare saved name
+		// must keep resolving to them).
+		if launchModelMatches(model.Name, name) {
 			return true
 		}
 	}

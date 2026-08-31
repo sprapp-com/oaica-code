@@ -464,11 +464,24 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 	for _, n := range preChecked {
 		checked[n] = true
 	}
+	// the ollama/ picker prefix is display-level: a checked/*/current name
+	// must match its prefixed inventory entry too.
+	isChecked := func(name string) bool {
+		if checked[name] {
+			return true
+		}
+		for _, n := range preChecked {
+			if launchModelMatches(n, name) {
+				return true
+			}
+		}
+		return false
+	}
 
 	if current != "" {
 		matchedCurrent := false
 		for _, item := range items {
-			if item.Name == current {
+			if launchModelMatches(item.Name, current) {
 				current = item.Name
 				matchedCurrent = true
 				break
@@ -484,8 +497,12 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 		}
 	}
 
-	if checked[current] {
-		preChecked = append([]string{current}, slices.DeleteFunc(preChecked, func(m string) bool { return m == current })...)
+	if isChecked(current) {
+		preChecked = append([]string{current}, slices.DeleteFunc(preChecked, func(m string) bool {
+			// launchModelMatches, not ==: the current name may carry the
+			// ollama/ picker prefix while preChecked holds the bare id.
+			return launchModelMatches(current, m)
+		})...)
 	}
 
 	notInstalled := make(map[string]bool)
@@ -513,7 +530,7 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 		// Keep the Recommended section pinned to recommendation order. Checked
 		// and default-model priority only apply within the More section.
 		slices.SortStableFunc(items, func(a, b ModelItem) int {
-			ac, bc := checked[a.Name], checked[b.Name]
+			ac, bc := isChecked(a.Name), isChecked(b.Name)
 			aNew, bNew := notInstalled[a.Name], notInstalled[b.Name]
 			aRec, bRec := recRank[a.Name] > 0, recRank[b.Name] > 0
 			if aRec != bRec {

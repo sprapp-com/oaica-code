@@ -79,6 +79,18 @@ func (i *modelInventory) Refresh(ctx context.Context) ([]LaunchModel, error) {
 // fields are left at zero value, which downstream code already treats as
 // "unknown" (WithCloudLimits falls back to lookupCloudModelLimit, which
 // simply won't match our model names and leaves them as-is).
+// ollamaPickerPrefix names daemon models in the picker. Local Ollama
+// models ("kat-awq", "gpt-oss:20b", ...) carry no provider hint, so
+// typing "ollama" in the picker filter matched nothing (2026-09-01) for
+// every model that isn't an OAICA SKU or user remote. They surface as
+// "ollama/<name>" — matching resolveLaunchEndpoint's pre-existing
+// "ollama/<id>" daemon-source vocabulary and the modelref-unspecial
+// "/" namespace — while both the prefixed AND the bare name keep
+// resolving (launchModelMatches), and a resolved entry reports the
+// bare name upstream (findLaunchModel strips the prefix, so the daemon
+// never sees "ollama/...").
+const ollamaPickerPrefix = "ollama/"
+
 func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, error) {
 	if i == nil {
 		return nil, nil
@@ -103,6 +115,12 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 				lm := launchModelFromListResponse(m)
 				if lm.Name == "" || seen[lm.Name] {
 					continue
+				}
+				// Already-namespaced ids (hf.co/..., "<remote>/<id>",
+				// ":local" tags, anything with a "/") keep their name; bare
+				// daemon models get the ollama/ picker prefix.
+				if !strings.Contains(lm.Name, "/") && !strings.HasSuffix(lm.Name, ":local") {
+					lm.Name = ollamaPickerPrefix + lm.Name
 				}
 				seen[lm.Name] = true
 				models = append(models, lm)
@@ -212,11 +230,36 @@ func resolveUserRemoteModelsDirect(names []string) ([]LaunchModel, bool) {
 	return out, true
 }
 
+// stripOllamaPickerNames removes the ollama/ picker prefix from selected
+// names — display-level only, and a user remote literally named "ollama"
+// keeps its namespace (its <remote>/<id> names win over our prefix).
+func stripOllamaPickerNames(names []string) []string {
+	for i, name := range names {
+		rest, ok := strings.CutPrefix(name, ollamaPickerPrefix)
+		if !ok {
+			continue
+		}
+		if _, _, isRemote := findUserRemoteForModel(name); isRemote {
+			continue
+		}
+		names[i] = rest
+	}
+	return names
+}
+
 func resolveLaunchModels(names []string, models []LaunchModel) ([]LaunchModel, bool) {
 	resolved := make([]LaunchModel, 0, len(names))
 	localMiss := false
+	seen := make(map[string]bool, len(names))
 	for _, name := range names {
 		if model, ok := findLaunchModel(models, name); ok {
+			// The ollama/ picker prefix is display-only, so a bare override
+			// ("gemma4") and its prefixed inventory entry resolve to the
+			// SAME bare name — drop the duplicate.
+			if seen[model.Name] {
+				continue
+			}
+			seen[model.Name] = true
 			resolved = append(resolved, model.WithCloudLimits())
 			continue
 		}
@@ -248,7 +291,11 @@ func fallbackLaunchModel(name string) LaunchModel {
 func findLaunchModel(models []LaunchModel, name string) (LaunchModel, bool) {
 	for _, model := range models {
 		if launchModelMatches(model.Name, name) {
-			return cloneLaunchModel(model), true
+			resolved := cloneLaunchModel(model)
+			// The daemon (and every downstream caller) knows the bare id;
+			// "ollama/<name>" is picker display only.
+			resolved.Name = strings.TrimPrefix(resolved.Name, ollamaPickerPrefix)
+			return resolved, true
 		}
 	}
 	return LaunchModel{}, false
@@ -258,7 +305,15 @@ func launchModelMatches(candidate, name string) bool {
 	if candidate == name {
 		return true
 	}
-	return strings.TrimSuffix(candidate, ":latest") == name
+	// The ollama/ picker prefix is display-level: a bare saved name must
+	// still resolve to the prefixed inventory entry, and vice versa.
+	if rest, ok := strings.CutPrefix(candidate, ollamaPickerPrefix); ok && (rest == name || strings.TrimSuffix(rest, ":latest") == name) {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(name, ollamaPickerPrefix); ok && (candidate == rest || strings.TrimSuffix(candidate, ":latest") == rest) {
+		return true
+	}
+	return strings.TrimSuffix(candidate, ":latest") == strings.TrimPrefix(strings.TrimSuffix(name, ":latest"), ollamaPickerPrefix)
 }
 
 func cloneLaunchModel(model LaunchModel) LaunchModel {
