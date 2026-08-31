@@ -98,3 +98,27 @@ every place that was tried (and the fix when the router rejected the key).
 - Upstream streaming is bounded only by connection setup and by Claude Code
   disconnecting — a slow local model may stream as long as it needs.
 - Ollama cloud models (`…:cloud`) need `ollama signin` on the daemon.
+
+## Route policies + fallback (2026-08-31)
+
+`oaica launch claude --route-policy <p>` decides what the launch proxy does
+when the selected backend starts failing. Only relevant when two legs are on
+DIFFERENT base URLs (a cross-remote/daemon `--sonnet-model` split, or future
+multi-remote plans); a single-remote launch builds no fallbacks and behaves
+byte-identically no matter the policy.
+
+| policy | when the selected leg's breaker is OPEN |
+|---|---|
+| `local-first` (default) | fail over to the local leg; else any healthy alternate |
+| `remote-first` | fail over to the remote leg; else any healthy alternate |
+| `auto` | alias of `local-first` for now (per-request task escalation ships in v1.1) |
+| `local-only` | never leave local — request fails visibly rather than crossing |
+| `remote-only` | never leave remote — same |
+
+Breaker mechanics (`cmd/launch/route_policy.go`): 3 consecutive failures
+(5xx after the proxy's retry budget, or transport error — 4xx/429 don't
+count) open the circuit for 90 s; any success or a healthy `/models` probe
+(30 s poll of every distinct base URL) closes it. Never re-routed mid-stream
+— only a NEW request picks the other leg. Every response carries
+`X-Oaica-Route: <label>` naming the leg that actually served it, so a silent
+failover is diagnosable and (at the gateway) attributable.

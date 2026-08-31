@@ -296,6 +296,23 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 			plan.Routes.ByModel[secondary.UpstreamModel] = routeFor(secondary)
 		}
 	}
+	// Route-policy fallback legs (route_policy.go): the OTHER legs of the
+	// plan, deduped by base URL. A plan with both legs on one remote has
+	// nothing to fall back onto — the URL is the failure domain — so a
+	// plain `--sonnet-model muse-x` (same remote) builds no fallbacks and
+	// behaves byte-identically to before.
+	fallbacks := []proxyRoute{plan.Routes.Default}
+	if plan.Secondary.Source != plan.Primary.Source || plan.Secondary.BaseURL != plan.Primary.BaseURL {
+		fallbacks = append(fallbacks, routeFor(plan.Secondary))
+	}
+	seenURL := map[string]bool{}
+	plan.Routes.Fallbacks = plan.Routes.Fallbacks[:0]
+	for _, f := range fallbacks {
+		if f.BaseURL != "" && !seenURL[f.BaseURL] {
+			seenURL[f.BaseURL] = true
+			plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, f)
+		}
+	}
 	return plan, nil
 }
 
@@ -350,6 +367,11 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	sonnetModel, args := extractSonnetModel(args)
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
+	policyArg, args := extractRoutePolicy(args)
+	policy, err := parseRoutePolicy(policyArg)
+	if err != nil {
+		return fmt.Errorf("--route-policy: %q is not one of local-first, remote-first, auto, local-only, remote-only", policyArg)
+	}
 
 	if planName != "" {
 		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
@@ -374,6 +396,7 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	if err != nil {
 		return err
 	}
+	plan.Routes.Policy = policy
 	// Real context window from the upstreams' /models metadata (claude.go's
 	// cloud-alias map covers :cloud; this covers user remotes and the
 	// router). Probed here, not in buildTierPlan: unit tests build plans
@@ -411,6 +434,9 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	if plan.SecondaryName != plan.PrimaryName {
 		fmt.Fprintf(os.Stderr, "tiers: opus/haiku -> %s (%s)  sonnet/subagents -> %s (%s)\n",
 			plan.PrimaryName, plan.Primary.Source, plan.SecondaryName, plan.Secondary.Source)
+	}
+	if len(plan.Routes.Fallbacks) > 1 {
+		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
 	}
 
 	cmd := exec.Command(claudePath, c.args(plan.PrimaryName, args)...)

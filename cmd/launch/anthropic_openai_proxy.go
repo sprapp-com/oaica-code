@@ -532,6 +532,17 @@ type proxyRouteTable struct {
 	// or a backend with no session-aware LB in front of it — harmless
 	// either way, since a leastconn-only LB just ignores an unknown header).
 	SessionID string
+	// Policy controls what happens when the selected route's upstream is
+	// failing — see route_policy.go. Empty = RouteLocalFirst defaults.
+	Policy routePolicy
+	// Fallbacks are the OTHER legs of the plan (primary + each distinct
+	// secondary endpoint), used (per Policy) only when the selected route's
+	// breaker is OPEN and never mid-stream. Empty = no fallback, byte
+	// identical to the pre-route-policy behavior.
+	Fallbacks []proxyRoute
+	// breakers is shared via pointer so table value-copies (the handler
+	// closes over one, the poll goroutine gets another) see the same state.
+	breakers *routeBreakers
 }
 
 // authorized reports whether r presents the table's client token.
@@ -706,6 +717,18 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
 	baseURL := table.Default.BaseURL
 
+	// Route-policy fallback legs present: breakers exist and a background
+	// probe keeps them honest (route_policy.go). Without Fallbacks there is
+	// nothing to break over — no breaker, no probe, identical to before.
+	if len(table.Fallbacks) > 0 {
+		if table.breakers == nil {
+			table.breakers = &routeBreakers{}
+		}
+		pollDone := make(chan struct{})
+		defer close(pollDone)
+		go table.startRouteHealthPoll(pollDone, 30*time.Second)
+	}
+
 	// Per-session prompt-size calibration for the context-fit clamp below --
 	// see context_calibration.go for the 2026-08-29 incident that made a
 	// pure chars/4 estimate untenable. Scoped to this proxy instance (one
@@ -771,7 +794,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// unaffected — byte-identical to before this existed.
 		// With a routing table (tier_routing.go) the id also selects WHICH
 		// upstream: primary and --sonnet-model can be different backends.
-		route, reqModel := table.resolve(anthReq.Model)
+		route, reqModel, _ := table.selectRoute(anthReq.Model)
+		// Always answer with the leg that will actually serve this request:
+		// our gateway logs it as routed_to for spend attribution, and it
+		// makes a silent --sonnet-model/fallback swap diagnosable from the
+		// client side.
+		w.Header().Set("X-Oaica-Route", route.Label)
 
 		// Off by default (see entitlement.go) — a hook point for a future
 		// license/entitlement product decision, not one made here.
@@ -877,10 +905,23 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		resp, err := proxyUpstreamRetryDo(upstreamReq, oaiBody)
 		if err != nil {
+			// Retries exhausted against a transport failure: feed the circuit
+			// breaker so later requests skip this leg immediately.
+			table.breakers.recordFail(route.BaseURL)
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 			return
 		}
 		defer resp.Body.Close()
+		// Feed the circuit breaker (route_policy.go): 5xx-class answers that
+		// survived the retry budget count as failures; 2xx proves recovery.
+		// 4xx (bad request, context overflow) and 429 (shedding, alive) are
+		// the leg WORKING and must not open the breaker.
+		switch {
+		case resp.StatusCode >= 500:
+			table.breakers.recordFail(route.BaseURL)
+		case resp.StatusCode < 300:
+			table.breakers.recordOK(route.BaseURL)
+		}
 
 		// Same local-only log the router path used to keep (request_log.go):
 		// model, which backend, sizes, status -- never content.
