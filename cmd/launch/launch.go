@@ -1282,10 +1282,12 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 	for _, m := range modelEntries {
 		isLocal := strings.HasSuffix(m.ID, oaicaLocalTagSuffix)
 		desc := m.Description
-		if desc == "" {
-			desc = "OAICA model — unrated"
-		}
+		// No description from the router -> no second line at all (the old
+		// "OAICA model — unrated" filler was noise).
 		if m.Stars > 0 && !isLocal {
+			if desc == "" {
+				desc = "unrated"
+			}
 			desc = strings.Repeat("★", m.Stars) + strings.Repeat("☆", 5-m.Stars) + "  " + desc
 		}
 		// Every router-catalog entry is an OAICA model, rated or not — they

@@ -121,10 +121,13 @@ func ReorderItems(items []SelectItem) []SelectItem {
 		switch {
 		case item.Local:
 			loc = append(loc, item)
+		case item.Recommended:
+			// Checked BEFORE Remote — OAICA router models carry both flags
+			// and must land in the OAICA segment (render checks the same
+			// order; see the section splits).
+			rec = append(rec, item)
 		case item.Remote:
 			rem = append(rem, item)
-		case item.Recommended:
-			rec = append(rec, item)
 		default:
 			other = append(other, item)
 		}
@@ -230,7 +233,10 @@ func cursorForItemName(items []SelectItem, name string, fallback int) int {
 
 func (m selectorModel) filteredItems() []SelectItem {
 	if m.filter == "" {
-		return m.items
+		// The flat order MUST match the rendered section order
+		// (Local → OAICA → Remote → More) so cursor navigation tracks the
+		// rows on screen — up/down walk this list.
+		return ReorderItems(m.items)
 	}
 	filterLower := strings.ToLower(m.filter)
 	var result []SelectItem
@@ -899,7 +905,8 @@ func (m *multiSelectorModel) replaceItems(items []SelectItem) {
 
 func (m multiSelectorModel) filteredItems() []SelectItem {
 	if m.filter == "" {
-		return m.items
+		// Same flat/display-order contract as single-select (see there).
+		return ReorderItems(m.items)
 	}
 	filterLower := strings.ToLower(m.filter)
 	var result []SelectItem
@@ -911,14 +918,16 @@ func (m multiSelectorModel) filteredItems() []SelectItem {
 	return result
 }
 
-// otherStart returns the index of the first non-recommended item in the filtered list.
+// otherStart returns the start of the scrollable "More" section — the first
+// item that is neither pinned (Local / Recommended / Remote). Matches the
+// render section order exactly (see single-select otherStart).
 func (m multiSelectorModel) otherStart() int {
 	if m.filter != "" {
 		return 0
 	}
 	filtered := m.filteredItems()
 	for i, item := range filtered {
-		if !item.Recommended {
+		if !item.Local && !item.Remote && !item.Recommended {
 			return i
 		}
 	}

@@ -1195,3 +1195,30 @@ func keyMsg(k keyType) tea.KeyMsg {
 func runeMsg(r rune) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
 }
+
+// Up from the first Remote row must reach the last OAICA row — flat order
+// (ReorderItems via filteredItems) matches the rendered section order.
+func TestUpdateNavigation_UpReachesOAIACrossSections(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "oaica-35b-a3b-vision", Recommended: true, Remote: true},
+			{Name: "oaica-nemotron-30b-a3b", Recommended: true, Remote: true},
+			{Name: "ollama/glm-5.2:cloud", Remote: true},
+			{Name: "deepseek/deepseek-v4-flash", Remote: true},
+		},
+	}
+	filtered := m.filteredItems()
+	if len(filtered) != 4 || filtered[0].Name != "oaica-35b-a3b-vision" || filtered[2].Name != "ollama/glm-5.2:cloud" {
+		t.Fatalf("unexpected flat order: %v", filtered)
+	}
+	m.cursor = 2 // first Remote row
+	m.updateNavigation(tea.KeyMsg{Type: tea.KeyUp})
+	if m.cursor != 1 || filtered[m.cursor].Name != "oaica-nemotron-30b-a3b" {
+		t.Fatalf("up from Remote should land on oaica-nemotron, cursor=%d", m.cursor)
+	}
+	m.updateNavigation(tea.KeyMsg{Type: tea.KeyUp})
+	if m.cursor != 0 {
+		t.Fatalf("up again should land on first OAICA row, cursor=%d", m.cursor)
+	}
+}
