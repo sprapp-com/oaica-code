@@ -525,10 +525,13 @@ func (m selectorModel) renderContent() string {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.Recommended:
+				// Checked BEFORE Remote: OAICA router-catalog models carry
+				// Recommended AND Remote — they belong in "OAICA Models",
+				// not "Remote Models".
+				recItems = append(recItems, i)
 			case item.Remote:
 				remoteItems = append(remoteItems, i)
-			case item.Recommended:
-				recItems = append(recItems, i)
 			default:
 				otherItems = append(otherItems, i)
 			}
@@ -1202,10 +1205,12 @@ func (m multiSelectorModel) View() string {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.Recommended:
+				// Checked BEFORE Remote (see single-select block) — OAICA
+				// router models are Recommended AND Remote.
+				recItems = append(recItems, i)
 			case item.Remote:
 				remoteItems = append(remoteItems, i)
-			case item.Recommended:
-				recItems = append(recItems, i)
 			default:
 				otherItems = append(otherItems, i)
 			}

@@ -293,6 +293,31 @@ func TestRenderContent_SectionHeaders(t *testing.T) {
 	}
 }
 
+// OAICA router models carry Recommended AND Remote — they must land in the
+// "OAICA Models" section, not "Remote Models".
+func TestRenderContent_OAIABeatsRemoteSection(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "oaica-35b-a3b-vision", Recommended: true, Remote: true},
+			{Name: "ollama/glm-5.2:cloud", Remote: true},
+			{Name: "deepseek/deepseek-v4-flash", Remote: true},
+		},
+	}
+	content := m.renderContent()
+	oaicaIdx := strings.Index(content, "OAICA Models")
+	remoteIdx := strings.Index(content, "Remote Models")
+	if oaicaIdx < 0 || remoteIdx < 0 || oaicaIdx > remoteIdx {
+		t.Fatalf("expected OAICA Models before Remote Models\n%s", content)
+	}
+	if !strings.Contains(content, "▸ oaica-35b-a3b-vision") || !strings.Contains(content, "oaica-35b-a3b-vision") {
+		t.Fatalf("expected oaica model in OAICA section\n%s", content)
+	}
+	if strings.Contains(strings.Split(content, "Remote Models")[1], "oaica-35b") {
+		t.Fatalf("oaica model must not appear under Remote Models\n%s", content)
+	}
+}
+
 func TestRenderContent_RemoteSectionHeader(t *testing.T) {
 	m := selectorModel{
 		title: "Pick:",
