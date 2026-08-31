@@ -70,8 +70,20 @@ ALERT=/workspace/vllm_awq_watchdog.ALERT           # touched on any restore/back
 # port is still LISTENING (i.e. not caught by the ordinary crash path
 # above), before a replica is force-killed and relaunched.
 STALL_PROBE_MODEL="${STALL_PROBE_MODEL:-oaica-35b-a3b-vision}"
-STALL_PROBE_TIMEOUT_SEC="${STALL_PROBE_TIMEOUT_SEC:-15}"
+STALL_PROBE_TIMEOUT_SEC="${STALL_PROBE_TIMEOUT_SEC:-25}"
 STALL_FAIL_THRESHOLD="${STALL_FAIL_THRESHOLD:-3}"
+# STALL_REBUSHR_GRACE_SEC: a replica that produced tokens at ANY point in
+# this window gets an extended stall streak before a force-kill. Why
+# (2026-08-31 03:27 UTC): making_progress() reads only the last ~60s of
+# log, and during a giant-prefill storm (6-13k tok/s prefill, decode
+# squeezed to ~0.2 tok/s) the last generation-throughput line can be 0.0
+# for one full probe cycle while the engine is honest — that window read
+# as "wedged", the replica was killed mid-flight, and every other
+# request on it died with it. Progress at ANY point in the recent past
+# proves the scheduler moves; only sustained silence (no fresh throughput
+# line within the grace window either) is a real wedge. 300s default = 2x
+# the log's own 10s metric cadence and comfortably past one probe cycle.
+STALL_REBUSHR_GRACE_SEC="${STALL_REBUSHR_GRACE_SEC:-300}"
 
 mkdir -p /workspace/.vllm_cache /workspace/.torch_cache
 export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib
@@ -212,13 +224,13 @@ REPLICAS_CONF="${REPLICAS_CONF:-/workspace/vllm_awq_replicas.conf}"
 BAD_CONF_SEEN=""   # last invalid conf content already alerted on (alert once, not every tick)
 
 # per-port backoff state: last launch epoch + current delay
-declare -A LAST DELAY STALLFAILS
+declare -A LAST DELAY STALLFAILS LASTBUSY
 init_replica_state() {
   local r p
   for r in $REPLICAS; do
     p=${r##*:}
     [ -n "${LAST[$p]:-}" ] && continue
-    LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0
+    LAST[$p]=0; DELAY[$p]=15; STALLFAILS[$p]=0; LASTBUSY[$p]=0
   done
 }
 init_replica_state
@@ -355,6 +367,7 @@ tick() {
   if listening "$port"; then
     if chat_probe_ok "$port"; then
       STALLFAILS[$port]=0
+      LASTBUSY[$port]=$now
       DELAY[$port]=15
     else
       STALLFAILS[$port]=$(( STALLFAILS[$port] + 1 ))
@@ -363,10 +376,15 @@ tick() {
         if making_progress "$logfile"; then
           alert ":${port} probe failed ${STALL_FAIL_THRESHOLD}x but engine is still producing tokens (busy under real load, not wedged) -- NOT killing, extending grace"
           STALLFAILS[$port]=$(( STALL_FAIL_THRESHOLD - 1 ))
+          LASTBUSY[$port]=$now
+        elif (( now - ${LASTBUSY[$port]:-$now} < STALL_REBUSHR_GRACE_SEC )); then
+          alert ":${port} probe failed ${STALL_FAIL_THRESHOLD}x but engine produced tokens within the last ${STALL_REBUSHR_GRACE_SEC}s (stalled under load NOW, not dead) -- NOT killing, extending grace"
+          STALLFAILS[$port]=$(( STALL_FAIL_THRESHOLD - 1 ))
         else
           force_kill_replica "$port"
           STALLFAILS[$port]=0
           LAST[$port]=$now
+          LASTBUSY[$port]=$now
           DELAY[$port]=15
         fi
       fi

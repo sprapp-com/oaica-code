@@ -78,6 +78,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -317,6 +318,19 @@ type gwKey struct {
 	// sold with a smaller output budget without minting a separate model
 	// entry. 0 = unset = no per-key clamp (today's behavior).
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
+	// MaxConcurrent: per-key cap on CONCURRENT completions in flight
+	// (streaming counts until its final byte). Why a second knob next to
+	// gatekeeper tiers: gatekeeper limits by TIER (free 2 / pro 10 /
+	// team 50 / internal 200), which is a blunt instrument — one key is
+	// a whole customer, and a plan change or a runaway agent loop needs
+	// a number set on THE key, not a tier re-shuffle that hits every key
+	// of that tier. Enforced with a fast 429 + Retry-After (cheap to
+	// retry, like the large-context admission path), before any upstream
+	// work starts or tokens are billed. 0 = unset = no per-key cap
+	// (tier limit still applies at gatekeeper). Priority keys are NOT
+	// exempt from this one: admission control protects the fleet from
+	// load, concurrency protects an account's bill from itself.
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
 }
 
 // priorityKeyCount is logged on load/reload so a config that accidentally
@@ -431,6 +445,20 @@ type gwConfig struct {
 	LargeContextTokenThreshold int `json:"large_context_token_threshold"`
 	// MaxConcurrentLargeContext: default 2 (0 uses the default).
 	MaxConcurrentLargeContext int `json:"max_concurrent_large_context"`
+	// RequestTimeoutSec bounds ONE completion's total wall clock, headers
+	// through final stream byte. Default 900 (15 min); negative disables.
+	// Why: 2026-08-31 ~03:27 UTC, one replica's oldest in-flight request
+	// was 2337 s old — a wedged/stalled generation that pinned a seq slot
+	// and KV for ~39 minutes until the replica watchdog killed the whole
+	// engine, taking every other request with it. Individual generations
+	// never legitimately run that long at our max output (32k tokens /
+	// ~80 tok/s ≈ 7 min); anything past 15 min is a wedge the CLIENT has
+	// abandoned or that will never finish. Aborting the request closes
+	// its upstream connection, so vLLM preempts/finishes that sequence
+	// and frees the slot in seconds instead of the engine-level kill.
+	// Set above the worst legitimate case (slow decode under load),
+	// which measured p95 is 180 s — 900 s is ~5x headroom.
+	RequestTimeoutSec int `json:"request_timeout_sec"`
 }
 
 func defaultConfig() gwConfig {
@@ -711,8 +739,23 @@ type gateway struct {
 	// same fields. -1 threshold means admission control is disabled
 	// (largeContextSem is nil in that case too). Guarded by mu since
 	// apply() can rebuild them on a config reload.
+	// largeContextThreshold / largeContextSem: see gwConfig's doc on the
+	// same fields. -1 threshold means admission control is disabled
+	// (largeContextSem is nil in that case too). Guarded by mu since
+	// apply() can rebuild them on a config reload.
 	largeContextThreshold int
 	largeContextSem       chan struct{}
+
+	// requestTimeout bounds a single completion's wall clock; see
+	// gwConfig.RequestTimeoutSec's doc. 0 = disabled. Guarded by mu
+	// (reload can change it via apply()).
+	requestTimeout time.Duration
+
+	// keyInflight tracks each key's concurrent completions for
+	// gwKey.MaxConcurrent enforcement; label -> *atomic.Int32,
+	// created on first sight. Labels come only from config keys, so the
+	// map is bounded and never needs eviction.
+	keyInflight sync.Map
 
 	// calib holds per-session (request bytes -> real prompt_tokens) pairs
 	// for the context-fit clamp; see context_calibration.go. Lazily built
@@ -725,6 +768,17 @@ type gateway struct {
 	healthMu   sync.Mutex
 	healthAt   time.Time
 	healthLast healthResult
+	// lastSuccessAt: last time a real routed completion returned 200 with
+	// usage (set where the calibrator records; see completionHandler). Lets
+	// /health answer "ok (recent traffic)" even when the probe ITSELF
+	// starves: under a giant-prefill storm the 1-token probe queues behind
+	// 18 real seqs and can time out at ANY timeout (25s tested, measured
+	// storms run 3+ min) while customer completions keep succeeding —
+	// reporting "down" then is crying wolf exactly when the fleet is at
+	// capacity. Serving proven working within healthTrafficFreshness is
+	// stronger evidence of health than a synthetic probe. Guarded by
+	// healthMu.
+	lastOKAt atomic.Int64 // unix seconds of the last successful completion
 
 	// meterCh feeds the background reporter goroutine (see
 	// startMeterReporter); nil when MeterHubAddr is unset. Buffered and
@@ -845,6 +899,15 @@ func (g *gateway) apply(cfg gwConfig) error {
 	} else {
 		g.largeContextThreshold = threshold
 		g.largeContextSem = make(chan struct{}, maxConcurrent)
+	}
+	// Per-request wall-clock cap — see gwConfig.RequestTimeoutSec's doc.
+	// 0 = default (15 min); negative = disabled.
+	if cfg.RequestTimeoutSec > 0 {
+		g.requestTimeout = time.Duration(cfg.RequestTimeoutSec) * time.Second
+	} else if cfg.RequestTimeoutSec < 0 {
+		g.requestTimeout = 0
+	} else {
+		g.requestTimeout = 900 * time.Second
 	}
 	g.mu.Unlock()
 	return nil
@@ -1053,6 +1116,27 @@ func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res.body)
 }
 
+// healthFallbackDown reports a probe failure, BUT reports 200 "ok" when a
+// real completion succeeded through this gateway within
+// healthTrafficFreshness — a fresh real success is stronger evidence of a
+// healthy fleet than a synthetic 1-token probe that starves under load
+// (measured: storms push probe latency past 25 s while customer streams
+// keep completing). If the freshness window is also exhausted, it's a
+// genuine outage: 503 down.
+const healthTrafficFreshness = 300 * time.Second
+
+func (g *gateway) healthFallbackDown(reason string) healthResult {
+	if last := g.lastOKAt.Load(); last > 0 && time.Since(time.Unix(last, 0)) < healthTrafficFreshness {
+		return healthResult{http.StatusOK, map[string]any{
+			"status":            "ok",
+			"detail":            "probe timed out, but a real completion succeeded " + fmt.Sprintf("%.0f", time.Since(time.Unix(last, 0)).Seconds()) + "s ago",
+			"probe_context":     reason,
+			"recent_traffic_ok": true,
+		}}
+	}
+	return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": reason}}
+}
+
 // probeHealth does the real check; healthHandler caches its result.
 func (g *gateway) probeHealth(r *http.Request) healthResult {
 	g.mu.RLock()
@@ -1066,8 +1150,14 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	// upstream credential, through gatekeeper -> katlb -> a replica. This is
 	// the only probe that proves a customer request would succeed. The old
 	// unauthenticated GET /v1/models got a 401 from gatekeeper and reported
-	// "ok" with every replica dead (audit 2026-08-25).
-	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	// "ok" with every replica dead (audit 2026-08-25). Timeout 25 s (was
+	// 8 s): under heavy real load the probe queues behind giant prefills
+	// like any other request, and an 8 s budget reported "down" (with the
+	// fleet actually serving 200s throughout) — the same busy-vs-wedged
+	// confusion the LB and watchdog probe timeouts had to be raised for.
+	// 600s ResponseHeaderTimeout is the real bound; 25s just avoids
+	// crying wolf, matching oaicalb's probe_timeout_sec.
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
 	// Deliberately still ONE probe, of models[0] on its own upstream: the
 	// gateway is "up" if the primary model serves. Probing every backend
@@ -1082,12 +1172,12 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": err.Error()}}
+		return g.healthFallbackDown(err.Error())
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode)}}
+		return g.healthFallbackDown(fmt.Sprintf("upstream chat probe HTTP %d", resp.StatusCode))
 	}
 	// upstreams is a topology hint only (how many distinct backends this
 	// gateway fronts), not a reachability report -- see probeUp above for
@@ -1382,6 +1472,29 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return
 	}
+	// Per-key concurrency cap — see gwKey.MaxConcurrent's doc. Counted
+	// for the WHOLE handler (including streams) and released on every
+	// exit path via defer. sync.Map keyed by label; values are *int32
+	// created on first sight and never deleted (label set is tiny and
+	// bounded by config size).
+	var inflight *atomic.Int32
+	if apiKey.MaxConcurrent > 0 {
+		v, _ := g.keyInflight.LoadOrStore(label, new(atomic.Int32))
+		inflight = v.(*atomic.Int32)
+		for {
+			cur := inflight.Load()
+			if cur >= int32(apiKey.MaxConcurrent) {
+				w.Header().Set("Retry-After", "1")
+				writeErr(w, http.StatusTooManyRequests, "concurrency_limited",
+					fmt.Sprintf("key %q has %d concurrent requests in flight (limit %d); wait for one to finish", label, cur, apiKey.MaxConcurrent))
+				return
+			}
+			if inflight.CompareAndSwap(cur, cur+1) {
+				defer inflight.Add(-1)
+				break
+			}
+		}
+	}
 	var isOverage bool
 	if g.entitlement != nil {
 		allowed, reason, overage := g.entitlement.check(label)
@@ -1621,6 +1734,22 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := context.WithValue(r.Context(), ctxKeyBackend{}, backend)
 	ctx = context.WithValue(ctx, ctxKeyErrCapture{}, errInfo)
+	// Wall-clock cap — see gwConfig.RequestTimeoutSec's doc. The deadline
+	// rides the request context, so ReverseProxy's outgoing request (and
+	// the buffered body copy for non-stream) inherits it: at expiry the
+	// transport closes the upstream connection, rec finishes with whatever
+	// status it has, and the ledger row records Abort/timeouts like any
+	// other mid-stream abort — no special-casing downstream. The deadline
+	// must NOT wrap the ledger write itself, hence a fresh cancel not
+	// deferred to handler exit in a way that races rec.finish (it can't:
+	// cancel only kills the upstream transfer, writes here are local).
+	g.mu.RLock()
+	if g.requestTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, g.requestTimeout)
+		defer cancel()
+	}
+	g.mu.RUnlock()
 	r = r.WithContext(ctx)
 	// The ledger write is DEFERRED so it runs on every exit path: normal
 	// completion, a client that disconnects mid-stream (ReverseProxy panics
@@ -1650,6 +1779,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// chunk as well as a non-stream usage object) -- never an error, never a
 	// zero. See context_calibration.go for the incident.
 	if rec.status == http.StatusOK && rec.seen && rec.usage.PromptTokens > 0 {
+		g.lastOKAt.Store(time.Now().Unix())
 		g.calibrator().record(calibKey, msgBytes, rec.usage.PromptTokens)
 	}
 	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
