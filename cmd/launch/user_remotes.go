@@ -100,6 +100,11 @@ type userRemote struct {
 	// "not priced" (e.g. a personal/free box) and prints nothing.
 	PriceInputPerM  float64 `json:"price_input_per_m,omitempty"`
 	PriceOutputPerM float64 `json:"price_output_per_m,omitempty"`
+	// RoutePolicy is the local default for `oaica launch claude
+	// --route-policy` (route_policy.go): local-first | remote-first | auto
+	// | local-only | remote-only. The launch flag wins when both are set.
+	// Invalid values fail loudly AT LAUNCH, not silently.
+	RoutePolicy string `json:"route_policy,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -373,6 +378,7 @@ type RemoteEndpoint struct {
 	ToolFormat      string
 	ToolReliable    bool
 	ForceTools      bool // remote.ForceTools — skip the capability gate's refusal for this remote
+	RoutePolicy     string // remote.RoutePolicy — default --route-policy for launches using this endpoint
 	PriceInputPerM  float64
 	PriceOutputPerM float64
 }
@@ -398,6 +404,7 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		ToolFormat:      d.ToolFormat,
 		ToolReliable:    d.ToolReliable,
 		ForceTools:      remote.ForceTools,
+		RoutePolicy:     remote.RoutePolicy,
 		PriceInputPerM:  remote.PriceInputPerM,
 		PriceOutputPerM: remote.PriceOutputPerM,
 	}, true

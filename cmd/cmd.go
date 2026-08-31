@@ -2878,6 +2878,7 @@ just to see the picker list.`,
 		// skip-heartbeat cases), so this is the actual precondition that
 		// applies (a configured OAICA key), not an Ollama server heartbeat.
 		launch.LaunchCmd(oaicaEnsureSignedIn, runInteractiveTUI),
+		launch.DoctorCmd(),
 		// Optional add-on; see cmd/site.go and internal/sitebuilder.
 		siteCmd(),
 	)

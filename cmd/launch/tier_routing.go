@@ -368,10 +368,6 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
-	policy, err := parseRoutePolicy(policyArg)
-	if err != nil {
-		return fmt.Errorf("--route-policy: %q is not one of local-first, remote-first, auto, local-only, remote-only", policyArg)
-	}
 	oversizeModel, args := extractOversizeModel(args)
 
 	if planName != "" {
@@ -396,6 +392,15 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	plan, err := buildTierPlan(model, sonnetModel, forceTools)
 	if err != nil {
 		return err
+	}
+	// Policy precedence: --route-policy flag > primary remote's
+	// route_policy (remotes.json) > local-first (parseRoutePolicy default).
+	if policyArg == "" {
+		policyArg = plan.Primary.RoutePolicy
+	}
+	policy, err := parseRoutePolicy(policyArg)
+	if err != nil {
+		return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only", policyArg)
 	}
 	plan.Routes.Policy = policy
 	if oversizeModel != "" {

@@ -122,3 +122,22 @@ count) open the circuit for 90 s; any success or a healthy `/models` probe
 — only a NEW request picks the other leg. Every response carries
 `X-Oaica-Route: <label>` naming the leg that actually served it, so a silent
 failover is diagnosable and (at the gateway) attributable.
+
+### Oversize crossover + remotes.json defaults (2026-08-31, v0.5.0)
+
+`--oversize <model>` (same picker vocabulary as `--sonnet-model`): the
+larger-context leg that serves any request the current leg cannot hold —
+the auto-compaction call near a 262k ceiling being the canonical case.
+Size-based (no compaction prompt sniffing): decided inside the context-fit
+clamp, when the current leg's fit budget is exhausted, and only if the
+oversize leg's probed window is strictly larger, breaker-healthy, and on
+the permitted side of a pinned policy. Pinned policies (`local-only`,
+`remote-only`) fail honestly instead of crossing. The oversize leg also
+serves as a breaker fallback leg and gets the 30s health probe.
+`X-Oaica-Route` always names the leg that actually served.
+
+remotes.json now accepts `"route_policy": "local-first|remote-first|auto|
+local-only|remote-only"` per remote as the default for launches using it;
+the `--route-policy` flag wins. `oaica doctor` prints every remote's
+reachability + wire + route_policy and the daemon leg — exit 1 on any
+failing probe, so cron/scripts can grep.
