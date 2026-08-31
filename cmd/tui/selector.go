@@ -116,15 +116,26 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 // function's order, so this only affects the relative order WITHIN the
 // scrollable "More" section and the underlying data list.
 func ReorderItems(items []SelectItem) []SelectItem {
-	var rec, other []SelectItem
+	var loc, rec, rem, other []SelectItem
 	for _, item := range items {
-		if item.Recommended {
+		switch {
+		case item.Local:
+			loc = append(loc, item)
+		case item.Remote:
+			rem = append(rem, item)
+		case item.Recommended:
 			rec = append(rec, item)
-		} else {
+		default:
 			other = append(other, item)
 		}
 	}
-	return append(rec, other...)
+	// Within Remote, builtin aggregators (ollama/, openrouter/) sort first —
+	// the render's Remote section uses the same order, so navigation (which
+	// walks the flat list) always agrees with what's on screen.
+	sort.SliceStable(rem, func(a, b int) bool {
+		return isBuiltinAggregatorProvider(rem[a].Name) && !isBuiltinAggregatorProvider(rem[b].Name)
+	})
+	return append(append(append(loc, rec...), rem...), other...)
 }
 
 // isBuiltinAggregatorProvider reports whether name is namespaced under one
@@ -244,7 +255,9 @@ func (m selectorModel) Init() tea.Cmd {
 	return waitForSelectorItems(m.updates)
 }
 
-// otherStart returns the index of the first non-recommended item in the filtered list.
+// otherStart returns the index of the first item that is neither pinned
+// (Local / Recommended / Remote) in the filtered list — the start of the
+// scrollable "More" section. Matches the render section order exactly.
 // When filtering, all items scroll together so this returns 0.
 func (m selectorModel) otherStart() int {
 	if m.filter != "" {
@@ -252,7 +265,7 @@ func (m selectorModel) otherStart() int {
 	}
 	filtered := m.filteredItems()
 	for i, item := range filtered {
-		if !item.Recommended {
+		if !item.Local && !item.Remote && !item.Recommended {
 			return i
 		}
 	}
@@ -500,12 +513,13 @@ func (m selectorModel) renderContent() string {
 			s.WriteString("\n")
 		}
 	} else {
-		// Split into pinned local, pinned remote, pinned recommended, and
-		// scrollable others. Local, Remote, and Recommended are ALL
-		// always-shown/non-scrolling (only "More" scrolls) — each gets its
-		// own header so a running `oaica serve`, a user-remote/aggregator
-		// model, and a router-catalog entry are never ambiguous with each
-		// other, even when they share a base name.
+		// Split into pinned local, pinned OAICA (recommended), pinned remote,
+		// and scrollable others. All pinned sections are always-shown/
+		// non-scrolling (only "More" scrolls) — each gets its own header so a
+		// running `oaica serve`, a user-remote/aggregator model, and a
+		// router-catalog entry are never ambiguous with each other, even when
+		// they share a base name. Section order matches ReorderItems' flat
+		// order, so key navigation always tracks the displayed rows.
 		var localItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
@@ -538,20 +552,21 @@ func (m selectorModel) renderContent() string {
 			s.WriteString("\n")
 		}
 
-		if len(remoteItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
+		// OAICA models first (pinned) — our own fleet/router SKUs lead the
+		// list; everything else is below.
+		if len(recItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("OAICA Models"))
 			s.WriteString("\n")
-			for _, idx := range remoteItems {
+			for _, idx := range recItems {
 				m.renderItem(&s, filtered[idx], idx)
 			}
 			s.WriteString("\n")
 		}
 
-		// Always render all recommended items (pinned)
-		if len(recItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Recommended"))
+		if len(remoteItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
-			for _, idx := range recItems {
+			for _, idx := range remoteItems {
 				m.renderItem(&s, filtered[idx], idx)
 			}
 		}
@@ -1209,20 +1224,22 @@ func (m multiSelectorModel) View() string {
 			s.WriteString("\n")
 		}
 
-		if len(remoteItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
+		// OAICA models first (pinned) — matches single-select layout order
+		// (Local → OAICA → Remote → More), which matches ReorderItems' flat
+		// order so the cursor tracks the displayed rows.
+		if len(recItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("OAICA Models"))
 			s.WriteString("\n")
-			for _, idx := range remoteItems {
+			for _, idx := range recItems {
 				renderItem(&s, filtered[idx], idx)
 			}
 			s.WriteString("\n")
 		}
 
-		// Always render all recommended items (pinned)
-		if len(recItems) > 0 {
-			s.WriteString(sectionHeaderStyle.Render("Recommended"))
+		if len(remoteItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
-			for _, idx := range recItems {
+			for _, idx := range remoteItems {
 				renderItem(&s, filtered[idx], idx)
 			}
 		}

@@ -285,8 +285,8 @@ func TestRenderContent_SectionHeaders(t *testing.T) {
 	}
 	content := m.renderContent()
 
-	if !strings.Contains(content, "Recommended") {
-		t.Error("should contain 'Recommended' header")
+	if !strings.Contains(content, "OAICA Models") {
+		t.Error("should contain 'OAICA Models' header")
 	}
 	if !strings.Contains(content, "More") {
 		t.Error("should contain 'More' header")
@@ -330,11 +330,12 @@ func TestRenderContent_LocalAndRemoteSectionsBothPresent(t *testing.T) {
 	if !strings.Contains(content, "Remote Models") {
 		t.Error("should contain 'Remote Models' header")
 	}
+	// Section order (and thus flat cursor order) is Local → OAICA → Remote.
 	localIdx := strings.Index(content, "Local Models")
 	remoteIdx := strings.Index(content, "Remote Models")
-	recIdx := strings.Index(content, "Recommended")
-	if !(localIdx < remoteIdx && remoteIdx < recIdx) {
-		t.Errorf("expected section order Local < Remote < Recommended, got Local=%d Remote=%d Recommended=%d", localIdx, remoteIdx, recIdx)
+	recIdx := strings.Index(content, "OAICA Models")
+	if !(localIdx < recIdx && recIdx < remoteIdx) {
+		t.Errorf("expected section order Local < OAICA < Remote, got Local=%d OAICA=%d Remote=%d", localIdx, recIdx, remoteIdx)
 	}
 }
 
@@ -714,6 +715,26 @@ func TestReorderItems_NoneRecommended(t *testing.T) {
 	}
 }
 
+// The flat order must match the rendered section order
+// (Local → OAICA → Remote → More) so cursor navigation tracks the screen.
+func TestReorderItems_SectionOrder(t *testing.T) {
+	input := []SelectItem{
+		{Name: "agg", Remote: true},                        // ollama/ aggregator
+		{Name: "plain-aggregator-name", Recommended: true}, // OAICA router SKU
+		{Name: "userremote/model", Remote: true},           // user remote
+		{Name: "ollama/z", Remote: true},                   // builtin aggregator
+		{Name: "other", Recommended: false},
+		{Name: "loc", Local: true, Recommended: true},
+	}
+	got := ReorderItems(input)
+	want := []string{"loc", "plain-aggregator-name", "ollama/z", "agg", "userremote/model", "other"}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("index %d: got %q, want %q (full order %v)", i, got[i].Name, w, got)
+		}
+	}
+}
+
 // --- Multi-select otherStart ---
 
 func TestMultiOtherStart(t *testing.T) {
@@ -776,8 +797,8 @@ func TestMultiView_SectionHeaders(t *testing.T) {
 	}, nil)
 	content := m.View()
 
-	if !strings.Contains(content, "Recommended") {
-		t.Error("should contain 'Recommended' header")
+	if !strings.Contains(content, "OAICA Models") {
+		t.Error("should contain 'OAICA Models' header")
 	}
 	if !strings.Contains(content, "More") {
 		t.Error("should contain 'More' header")
