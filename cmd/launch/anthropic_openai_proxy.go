@@ -729,16 +729,21 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
 	baseURL := table.Default.BaseURL
 
-	// Route-policy fallback legs present: breakers exist and a background
-	// probe keeps them honest (route_policy.go). Without Fallbacks there is
-	// nothing to break over — no breaker, no probe, identical to before.
+	// Breaker/escalation state: created unconditionally. The messages
+	// handler records breaker/escalation signals on EVERY upstream result
+	// (nil-safe no-ops today, but a stale/future caller path that derefs
+	// without the nil guard would nil-panic on a plain single-leg launch —
+	// these are two empty structs; creating them always costs nothing).
+	if table.breakers == nil {
+		table.breakers = &routeBreakers{}
+	}
+	if table.escalations == nil {
+		table.escalations = &routeEscalations{}
+	}
+	// Route-policy fallback legs present: a background probe keeps the
+	// breakers honest (route_policy.go). Without Fallbacks there is nothing
+	// to break over — no probe, identical to before.
 	if len(table.Fallbacks) > 0 || table.Oversize.BaseURL != "" {
-		if table.breakers == nil {
-			table.breakers = &routeBreakers{}
-		}
-		if table.escalations == nil {
-			table.escalations = &routeEscalations{}
-		}
 		pollCtx, cancelPoll := context.WithCancel(context.Background())
 		defer cancelPoll() // aborts in-flight probes' HTTP requests too
 		go table.startRouteHealthPoll(pollCtx, 30*time.Second)
