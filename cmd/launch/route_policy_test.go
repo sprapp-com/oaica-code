@@ -162,3 +162,122 @@ func TestRoutePolicy_LocalOnlyDoesNotCross(t *testing.T) {
 		}
 	}
 }
+// TestOversizeSwapRules pins the crossover gate: strictly-larger window,
+// different base URL, healthy breaker, locality pin respected, and the
+// oversized leg itself must be able to hold the request (else no point).
+func TestOversizeSwapRules(t *testing.T) {
+	small := proxyRoute{BaseURL: "http://127.0.0.1:9206/v1", UpstreamModel: "m", Label: "local-serve:local", ContextWindow: 262144}
+	big := proxyRoute{BaseURL: "https://big.example/v1", UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000}
+	mk := func(policy routePolicy) *routeBreakers {
+		table := proxyRouteTable{
+			Policy:   policy,
+			Default:  small,
+			Oversize: big,
+		}
+		b := &routeBreakers{}
+		table.breakers = b
+		return b
+	}
+	// 230k-est prompt against 262k with a margin: no fit on the small leg…
+	est, margin := 262000, 1000
+	if got, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, est, margin); !swapped || got.UpstreamModel != "big-m" {
+		t.Errorf("overflow request should swap to the big leg (got %v, %v)", got, swapped)
+	}
+	// …but one that fits must stay on the small leg.
+	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 1000, 1000); swapped {
+		t.Error("fitting request must not crossover")
+	}
+	// Same base URL = same leg, no swap.
+	if _, swapped := (&proxyRouteTable{Oversize: small, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000); swapped {
+		t.Error("same-base-URL oversize is a no-op")
+	}
+	// local-only pin must block the remote crossover.
+	if _, swapped := (&proxyRouteTable{Policy: RouteLocalOnly, Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000); swapped {
+		t.Error("local-only must not crossover to a remote oversize leg")
+	}
+	// OPEN breaker on the oversize leg blocks the swap (visible 400 instead).
+	rb := mk(RouteLocalFirst)
+	for i := 0; i < breakerFailsToOpen; i++ {
+		rb.recordFail(big.BaseURL)
+	}
+	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: rb}).oversizeSwap(small, 262000, 1000); swapped {
+		t.Error("OPEN oversize breaker must block the swap")
+	}
+}
+
+// TestOversizeCrossOverEndToEnd: primary claims a 300-token window, the
+// request needs more, and the --oversize leg (real, healthy) serves it
+// instead of a 400 — with the attribution header naming the new leg.
+func TestOversizeCrossOverEndToEnd(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+
+	// A leg whose /models reports max_model_len 300; the chat call always
+	// 501s to prove it never sees the request.
+	tiny := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"tiny","context_length":300,"max_model_len":300}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer tiny.Close()
+
+	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"big-m","context_length":1000000,"max_model_len":1000000}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-3", "model": "big-m",
+			"choices": []map[string]any{{"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "compacted on big"}}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 3},
+		})
+	}))
+	defer big.Close()
+
+	// Stub the 2s launch-time probe to real values via the swappable fn.
+	oldProbe := remoteContextWindowFn
+	remoteContextWindowFn = func(route proxyRoute) int {
+		if route.BaseURL == tiny.URL {
+			return 300
+		}
+		return 1000000
+	}
+	defer func() { remoteContextWindowFn = oldProbe }()
+
+	table := proxyRouteTable{
+		Default:  proxyRoute{BaseURL: tiny.URL, UpstreamModel: "tiny", Label: "remote:small", ContextWindow: 300},
+		Oversize: proxyRoute{BaseURL: big.URL, UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000},
+		breakers: &routeBreakers{},
+		// 10KB of prompt text: clearly beyond 300 tokens, trivially inside 1M.
+	}
+	// (SessionID empty: calib keys per-label, fine for a one-shot test.)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, table) }()
+
+	body, _ := json.Marshal(map[string]any{
+		"model": "tiny", "max_tokens": 8,
+		"messages": []map[string]any{{"role": "user", "content": "please compact this: " + string(make([]byte, 10240))}},
+	})
+	resp, err := http.Post("http://"+ln.Addr().String()+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if out["error"] != nil {
+		t.Fatalf("expected oversize crossover to serve the request, got error: %v", out["error"])
+	}
+	if got := resp.Header.Get("X-Oaica-Route"); got != "remote:big" {
+		t.Fatalf("X-Oaica-Route = %q, want remote:big", got)
+	}
+}

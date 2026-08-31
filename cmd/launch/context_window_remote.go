@@ -111,6 +111,9 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 			}
 		}
 	}
+	if p.Routes.Oversize.BaseURL != "" && p.Routes.Oversize.BaseURL != p.Routes.Default.BaseURL {
+		p.Routes.Oversize.ContextWindow = remoteContextWindowFn(p.Routes.Oversize)
+	}
 	return p
 }
 

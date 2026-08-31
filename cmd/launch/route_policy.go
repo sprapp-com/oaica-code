@@ -257,6 +257,43 @@ func (t proxyRouteTable) selectRoute(requested string) (proxyRoute, string, bool
 	return base, model, false
 }
 
+// minViableCompletionTokens mirrors the handler's minViableCompletion: below
+// this leftover budget no safe positive max_tokens exists, so the request is
+// already doomed.
+const minViableCompletionTokens = 16
+
+// oversizeSwap returns the Oversize leg when the request cannot fit on
+// route: the leg's fit budget for THIS est/margin is already exhausted, the
+// oversize leg is strictly larger, on a DIFFERENT base URL, breaker-healthy,
+// and (for pinned policies like local-only) on the permitted side of the
+// locality pin — crossover is an opt-out, not an opt-in, because a pinned
+// user's reason (residency, cost cap) outranks a marginal success. Any
+// condition failing returns the original route, whose caller then fails
+// visibly with the existing "prompt is too long" 400.
+func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (proxyRoute, bool) {
+	// Precondition: the current leg must actually be unable to hold the
+	// request (the handler's only caller guarantees this; kept inside so the
+	// function is honest standalone).
+	if route.ContextWindow-estTokens-margin >= minViableCompletionTokens {
+		return route, false
+	}
+	if route.ContextWindow <= 0 || t.Oversize.BaseURL == "" ||
+		t.Oversize.BaseURL == route.BaseURL ||
+		t.Oversize.ContextWindow <= route.ContextWindow {
+		return route, false
+	}
+	if t.Oversize.ContextWindow-estTokens-margin < minViableCompletionTokens {
+		return route, false // even the oversized leg can't hold it
+	}
+	if pin := t.Policy.pinned(); pin != "" && routeLocality(t.Oversize.BaseURL) != pin {
+		return route, false
+	}
+	if t.breakers.open(t.Oversize.BaseURL) {
+		return route, false
+	}
+	return t.Oversize, true
+}
+
 // startRouteHealthPoll probes every distinct fallback base URL every
 // pollInterval until ln closes, recording the outcome so breakers both OPEN
 // proactively and RECOVER without waiting for a real request to prove the
@@ -266,7 +303,11 @@ func (t proxyRouteTable) selectRoute(requested string) (proxyRoute, string, bool
 func (t proxyRouteTable) startRouteHealthPoll(ln <-chan struct{}, pollInterval time.Duration) {
 	seen := map[string]bool{}
 	var urls []string
-	for _, r := range append([]proxyRoute{t.Default}, t.Fallbacks...) {
+	legs := append([]proxyRoute{t.Default}, t.Fallbacks...)
+	if t.Oversize.BaseURL != "" {
+		legs = append(legs, t.Oversize)
+	}
+	for _, r := range legs {
 		if r.BaseURL != "" && !seen[r.BaseURL] {
 			seen[r.BaseURL] = true
 			urls = append(urls, r.BaseURL)
@@ -313,6 +354,25 @@ func extractRoutePolicy(args []string) (string, []string) {
 			return p, append(args[:i:i], args[i+2:]...)
 		case strings.HasPrefix(a, "--route-policy="):
 			return strings.TrimPrefix(a, "--route-policy="), append(args[:i:i], args[i+1:]...)
+		}
+	}
+	return "", args
+}
+
+// extractOversizeModel pulls "--oversize <model>" (or "--oversize=<model>"),
+// the larger-context leg that serves requests the current leg cannot hold
+// (the auto-compaction call near a ceiling, mostly). Same picker vocabulary
+// as --sonnet-model: "<remote>/<id>", "router/<id>", "<id>:local", bare id.
+// Not forwarded to the child binary.
+func extractOversizeModel(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--oversize" && i+1 < len(args):
+			m := args[i+1]
+			return m, append(args[:i:i], args[i+2:]...)
+		case strings.HasPrefix(a, "--oversize="):
+			return strings.TrimPrefix(a, "--oversize="), append(args[:i:i], args[i+1:]...)
 		}
 	}
 	return "", args

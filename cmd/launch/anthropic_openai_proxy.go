@@ -543,6 +543,13 @@ type proxyRouteTable struct {
 	// breakers is shared via pointer so table value-copies (the handler
 	// closes over one, the poll goroutine gets another) see the same state.
 	breakers *routeBreakers
+	// Oversize (--oversize <model>) is the larger-context leg for requests
+	// THIS leg's window cannot hold — the auto-compaction call being the
+	// canonical case on a 262k local backend. Rule lives in the handler's
+	// context-fit clamp (oversizeSwap) and honors Policy's pinned
+	// localities and the breaker like everything else. ContextWindow is
+	// probed at launch (withContextWindows) and must exceed the primary's.
+	Oversize proxyRoute
 }
 
 // authorized reports whether r presents the table's client token.
@@ -720,7 +727,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	// Route-policy fallback legs present: breakers exist and a background
 	// probe keeps them honest (route_policy.go). Without Fallbacks there is
 	// nothing to break over — no breaker, no probe, identical to before.
-	if len(table.Fallbacks) > 0 {
+	if len(table.Fallbacks) > 0 || table.Oversize.BaseURL != "" {
 		if table.breakers == nil {
 			table.breakers = &routeBreakers{}
 		}
@@ -872,6 +879,19 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// positive max_tokens to force -- reject client-side with a
 			// clear reason instead of forwarding one still doomed to fail.
 			const minViableCompletion = 16
+			if fitBudget < minViableCompletion {
+				// Oversize crossover (route_policy.go): this leg cannot hold
+				// the request (the auto-compaction call being the canonical
+				// case near a 262k ceiling) and a strictly larger-context
+				// --oversize leg exists → serve on it instead of rejecting.
+				// Re-derive the budget against the new leg's window.
+				if over, swapped := table.oversizeSwap(route, estTokens, margin); swapped {
+					route = over
+					oaiReq.Model = route.UpstreamModel
+					w.Header().Set("X-Oaica-Route", route.Label)
+					fitBudget = route.ContextWindow - estTokens - margin
+				}
+			}
 			if fitBudget < minViableCompletion {
 				// Anthropic's own wording -- see promptTooLongMessage for
 				// why the exact phrasing is load-bearing for Claude Code's

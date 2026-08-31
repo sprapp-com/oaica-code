@@ -372,6 +372,7 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	if err != nil {
 		return fmt.Errorf("--route-policy: %q is not one of local-first, remote-first, auto, local-only, remote-only", policyArg)
 	}
+	oversizeModel, args := extractOversizeModel(args)
 
 	if planName != "" {
 		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
@@ -397,6 +398,25 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 	plan.Routes.Policy = policy
+	if oversizeModel != "" {
+		over, err := resolveLaunchEndpoint(oversizeModel)
+		if err != nil {
+			return fmt.Errorf("--oversize: %w", err)
+		}
+		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
+			return fmt.Errorf("--oversize: %w", err)
+		}
+		plan.Routes.Oversize = routeFor(over)
+		// The oversize leg is a full route leg: it can also serve as the
+		// breaker fallback for the other legs (and it gets health-probed).
+		urlSeen := map[string]bool{}
+		for _, f := range plan.Routes.Fallbacks {
+			urlSeen[f.BaseURL] = true
+		}
+		if !urlSeen[plan.Routes.Oversize.BaseURL] {
+			plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, plan.Routes.Oversize)
+		}
+	}
 	// Real context window from the upstreams' /models metadata (claude.go's
 	// cloud-alias map covers :cloud; this covers user remotes and the
 	// router). Probed here, not in buildTierPlan: unit tests build plans
@@ -437,6 +457,10 @@ func (c *Claude) Run(model string, _ []LaunchModel, args []string) error {
 	}
 	if len(plan.Routes.Fallbacks) > 1 {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
+	}
+	if plan.Routes.Oversize.BaseURL != "" {
+		fmt.Fprintf(os.Stderr, "oversize: >%dk-token requests -> %s (%s)\n",
+			plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
 	}
 
 	cmd := exec.Command(claudePath, c.args(plan.PrimaryName, args)...)
