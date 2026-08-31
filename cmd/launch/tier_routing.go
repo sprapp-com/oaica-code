@@ -349,11 +349,21 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 	}
 	if isCloudModelName(p.PrimaryName) {
 		if l, ok := lookupCloudModelLimit(p.PrimaryName); ok {
-			env = append(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(l.Context))
+			// Full window (no reserved-output subtraction): the cloud
+			// alias path always used the raw number and the probed path
+			// below applies its own reserve. MAX_CONTEXT_TOKENS added too
+			// — it also silences Claude Code's "unknown model, assuming
+			// 200k" warning on unmatched ids (e.g. "glm-5.3-flash:cloud"),
+			// which AUTO_COMPACT_WINDOW alone never did.
+			v := strconv.Itoa(l.Context)
+			env = append(env,
+				"CLAUDE_CODE_MAX_CONTEXT_TOKENS="+v,
+				"CLAUDE_CODE_AUTO_COMPACT_WINDOW="+v,
+			)
 		}
 	}
-	// Probed upstream windows (kat-awq on vLLM: 262144) — same knob the
-	// cloud-alias branch sets, so this must not run for that path twice.
+	// Probed upstream windows (kat-awq on vLLM: 262144) — this must not
+	// run for the cloud path twice.
 	if p.PrimaryContext > 0 && !isCloudModelName(p.PrimaryName) {
 		env = append(env, p.contextEnvVars()...)
 	}
@@ -374,6 +384,13 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
 	oversizeModel, args := extractOversizeModel(args)
+	// --wizard forces steps 2-4 even when the eligibility gate would skip
+	// them (a --model launch, mainly); it cannot rescue a non-interactive
+	// session, where the selectors have nowhere to draw.
+	wizardForced, args := extractWizardFlag(args)
+	if wizardForced && !isInteractiveSession() {
+		return fmt.Errorf("launch wizard: --wizard requires an interactive session")
+	}
 
 	if planName != "" {
 		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
@@ -387,7 +404,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--plan: %w", err)
 		}
-	} else if tierWizardEligible(args) {
+	} else if wizardForced || tierWizardEligible(args) {
 		w, err := runTierWizard(models, model)
 		if err != nil {
 			return fmt.Errorf("launch wizard: %w", err)

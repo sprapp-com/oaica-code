@@ -321,3 +321,26 @@ func mustPlanPath(t *testing.T) string {
 	}
 	return path
 }
+
+func TestExtractWizardFlag(t *testing.T) {
+	forced, rest := extractWizardFlag([]string{"--wizard", "--model", "m"})
+	if !forced {
+		t.Fatal("expected --wizard to force")
+	}
+	for _, a := range rest {
+		if a == "--wizard" {
+			t.Fatalf("--wizard not stripped: %v", rest)
+		}
+	}
+	forced, rest = extractWizardFlag([]string{"--wizard=false", "x"})
+	if forced {
+		t.Fatal("--wizard=false must not force")
+	}
+	if len(rest) != 1 || rest[0] != "x" {
+		t.Fatalf("unexpected rest %v", rest)
+	}
+	forced, _ = extractWizardFlag([]string{"--model", "m"})
+	if forced {
+		t.Fatal("no --wizard given")
+	}
+}

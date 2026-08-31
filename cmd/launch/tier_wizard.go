@@ -47,6 +47,24 @@ type tierWizardChoice struct {
 // for flag-only launches, which must stay untouched.
 var tierWizardEligibleLaunch bool
 
+// extractWizardFlag pulls a launcher-level "--wizard" (or "--wizard=true")
+// flag that FORCES steps 2-4 even on a launch the eligibility gate would
+// skip (a --model launch, mainly). Not forwarded to the child binary.
+func extractWizardFlag(args []string) (bool, []string) {
+	rest := args[:0:0]
+	found := false
+	for _, a := range args {
+		switch a {
+		case "--wizard":
+			found = true
+		case "--wizard=false":
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return found, rest
+}
+
 // tierWizardFlags are the launcher-level flags that suppress the wizard: a
 // caller who passed any of them already made (part of) these decisions.
 var tierWizardFlags = []string{"--sonnet-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode"}
