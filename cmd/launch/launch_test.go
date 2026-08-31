@@ -3551,9 +3551,26 @@ func TestLaunchIntegration_ClaudeModelOverrideSkipsSelector(t *testing.T) {
 	t.Setenv("PATH", binDir)
 
 	var selectorCalls int
+	// Wizard runs on this --model interactive launch: answer its defaults
+	// (selectors via the hook, plan-save via the readline hook's blank).
+	origReadLine := tierWizardReadLine
+	t.Cleanup(func() { tierWizardReadLine = origReadLine })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
 	DefaultSingleSelector = func(title string, items []SelectionItem, current string) (string, error) {
+		// Since the wizard runs on interactive --model launches too, its
+		// own steps (secondary/oversize/route policy) are allowed to
+		// prompt; answer their default (Enter keeps it). Only the
+		// PRIMARY model picker is forbidden.
+		if strings.HasPrefix(title, "Sonnet/subagent tier") ||
+			strings.HasPrefix(title, "Compaction/oversize model") ||
+			strings.HasPrefix(title, "Route policy") {
+			if len(items) == 0 {
+				return "", fmt.Errorf("wizard step offered no choices")
+			}
+			return items[0].Name, nil
+		}
 		selectorCalls++
-		return "", fmt.Errorf("selector should not run when --model override is set")
+		return "", fmt.Errorf("primary selector should not run when --model override is set")
 	}
 
 	var confirmCalls int

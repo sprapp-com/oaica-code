@@ -42,9 +42,9 @@ type tierWizardChoice struct {
 }
 
 // tierWizardEligibleLaunch is set per launch by LaunchIntegration (launch.go):
-// true when the primary model came from the interactive picker (no
-// --model/--plan override) and the session is interactive. Cleared/never set
-// for flag-only launches, which must stay untouched.
+// true for any interactive, non-restore launch (--model included — the
+// wizard's defaults are Enter = keep it). Cleared/never set for flag-only
+// and headless launches, which must stay untouched.
 var tierWizardEligibleLaunch bool
 
 // extractWizardFlag pulls a launcher-level "--wizard" (or "--wizard=true")

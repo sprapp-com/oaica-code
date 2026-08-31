@@ -504,12 +504,13 @@ func LaunchIntegration(ctx context.Context, req IntegrationLaunchRequest) error 
 	}
 
 	policy := launchIntegrationPolicy(req)
-	// Interactive launch-tier wizard (tier_wizard.go): only when the primary
-	// model came from the interactive picker — no --model override, and
-	// either the TUI flow (no policy set) or an interactive session. Every
-	// flag-only/headless launch leaves this false and stays byte-identical.
-	tierWizardEligibleLaunch = req.ModelOverride == "" && !req.Restore &&
-		(policy.Confirm != LaunchConfirmAutoApprove || isInteractiveSession())
+	// Interactive launch-tier wizard (tier_wizard.go): any interactive,
+	// non-restore launch -- --model included (the wizard's defaults are all
+	// "Enter = keep it", and most steps collapse when there's no real
+	// choice). Every flag-only/headless launch leaves this false and stays
+	// byte-identical; --plan/--sonnet-model/--oversize/--route-policy
+	// callers already made these decisions (tierWizardFlags).
+	tierWizardEligibleLaunch = !req.Restore && isInteractiveSession()
 	if req.Restore {
 		return restoreIntegration(name, runner, req)
 	}
