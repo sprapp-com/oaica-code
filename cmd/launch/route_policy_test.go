@@ -281,3 +281,178 @@ func TestOversizeCrossOverEndToEnd(t *testing.T) {
 		t.Fatalf("X-Oaica-Route = %q, want remote:big", got)
 	}
 }
+
+// TestAutoPolicy_EscalatesToStrongerLeg end-to-end: under `auto`, two
+// consecutive 5xx on the primary escalate the session to the larger
+// secondary leg WITHOUT the breaker being open (2 < breakerFailsToOpen).
+// Under local-first the identical traffic stays on the primary.
+func TestAutoPolicy_EscalatesToStrongerLeg(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	oldMax := proxyUpstreamMaxRetries
+	proxyUpstreamMaxRetries = 1
+	defer func() { proxyUpstreamMaxRetries = oldMax }()
+
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer down.Close()
+
+	upOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-4", "model": "big-m",
+			"choices": []map[string]any{{"index": 0, "finish_reason": "stop",
+				"message": map[string]any{"role": "assistant", "content": "escalated ok"}}},
+		})
+	}))
+	defer upOK.Close()
+
+	tbl := func(policy routePolicy) proxyRouteTable {
+		return proxyRouteTable{
+			Policy:     policy,
+			Default:    proxyRoute{BaseURL: down.URL, UpstreamModel: "m", Label: "remote:down", ContextWindow: 262144},
+			Fallbacks:  []proxyRoute{{BaseURL: upOK.URL, UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000}},
+			breakers:   &routeBreakers{},
+			escalations: &routeEscalations{},
+		}
+	}
+
+	// auto: requests 1..N stay on the (failing) primary; request N+1 has
+	// escalated to the bigger leg, with the attribution header naming it.
+	post := func(table proxyRouteTable) http.Header {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, table) }()
+		body, _ := json.Marshal(map[string]any{
+			"model": "m", "max_tokens": 4,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		})
+		resp, err := http.Post("http://"+ln.Addr().String()+"/v1/messages", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.Header
+	}
+
+	runN := func(policy routePolicy) http.Header {
+		table := tbl(policy)
+		for i := 0; i < autoEscalateAfterFails; i++ {
+			post(table)
+		}
+		return post(table)
+	}
+
+	// auto: after autoEscalateAfterFails failures, the next request lands on
+	// the escalated (bigger) leg. Note the breaker is NOT open here (2 < 3)
+	// — this is escalation, not ordinary failover.
+	if got := runN(RouteAuto).Get("X-Oaica-Route"); got != "remote:big" {
+		t.Fatalf("auto: request %d should land on the escalated leg, X-Oaica-Route = %q", autoEscalateAfterFails+1, got)
+	}
+
+	// local-first: WITHOUT the breaker open there is no failover, so the
+	// identical traffic stays on the primary.
+	if got := runN(RouteLocalFirst).Get("X-Oaica-Route"); got != "remote:down" {
+		t.Fatalf("local-first must NOT escalate (X-Oaica-Route = %q, want remote:down)", got)
+	}
+}
+
+// TestAutoPolicy_ResetAndSignals pins the escalation state machine at the
+// selection layer: N consecutive failures escalate; a 200 resets the
+// consecutive counter; an active escalation survives that success but decays
+// after autoEscalateHoldFor; an OPEN breaker on the target leg degrades back
+// to the base route; other policies never escalate.
+func TestAutoPolicy_ResetAndSignals(t *testing.T) {
+	oldHold := autoEscalateHoldFor
+	autoEscalateHoldFor = 20 * time.Millisecond
+	defer func() { autoEscalateHoldFor = oldHold }()
+
+	base := proxyRoute{BaseURL: "https://primary.example/v1", UpstreamModel: "m", Label: "remote:primary", ContextWindow: 262144}
+	big := proxyRoute{BaseURL: "https://big.example/v1", UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000}
+
+	table := proxyRouteTable{
+		Policy: RouteAuto, Default: base,
+		Fallbacks:   []proxyRoute{big},
+		breakers:    &routeBreakers{},
+		escalations: &routeEscalations{},
+	}
+
+	for i := 0; i < autoEscalateAfterFails-1; i++ {
+		table.escalations.recordFail(table.SessionID)
+	}
+	if _, _, fb := table.selectRoute("m"); fb {
+		t.Error("1 failure below the threshold must not escalate")
+	}
+	table.escalations.recordFail(table.SessionID)
+	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
+		t.Errorf("consecutive failures at the threshold must escalate to the big leg (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+	// A success clears the CONSECUTIVE counter, but an escalation already
+	// earned stands until the hold window decays (one lucky 200 on the
+	// secondary must not bounce the session back onto a flapping primary).
+	table.escalations.recordOK(table.SessionID)
+	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
+		t.Errorf("active escalation must survive a success (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+	time.Sleep(2 * autoEscalateHoldFor)
+	if r, _, fb := table.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
+		t.Errorf("escalation must reset after the hold window (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+	// After the reset, ONE failure alone can't re-escalate (the counter was
+	// cleared by the OK above).
+	table.escalations.recordFail(table.SessionID)
+	if _, _, fb := table.selectRoute("m"); fb {
+		t.Error("single post-reset failure must not escalate")
+	}
+
+	// OPEN breaker on the target leg degrades to the base route gracefully.
+	table2 := proxyRouteTable{
+		Policy: RouteAuto, Default: base,
+		Fallbacks:   []proxyRoute{big},
+		breakers:    &routeBreakers{},
+		escalations: &routeEscalations{},
+	}
+	for i := 0; i < autoEscalateAfterFails; i++ {
+		table2.escalations.recordFail(table2.SessionID)
+	}
+	for i := 0; i < breakerFailsToOpen; i++ {
+		table2.breakers.recordFail(big.BaseURL)
+	}
+	if r, _, fb := table2.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
+		t.Errorf("OPEN breaker on the escalation target must keep the base route (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+
+	// local-first never escalates, no matter how many failures accumulate.
+	table3 := proxyRouteTable{
+		Policy: RouteLocalFirst, Default: base,
+		Fallbacks:   []proxyRoute{big},
+		breakers:    &routeBreakers{},
+		escalations: &routeEscalations{},
+	}
+	for i := 0; i < autoEscalateAfterFails*3; i++ {
+		table3.escalations.recordFail(table3.SessionID)
+	}
+	if r, _, fb := table3.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
+		t.Errorf("non-auto policy must not escalate (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+
+	// No escalation state allocated -> route unchanged (nil-safety).
+	table4 := proxyRouteTable{
+		Policy: RouteAuto, Default: base,
+		Fallbacks: []proxyRoute{big},
+		breakers:  &routeBreakers{},
+	}
+	if r, _, fb := table4.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
+		t.Errorf("nil escalations must not escalate (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+}

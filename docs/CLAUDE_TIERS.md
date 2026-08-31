@@ -111,9 +111,27 @@ byte-identically no matter the policy.
 |---|---|
 | `local-first` (default) | fail over to the local leg; else any healthy alternate |
 | `remote-first` | fail over to the remote leg; else any healthy alternate |
-| `auto` | alias of `local-first` for now (per-request task escalation ships in v1.1) |
+| `auto` | like `local-first`, PLUS session escalation — see below |
 | `local-only` | never leave local — request fails visibly rather than crossing |
 | `remote-only` | never leave remote — same |
+
+### `auto`: session escalation (2026-08-31, v1.1)
+
+No longer an alias of `local-first`. Under `auto` the proxy additionally
+counts consecutive failed requests per session (the same signals that feed
+the breaker: 5xx after the proxy's retry budget, or transport error — 4xx
+and 429 never count). After 2 consecutive failures (`autoEscalateAfterFails`)
+that session's NEW requests skip straight to the strongest healthy secondary
+leg — the largest-ContextWindow fallback, with the `--oversize` leg included
+when larger — without waiting for the breaker to open. Escalation persists
+through a lucky success (so the session isn't bounced back onto a flapping
+primary) and decays 10 minutes after the last failure
+(`autoEscalateHoldFor`, "minutes of healthy service"). If the escalation
+target's own breaker is OPEN, or a pinned locality forbids it, the request
+stays on the base route and fails normally — escalation degrades, never
+crosses. Like the breaker, it is only consulted in `selectRoute`: an
+in-flight response is never re-routed mid-stream, and `X-Oaica-Route`
+always names the leg that actually served.
 
 Breaker mechanics (`cmd/launch/route_policy.go`): 3 consecutive failures
 (5xx after the proxy's retry budget, or transport error — 4xx/429 don't

@@ -543,6 +543,10 @@ type proxyRouteTable struct {
 	// breakers is shared via pointer so table value-copies (the handler
 	// closes over one, the poll goroutine gets another) see the same state.
 	breakers *routeBreakers
+	// escalations is the `auto` policy's per-session escalation state (see
+	// route_policy.go), also shared via pointer for the same reason. Keyed
+	// by SessionID; nil-safe and simply never escalates when unset.
+	escalations *routeEscalations
 	// Oversize (--oversize <model>) is the larger-context leg for requests
 	// THIS leg's window cannot hold — the auto-compaction call being the
 	// canonical case on a 262k local backend. Rule lives in the handler's
@@ -730,6 +734,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	if len(table.Fallbacks) > 0 || table.Oversize.BaseURL != "" {
 		if table.breakers == nil {
 			table.breakers = &routeBreakers{}
+		}
+		if table.escalations == nil {
+			table.escalations = &routeEscalations{}
 		}
 		pollDone := make(chan struct{})
 		defer close(pollDone)
@@ -928,6 +935,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// Retries exhausted against a transport failure: feed the circuit
 			// breaker so later requests skip this leg immediately.
 			table.breakers.recordFail(route.BaseURL)
+			// Same signal feeds the `auto` policy's per-session escalation
+			// (route_policy.go): consecutive failures escalate the session to
+			// the stronger secondary leg.
+			table.escalations.recordFail(table.SessionID)
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 			return
 		}
@@ -935,12 +946,19 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// Feed the circuit breaker (route_policy.go): 5xx-class answers that
 		// survived the retry budget count as failures; 2xx proves recovery.
 		// 4xx (bad request, context overflow) and 429 (shedding, alive) are
-		// the leg WORKING and must not open the breaker.
+		// the leg WORKING and must not open the breaker. The `auto` policy's
+		// per-session escalation eats the same signals (route_policy.go): a
+		// success clears the consecutive-failure counter — but NOT an active
+		// escalation, which only decays after autoEscalateHoldFor so one
+		// lucky 200 on the secondary can't bounce the session back onto a
+		// still-flapping primary.
 		switch {
 		case resp.StatusCode >= 500:
 			table.breakers.recordFail(route.BaseURL)
+			table.escalations.recordFail(table.SessionID)
 		case resp.StatusCode < 300:
 			table.breakers.recordOK(route.BaseURL)
+			table.escalations.recordOK(table.SessionID)
 		}
 
 		// Same local-only log the router path used to keep (request_log.go):
