@@ -363,6 +363,11 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 // Run launches Claude Code against the plan: one local translation proxy,
 // routing per request model id.
 func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
+	// "claude/<tier>" picker entries take the native path: the REAL Claude
+	// Code binary, clean env, Anthropic's own auth — no OAICA proxy.
+	if tier, ok := nativeClaudeModelTier(model); ok {
+		return c.runNative(tier, args)
+	}
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	planName, args := extractPlanFlag(args)

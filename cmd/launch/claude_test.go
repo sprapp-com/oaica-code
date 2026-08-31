@@ -473,3 +473,31 @@ func TestEnsureClaudeInstalled_NonInteractiveMessage(t *testing.T) {
 		t.Fatalf("err = %q, want %q", err.Error(), want)
 	}
 }
+
+// Native "claude/<tier>" picker entries: tier parsing and --model handling.
+func TestNativeClaudeModelTier(t *testing.T) {
+	if tier, ok := nativeClaudeModelTier("claude/opus"); !ok || tier != "opus" {
+		t.Errorf("claude/opus -> (%q, %v), want (opus, true)", tier, ok)
+	}
+	if _, ok := nativeClaudeModelTier("oaica-35b-a3b-vision"); ok {
+		t.Error("oaica model must not be native")
+	}
+	if !isNativeClaudeModel("claude/sonnet") || isNativeClaudeModel("sonnet") {
+		t.Error("isNativeClaudeModel prefix check broken")
+	}
+}
+
+func TestClaudeHasModelFlag(t *testing.T) {
+	if hasClaudeModelFlag([]string{"--dangerously-skip-permissions"}) {
+		t.Error("no model flag present")
+	}
+	for _, args := range [][]string{
+		{"--model", "opus"},
+		{"--model=opus"},
+		{"--dangerously-skip-permissions", "--model", "sonnet"},
+	} {
+		if !hasClaudeModelFlag(args) {
+			t.Errorf("--model %q not detected", args)
+		}
+	}
+}

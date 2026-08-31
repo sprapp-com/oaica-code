@@ -98,6 +98,66 @@ func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, sonnetModel, an
 	return env
 }
 
+// nativeClaudePickerModels are the "claude/<alias>" picker entries: they run
+// the REAL Claude Code binary with a clean environment (RunNative below) so
+// Claude Code uses its own /login (Anthropic subscription) — or a plain
+// ANTHROPIC_API_KEY — instead of the OAICA router. The alias maps directly to
+// Claude Code's built-in --model aliases.
+var nativeClaudePickerModels = []ModelItem{
+	{Name: "claude/opus", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
+	{Name: "claude/sonnet", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
+	{Name: "claude/fable", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
+}
+
+// isNativeClaudeModel reports whether name selects the native (non-OAICA)
+// Claude Code path: "claude/<tier>", e.g. "claude/opus".
+func isNativeClaudeModel(model string) bool {
+	return strings.HasPrefix(model, "claude/")
+}
+
+// nativeClaudeModelTier splits "claude/opus" into the Claude Code --model
+// alias ("opus"). ok is false for anything that is not a native entry.
+func nativeClaudeModelTier(model string) (string, bool) {
+	if rest, ok := strings.CutPrefix(model, "claude/"); ok {
+		return rest, true
+	}
+	return "", false
+}
+
+// runNative execs the real Claude Code binary with an untouched environment —
+// no ANTHROPIC_BASE_URL/AUTH_TOKEN injection, no translation proxy. The tier
+// becomes Claude Code's own --model alias; a user-supplied --model in extra
+// wins over the picker alias.
+func (c *Claude) runNative(tier string, extra []string) error {
+	claudePath, err := ensureClaudeInstalled()
+	if err != nil {
+		return err
+	}
+	args := extra
+	if tier != "" && !hasClaudeModelFlag(extra) {
+		args = append([]string{"--model", tier}, extra...)
+	}
+	fmt.Fprintln(os.Stderr, "claude native: running Claude Code with your own Anthropic login / API key (not OAICA)")
+	cmd := exec.Command(claudePath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ() // deliberately untouched — clean native environment
+	return cmd.Run()
+}
+
+func hasClaudeModelFlag(args []string) bool {
+	for i, a := range args {
+		if a == "--model" {
+			return true
+		}
+		if strings.HasPrefix(a, "--model=") || (i > 0 && args[i-1] == "--model") {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Claude) envVars(model, anthropicBaseURL string) []string {
 	// THIS WAS THE REAL BUG (found via a live user repro that persisted
 	// through multiple other fixes): envconfig.Host() reads OLLAMA_HOST,

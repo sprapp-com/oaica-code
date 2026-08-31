@@ -1088,6 +1088,12 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 	if err != nil {
 		return "", err
 	}
+	// Native "claude/<tier>" entries only make sense for the Claude Code
+	// integration (commandName is the integration name; the generic select
+	// path passes ""). They run Claude Code's own Anthropic auth.
+	if commandName == "claude" {
+		items = append(items, nativeClaudePickerModels...)
+	}
 
 	for {
 		accountState := c.latestAccountState()
@@ -1106,6 +1112,10 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		// "ollama/<name>" is picker display only; the daemon and every
 		// saved config know the bare id.
 		selected = stripOllamaPickerNames([]string{selected})[0]
+		if isNativeClaudeModel(selected) {
+			// Native Claude entries bypass OAICA readiness entirely.
+			return selected, nil
+		}
 		if ensureReady {
 			if err := c.ensureModelsReadyFor(ctx, []string{selected}, label, commandName); err != nil {
 				if errors.Is(err, errUpgradeCancelled) {
@@ -1486,6 +1496,11 @@ func (c *launcherClient) showBasedModelUsable(ctx context.Context, name string) 
 func (c *launcherClient) singleModelUsable(ctx context.Context, name string, inventory []LaunchModel) bool {
 	if name == "" {
 		return false
+	}
+	// "claude/<tier>" native entries need no OAICA readiness — they route to
+	// Claude Code's own Anthropic auth (see Claude.runNative).
+	if isNativeClaudeModel(name) {
+		return true
 	}
 	if isCloudModelName(name) {
 		cloudDisabled, _ := cloudStatusDisabled(ctx, c.apiClient)
