@@ -1485,12 +1485,21 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			cur := inflight.Load()
 			if cur >= int32(apiKey.MaxConcurrent) {
 				w.Header().Set("Retry-After", "1")
+				w.Header().Set("x-ratelimit-limit-requests", strconv.Itoa(apiKey.MaxConcurrent))
+				w.Header().Set("x-ratelimit-remaining-requests", "0")
 				writeErr(w, http.StatusTooManyRequests, "concurrency_limited",
 					fmt.Sprintf("key %q has %d concurrent requests in flight (limit %d); wait for one to finish", label, cur, apiKey.MaxConcurrent))
 				return
 			}
 			if inflight.CompareAndSwap(cur, cur+1) {
 				defer inflight.Add(-1)
+				// OpenAI-style rate-limit headers so professional SDKs /
+				// agents can self-throttle BEFORE getting a 429 (they read
+				// x-ratelimit-remaining-requests and pace themselves --
+				// exactly the concurrency management the official SDKs
+				// implement). Only sent when the key declares a cap.
+				w.Header().Set("x-ratelimit-limit-requests", strconv.Itoa(apiKey.MaxConcurrent))
+				w.Header().Set("x-ratelimit-remaining-requests", strconv.FormatInt(int64(apiKey.MaxConcurrent)-1-int64(cur), 10))
 				break
 			}
 		}

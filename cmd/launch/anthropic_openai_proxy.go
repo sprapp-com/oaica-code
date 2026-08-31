@@ -34,6 +34,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"io"
 	"net"
 	"net/http"
@@ -588,6 +589,108 @@ var proxyUpstreamClient = &http.Client{Transport: &http.Transport{
 	IdleConnTimeout:     90 * time.Second,
 }}
 
+// proxyUpstreamMaxRetries bounds client-side retrying of transient upstream
+// failures, mirroring what the official Anthropic/OpenAI SDKs do client-side
+// (anthropic: default 2 retries; openai-go: 3): a client SDK that hit a
+// fleet hiccup would sit and back off instead of surfacing the error into
+// the agent loop. 2026-08-31 context: the gateway now sheds load via
+// standard signals -- 429 (+Retry-After) from per-key concurrency /
+// large-context admission, 502 when a replica flips DOWN, 504 headers on
+// long prefills -- and Claude Code behind this proxy should absorb the
+// cheap ones instead of showing the user "API Error".
+//
+// Retry discipline (what makes this safe):
+//   - ONLY before a response comes back (and therefore before any byte is
+//     written to the caller): a mid-stream failure is NOT retried here,
+//     because we may have already streamed tokens to Claude Code. The
+//     caller sees a clean upstream_error instead.
+//   - Idempotency: a completion that never answered did no billed work the
+//     client can observe; the one risk is double-billed hidden work, which
+//     the 429/503 paths (rejected BEFORE backend work) never incur.
+//   - Backoff: Retry-After honored verbatim (the server tuned it), else
+//     exponential 500ms/1s/2s with ±25% full jitter, 10s ceiling, and the
+//     caller's context always wins (Claude Code disconnect cancels the
+//     wait).
+var proxyUpstreamMaxRetries = 3
+
+func proxyUpstreamRetryDelay(resp *http.Response, attempt int) time.Duration {
+	if resp != nil {
+		if v := resp.Header.Get("Retry-After"); v != "" {
+			if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
+				// Cap server-requested waits too: a broken upstream asking
+				// for an hour must not wedge one Claude Code turn.
+				if secs > 10 {
+					secs = 10
+				}
+				return time.Duration(secs) * time.Second
+			}
+		}
+	}
+	// Full-ish jitter, AWS-recommended shape: uniform in [d/2, 3d/2).
+	// attempt is 0-based here; the shift expresses 500ms * 2^attempt.
+	d := time.Duration(500) * time.Millisecond << uint(attempt)
+	jitter, err := rand.Int(rand.Reader, big.NewInt(int64(d/2)))
+	if err != nil {
+		jitter = big.NewInt(0) // crypto/rand unavailable: plain deterministic backoff still bounds retries
+	}
+	return d/2 + time.Duration(jitter.Int64())
+}
+
+func proxyUpstreamRetryable(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func proxyUpstreamRetryDo(req *http.Request, reqBytes []byte) (*http.Response, error) {
+	var lastResp *http.Response
+	for attempt := 0; attempt < proxyUpstreamMaxRetries; attempt++ {
+		attemptReq := req
+		if attempt > 0 {
+			// The body reader is consumed on the first attempt; replace it
+			// (reqBytes is a buffered copy -- see the call site).
+			attemptReq = req.Clone(req.Context())
+			attemptReq.Body = io.NopCloser(bytes.NewReader(reqBytes))
+		}
+		resp, err := proxyUpstreamClient.Do(attemptReq)
+		if err != nil {
+			// Transport errors before any response are safe to retry EXCEPT
+			// when the caller themselves hung up (context canceled) -- that
+			// is not an upstream failure, and retrying would write to a
+			// dead connection.
+			if req.Context().Err() != nil {
+				return nil, err
+			}
+			lastResp = nil
+			delay := proxyUpstreamRetryDelay(nil, attempt)
+			select {
+			case <-time.After(delay):
+				continue
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		if proxyUpstreamRetryable(resp) && attempt < proxyUpstreamMaxRetries-1 {
+			delay := proxyUpstreamRetryDelay(resp, attempt)
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			select {
+			case <-time.After(delay):
+				continue
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return resp, nil
+	}
+	return lastResp, nil
+}
+
 func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 	if requested == "" {
 		return t.Default, t.Default.UpstreamModel
@@ -772,7 +875,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			upstreamReq.Header.Set("X-Session-Id", table.SessionID)
 		}
 
-		resp, err := proxyUpstreamClient.Do(upstreamReq)
+		resp, err := proxyUpstreamRetryDo(upstreamReq, oaiBody)
 		if err != nil {
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 			return
