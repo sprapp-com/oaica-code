@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OAICA — Run serious coding models. Hosted API or your own GPU.</title>
+<meta name="description" content="OAICA runs oaica-35b-a3b-vision and oaica-nemotron-30b-a3b. $0.05/M input, $0.28/M output. Self-host or use our hosted API.">
+<meta property="og:title" content="OAICA — Run serious coding models">
+<meta property="og:description" content="Hosted API or your own GPU. Ollama-simple. $0.05/M input, prefix-cache discounts.">
+<meta property="og:image" content="https://oaica.com/og-image.png">
+<style>
+:root { color-scheme: light dark; }
+body { font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+  max-width: 760px; margin: 0 auto; padding: 3rem 1.25rem; }
+h1 { font-weight: 650; }
+h2 { margin-top: 2.5rem; border-bottom: 1px solid rgba(128,128,128,.25); padding-bottom: .3rem; }
+p { color: #555; }
+a { color: #0969da; text-decoration: none; }
+pre { background: #16181f; color: #e8e9ee; padding: 1rem 1.25rem; border-radius: 10px; overflow-x: auto; position: relative; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.hint { color: #888; font-size: .9rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid rgba(128,128,128,.2); }
+.copy-btn {
+  position: absolute; top: .5rem; right: .5rem;
+  background: rgba(255,255,255,.08); color: #e8e9ee; border: 1px solid rgba(255,255,255,.18);
+  border-radius: 6px; padding: .25rem .55rem; font-size: .75rem; cursor: pointer;
+  font-family: inherit; line-height: 1.4;
+}
+.copy-btn:hover { background: rgba(255,255,255,.16); }
+.copy-btn.copied { background: #2e7d32; border-color: #2e7d32; }
+.hero { margin-bottom: 2rem; }
+.hero h1 { font-size: 28px; line-height: 1.3; }
+.hero p { font-size: 17px; color: #6e7781; margin-bottom: 1.5rem; }
+.code-box {
+  display: inline-block; position: relative; margin: 1rem 0;
+}
+.code-box code { display: block; white-space: pre; }
+.cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 1.5rem; }
+.btn {
+  display: inline-block; padding: 10px 20px; border-radius: 8px;
+  font-weight: 600; font-size: 15px; text-decoration: none;
+}
+.btn-primary { background: #0969da; color: #fff; }
+.btn-secondary { border: 1px solid rgba(128,128,128,.3); color: #24292f; background: #fafbfc; }
+.column { margin: 1.5rem 0; }
+.column h3 { margin: 0 0 .5rem; font-size: 17px; }
+.column p { margin: 0 0 .75rem; font-size: 15px; }
+.proof { display: flex; gap: 2rem; flex-wrap: wrap; padding: 1.5rem 0; border-top: 1px solid rgba(128,128,128,.25); border-bottom: 1px solid rgba(128,128,128,.25); margin: 2rem 0; }
+.proof-item { text-align: center; }
+.proof-item .num { font-size: 24px; font-weight: 700; color: #0969da; }
+.proof-item .lbl { color: #6e7781; font-size: 13px; margin-top: 2px; }
+.model-card { border: 1px solid rgba(128,128,128,.2); border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+.model-card h3 { margin: 0 0 .5rem; font-size: 17px; }
+.badge { display: inline-block; background: rgba(9,105,218,.1); color: #0969da; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-left: 8px; }
+.badge.on-demand { background: rgba(149,51,228,.1); color: #8957e5; }
+footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid rgba(128,128,128,.25); color: #6e7781; font-size: 14px; text-align: center; }
+footer a { color: #0969da; }
+</style>
+</head>
+<body>
+
+<h1>OAICA</h1>
+
+<div class="hero">
+  <h1>Run serious coding models.<br>Hosted API or your own GPU.</h1>
+  <p>Ollama-simple. $0.05/M input, prefix-cache discounts, 262K context.</p>
+
+  <div class="code-box">
+    <code id="install-cmd">curl -fsSL https://oaica.com/install.sh | bash</code>
+    <button class="copy-btn">Copy</button>
+  </div>
+
+  <div class="cta-row">
+    <a class="btn btn-primary" href="mailto:oaica@sprapp.com">Get an API key</a>
+    <a class="btn btn-secondary" href="#docs">Read the docs</a>
+  </div>
+</div>
+
+<div class="column">
+  <h3>Hosted API</h3>
+  <p>OpenAI- and Anthropic-compatible. 262K context, vision, prefix-cache discounts (~55% hit rate on agent workloads).</p>
+  <pre><code>curl -X POST https://api.oaica.com/v1/chat/completions \
+  -H "Authorization: Bearer $OAICA_API_KEY" \
+  -d '{"model":"oaica-35b-a3b-vision","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+</div>
+
+<div class="column">
+  <h3>Self-host</h3>
+  <p>Free. Pull models and run on your own infrastructure with <code>oaica pull</code> and <code>oaica serve</code>.</p>
+  <pre><code>oaica pull oaica-nemotron-30b-a3b
+oaica serve oaica-nemotron-30b-a3b</code></pre>
+</div>
+
+<div class="column">
+  <h3>Claude Code ready</h3>
+  <p>Context window auto-configured. Launch Claude Code directly on our models.</p>
+  <pre><code>oaica launch claude --model oaica-35b-a3b-vision</code></pre>
+</div>
+
+<div class="proof">
+  <div class="proof-item">
+    <div class="num">4×</div>
+    <div class="lbl">A100 fleet</div>
+  </div>
+  <div class="proof-item">
+    <div class="num">55%</div>
+    <div class="lbl">Prefix-cache hit rate</div>
+  </div>
+  <div class="proof-item">
+    <div class="num">262K</div>
+    <div class="lbl">Context length</div>
+  </div>
+  <div class="proof-item">
+    <div class="num">Token</div>
+    <div class="lbl">Usage-metered billing</div>
+  </div>
+</div>
+
+<h2 id="pricing">Pricing</h2>
+<p class="hint">Per M tokens. Simple rates.</p>
+
+<table>
+  <thead><tr><th></th><th>Input</th><th>Cache-hit</th><th>Output</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>OAICA</strong></td>
+      <td>$0.05</td>
+      <td>$0.008</td>
+      <td>$0.28</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="hint">Cached prefix always bills at $0.008/M. Agent sessions that reuse context pay mostly cache rates. Flat monthly plans available — talk to us at <a href="mailto:oaica@sprapp.com">oaica@sprapp.com</a>.</p>
+
+<h2 id="models">Models</h2>
+<p class="hint">Generated from the gateway. Live at <code>https://api.oaica.com/v1/models</code>.</p>
+
+<div class="model-card">
+  <h3>oaica-35b-a3b-vision <span class="badge">Live</span></h3>
+  <p>262,144 context · 32K max output · Text + image (2 images/request)</p>
+  <p class="hint">Vision-capable for coding assistance with screenshots.</p>
+  <pre><code># OpenAI-compatible
+curl -X POST https://api.oaica.com/v1/chat/completions \
+  -H "Authorization: Bearer $OAICA_API_KEY" \
+  -d '{"model":"oaica-35b-a3b-vision","messages":[{"role":"user","content":"Hello"}]}'
+
+# CLI
+oaica run oaica-35b-a3b-vision
+
+# Claude Code
+oaica launch claude --model oaica-35b-a3b-vision</code></pre>
+</div>
+
+<div class="model-card">
+  <h3>oaica-nemotron-30b-a3b <span class="badge on-demand">On-demand</span></h3>
+  <p>262,144 context · Text-only · Reasoning + tool-calling</p>
+  <p class="hint">Currently on-demand (pool paused). Auto-configures context window for Claude Code.</p>
+  <pre><code># Self-host
+oaica pull oaica-nemotron-30b-a3b
+oaica serve oaica-nemotron-30b-a3b
+
+# Check catalog
+curl https://api.oaica.com/v1/catalog</code></pre>
+</div>
+
+<h2 id="docs">Quickstart</h2>
+<p class="hint">Three paths. Pick yours.</p>
+
+<h3 style="margin-top: 1.5rem;">1. Hosted API</h3>
+<pre><code>curl -fsSL https://oaica.com/install.sh | bash
+oaica signin
+oaica run oaica-35b-a3b-vision
+oaica launch claude --model oaica-35b-a3b-vision</code></pre>
+
+<h3>2. Direct API</h3>
+<pre><code>export OAICA_API_KEY=<your-key>
+
+curl -X POST https://api.oaica.com/v1/chat/completions \
+  -H "Authorization: Bearer $OAICA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"oaica-35b-a3b-vision","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Note: scripted clients must set a custom User-Agent
+# (default Python-urllib is bot-blocked at the edge)
+curl -X POST https://api.oaica.com/v1/chat/completions \
+  -H "User-Agent: my-app/1.0" \
+  -H "Authorization: Bearer $OAICA_API_KEY" \
+  -d '{"model":"oaica-35b-a3b-vision","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+
+<h3>3. Self-host</h3>
+<pre><code># List available models
+curl https://api.oaica.com/v1/catalog
+
+# Pull a model (25 GB for nemotron)
+oaica pull oaica-nemotron-30b-a3b
+
+# Serve it
+oaica serve oaica-nemotron-30b-a3b
+
+# Licensed models require OAICA_LICENSE_KEY
+export OAICA_LICENSE_KEY=<your-key>
+oaica pull <licensed-model>
+oaica serve <licensed-model></code></pre>
+
+<h2 id="status">Status</h2>
+<p class="hint">
+  Live health: <a href="https://api.oaica.com/health" target="_blank">api.oaica.com/health</a>
+  (currently <span id="health-status">checking...</span>)
+</p>
+<p class="hint">Uptime monitoring coming soon.</p>
+
+<footer>
+  <p>
+    <a href="https://github.com/sprapp-com/oaica-code">GitHub</a> ·
+    <a href="https://api.oaica.com/health">Status</a> ·
+    <a href="mailto:oaica@sprapp.com">oaica@sprapp.com</a>
+  </p>
+  <p style="margin-top: 8px; font-size: 12px;">
+    © 2026 BCZ Singapore Pte Ltd. All rights reserved.
+  </p>
+</footer>
+
+<script>
+// Copy button for install command
+document.querySelector('.code-box').addEventListener('click', function(e) {
+  if (e.target.classList.contains('copy-btn')) return;
+  const code = this.querySelector('code');
+  const btn = this.querySelector('.copy-btn');
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+  });
+});
+
+// Check health endpoint
+fetch('https://api.oaica.com/health')
+  .then(r => r.json())
+  .then(data => {
+    const el = document.getElementById('health-status');
+    if (data.status === 'ok') {
+      el.textContent = 'ok (' + data.upstreams + ' upstreams)';
+      el.style.color = '#1a7f37';
+    } else {
+      el.textContent = 'degraded';
+      el.style.color = '#d4a72c';
+    }
+  })
+  .catch(() => {
+    const el = document.getElementById('health-status');
+    el.textContent = 'unknown';
+    el.style.color = '#888';
+  });
+</script>
+</body>
+</html>
