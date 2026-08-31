@@ -206,3 +206,50 @@ deployed; it is the config to use for a short-context/vision pool. Details
 and rationale: `tools/a100b/README.md` → "Production checkpoint + launch
 tiers". The draft-eager MTP crash mitigation is moot on this config (no
 draft); its 24-h soak on the previous config recorded 0 IMA crashes.
+
+## Addendum — 2026-08-30/31: session affinity, prefill chunk, fleetctl drill, pricing tiers, vision — all measured on prod
+
+1. **Session affinity enabled on the production path**: gatekeeper
+   `upstream_addr` :30099 leastconn → :8091 oaicalb session-hash;
+   `X-Session-Id` flows client proxy → gateway → gatekeeper → oaicalb.
+   Before: 8 of 8 sessions scattered across all four replicas (one split
+   157/116/124/65). Measured cache-hit: 40.3% before (681 req,
+   21:00–22:07Z) → 57.5% clean after (613 req, 22:35Z+) → 53.7% steady
+   past hour. Verified sticky: 3/3 same-session requests to one backend.
+   `session_overflow_factor 1.5` spills hot sessions.
+2. **Prefill chunk 12288 → 8192** (`--max-num-batched-tokens`) fleet-wide:
+   decode no longer starves to ~1 tok/s under prefill storms. Combined
+   effect with affinity, past-hour latency: p50 73.6s → 32.4s, p95
+   172s → 98.9s, at similar traffic (230 req/h, 24.9M prompt tok). Cost
+   per request ≈ −45%.
+3. **Zero-downtime fleet ops proven live**: fleetctl remove+add drill on
+   `2:30110` and later a full 4-replica rolling flag change, with a
+   public-API probe every 4s → 200/200 HTTP 200 including a gateway
+   binary swap in the window. Watchdog hot-reloads
+   `/workspace/vllm_awq_replicas.conf` per tick (no restarts for set
+   changes); one real gotcha found and fixed: fleetctl's GPU-busy
+   preflight refused GPU7's permanent ~6 GB co-tenant → default
+   `GPU_BUSY_MIB` now 8192.
+4. **Pricing tiers live in prod** since ~2026-08-31 00:xx: ≤32k $0.05 /
+   ≤128k $0.06 / >128k $0.10 per M on uncached input; cache-hit $0.008;
+   output $0.28. Past-hour tier split: 5 / 148 / 77 requests. Ledger rows
+   carry `price_tier`. `internal-91` is a priority key (bypasses
+   large-context admission); new `internal-batch` key (no priority,
+   `internal` tier) exists for background agents — plaintext on the
+   laptop at `~/.secrets/oaica_internal_batch_key`.
+5. **Vision enabled and verified through the gateway**:
+   `input_modalities: ["text","image"]` on oaica-35b-a3b-vision (was
+   deliberately off from the old AWQ-only era that produced garbage; the
+   current AWQ+bf16-vision build is correct). Public-API tests 4/4: solid
+   color ("Blue"), spatial split ("left: red, right: green"),
+   shape+background ("yellow circle on black"), two-image reference
+   ("second image contains a circle"). Zero image/multimodal errors in
+   any replica log since enabling; limit stays 2 images/request;
+   Nemotron is text-only.
+
+Gotcha worth recording: Cloudflare in front of `api.oaica.com` 403-blocks
+the `Python-urllib` User-Agent; curl or any custom UA passes. Scripted
+clients must set a UA.
+
+Full operational detail: `tools/a100b/README.md` → "Optimization pass
+(2026-08-30/31): measured results".

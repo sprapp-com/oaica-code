@@ -466,3 +466,54 @@ anything new added here.
 > backslash-continued `CUDA_VISIBLE_DEVICES=$gpu nohup ... disown` launch
 > block — a comment silently truncates the command. Check with
 > `awk '/CUDA_VISIBLE_DEVICES=\$gpu nohup/,/disown/' vllm_awq_watchdog.sh | grep -c '^\s*#'` (must print 0).
+
+### `GPU_BUSY_MIB` (found during the fleetctl drill, 2026-08-30/31)
+
+`fleetctl.sh add`'s GPU-busy preflight (`>2 GiB used by others per
+nvidia-smi`, described above) refused GPU7 outright — it carries a
+permanent ~6 GB co-tenant that isn't going away. Default `GPU_BUSY_MIB`
+is now **8192** fleet-wide so GPU7 remains addable; a real leak on any
+GPU still trips the check well before the practical ~20 GB/replica
+footprint would matter.
+
+## Optimization pass (2026-08-30/31): measured results
+
+All measured live on prod a100b, 2026-08-30 evening → 2026-08-31 02:14 UTC.
+
+**Session affinity on the production path.** `gatekeeper` now routes
+`upstream_addr` :30099 leastconn → :8091 `oaicalb` session-hash, with
+`X-Session-Id` flowing client proxy → gateway → gatekeeper → oaicalb. Before: 8 of 8 live sessions were scattered across all four
+replicas (one session split 157/116/124/65 requests across backends).
+Measured cache-hit rate: 40.3% before (681 req, 21:00–22:07Z) → 57.5%
+clean after (613 req, 22:35Z+) → 53.7% steady over the following hour.
+Verified sticky routing directly: 3/3 same-session requests landed on the
+same backend. `session_overflow_factor 1.5` spills a session to a second
+backend once it's carrying too much load, so one hot session can't starve
+a replica.
+
+**Prefill chunk 12288 → 8192** (`--max-num-batched-tokens`), fleet-wide.
+Decode no longer starves to ~1 tok/s under prefill storms. Combined with
+affinity, past-hour latency: p50 73.6s → 32.4s, p95 172s → 98.9s, at
+similar traffic (230 req/h, 24.9M prompt tok). Cost per request ≈ −45%.
+
+**Zero-downtime fleet ops proven live**, not just claimed: a
+`fleetctl.sh` remove+add drill on `2:30110`, then a full 4-replica
+rolling flag change, with a public-API probe every 4s throughout →
+200/200 HTTP 200, including across a gateway binary swap inside the
+window. The watchdog hot-reloads `vllm_awq_replicas.conf` per tick, so
+set changes need no restarts. See the `GPU_BUSY_MIB` note above for the
+one real gotcha the drill surfaced.
+
+**Vision confirmed live through the gateway.** `input_modalities:
+["text","image"]` is back on for `oaica-35b-a3b-vision` (it had been off
+on purpose since the old AWQ-only era, which produced garbage on images —
+the current AWQ+bf16-vision build is correct). Public-API tests 4/4:
+solid color ("Blue"), spatial split ("left: red, right: green"),
+shape+background ("yellow circle on black"), two-image reference ("second
+image contains a circle"). Zero image/multimodal errors in any replica
+log since enabling. Limit stays 2 images/request; Nemotron is text-only.
+
+**Gotcha: Cloudflare blocks the `Python-urllib` User-Agent.** Cloudflare
+sits in front of `api.oaica.com` and 403s requests carrying the default
+`Python-urllib` UA; curl or any custom UA passes fine. Any scripted
+client (including test/monitoring scripts) must set its own UA.

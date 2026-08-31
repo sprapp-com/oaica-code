@@ -455,3 +455,12 @@ strangers; the subscription plans above are the revenue base. Follow-on
 lever: ~50% off-peak discount (00–08 UTC) to fill idle capacity instead
 of cutting the base card. Not deployed — gateway pricing is one line per
 rate in /workspace/oaica-gateway.json when approved.
+
+### Deployed + first measurements (2026-08-31)
+
+Tiers went live in prod: ≤32k $0.05 / ≤128k $0.06 / >128k $0.10 per M on
+uncached input; cache-hit $0.008; output $0.28. Past-hour tier split: 5 /
+148 / 77 requests. Ledger rows carry `price_tier`. Cache-hit rate sits at
+53.7% (session-affinity effect, see `tools/a100b/README.md`). Revenue per
+request fell with the cache-hit discount, but GPU cost per request fell
+more (prefill-chunk + affinity latency work) — margin improved.
