@@ -251,9 +251,21 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	autoSecondary := "" // what "auto" resolves to: the first recommended non-primary model
 	if len(names) > 0 {
 		recommended := map[string]bool{}
+		routerRec := map[string]bool{}
 		for _, m := range models {
-			if m.Recommended {
-				recommended[m.Name] = true
+			if !m.Recommended {
+				continue
+			}
+			recommended[m.Name] = true
+			// The picker's "Recommended" set is a curated mix (local
+			// gemma4/qwen3.5, cloud glm/deepseek, router SKUs); the wizard
+			// labels its pinned section "OAICA Models", so only actual
+			// router SKUs may be pinned there — anything else would read as
+			// served by the router when it isn't (2026-09-02 .46: deepseek/
+			// glm/gemma rows under "OAICA Models"). Other recommendations
+			// stay in the general Remote section and still feed "auto".
+			if strings.HasPrefix(m.Name, "oaica-") {
+				routerRec[m.Name] = true
 			}
 		}
 		sonnetItems = []SelectionItem{
@@ -272,10 +284,11 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				if autoSecondary == "" {
 					autoSecondary = n
 				}
-				// Recommended+Remote flags: the selector buckets these into
-				// the pinned "OAICA Models" section at the top (same as the
-				// primary picker's router-catalog rows).
-				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)", Recommended: true, Remote: true})
+				// Recommended+Remote flags pin the row into the "OAICA
+				// Models" section at the top — router SKUs only; other
+				// recommended rows fall through to the Remote section below
+				// but still count for "auto".
+				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)", Recommended: routerRec[n], Remote: true})
 			}
 		}
 		for _, n := range names {
