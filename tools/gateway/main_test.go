@@ -171,8 +171,14 @@ func TestModels_PublicWithoutKey(t *testing.T) {
 			t.Fatalf("%s without key: %d, %v", p, resp.StatusCode, doc.Data)
 		}
 	}
+	// annotateHealth (health.go) probes each model's upstream with a cached
+	// 1-token ping to badge unhealthy models — deliberate, the only allowed
+	// upstream call from /models. Anything else (the caller's completion
+	// body, a forwarded model rewrite) would be a leak.
 	if got != nil {
-		t.Fatal("/models must never call upstream")
+		if max, _ := got["max_tokens"].(float64); max != 1 {
+			t.Fatalf("/models may only trigger the 1-token health probe, got: %v", got)
+		}
 	}
 }
 

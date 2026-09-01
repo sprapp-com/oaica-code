@@ -56,10 +56,10 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -75,6 +75,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -500,6 +501,9 @@ func loadConfig(path string) (gwConfig, error) {
 		return cfg, errors.New("api_keys is empty: refusing a config that would accept nobody")
 	}
 	for i, k := range cfg.APIKeys {
+		if strings.TrimSpace(k.Label) == "" {
+			return cfg, fmt.Errorf("api_keys[%d]: label must be non-empty (empty labels authenticate by digest but then 401 and unmeter)", i)
+		}
 		if len(k.SHA256) != 64 {
 			return cfg, fmt.Errorf("api_keys[%d]: sha256 must be 64 hex chars (got %d)", i, len(k.SHA256))
 		}
@@ -614,10 +618,13 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 		if b, ok := resp.Request.Context().Value(ctxKeyBackend{}).(*string); ok {
 			*b = resp.Header.Get("X-Katlb-Backend")
 		}
-		// Internal topology must not leak to the public.
+		// Internal topology must not leak to the public (audit L16: Via and
+		// Server name internal hops too).
 		resp.Header.Del("X-Katlb-Backend")
 		resp.Header.Del("X-Gatekeeper-Tier")
 		resp.Header.Del("X-Gatekeeper-Limit")
+		resp.Header.Del("Via")
+		resp.Header.Del("Server")
 		// gatekeeper (429/401) and katlb (503) answer with text/plain or a
 		// non-OpenAI JSON; normalize so clients see {"error":{...}} and keep
 		// Retry-After. Streaming bodies are never rewritten (status 200).
@@ -668,7 +675,7 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 			// back into this session's calibration. The error LOG keeps the
 			// verbatim upstream text -- that sink exists for diagnosis, and
 			// the raw numbers are the whole point of it.
-			clientMsg := msg
+			clientMsg := redactCredentialURLs(msg)
 			if resp.StatusCode == http.StatusBadRequest {
 				if promptTokens, maxTokens, ok := parseUpstreamContextOverflow(msg); ok {
 					if info != nil && info.Calibrate != nil {
@@ -835,6 +842,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 	if cfg.UpstreamErrorLogPath != "" {
 		ef, err = os.OpenFile(cfg.UpstreamErrorLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
+			f.Close() // don't leak the already-opened ledger (audit L15)
 			return fmt.Errorf("open upstream error log %s: %w", cfg.UpstreamErrorLogPath, err)
 		}
 	}
@@ -1019,14 +1027,42 @@ func (g *gateway) keyLabel(r *http.Request) string {
 	return k.Label
 }
 
+// redactCredentialUrlsRE matches URLs with embedded userinfo, the one shape
+// in upstream error text that can carry a secret (audit 2026-09-01 L17).
+var redactCredentialUrlsRE = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s@]+:[^@\s/]+@`)
+
+// redactCredentialUrls strips userinfo from any URL embedded in upstream
+// error text before that text reaches the public client (audit L17: a
+// misconfigured base_url with embedded credentials would otherwise echo
+// them into the client's error). Everything else passes verbatim — the
+// message is still the most useful explanation of the failure.
+func redactCredentialURLs(text string) string {
+	return redactCredentialUrlsRE.ReplaceAllStringFunc(text, func(m string) string {
+		if i := strings.Index(m, "://"); i >= 0 {
+			return m[:i+3] + "[redacted]@"
+		}
+		return m
+	})
+}
+
+// bearerCredential extracts the credential from an Authorization header
+// case-insensitively (audit 2026-09-01 L13): some proxies/lambdas lowercase
+// the scheme, and the old exact "Bearer " prefix rejected them.
+func bearerCredential(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return strings.TrimSpace(auth)
+}
+
 // lookupKey resolves the presented Bearer key to its whole config entry (not
 // just the label) so per-key policy -- Priority, MaxCompletionTokens -- is
 // available on the request path. Same constant-time scan of every stored
 // digest as before, and it deliberately does NOT break early on a match so
 // the comparison count stays independent of which key was presented.
 func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
-	auth := r.Header.Get("Authorization")
-	key := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	key := bearerCredential(r)
 	if key == "" {
 		return gwKey{}, false
 	}
@@ -1115,10 +1151,22 @@ func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	g.healthMu.Lock()
-	if g.healthAt.IsZero() || time.Since(g.healthAt) >= healthCacheTTL {
-		g.healthLast = g.probeHealth(r)
+	fresh := !g.healthAt.IsZero() && time.Since(g.healthAt) < healthCacheTTL
+	g.healthMu.Unlock()
+	if !fresh {
+		// Probe OUTSIDE the lock (2026-09-01 audit L9): the lock used to be
+		// held across the whole <=25s probe, queuing every concurrent /health
+		// GET behind it, and the probe ran on the FIRST requester's context —
+		// that client disconnecting mid-probe cached a failure for everyone.
+		// Concurrent refresher GETs may each probe once; the last write wins
+		// and the cache means at most a handful of 1-token probes per TTL.
+		res := g.probeHealth(r)
+		g.healthMu.Lock()
+		g.healthLast = res
 		g.healthAt = time.Now()
+		g.healthMu.Unlock()
 	}
+	g.healthMu.Lock()
 	res := g.healthLast
 	g.healthMu.Unlock()
 	w.WriteHeader(res.code)
@@ -1166,7 +1214,9 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	// confusion the LB and watchdog probe timeouts had to be raised for.
 	// 600s ResponseHeaderTimeout is the real bound; 25s just avoids
 	// crying wolf, matching oaicalb's probe_timeout_sec.
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	// Background context, NOT the requester's (audit L9): a monitor that
+	// disconnects must not fail the shared cached result for everyone.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	// Deliberately still ONE probe, of models[0] on its own upstream: the
 	// gateway is "up" if the primary model serves. Probing every backend
@@ -1269,7 +1319,12 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 	}
 	g.ledgerMu.Lock()
 	if g.ledger != nil {
-		g.ledger.Write(append(b, '\n'))
+		if _, err := g.ledger.Write(append(b, '\n')); err != nil {
+		// Audit L14: a silent failure here silently loses billing rows
+		// (disk full, fd closed). One log line per failure is cheap; the
+		// request still serves.
+		log.Printf("ledger write failed: %v", err)
+	}
 	}
 	g.ledgerMu.Unlock()
 
@@ -1364,7 +1419,15 @@ func (u *usageRecorder) WriteHeader(code int) {
 func (u *usageRecorder) Write(p []byte) (int, error) {
 	n, err := u.ResponseWriter.Write(p)
 	if u.stream {
-		u.scanSSE(p)
+		// Cap the partial-line buffer (2026-09-01 audit M5): a wedged
+		// upstream emitting one endless SSE line with no newline would grow
+		// tail without limit and OOM the gateway. scanSSE keeps parsing
+		// whatever fits — past the cap usage extraction from an overlong
+		// line is abandoned, but the include_usage close-up chunk is on its
+		// own line anyway.
+		if u.tail.Len() < 1<<20 {
+			u.scanSSE(p)
+		}
 	} else if u.body.Len() < 4<<20 {
 		u.body.Write(p)
 	}
@@ -1421,24 +1484,20 @@ func (u *usageRecorder) finish() {
 
 func newRequestID() string {
 	var b [12]byte
-	if _, err := io.ReadFull(randReader, b[:]); err != nil {
+	// crypto/rand, not /dev/urandom-by-hand (2026-09-01 audit L10): the old
+	// fallback on open failure read an empty string, making every request id
+	// a collidable UnixNano. crypto/rand has no such failure mode (panics
+	// only if the OS CSPRNG is irrecoverably broken).
+	if _, err := rand.Read(b[:]); err != nil {
 		return fmt.Sprintf("req_%d", time.Now().UnixNano())
 	}
 	return "req_" + hex.EncodeToString(b[:])
 }
 
-var randReader = mustRand()
-
 // processStart is the fallback "created" timestamp for /models entries.
 var processStart = time.Now().Unix()
 
-func mustRand() io.Reader {
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
-		return bufio.NewReader(strings.NewReader(""))
-	}
-	return f
-}
+
 
 // completionHandler is the metered proxy path for /v1/chat/completions and
 // /v1/completions. It reads the (capped) body once to: validate the model id
@@ -1546,10 +1605,19 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	modelID, _ := req["model"].(string)
 	g.mu.RLock()
 	m, ok := g.byID[modelID]
-	// Route to the model's own backend when it declares one; models
-	// without upstream_addr keep hitting the default proxy.
-	proxy := g.proxies[m.upstreamAddr(g.cfg.UpstreamAddr)]
-	if proxy == nil {
+	// Route to the model's own backend when it declares one. A model WITH a
+	// distinct upstream_addr whose proxy is missing (config/reload skew,
+	// audit 2026-09-01 L11) is a 503, not a silent fallback: the default
+	// upstream may not host that upstream_id at all, and quietly forwarding
+	// hides the skew behind a confusing "model not supported" from the wrong
+	// backend.
+	proxy, proxyOK := g.proxies[m.upstreamAddr(g.cfg.UpstreamAddr)]
+	if !proxyOK {
+		if m.upstreamAddr(g.cfg.UpstreamAddr) != g.cfg.UpstreamAddr {
+			g.mu.RUnlock()
+			writeErr(w, http.StatusServiceUnavailable, "server_error", "model upstream unavailable")
+			return
+		}
 		proxy = g.proxy
 	}
 	threshold := g.largeContextThreshold
@@ -1576,8 +1644,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// (several conversations from one key share a bucket) but still far
 	// closer to reality than chars/4, and the sanity bounds in
 	// promptCalibrator.record catch a mismatched pairing.
-	calibKey := r.Header.Get("X-Session-Id")
-	if calibKey == "" {
+	// L8 (2026-09-01 audit): always namespace by the caller's key label —
+	// X-Session-Id is client-controlled, and an un-namespaced map let one
+	// valid key spray unique ids to evict every other key's calibrated
+	// sessions. Same label+model fallback as before when no session header.
+	calibKey := label + "\x00" + r.Header.Get("X-Session-Id")
+	if r.Header.Get("X-Session-Id") == "" {
 		calibKey = label + "\x00" + modelID
 	}
 	// Admission control for large-context requests — see
@@ -1949,9 +2021,18 @@ func (c *entitlementCache) check(label string) (allowed bool, reason string, ove
 		return e.allowed, e.reason, e.overage
 	}
 
-	allowed, reason, overage = c.fetchAndDecide(label)
+	allowed, reason, overage, authoritative := c.fetchAndDecide(label)
 	c.mu.Lock()
-	c.entries[label] = entitlementCacheEntry{allowed: allowed, reason: reason, overage: overage, fetchedAt: time.Now()}
+	// A DEGRADED decision (meterhub unreachable) must not stick for the full
+	// TTL (2026-09-01 security audit M6): in fail-open mode that was a
+	// ttl-long billing bypass per key after recovery; in fail-closed mode it
+	// refused real traffic for the same window. Degraded entries get a 5s
+	// TTL so the next request re-probes meterhub.
+	fetchedAt := time.Now()
+	if !authoritative {
+		fetchedAt = fetchedAt.Add(-c.ttl).Add(5 * time.Second)
+	}
+	c.entries[label] = entitlementCacheEntry{allowed: allowed, reason: reason, overage: overage, fetchedAt: fetchedAt}
 	c.mu.Unlock()
 	return allowed, reason, overage
 }
@@ -1960,10 +2041,13 @@ func (c *entitlementCache) check(label string) (allowed bool, reason string, ove
 // applies the fail-open/fail-closed policy. Never blocks longer than the
 // client's 3s timeout — a slow or unreachable meterhub degrades to
 // whatever failOpen says, it never hangs the request.
-func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool) {
+// The 4th return, authoritative, is false when the answer came from a
+// DEGRADED path (meterhub unreachable / malformed response) rather than an
+// actual subscriber lookup — check() caches those for only 5s (see its doc).
+func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool, bool) {
 	req, err := http.NewRequest(http.MethodGet, c.addr+"/subscribers/get?key="+url.QueryEscape(label), nil)
 	if err != nil {
-		return c.failOpen, "entitlement check unavailable", false
+		return c.failOpen, "entitlement check unavailable", false, false
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -1971,25 +2055,25 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if c.failOpen {
-			return true, "", false
+			return true, "", false, false
 		}
-		return false, "entitlement service unreachable", false
+		return false, "entitlement service unreachable", false, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		if c.failOpen {
-			return true, "", false
+			return true, "", false, false
 		}
-		return false, "entitlement check failed", false
+		return false, "entitlement check failed", false, false
 	}
 	var s struct {
 		Status string `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		if c.failOpen {
-			return true, "", false
+			return true, "", false, false
 		}
-		return false, "entitlement check failed", false
+		return false, "entitlement check failed", false, false
 	}
 	switch s.Status {
 	case "active", "past_due":
@@ -2001,18 +2085,18 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool) {
 		// anyway", never "was blocked for an unrelated reason".
 		overage := c.overageBilling && strings.HasPrefix(reason, "rate limit:")
 		if overage {
-			return true, reason, true
+			return true, reason, true, true
 		}
-		return allowed, reason, false
+		return allowed, reason, false, true
 	case "canceled":
-		return false, "subscription canceled", false
+		return false, "subscription canceled", false, true
 	case "suspended":
-		return false, "account suspended", false
+		return false, "account suspended", false, true
 	default: // "unknown" — no subscriber record at all
 		if c.failOpen {
-			return true, "", false
+			return true, "", false, false
 		}
-		return false, "no active subscription for this key", false
+		return false, "no active subscription for this key", false, true
 	}
 }
 

@@ -185,7 +185,11 @@ func (g *gateway) pullEntry(model string) (gwPullEntry, bool) {
 // "wrong license" (the client renders different advice for each).
 func (g *gateway) licenseLabel(r *http.Request) (label string, presentedKey bool) {
 	auth := r.Header.Get("Authorization")
-	key := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	// Case-insensitive scheme (audit L13), matching bearerCredential.
+	key := strings.TrimSpace(auth)
+	if len(key) >= 7 && strings.EqualFold(key[:7], "Bearer ") {
+		key = strings.TrimSpace(key[7:])
+	}
 	if key == "" {
 		return "", false
 	}
@@ -300,6 +304,13 @@ func (g *gateway) manifestHandler(w http.ResponseWriter, r *http.Request) {
 // requests work: a pull is a multi-gigabyte download over a link that may
 // drop, and resuming from a byte offset beats restarting from zero.
 // Also not metered/ledgered — see manifestHandler.
+// pullStreamSem caps concurrent /v1/pull body streams (audit 2026-09-01
+// M7): a multi-GB file to a deliberately slow client held a goroutine +
+// connection indefinitely, with unbounded concurrency on a Cloudflare-exposed
+// port. 4 concurrent streams saturates any reasonable client link without
+// starving a legit CLI pull; further requests get 429 and retry.
+var pullStreamSem = make(chan struct{}, 4)
+
 func (g *gateway) pullHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writePullErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
@@ -340,6 +351,15 @@ func (g *gateway) pullHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	select {
+	case pullStreamSem <- struct{}{}:
+		defer func() { <-pullStreamSem }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writePullErr(w, http.StatusTooManyRequests, "pull_busy",
+			"too many concurrent downloads; retry shortly")
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// ServeContent sets Content-Length (or Content-Range for a Range
 	// request) and handles 206/416 for us.

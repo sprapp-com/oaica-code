@@ -70,36 +70,6 @@ func RunNative(args []string) error {
 	return cmd.Run()
 }
 
-// userRemoteEnvVars builds the Claude Code environment for a user-defined
-// remote model. The auth token is the REMOTE's key (not the OAICA key), the
-// model env vars pin to the bare upstream id, and ANTHROPIC_BASE_URL points
-// at the local Anthropic↔OpenAI translation proxy. sonnetModel is normally
-// equal to bareModel (single-model launch, byte-identical to before tier
-// splitting existed); when --sonnet-model gives a different bare id,
-// ANTHROPIC_DEFAULT_SONNET_MODEL/CLAUDE_CODE_SUBAGENT_MODEL point at it
-// instead, so Claude Code's opusplan mode (Opus plans, Sonnet executes) and
-// its normal per-tier calls resolve to two different upstream models through
-// the SAME remote/proxy (the proxy honors whichever model each request
-// carries — see anthReq.Model handling in anthropic_openai_proxy.go).
-func (c *Claude) userRemoteEnvVars(remote userRemote, bareModel, sonnetModel, anthropicBaseURL string) []string {
-	env := []string{
-		"ANTHROPIC_BASE_URL=" + anthropicBaseURL,
-		"ANTHROPIC_API_KEY=",
-		"ANTHROPIC_AUTH_TOKEN=" + remote.key(),
-		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
-		"DISABLE_ERROR_REPORTING=1",
-		"DISABLE_FEEDBACK_COMMAND=1",
-		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
-		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + bareModel,
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + sonnetModel,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + bareModel,
-		"CLAUDE_CODE_SUBAGENT_MODEL=" + sonnetModel,
-		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
-		"CLAUDE_CODE_AUTO_MODE_MODEL=" + bareModel,
-	}
-	return env
-}
-
 // nativeClaudePickerModels are the "claude/<alias>" picker entries: they run
 // the REAL Claude Code binary with a clean environment (RunNative below) so
 // Claude Code uses its own /login (Anthropic subscription) — or a plain
@@ -171,44 +141,6 @@ func hasClaudeModelFlag(args []string) bool {
 	return false
 }
 
-func (c *Claude) envVars(model, anthropicBaseURL string) []string {
-	// THIS WAS THE REAL BUG (found via a live user repro that persisted
-	// through multiple other fixes): envconfig.Host() reads OLLAMA_HOST,
-	// defaulting to 127.0.0.1:11434 — a REAL, unrelated local Ollama
-	// server that happens to be running on this box (different models
-	// entirely: qwen2.5:7b, nanbeige-ternary, ...). Every prior fix
-	// (router-side Jinja crash, Auto-mode disable) was real and necessary
-	// but couldn't matter — Claude Code was never even reaching our OAICA
-	// router. Confirmed by direct curl: 127.0.0.1:11434 has no "flashplan"
-	// model, producing the exact "model 'flashplan' not found" error seen
-	// in the user's debug logs. Use oaicaLaunchHost()/OAICA_API_KEY (this
-	// package's own OAICA client, matching cmd/oaica_client.go's
-	// equivalents) instead — the actual router this whole fork exists to
-	// route through.
-	//
-	// oaicaResolveHostForModel — routes to a locally running `oaica serve`
-	// ONLY when the caller picked the explicit "<model>:local" entry
-	// (bare name always means cloud now, see oaicaLocalTagSuffix's doc).
-	// Explicit OAICA_HOST still overrides both. The bare model name (tag
-	// stripped) is what actually goes to the backend from here on — the
-	// tag is a picker-selection detail, the local llama-server/cloud
-	// router should never see it.
-	bareModel, _ := oaicaStripLocalTag(model)
-
-	env := []string{
-		"ANTHROPIC_BASE_URL=" + anthropicBaseURL,
-		"ANTHROPIC_API_KEY=",
-		"ANTHROPIC_AUTH_TOKEN=" + oaicaLaunchAPIKeyForEnv(),
-		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
-		"DISABLE_ERROR_REPORTING=1",
-		"DISABLE_FEEDBACK_COMMAND=1",
-		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
-	}
-
-	env = append(env, c.modelEnvVars(bareModel)...)
-	return env
-}
-
 func ensureClaudeInstalled() (string, error) {
 	if path, err := (&Claude{}).findPath(); err == nil {
 		return path, nil
@@ -247,6 +179,7 @@ func ensureClaudeInstalled() (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to install claude: %w", err)
 	}
+	os.Remove(args[len(args)-1]) // fetched installer temp file
 
 	path, err := (&Claude{}).findPath()
 	if err != nil {
@@ -289,10 +222,13 @@ func claudeInstallerCommand(goos string) (string, []string, error) {
 			"irm https://claude.ai/install.ps1 | iex",
 		}, nil
 	case "darwin", "linux":
-		return "bash", []string{
-			"-c",
-			"curl -fsSL https://claude.ai/install.sh | bash",
-		}, nil
+		// Verified-download flow (audit L3): fetch to a temp file, check any
+		// SHA-256 pin, then execute the file — never pipe straight into bash.
+		path, err := fetchInstallerScriptFn("https://claude.ai/install.sh")
+		if err != nil {
+			return "", nil, err
+		}
+		return "bash", []string{path}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported platform for claude install: %s", goos)
 	}

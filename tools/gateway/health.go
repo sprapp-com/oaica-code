@@ -35,14 +35,25 @@ type upstreamProbe struct {
 	health bool
 }
 
+// probeFlight is the single-flight ticket for an in-flight upstream probe.
+type probeFlight struct {
+	done chan struct{}
+}
+
 var upstreamProbes struct {
 	sync.Mutex
-	m map[string]upstreamProbe
+	m       map[string]upstreamProbe
+	flights map[string]*probeFlight
 }
 
 // probeUpstreamHealth answers whether addr is serving right now: a real
 // 1-token chat completion against the first model bound to it, with the
 // gateway's upstream credential. Cached probeTTL per address.
+//
+// Single-flight (2026-09-01 audit M3): the check-then-probe gap let N
+// concurrent /v1/models requests on TTL expiry all fire a real (billable)
+// completion at the upstream simultaneously. The in-flight map pins one
+// probe per address; every other caller waits and shares the result.
 func (g *gateway) probeUpstreamHealth(addr, upstreamID string) bool {
 	now := time.Now()
 	upstreamProbes.Lock()
@@ -53,13 +64,31 @@ func (g *gateway) probeUpstreamHealth(addr, upstreamID string) bool {
 		upstreamProbes.Unlock()
 		return p.health
 	}
+	// Another probe for this addr is already in flight: wait for it and
+	// share its result (single-flight, 2026-09-01 audit M3 — the old
+	// check-then-probe gap fired N real billable completions on TTL expiry).
+	if upstreamProbes.flights == nil {
+		upstreamProbes.flights = map[string]*probeFlight{}
+	}
+	if existing, ok := upstreamProbes.flights[addr]; ok {
+		upstreamProbes.Unlock()
+		<-existing.done
+		upstreamProbes.Lock()
+		p := upstreamProbes.m[addr]
+		upstreamProbes.Unlock()
+		return p.health
+	}
+	flight := &probeFlight{done: make(chan struct{})}
+	upstreamProbes.flights[addr] = flight
 	upstreamProbes.Unlock()
 
 	healthy := g.probeUpstreamHealthUncached(addr, upstreamID)
 
 	upstreamProbes.Lock()
-	upstreamProbes.m[addr] = upstreamProbe{at: now, health: healthy}
+	upstreamProbes.m[addr] = upstreamProbe{at: time.Now(), health: healthy}
+	delete(upstreamProbes.flights, addr)
 	upstreamProbes.Unlock()
+	close(flight.done)
 	return healthy
 }
 

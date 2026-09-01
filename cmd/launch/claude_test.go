@@ -177,12 +177,19 @@ func TestEnsureClaudeInstalled(t *testing.T) {
 		t.Setenv("PATH", tmpDir)
 
 		writeFakeBinary(t, tmpDir, "curl")
+		// Verified-download flow: the "downloaded installer" is a stubbed
+		// temp-file path; the fake bash creates the binary on any invocation.
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpDir, "claude-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
 
 		installLog := filepath.Join(tmpDir, "bash.log")
 		installedClaude := filepath.Join(homeDir, ".local", "bin", "claude")
 		bashScript := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
-if [ "$1" = "-c" ]; then
+if [ -n "$1" ]; then
   /bin/mkdir -p %q
   /bin/cat > %q <<'EOS'
 #!/bin/sh
@@ -212,8 +219,8 @@ exit 0
 		if err != nil {
 			t.Fatalf("failed to read install log: %v", err)
 		}
-		if !strings.Contains(string(logData), "https://claude.ai/install.sh") {
-			t.Fatalf("expected install.sh command in log, got:\n%s", string(logData))
+		if !strings.Contains(string(logData), "claude-install.sh") {
+			t.Fatalf("expected downloaded installer invocation in log, got:\n%s", string(logData))
 		}
 	})
 
@@ -226,6 +233,11 @@ exit 0
 		tmpDir := t.TempDir()
 		t.Setenv("PATH", tmpDir)
 		writeFakeBinary(t, tmpDir, "curl")
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpDir, "claude-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
 		if err := os.WriteFile(filepath.Join(tmpDir, "bash"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatalf("failed to write fake bash: %v", err)
 		}
@@ -263,13 +275,15 @@ func TestClaudeInstallerCommand(t *testing.T) {
 			name:    "unix",
 			goos:    "linux",
 			wantBin: "bash",
-			want:    "curl -fsSL https://claude.ai/install.sh | bash",
+			// Verified-download flow: the fetched temp-file path (stubbed),
+			// not a curl|bash one-liner.
+			want: stubInstallerPath,
 		},
 		{
 			name:    "macos",
 			goos:    "darwin",
 			wantBin: "bash",
-			want:    "curl -fsSL https://claude.ai/install.sh | bash",
+			want:    stubInstallerPath,
 		},
 		{
 			name:    "windows",
@@ -286,6 +300,8 @@ func TestClaudeInstallerCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			restore := stubFetchInstallerScript(t)
+			defer restore()
 			bin, args, err := claudeInstallerCommand(tt.goos)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
@@ -333,53 +349,10 @@ func TestClaudeArgs(t *testing.T) {
 	}
 }
 
-func TestClaudeEnvVars(t *testing.T) {
-	c := &Claude{}
-
-	envMap := func(envs []string) map[string]string {
-		m := make(map[string]string)
-		for _, e := range envs {
-			k, v, _ := strings.Cut(e, "=")
-			m[k] = v
-		}
-		return m
-	}
-
-	// envVars takes the resolved ANTHROPIC_BASE_URL as an explicit
-	// parameter now (Run() routes it through a local logging proxy first,
-	// see request_log.go) rather than resolving it internally via
-	// envconfig.Host() — that was the real "flashplan not found" bug
-	// (OLLAMA_HOST default 127.0.0.1:11434, an unrelated real local
-	// Ollama server), fixed in commit 7530c3d5. ANTHROPIC_AUTH_TOKEN
-	// comes from oaicaLaunchAPIKeyForEnv() (OAICA_API_KEY env, falling
-	// back to ~/.oaica/api_key) — no OAICA key configured in this test
-	// environment, so it's expected empty, not the old hardcoded "ollama".
-	got := envMap(c.envVars("llama3.2", "http://127.0.0.1:9999"))
-	for key, want := range map[string]string{
-		"ANTHROPIC_BASE_URL":                  "http://127.0.0.1:9999",
-		"ANTHROPIC_API_KEY":                   "",
-		"ANTHROPIC_AUTH_TOKEN":                oaicaLaunchAPIKeyForEnv(),
-		"CLAUDE_CODE_ATTRIBUTION_HEADER":      "0",
-		"DISABLE_ERROR_REPORTING":             "1",
-		"DISABLE_FEEDBACK_COMMAND":            "1",
-		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
-		"ANTHROPIC_DEFAULT_OPUS_MODEL":        "llama3.2",
-		"ANTHROPIC_DEFAULT_SONNET_MODEL":      "llama3.2",
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL":       "llama3.2",
-		"CLAUDE_CODE_SUBAGENT_MODEL":          "llama3.2",
-	} {
-		if got[key] != want {
-			t.Errorf("%s = %q, want %q", key, got[key], want)
-		}
-	}
-
-	// Both variables disable Claude Code feature-flag evaluation, which keeps Channels unavailable.
-	for _, key := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY"} {
-		if _, ok := got[key]; ok {
-			t.Errorf("%s must not be set by Ollama", key)
-		}
-	}
-}
+// TestClaudeEnvVars removed: the Claude.envVars method was deleted
+// (audit M1 — it built an env containing real credentials). The child
+// environment now comes from tierPlan.envVars (tier_routing.go), covered
+// by tier_routing_test.go, and Claude.modelEnvVars, covered below.
 
 func TestClaudeModelEnvVars(t *testing.T) {
 	c := &Claude{}

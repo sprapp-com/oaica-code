@@ -403,7 +403,7 @@ func (b *anthropicBridge) finalize() {
 			writeAnthropicErrorVal(b.ResponseWriter, b.errStatus, oe.Error)
 			return
 		}
-		writeAnthropicErr(b.ResponseWriter, b.errStatus, "api_error", strings.TrimSpace(b.errBody.String()))
+		writeAnthropicErr(b.ResponseWriter, b.errStatus, "api_error", redactCredentialURLs(strings.TrimSpace(b.errBody.String())))
 		return
 	}
 	// Non-stream success: translate the buffered OpenAI completion.
@@ -464,7 +464,14 @@ func (b *anthropicBridge) finalize() {
 // arrive. Chunk shapes handled: delta.content, delta.reasoning,
 // delta.tool_calls fragments, finish_reason, the trailing usage-only chunk.
 func (b *anthropicBridge) writeStream(p []byte) (int, error) {
-	b.sse.tail.Write(p)
+	// Cap the partial-line buffer (2026-09-01 audit M5): an upstream
+	// emitting one endless SSE line would otherwise grow tail unboundedly.
+	// Past the cap the remaining line is dropped — its deltas were already
+	// forwarded; only usage extraction from a hypothetical later segment of
+	// the same line is lost.
+	if b.sse.tail.Len() < 1<<20 {
+		b.sse.tail.Write(p)
+	}
 	for {
 		raw := b.sse.tail.Bytes()
 		i := bytes.IndexByte(raw, '\n')
@@ -659,10 +666,6 @@ type openAICompletion struct {
 }
 
 // str reads a string field defensively.
-func str(m map[string]any) string {
-	s, _ := m["model"].(string)
-	return s
-}
 
 // readCappedBody reads the request body with the same cap the OpenAI path
 // enforces, writing the Anthropic-shaped error on failure.

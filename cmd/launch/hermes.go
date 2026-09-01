@@ -410,7 +410,9 @@ func (h *Hermes) runInstallScript() error {
 	if hermesGOOS == "windows" {
 		return hermesAttachedCommand("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", hermesWindowsInstallCmd).Run()
 	}
-	return hermesAttachedCommand("bash", "-lc", hermesInstallScript).Run()
+	// Verified-download flow (audit L3): fetch + SHA-pin check, then execute
+	// the downloaded file instead of piping curl straight into bash.
+	return runInstallerScriptFn("https://hermes-agent.nousresearch.com/install.sh", "--skip-setup")
 }
 
 func (h *Hermes) listModels(defaultModel string) []string {

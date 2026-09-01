@@ -136,7 +136,11 @@ func openCodeInstallerCommand(goos string) (string, []string, error) {
 	case "windows":
 		return "npm", []string{"install", "-g", "opencode-ai@latest"}, nil
 	case "darwin", "linux":
-		return "bash", []string{"-c", "set -o pipefail; " + openCodeInstallScript}, nil
+		path, err := fetchInstallerScriptFn("https://opencode.ai/install")
+		if err != nil {
+			return "", nil, err
+		}
+		return "bash", []string{path}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported platform for opencode install: %s", goos)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -1406,6 +1407,15 @@ func TestHermesEnsureInstalledUnixPromptsBeforeInstall(t *testing.T) {
 
 	writeScript("curl", "#!/bin/sh\nexit 0\n")
 	writeScript("git", "#!/bin/sh\nexit 0\n")
+	// Verified-download flow (audit L3): the installer fetch is stubbed to a
+	// local path — no network in tests — and the fake bash below logs the
+	// invocation (the downloaded path + --skip-setup).
+	oldRun := runInstallerScriptFn
+	runInstallerScriptFn = func(url string, args ...string) error {
+		full := append([]string{filepath.Join(tmpDir, "hermes-install.sh")}, args...)
+		return exec.Command(filepath.Join(tmpDir, "bash"), full...).Run()
+	}
+	t.Cleanup(func() { runInstallerScriptFn = oldRun })
 	writeScript("bash", fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 /bin/cat > %q <<'EOS'
@@ -1435,8 +1445,8 @@ exit 0
 	if !strings.Contains(string(data), "--skip-setup") {
 		t.Fatalf("expected install script to skip upstream setup, got logs:\n%s", data)
 	}
-	if !strings.Contains(string(data), "-lc "+hermesInstallScript) {
-		t.Fatalf("expected official install script invocation, got logs:\n%s", data)
+	if !strings.Contains(string(data), "hermes-install.sh --skip-setup") {
+		t.Fatalf("expected verified-download installer invocation, got logs:\n%s", data)
 	}
 }
 

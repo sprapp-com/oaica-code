@@ -57,7 +57,10 @@ var museGOOS = runtime.GOOS
 
 // museInstallCommand runs Meta's official installer, which places the muse
 // launcher in ~/.local/bin and downloads the matching binary next to it.
-var museInstallCommand = []string{"bash", "-c", "curl -fsSL https://dev.meta.ai/install.sh | bash"}
+// museInstallCommand overrides the install invocation for tests. When nil
+// (production), ensureMuseInstalled uses the verified-download helper
+// (installer_dl.go) instead of piping Meta's installer into bash.
+var museInstallCommand []string
 
 // ensureMuseInstalled returns the muse binary path, offering to run the
 // official installer when it is missing and verifying the binary afterward.
@@ -75,12 +78,18 @@ func ensureMuseInstalled() (string, error) {
 	}
 
 	fmt.Fprintf(os.Stderr, "\nInstalling Muse...\n")
-	cmd := exec.Command(museInstallCommand[0], museInstallCommand[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("muse installation failed: %w", err)
+	if museInstallCommand == nil {
+		if err := runInstallerScriptFn("https://dev.meta.ai/install.sh"); err != nil {
+			return "", fmt.Errorf("failed to install muse: %w", err)
+		}
+	} else {
+		cmd := exec.Command(museInstallCommand[0], museInstallCommand[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("muse installation failed: %w", err)
+		}
 	}
 
 	path, err := findMuse()

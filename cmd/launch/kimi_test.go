@@ -449,12 +449,19 @@ func TestEnsureKimiInstalled(t *testing.T) {
 		kimiGOOS = "linux"
 
 		writeFakeBinary(t, tmpDir, "curl")
+		// Verified-download flow: stub the fetch; fake bash creates the
+		// binary on any invocation.
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpDir, "kimi-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
 
 		installLog := filepath.Join(tmpDir, "bash.log")
 		kimiPath := filepath.Join(tmpDir, "kimi")
 		bashScript := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
-if [ "$1" = "-c" ]; then
+if [ -n "$1" ]; then
   /bin/cat > %q <<'EOS'
 #!/bin/sh
 exit 0
@@ -481,8 +488,8 @@ exit 0
 		if err != nil {
 			t.Fatalf("failed to read install log: %v", err)
 		}
-		if !strings.Contains(string(logData), "https://code.kimi.com/install.sh") {
-			t.Fatalf("expected install.sh command in log, got:\n%s", string(logData))
+		if !strings.Contains(string(logData), "kimi-install.sh") {
+			t.Fatalf("expected downloaded installer invocation in log, got:\n%s", string(logData))
 		}
 	})
 
@@ -499,9 +506,15 @@ exit 0
 		kimiGOOS = "linux"
 		writeFakeBinary(t, tmpBin, "curl")
 
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpBin, "kimi-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+
 		installedKimi := filepath.Join(homeDir, ".local", "bin", "kimi")
 		bashScript := fmt.Sprintf(`#!/bin/sh
-if [ "$1" = "-c" ]; then
+if [ -n "$1" ]; then
   /bin/mkdir -p %q
   /bin/cat > %q <<'EOS'
 #!/bin/sh
@@ -589,13 +602,13 @@ func TestKimiInstallerCommand(t *testing.T) {
 			name:      "linux",
 			goos:      "linux",
 			wantBin:   "bash",
-			wantParts: []string{"-c", "install.sh"},
+			wantParts: []string{stubInstallerPath},
 		},
 		{
 			name:      "darwin",
 			goos:      "darwin",
 			wantBin:   "bash",
-			wantParts: []string{"-c", "install.sh"},
+			wantParts: []string{stubInstallerPath},
 		},
 		{
 			name:      "windows",
@@ -612,6 +625,8 @@ func TestKimiInstallerCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			restore := stubFetchInstallerScript(t)
+			defer restore()
 			bin, args, err := kimiInstallerCommand(tt.goos)
 			if tt.wantErr {
 				if err == nil {

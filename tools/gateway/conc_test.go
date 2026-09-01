@@ -85,7 +85,14 @@ func TestKeyConcurrent_ZeroIsUnlimited(t *testing.T) {
 // request wall-clock cap: gwConfig.RequestTimeoutSec
 func TestRequestTimeout_SluggishUpstreamAborted(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done() // hang until the gateway's deadline kills it
+		// Hang until the gateway's deadline kills the upstream connection —
+		// but never forever: select with a floor so the deferred
+		// upstream.Close() can't deadlock the test run when the
+		// cancellation doesn't propagate (observed flake 2026-09-02).
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
 	}))
 	defer upstream.Close()
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")

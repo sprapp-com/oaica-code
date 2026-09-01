@@ -459,11 +459,19 @@ func TestEnsureOpenCodeInstalled(t *testing.T) {
 		openCodeGOOS = "linux"
 		writeFakeBinary(t, tmpDir, "curl")
 
+		// Verified-download flow: stub the fetch; fake bash creates the
+		// binary on any invocation.
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpDir, "opencode-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+
 		installLog := filepath.Join(tmpDir, "bash.log")
 		opencodePath := filepath.Join(homeDir, ".opencode", "bin", "opencode")
 		bashScript := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
-if [ "$1" = "-c" ]; then
+if [ -n "$1" ]; then
   /bin/mkdir -p %q
   /bin/cat > %q <<'EOS'
 #!/bin/sh
@@ -493,8 +501,8 @@ exit 0
 		if err != nil {
 			t.Fatalf("failed to read install log: %v", err)
 		}
-		if !strings.Contains(string(logData), openCodeInstallScript) {
-			t.Fatalf("expected opencode install script in log, got:\n%s", string(logData))
+		if !strings.Contains(string(logData), "opencode-install.sh") {
+			t.Fatalf("expected verified-download installer path in log, got:\n%s", string(logData))
 		}
 	})
 
@@ -583,13 +591,13 @@ func TestOpenCodeInstallerCommand(t *testing.T) {
 			name:      "linux",
 			goos:      "linux",
 			wantBin:   "bash",
-			wantParts: []string{"-c", "set -o pipefail", "https://opencode.ai/install"},
+			wantParts: []string{stubInstallerPath},
 		},
 		{
 			name:      "darwin",
 			goos:      "darwin",
 			wantBin:   "bash",
-			wantParts: []string{"-c", "set -o pipefail", "https://opencode.ai/install"},
+			wantParts: []string{stubInstallerPath},
 		},
 		{
 			name:      "windows",
@@ -606,6 +614,8 @@ func TestOpenCodeInstallerCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			restore := stubFetchInstallerScript(t)
+			defer restore()
 			bin, args, err := openCodeInstallerCommand(tt.goos)
 			if tt.wantErr {
 				if err == nil {

@@ -136,7 +136,11 @@ func RunLocalNormalizingProxy(listenPort, backendPort int) error {
 func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey string) error {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", backendPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if apiKey != "" && r.URL.Path != "/health" {
+		// /health stays unauthenticated ONLY on a loopback bind — on a
+		// network-facing bind (0.0.0.0) it is behind the same bearer check
+		// as everything else, so it leaks nothing (liveness, backend
+		// presence) to off-box scanners (audit L2).
+		if apiKey != "" && (r.URL.Path != "/health" || !isLoopbackBind(bindHost)) {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(apiKey)) != 1 {
 				w.Header().Set("content-type", "application/json")
@@ -184,4 +188,13 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 		return err
 	}
 	return http.Serve(ln, handler)
+}
+
+// isLoopbackBind reports whether bindHost is a loopback-only bind.
+func isLoopbackBind(bindHost string) bool {
+	switch bindHost {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
 }

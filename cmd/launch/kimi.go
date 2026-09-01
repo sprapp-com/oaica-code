@@ -295,6 +295,7 @@ func ensureKimiInstalled() (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to install kimi: %w", err)
 	}
+	os.Remove(args[len(args)-1]) // fetched installer temp file
 
 	path, err := findKimiBinary()
 	if err != nil {
@@ -337,10 +338,11 @@ func kimiInstallerCommand(goos string) (string, []string, error) {
 			"Invoke-RestMethod https://code.kimi.com/install.ps1 | Invoke-Expression",
 		}, nil
 	case "darwin", "linux":
-		return "bash", []string{
-			"-c",
-			"curl -LsSf https://code.kimi.com/install.sh | bash",
-		}, nil
+		path, err := fetchInstallerScriptFn("https://code.kimi.com/install.sh")
+		if err != nil {
+			return "", nil, err
+		}
+		return "bash", []string{path}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported platform for kimi install: %s", goos)
 	}
