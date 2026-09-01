@@ -269,3 +269,29 @@ func TestProxyRoutes_PerModelUpstream(t *testing.T) {
 		t.Fatalf("upstream B saw %+v", b)
 	}
 }
+
+func TestProxyMapsUnpinnedAnthropicIdsToDefault(t *testing.T) {
+	// Claude Code's background calls send real Anthropic ids (claude-haiku-4-5-20251001)
+	// regardless of ANTHROPIC_DEFAULT_HAIKU_MODEL; they must ride the default
+	// leg's upstream id instead of 404ing at the backend, while ordinary
+	// unknown ids keep forwarding (single-remote tier split depends on it).
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: "http://up/v1", UpstreamModel: "primary-id", Label: "default"},
+		Policy:  RouteLocalFirst,
+	}
+	cases := map[string]string{
+		"claude-haiku-4-5-20251001": "primary-id",
+		"claude-3-5-haiku-latest":   "primary-id",
+		"muse-spark-1.2":            "muse-spark-1.2", // passthrough preserved
+		"":                          "primary-id",
+	}
+	for req, want := range cases {
+		route, model := table.resolve(req)
+		if model != want {
+			t.Errorf("resolve(%q) model = %q, want %q", req, model, want)
+		}
+		if route.BaseURL != "http://up/v1" {
+			t.Errorf("resolve(%q) route = %q, want default", req, route.BaseURL)
+		}
+	}
+}

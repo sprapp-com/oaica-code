@@ -721,6 +721,18 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 	if r, ok := t.ByModel[requested]; ok {
 		return r, r.UpstreamModel
 	}
+	// Unknown ids pass through by default — a single-remote tier split
+	// (userRemoteEnvVars: ANTHROPIC_DEFAULT_SONNET_MODEL=<bare id> with NO
+	// ByModel route for it) relies on exactly that.
+	// EXCEPT real Anthropic family ids (claude-haiku-4-5-20251001 etc.):
+	// Claude Code's own background calls (topic detection, title gen) send
+	// those regardless of our ANTHROPIC_DEFAULT_HAIKU_MODEL, and no backend
+	// of ours knows them — forwarding raw made the upstream 404. Map them
+	// onto the default leg instead.
+	if strings.HasPrefix(requested, "claude-") || strings.HasPrefix(requested, "anthropic.") ||
+		requested == "claude" || requested == "haiku" || requested == "opus" || requested == "sonnet" {
+		return t.Default, t.Default.UpstreamModel
+	}
 	return t.Default, requested
 }
 
