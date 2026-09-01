@@ -299,6 +299,9 @@ func pickerPlanItems() []ModelItem {
 			if prof.SonnetModel != "" {
 				parts = append(parts, "sonnet "+prof.SonnetModel)
 			}
+			if prof.HaikuModel != "" {
+				parts = append(parts, "haiku "+prof.HaikuModel)
+			}
 			if prof.OversizeModel != "" {
 				parts = append(parts, "oversize "+prof.OversizeModel)
 			}
