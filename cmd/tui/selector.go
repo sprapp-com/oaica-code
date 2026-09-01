@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -473,6 +474,44 @@ func cursorItemSuffix(item SelectItem) string {
 	return " " + selectorDefaultTagStyle.Render("("+item.AvailabilityBadge+")")
 }
 
+// pinnedSectionCap bounds the rows shown for each pinned (non-"More")
+// section. These sections render fully otherwise, so the 16-row Ollama
+// cloud catalog + Local + OAICA + Remote sections overflow a normal
+// terminal and clip the header (2026-09-01): the picker must fit on
+// screen, with the section's window sliding when the cursor moves into
+// the hidden rows.
+const pinnedSectionCap = 8
+
+// renderSectionRows draws one section's rows as a sliding window of at
+// most cap rows (all rows when the section is short). The window centers
+// on the cursor when the cursor sits in this section, otherwise the top —
+// so arrowing through a long section scrolls that section in place while
+// the others stay anchored, and the cursor row is always on screen.
+// Shared by the single- and multi-select renderers.
+func renderSectionRows(s *strings.Builder, cursor int, filtered []SelectItem, idxs []int, cap int, renderRow func(s *strings.Builder, item SelectItem, idx int)) {
+	if len(idxs) <= cap {
+		for _, idx := range idxs {
+			renderRow(s, filtered[idx], idx)
+		}
+		return
+	}
+	start := 0
+	if pos := slices.Index(idxs, cursor); pos >= 0 {
+		start = min(max(0, pos-(cap-1)), len(idxs)-cap)
+	}
+	if start > 0 {
+		s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... %d above", start)))
+		s.WriteString("\n")
+	}
+	for _, idx := range idxs[start : start+cap] {
+		renderRow(s, filtered[idx], idx)
+	}
+	if below := len(idxs) - start - cap; below > 0 {
+		s.WriteString(selectorMoreStyle.Render(fmt.Sprintf("... %d more", below)))
+		s.WriteString("\n")
+	}
+}
+
 // renderItem draws one row: name only — a description line appears ONLY
 // under the cursor row (opencode-style), so a 40-model menu is a clean
 // name column instead of every row dragging its own blurb along.
@@ -577,9 +616,7 @@ func (m selectorModel) renderContent() string {
 		if len(localItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Local Models"))
 			s.WriteString("\n")
-			for _, idx := range localItems {
-				m.renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, localItems, pinnedSectionCap, m.renderItem)
 			s.WriteString("\n")
 		}
 
@@ -588,27 +625,21 @@ func (m selectorModel) renderContent() string {
 		if len(recItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("OAICA Models"))
 			s.WriteString("\n")
-			for _, idx := range recItems {
-				m.renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, recItems, pinnedSectionCap, m.renderItem)
 			s.WriteString("\n")
 		}
 
 		if len(ollamaItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Ollama (daemon + cloud)"))
 			s.WriteString("\n")
-			for _, idx := range ollamaItems {
-				m.renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, ollamaItems, pinnedSectionCap, m.renderItem)
 			s.WriteString("\n")
 		}
 
 		if len(remoteItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
-			for _, idx := range remoteItems {
-				m.renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, remoteItems, pinnedSectionCap, m.renderItem)
 		}
 
 		if len(otherItems) > 0 {
@@ -616,7 +647,7 @@ func (m selectorModel) renderContent() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(ollamaItems) - len(remoteItems)
+			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
@@ -1266,9 +1297,7 @@ func (m multiSelectorModel) View() string {
 		if len(localItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Local Models"))
 			s.WriteString("\n")
-			for _, idx := range localItems {
-				renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, localItems, pinnedSectionCap, renderItem)
 			s.WriteString("\n")
 		}
 
@@ -1278,27 +1307,21 @@ func (m multiSelectorModel) View() string {
 		if len(recItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("OAICA Models"))
 			s.WriteString("\n")
-			for _, idx := range recItems {
-				renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, recItems, pinnedSectionCap, renderItem)
 			s.WriteString("\n")
 		}
 
 		if len(ollamaItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Ollama (daemon + cloud)"))
 			s.WriteString("\n")
-			for _, idx := range ollamaItems {
-				renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, ollamaItems, pinnedSectionCap, renderItem)
 			s.WriteString("\n")
 		}
 
 		if len(remoteItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
-			for _, idx := range remoteItems {
-				renderItem(&s, filtered[idx], idx)
-			}
+			renderSectionRows(&s, m.cursor, filtered, remoteItems, pinnedSectionCap, renderItem)
 		}
 
 		if len(otherItems) > 0 {
@@ -1306,7 +1329,7 @@ func (m multiSelectorModel) View() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(ollamaItems) - len(remoteItems)
+			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
