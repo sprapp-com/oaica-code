@@ -777,6 +777,12 @@ func (c *launcherClient) launchSingleIntegration(ctx context.Context, name strin
 	// got a 1-model list and the wizard silently collapsed to primary-only.
 	if w, ok := runner.(fullModelChoicesRunner); ok && w.WantsFullModelChoices() {
 		if full, err := c.modelInventory().Load(ctx); err == nil && len(full) > 1 {
+			// OAICA router recommendations lead the wizard's secondary list
+			// and get marked, same as the picker's "OAICA Models" section.
+			recNames := map[string]bool{}
+			for _, rec := range c.recommendations(ctx) {
+				recNames[stripOllamaPickerNames([]string{rec.Name})[0]] = true
+			}
 			// Local daemon models load as picker names ("ollama/<id>") —
 			// strip to the launch vocabulary ("--sonnet-model" et al. take
 			// the bare id), then dedupe.
@@ -794,6 +800,7 @@ func (c *launcherClient) launchSingleIntegration(ctx context.Context, name strin
 				if seenW[m.Name] {
 					continue
 				}
+				m.Recommended = recNames[m.Name]
 				seenW[m.Name] = true
 				stripped = append(stripped, m)
 			}

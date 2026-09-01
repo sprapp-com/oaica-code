@@ -30,6 +30,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -201,10 +203,26 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 
 	if len(names) > 0 {
 		// Step 2 — Sonnet/subagent tier. Same picker vocabulary; "(same as
-		// primary)" first so Enter keeps the single-model launch.
+		// primary)" first so Enter keeps the single-model launch, OAICA
+		// router recommendations lead the rest and are marked (the picker's
+		// "OAICA Models" section order, carried over).
+		recommended := map[string]bool{}
+		for _, m := range models {
+			if m.Recommended {
+				recommended[m.Name] = true
+			}
+		}
 		items := []SelectionItem{{Name: "(same as primary)", Description: "route all tiers to " + primary}}
 		for _, n := range names {
-			if n != primary {
+			if n == primary {
+				continue
+			}
+			if recommended[n] {
+				items = append(items, SelectionItem{Name: n, Description: "(Recommended)"})
+			}
+		}
+		for _, n := range names {
+			if n != primary && !recommended[n] {
 				items = append(items, SelectionItem{Name: n})
 			}
 		}
@@ -299,4 +317,36 @@ func tierWizardPreview(primary string, c tierWizardChoice) string {
 		policy = string(RouteLocalFirst)
 	}
 	return line + " · policy: " + policy
+}
+
+// claudeResumeHint turns Claude Code's bare "No conversation found with
+// session ID" exit into an actionable one-liner: point at the directory the
+// session transcript actually lives in (Claude sessions are per-cwd), or
+// suggest --continue when the id is unknown anywhere on this machine.
+// Best-effort; never masks the child's own error output.
+func claudeResumeHint(err error, args []string) {
+	if err == nil {
+		return
+	}
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+		return
+	}
+	var resumeID string
+	for i, a := range args {
+		if a == "--resume" && i+1 < len(args) {
+			resumeID = args[i+1]
+		}
+	}
+	if resumeID == "" {
+		return
+	}
+	if home, e := os.UserHomeDir(); e == nil {
+		matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", resumeID+".jsonl"))
+		if len(matches) > 0 {
+			dir := filepath.Dir(matches[0])
+			fmt.Fprintf(os.Stderr, "\nresume: session %s lives in %s — launch claude from that directory (or use --continue there)\n", resumeID, dir)
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\nresume: no session %s exists for this directory — use --continue to resume the latest one here\n", resumeID)
 }

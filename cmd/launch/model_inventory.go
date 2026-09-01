@@ -16,7 +16,11 @@ import (
 type LaunchModel struct {
 	Name            string
 	Remote          bool
-	ToolCapable     bool
+	// Recommended: an OAICA router recommendation (picker "OAICA Models"
+	// section). Populated on the wizard's full-inventory path so the
+	// secondary step can lead our models and mark them.
+	Recommended bool
+	ToolCapable bool
 	Capabilities    []modelpkg.Capability
 	ContextLength   int
 	MaxOutputTokens int

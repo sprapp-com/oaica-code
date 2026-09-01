@@ -517,5 +517,9 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), plan.envVars(anthropicBaseURL, clientToken)...)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		claudeResumeHint(err, args)
+		return err
+	}
+	return nil
 }
