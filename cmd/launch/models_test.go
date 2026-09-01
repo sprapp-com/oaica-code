@@ -8,6 +8,22 @@ import (
 	modelpkg "github.com/ollama/ollama/types/model"
 )
 
+func TestBillingPlanLabel(t *testing.T) {
+	cases := map[string]string{
+		"opencode-go/glm-5.3-flash": "Coding Plan (zen — shared subscription)",
+		"opencode-go/glm-5.1":       "Coding Plan (zen — shared subscription)",
+		"zai/glm-5.3":               "API Plan (Z.AI — per-token key)",
+		"opencode-go/kimi-k2.6":     "",
+		"glm-5.3-flash":             "",
+		"box/glm-5.3-flash":         "",
+	}
+	for name, want := range cases {
+		if got := billingPlanLabel(name); got != want {
+			t.Errorf("billingPlanLabel(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
 func TestBuildModelList_UsesInventoryMetadataForInstalledModels(t *testing.T) {
 	existing := []modelInfo{
 		{

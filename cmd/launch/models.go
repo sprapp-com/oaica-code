@@ -596,7 +596,30 @@ func modelItemFromInventory(name string, info modelInfo, item ModelItem) ModelIt
 			item.Description += " (free)"
 		}
 	}
+	if label := billingPlanLabel(name); label != "" && item.Description == "" {
+		item.Description = label
+	}
 	return item
+}
+
+// billingPlanLabel tags a picker row with how it's billed, when the model id
+// carries a known GLM/Z.AI naming pattern: distinguishes a shared aggregator
+// key's flat-rate "Coding Plan" (all of zen's traffic rides one subscription,
+// regardless of which model you pick) from a direct per-token Z.AI API key
+// (2026-09-02 — the user's own opencode picker shows this distinction native;
+// ours had none, so a GLM row here looked billing-agnostic when it isn't).
+// Bare "<remote>/glm-*" names are the zen/opencode-go aggregator; an explicit
+// "zai/glm-*" (a direct Z.AI remote, once one is configured in remotes.json)
+// is the API-key path instead.
+func billingPlanLabel(name string) string {
+	rest, ok := strings.CutPrefix(name, "opencode-go/")
+	if ok && strings.HasPrefix(rest, "glm-") {
+		return "Coding Plan (zen — shared subscription)"
+	}
+	if rest, ok := strings.CutPrefix(name, "zai/"); ok && strings.HasPrefix(rest, "glm-") {
+		return "API Plan (Z.AI — per-token key)"
+	}
+	return ""
 }
 
 // isCloudModelName reports whether the model name has an explicit cloud source.
