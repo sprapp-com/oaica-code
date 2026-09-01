@@ -2,6 +2,7 @@ package launch
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,5 +176,35 @@ func TestResolveAgentModelUnknownModelFallsBackToDefaults(t *testing.T) {
 	}
 	if meta.ContextLength <= 0 || meta.MaxOutputTokens <= 0 {
 		t.Errorf("defaults not applied: ContextLength=%d MaxOutputTokens=%d", meta.ContextLength, meta.MaxOutputTokens)
+	}
+}
+
+// TestResolveAgentModel_RouterSKUBareWhenCatalogUnreachable: a bare "oaica-*"
+// id must resolve to the router even when the catalog fetch FAILS (launch
+// with router down) and a user remote mirrors the id in its /models. The
+// catalog-based guard alone flipped the sonnet tier onto the mirroring
+// remote (opencode zen), which 401'd "Model ... is not supported"
+// (2026-09-01 fleet, port 5929).
+func TestResolveAgentModel_RouterSKUBareWhenCatalogUnreachable(t *testing.T) {
+	stubBareIndex(t, map[string][]string{"oaica-35b-a3b-vision": {"opencode-go/oaica-35b-a3b-vision"}})
+	stubUserRemoteModels(t, nil, nil)
+	stubCloudFetch(t, nil, errors.New("router unreachable (test stub)"))
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+	t.Setenv("OAICA_REMOTES_FILE", writeRemotesFile(t))
+	t.Setenv("OAICA_API_KEY", "oaica-key")
+	t.Setenv("OAICA_HOST", "https://api.oaica.com/v1")
+
+	baseURL, token, _, _, err := ResolveAgentModel(context.Background(), "oaica-35b-a3b-vision")
+	if err != nil {
+		t.Fatalf("ResolveAgentModel: %v", err)
+	}
+	if strings.Contains(baseURL, "127.0.0.1") {
+		// A loopback bind is allowed only for the logging proxy in front of
+		// the router host; the token must still be the OAICA key.
+		if token != "oaica-key" {
+			t.Errorf("token = %q, want OAICA key (router leg)", token)
+		}
+	} else if baseURL != "https://api.oaica.com/v1" {
+		t.Errorf("baseURL = %q, want router host", baseURL)
 	}
 }

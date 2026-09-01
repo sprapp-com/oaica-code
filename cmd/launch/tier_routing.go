@@ -273,7 +273,7 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 		// The router is the authority on its own ids — a bare id on the
 		// router catalog always routes there; a bare NON-router id keeps the
 		// generic path (daemon / :local / single-owner remote).
-		if !strings.Contains(sonnetModel, "/") && oaicaModelIsReady(sonnetModel) {
+		if oaicaRouterSKU(sonnetModel) {
 			return resolveLaunchEndpoint("router/" + sonnetModel)
 		}
 		return resolveLaunchEndpoint(sonnetModel)

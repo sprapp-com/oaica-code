@@ -438,6 +438,25 @@ func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	return entries, nil
 }
 
+// oaicaRouterSKU reports whether a bare model name belongs to the OAICA
+// router. Prefix-based first ("oaica-…"), catalog-based second: a failed or
+// stale catalog fetch (no network, router down at launch) must never flip a
+// bare OAICA id onto a user remote that mirrors it in its own /models —
+// opencode zen proxies our SKUs, and the bare single-owner match then sent
+// the sonnet tier there with the wrong key (2026-09-01 fleet, 401
+// "Model ... is not supported"). The router is the authority on its own ids
+// regardless of catalog reachability.
+func oaicaRouterSKU(model string) bool {
+	if strings.Contains(model, "/") {
+		return false
+	}
+	base := model
+	if idx := strings.Index(model, "+"); idx >= 0 {
+		base = model[:idx]
+	}
+	return strings.HasPrefix(base, "oaica-") || oaicaModelIsReady(model)
+}
+
 // oaicaModelIsReady reports whether name is a real OAICA model, or a valid
 // "<model>+<lora>..." composite of one — the only "readiness" concept that
 // applies to router-served models (see showOrPullWithPolicy's doc comment).

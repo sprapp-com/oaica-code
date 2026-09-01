@@ -251,9 +251,11 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 	// OAICA router SKUs are the router's own ids: opencode zen mirrors our
 	// SKUs in its /models, so the bare-id single-owner match would hijack
 	// "oaica-35b-a3b-vision" onto zen's endpoint (401 "Model not supported",
-	// 2026-09-01 fleet, 10x retries). A bare id on the router catalog
-	// resolves to the router; "<remote>/<id>" namespaces a non-OAICA backend.
-	routerSKU := !strings.Contains(model, "/") && oaicaModelIsReady(model)
+	// 2026-09-01 fleet, 10x retries). oaicaRouterSKU is prefix-based so a
+	// failed catalog fetch at launch doesn't reintroduce the hijack.
+	// A bare id on the router catalog resolves to the router;
+	// "<remote>/<id>" namespaces a non-OAICA backend.
+	routerSKU := oaicaRouterSKU(model)
 	if remote, bare, ok := findUserRemoteForModel(model); ok && !routerSKU {
 		if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, opts.ForceTools); err != nil {
 			return "", "", "", AgentModelMeta{}, err
