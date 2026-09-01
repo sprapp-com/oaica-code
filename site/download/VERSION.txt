@@ -1,2 +1,2 @@
-version=0.5.10
-commit=93c93e6e9df4
+version=0.5.11
+commit=5914bd2430bd
