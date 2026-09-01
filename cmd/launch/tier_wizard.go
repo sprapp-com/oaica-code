@@ -377,7 +377,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				// model name, and "auto" has no meaning after launch.
 				sel = autoSecondary
 			}
-			if sel != "" && sel != s.items[0].Name {
+			if sel != "" && sel != s.items[0].Name && sel != "(same as primary)" {
 				c.SonnetModel = sel
 			}
 		case 1:
