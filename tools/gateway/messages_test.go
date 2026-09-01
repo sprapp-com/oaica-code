@@ -314,7 +314,11 @@ func TestMessages_MeteredLikeNativeWire(t *testing.T) {
 	if rows[0].PromptTokens != 7 || rows[0].CompletionTokens != 3 {
 		t.Errorf("metered usage = %d/%d, want 7/3", rows[0].PromptTokens, rows[0].CompletionTokens)
 	}
-	if rows[0].Path != "/v1/messages" {
-		t.Errorf("ledger path = %q, want /v1/messages", rows[0].Path)
+	// The proxied path is pinned to /v1/chat/completions (the upstream must
+	// answer on the OpenAI wire — see messagesHandler), so the ledger row
+	// records the upstream wire, not the client-facing one. Metering is the
+	// point: translation must not open a billing bypass.
+	if rows[0].Path != "/v1/chat/completions" {
+		t.Errorf("ledger path = %q, want /v1/chat/completions", rows[0].Path)
 	}
 }

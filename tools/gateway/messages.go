@@ -43,6 +43,7 @@ package main
 //	  status code, so an upstream 4xx/5xx reads native to the client.
 
 import (
+	"log"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -87,6 +88,10 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = readCloserBytes(nb)
 	r.ContentLength = int64(len(nb))
 	r.Header.Set("Content-Length", fmt.Sprint(len(nb)))
+	// completionHandler forwards r.URL.Path verbatim; upstream oaicalb
+	// answers /v1/messages itself (in Anthropic shape). We must hit its
+	// OpenAI wire so the response is the one shape this file translates.
+	r.URL.Path = "/v1/chat/completions"
 
 	model, _ := req["model"].(string)
 	bridge := newAnthropicBridge(w, stream, model)
@@ -405,6 +410,13 @@ func (b *anthropicBridge) finalize() {
 	var resp openAICompletion
 	if err := json.Unmarshal(b.sse.tail.Bytes(), &resp); err != nil {
 		writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "unparseable upstream response")
+		return
+	}
+	if len(resp.Choices) == 0 {
+		// Upstream 200 with no choices (some backends do this on refusal or
+		// empty completion) — an empty message beats a panic.
+		log.Printf("oaica-gateway: /v1/messages upstream 200 with no choices")
+		writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned no completion choices")
 		return
 	}
 	msg := resp.Choices[0].Message
