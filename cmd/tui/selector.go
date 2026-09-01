@@ -154,7 +154,7 @@ func ReorderItems(items []SelectItem) []SelectItem {
 	})
 	sort.SliceStable(loc, func(a, b int) bool { return byName(loc[a], loc[b]) })
 	sort.SliceStable(other, func(a, b int) bool { return byName(other[a], other[b]) })
-	return append(append(append(loc, rec...), rem...), other...)
+	return append(append(append(append(loc, rec...), olc...), rem...), other...)
 }
 
 // isBuiltinAggregatorProvider reports whether name is namespaced under one

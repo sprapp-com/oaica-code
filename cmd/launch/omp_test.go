@@ -21,6 +21,13 @@ func TestMain(m *testing.M) {
 		return
 	}
 	hermeticTestEnv()
+	// HOME too: load()'s disk fast paths (picker_cache.json, the ollama-cloud
+	// catalog cache under ~/.oaica) read the developer's real files when HOME
+	// is untouched, so a test's "empty inventory" suddenly contains 28 live
+	// entries and the daemon-stub call counts never add up.
+	home := filepath.Join(os.TempDir(), "oaica-launch-tests", "home")
+	_ = os.MkdirAll(home, 0o700)
+	os.Setenv("HOME", home)
 	os.Exit(m.Run())
 }
 
