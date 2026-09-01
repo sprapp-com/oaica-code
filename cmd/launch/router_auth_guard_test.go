@@ -14,6 +14,7 @@ import (
 func stubCloudFetch(t *testing.T, entries []oaicaModelEntry, err error) {
 	t.Helper()
 	old := oaicaFetchCloudModelEntries
+	ollamaCloudEntriesFn = nil
 	oaicaFetchCloudModelEntries = func() ([]oaicaModelEntry, error) { return entries, err }
 	t.Cleanup(func() { oaicaFetchCloudModelEntries = old })
 }

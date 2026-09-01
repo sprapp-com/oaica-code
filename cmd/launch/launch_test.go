@@ -207,6 +207,7 @@ func setLaunchTestHome(t *testing.T, dir string) {
 	t.Setenv("OPENROUTER_API_KEY", "")
 	t.Setenv("OAICA_REMOTES_FILE", filepath.Join(dir, "no-remotes.json"))
 	prev := oaicaFetchCloudModelEntries
+	ollamaCloudEntriesFn = nil
 	oaicaFetchCloudModelEntries = func() ([]oaicaModelEntry, error) { return nil, nil }
 	t.Cleanup(func() { oaicaFetchCloudModelEntries = prev })
 }

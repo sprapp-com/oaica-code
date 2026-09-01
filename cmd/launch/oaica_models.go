@@ -420,6 +420,12 @@ func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {
 	if len(entries) == 0 && cloudErr != nil {
 		return nil, cloudErr
 	}
+	// Ollama's public cloud catalog ("<name>:cloud", served through the
+	// daemon's Ollama account). Failure never hides the entries above.
+	// Var-indirected so tests can stub the network away.
+	if ollamaCloudEntriesFn != nil {
+		entries = append(entries, ollamaCloudEntriesFn()...)
+	}
 	return entries, nil
 }
 
