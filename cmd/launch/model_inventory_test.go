@@ -86,17 +86,27 @@ func TestPickerCacheRoundTripAndTTL(t *testing.T) {
 	withTempOaicaHome(t)
 	models := []LaunchModel{{Name: "oaica-35b-a3b-vision", Remote: true}, {Name: "ollama/kat-awq"}}
 	savePickerCache(models)
-	got, ok := loadPickerCache()
-	if !ok || len(got) != 2 || got[0].Name != "oaica-35b-a3b-vision" {
-		t.Fatalf("round trip: ok=%v models=%v", ok, got)
+	got, stale, ok := loadPickerCache()
+	if !ok || stale || len(got) != 2 || got[0].Name != "oaica-35b-a3b-vision" {
+		t.Fatalf("round trip: ok=%v stale=%v models=%v", ok, stale, got)
 	}
-	// Stale cache: expired SavedAt must miss.
+	// Stale cache within the grace window: loads, marked stale (a background
+	// refresh will run), NOT a miss.
 	b, _ := json.Marshal(pickerCacheFile{SavedAt: time.Now().Add(-2 * time.Hour), TTLSecond: time.Hour.Seconds(), Models: models})
 	path, _ := pickerCachePath()
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := loadPickerCache(); ok {
-		t.Fatal("stale cache must not load")
+	got, stale, ok = loadPickerCache()
+	if !ok || !stale || len(got) != 2 {
+		t.Fatalf("grace-window cache: ok=%v stale=%v models=%v", ok, stale, got)
+	}
+	// Beyond grace: full miss.
+	b, _ = json.Marshal(pickerCacheFile{SavedAt: time.Now().Add(-7 * time.Hour), TTLSecond: time.Hour.Seconds(), Models: models})
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := loadPickerCache(); ok {
+		t.Fatal("beyond-grace cache must not load")
 	}
 }

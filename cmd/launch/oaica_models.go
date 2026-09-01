@@ -249,6 +249,58 @@ var cloudEntriesCache struct {
 
 const cloudEntriesTTL = 5 * time.Minute
 
+// routerCacheFile is the cross-process router-list cache:
+// ~/.oaica/cache/models/router.json. Carries the router's ETag so a refresh
+// sends If-None-Match and a 304 costs no body transfer at all.
+type routerCacheFile struct {
+	SavedAt   time.Time         `json:"saved_at"`
+	TTLSecond float64           `json:"ttl_seconds"`
+	Host      string            `json:"host,omitempty"`
+	ETag      string            `json:"etag,omitempty"`
+	Entries   []oaicaModelEntry `json:"entries,omitempty"`
+	Error     string            `json:"error,omitempty"`
+}
+
+func routerCachePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica", "cache", "models", "router.json"), nil
+}
+
+func mustRouterCachePath() string { p, _ := routerCachePath(); return p }
+
+func loadRouterCache(host string) (routerCacheFile, bool) {
+	path, err := routerCachePath()
+	if err != nil {
+		return routerCacheFile{}, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return routerCacheFile{}, false
+	}
+	var f routerCacheFile
+	if json.Unmarshal(b, &f) != nil {
+		return routerCacheFile{}, false
+	}
+	if f.Host != "" && f.Host != host {
+		return routerCacheFile{}, false // different router: ignore entirely
+	}
+	return f, true
+}
+
+func saveRouterCache(host, etag string, entries []oaicaModelEntry) error {
+	b, err := json.Marshal(routerCacheFile{
+		SavedAt: time.Now(), TTLSecond: cloudEntriesTTL.Seconds(),
+		Host: host, ETag: etag, Entries: entries,
+	})
+	if err != nil {
+		return err
+	}
+	return writeAtomic(mustRouterCachePath(), b)
+}
+
 func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	host := oaicaLaunchHost()
 	cloudEntriesCache.Lock()
@@ -259,7 +311,29 @@ func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	}
 	cloudEntriesCache.Unlock()
 
-	entries, err := oaicaFetchCloudModelEntriesLiveUncached(host)
+	cached, haveCache := loadRouterCache(host)
+
+	entries, etag, err := oaicaFetchCloudModelEntriesLiveUncached(host, cached.ETag)
+
+	if err == nil {
+		// 200 with a body: persist entries (+ etag) to disk.
+		_ = saveRouterCache(host, etag, entries)
+	} else if haveCache && isRouterNotModified(err) && len(cached.Entries) > 0 {
+		// 304: the body we skipped is identical to the cache — reuse it and
+		// extend the freshness window.
+		entries = cached.Entries
+		err = nil
+		cached.SavedAt = time.Now()
+		if b, jerr := json.Marshal(cached); jerr == nil {
+			_ = writeAtomic(mustRouterCachePath(), b)
+		}
+	} else if haveCache && len(cached.Entries) > 0 && !isRouterAuthErr(err) {
+		// Router down/unreachable but we HAVE a list: serve the stale copy
+		// rather than blanking the whole catalog.
+		entries = cached.Entries
+		err = nil
+	}
+
 	cloudEntriesCache.Lock()
 	cloudEntriesCache.host = host
 	cloudEntriesCache.entries = entries
@@ -269,21 +343,35 @@ func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 	return entries, err
 }
 
-func oaicaFetchCloudModelEntriesLiveUncached(host string) ([]oaicaModelEntry, error) {
+func isRouterNotModified(err error) bool {
+	var re *oaicaRouterError
+	return errors.As(err, &re) && re.Status == http.StatusNotModified
+}
+
+func isRouterAuthErr(err error) bool { return isOaicaRouterAuthErr(err) }
+
+func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEntry, string, error) {
 	req, err := http.NewRequest(http.MethodGet, host+"/v1/models", nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
 	oaicaLaunchAuthorize(req)
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaLaunchHost(), err)
+		return nil, "", fmt.Errorf("couldn't reach %s: %w", host, err)
 	}
 	defer resp.Body.Close()
+	respETag := resp.Header.Get("ETag")
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host}
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, &oaicaRouterError{Status: resp.StatusCode, Host: oaicaLaunchHost(), Body: strings.TrimSpace(string(body))}
+		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host, Body: strings.TrimSpace(string(body))}
 	}
 	var list struct {
 		Data []struct {
@@ -293,13 +381,13 @@ func oaicaFetchCloudModelEntriesLiveUncached(host string) ([]oaicaModelEntry, er
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("bad response from %s: %w", host, err)
+		return nil, respETag, fmt.Errorf("bad response from %s: %w", host, err)
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
 		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
 	}
-	return entries, nil
+	return entries, respETag, nil
 }
 
 func oaicaLiveModelEntriesErr() ([]oaicaModelEntry, error) {

@@ -18,13 +18,13 @@ import (
 // LaunchModel is the model metadata Launch passes to integration config
 // writers after resolving selected model names through the per-run inventory.
 type LaunchModel struct {
-	Name            string
-	Remote          bool
+	Name   string
+	Remote bool
 	// Recommended: an OAICA router recommendation (picker "OAICA Models"
 	// section). Populated on the wizard's full-inventory path so the
 	// secondary step can lead our models and mark them.
-	Recommended bool
-	ToolCapable bool
+	Recommended     bool
+	ToolCapable     bool
 	Capabilities    []modelpkg.Capability
 	ContextLength   int
 	MaxOutputTokens int
@@ -111,16 +111,25 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		return cloneLaunchModels(i.models), i.err
 	}
 
-	// Disk fast path: a fresh cache file renders the picker from the last
-	// successful inventory with ZERO network calls. The full load below
-	// probes the local daemon, every configured remote AND the cloud
-	// router — with slow/dead remotes that's seconds of dead latency before
-	// the menu paints. Stale entries simply fall through to the full load.
+	// Disk fast path: a cache file renders the picker from the last
+	// successful inventory with ZERO network calls. Fresh within
+	// pickerCacheTTL; within the grace window the stale list paints the
+	// menu instantly and a background goroutine refreshes the real
+	// inventory (rewriting the cache for the next launch); beyond grace we
+	// fall through to the full load.
 	if !force {
-		if models, ok := loadPickerCache(); ok {
+		models, stale, ok := loadPickerCache()
+		if ok {
 			i.models = models
 			i.err = nil
 			i.loaded = true
+			if stale {
+				go func() {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_, _ = i.load(bgCtx, true) // force: bypass the just-returned cache
+				}()
+			}
 			return cloneLaunchModels(i.models), nil
 		}
 	}
@@ -194,10 +203,16 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	return cloneLaunchModels(i.models), i.err
 }
 
-// pickerCacheTTL bounds how long the disk cache is trusted. One launch
-// cycle per hour pays the full probe cost; everything in between opens
-// the picker from the file.
-const pickerCacheTTL = time.Hour
+// pickerCacheTTL bounds how long the disk cache is trusted as fresh. One
+// launch cycle per hour pays the full probe cost; everything in between
+// opens the picker from the file. pickerCacheGrace is how long a STALE
+// cache still paints the menu instantly (with a background refresh kicked
+// off) before we give up and do the full load synchronously — a menu that
+// is a few hours old beats no menu for several seconds.
+const (
+	pickerCacheTTL   = time.Hour
+	pickerCacheGrace = 6 * time.Hour
+)
 
 type pickerCacheFile struct {
 	SavedAt   time.Time     `json:"saved_at"`
@@ -233,27 +248,28 @@ func savePickerCache(models []LaunchModel) {
 	_ = os.Rename(tmp, path) // atomic swap: a crash never leaves a half-written cache
 }
 
-func loadPickerCache() ([]LaunchModel, bool) {
+func loadPickerCache() ([]LaunchModel, bool, bool) {
 	path, err := pickerCachePath()
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	var f pickerCacheFile
 	if json.Unmarshal(b, &f) != nil || len(f.Models) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	ttl := f.TTLSecond
 	if ttl <= 0 {
 		ttl = pickerCacheTTL.Seconds()
 	}
-	if time.Since(f.SavedAt) > time.Duration(ttl*float64(time.Second)) {
-		return nil, false
+	age := time.Since(f.SavedAt)
+	if age > pickerCacheGrace {
+		return nil, false, false
 	}
-	return f.Models, true
+	return f.Models, age > time.Duration(ttl*float64(time.Second)), true
 }
 
 func (i *modelInventory) Resolve(ctx context.Context, names []string) []LaunchModel {

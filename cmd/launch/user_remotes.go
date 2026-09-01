@@ -50,6 +50,7 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -377,7 +378,7 @@ type RemoteEndpoint struct {
 	Wire            string
 	ToolFormat      string
 	ToolReliable    bool
-	ForceTools      bool // remote.ForceTools — skip the capability gate's refusal for this remote
+	ForceTools      bool   // remote.ForceTools — skip the capability gate's refusal for this remote
 	RoutePolicy     string // remote.RoutePolicy — default --route-policy for launches using this endpoint
 	PriceInputPerM  float64
 	PriceOutputPerM float64
@@ -517,6 +518,88 @@ var userRemoteLaunchModels = userRemoteLaunchModelsLive
 // cost is bounded by the single slowest remote, ~6s worst case. Results are
 // reassembled in the original remotes.json order so the picker stays
 // deterministic across runs regardless of which goroutine finishes first.
+// remoteModelsCacheTTL is how long a remote's /models answer is trusted on
+// disk; remoteModelsErrorTTL bounds how long a FAILED fetch is remembered
+// (shorter — a box that was asleep may wake up any minute).
+const (
+	remoteModelsCacheTTL = 10 * time.Minute
+	remoteModelsErrorTTL = 2 * time.Minute
+)
+
+type remoteModelsCacheFile struct {
+	SavedAt   time.Time `json:"saved_at"`
+	TTLSecond float64   `json:"ttl_seconds"`
+	Error     string    `json:"error,omitempty"`
+	IDs       []string  `json:"ids,omitempty"`
+}
+
+// remoteModelsCachePath is one file per remote under ~/.oaica/cache/models/.
+// A section cache, not a bundle cache: one dead remote no longer invalidates
+// (or re-triggers) every other source's fetch.
+func remoteModelsCachePath(remoteName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	safe := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '_'
+	}, remoteName)
+	return filepath.Join(home, ".oaica", "cache", "models", "remote-"+safe+".json"), nil
+}
+
+// fetchRemoteModelsCached wraps fetchRemoteModels with a per-remote disk
+// cache: fresh within remoteModelsCacheTTL, remembered failure within
+// remoteModelsErrorTTL (a sleeping box costs its timeout once, not once per
+// launch), refetched otherwise. Atomic rename, best-effort — a cache write
+// failure just means the next launch re-probes.
+func fetchRemoteModelsCached(r userRemote) ([]string, error) {
+	path, err := remoteModelsCachePath(r.Name)
+	if err != nil {
+		return fetchRemoteModels(r)
+	}
+	if b, rerr := os.ReadFile(path); rerr == nil {
+		var f remoteModelsCacheFile
+		if json.Unmarshal(b, &f) == nil {
+			ttl := f.TTLSecond
+			if ttl <= 0 {
+				ttl = remoteModelsCacheTTL.Seconds()
+			}
+			if time.Since(f.SavedAt) < time.Duration(ttl*float64(time.Second)) {
+				if f.Error != "" {
+					return nil, errors.New(f.Error)
+				}
+				return f.IDs, nil
+			}
+		}
+	}
+
+	ids, ferr := fetchRemoteModels(r)
+	if ferr != nil {
+		// Remember the failure briefly so a sleeping box costs its timeout
+		// once per window, not once per launch.
+		b, _ := json.Marshal(remoteModelsCacheFile{SavedAt: time.Now(), TTLSecond: remoteModelsErrorTTL.Seconds(), Error: ferr.Error()})
+		_ = writeAtomic(path, b)
+		return ids, ferr
+	}
+	b, _ := json.Marshal(remoteModelsCacheFile{SavedAt: time.Now(), TTLSecond: remoteModelsCacheTTL.Seconds(), IDs: ids})
+	_ = writeAtomic(path, b)
+	return ids, nil
+}
+
+func writeAtomic(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 	remotes, err := loadUserRemotes()
 	if err != nil {
@@ -533,7 +616,7 @@ func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 		wg.Add(1)
 		go func(i int, r userRemote) {
 			defer wg.Done()
-			ids, ferr := fetchRemoteModels(r)
+			ids, ferr := fetchRemoteModelsCached(r)
 			if ferr != nil {
 				results[i] = result{err: ferr}
 				return
