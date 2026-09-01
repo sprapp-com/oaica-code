@@ -248,7 +248,13 @@ func ResolveAgentModel(ctx context.Context, model string) (baseURL, token, upstr
 func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOpts) (baseURL, token, upstreamModel string, meta AgentModelMeta, err error) {
 	upstreamModel, _ = oaicaStripLocalTag(model)
 
-	if remote, bare, ok := findUserRemoteForModel(model); ok {
+	// OAICA router SKUs are the router's own ids: opencode zen mirrors our
+	// SKUs in its /models, so the bare-id single-owner match would hijack
+	// "oaica-35b-a3b-vision" onto zen's endpoint (401 "Model not supported",
+	// 2026-09-01 fleet, 10x retries). A bare id on the router catalog
+	// resolves to the router; "<remote>/<id>" namespaces a non-OAICA backend.
+	routerSKU := !strings.Contains(model, "/") && oaicaModelIsReady(model)
+	if remote, bare, ok := findUserRemoteForModel(model); ok && !routerSKU {
 		if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, opts.ForceTools); err != nil {
 			return "", "", "", AgentModelMeta{}, err
 		}
@@ -260,6 +266,28 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 		go func() { _ = RunAnthropicOpenAIProxy(ln, remote, bare) }()
 		baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 		token = remote.key()
+	} else if !routerSKU {
+		if remote, bare, ok := findUserRemoteForModel(model); ok {
+			if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, opts.ForceTools); err != nil {
+				return "", "", "", AgentModelMeta{}, err
+			}
+			upstreamModel = bare
+			ln, port, lerr := ListenAnthropicOpenAIProxy(remote, bare)
+			if lerr != nil {
+				return "", "", "", AgentModelMeta{}, fmt.Errorf("failed to start translation proxy for remote %q: %w", remote.Name, lerr)
+			}
+			go func() { _ = RunAnthropicOpenAIProxy(ln, remote, bare) }()
+			baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+			token = remote.key()
+		} else {
+			realHost := oaicaResolveHostForModel(model)
+			baseURL = realHost
+			if ln, port, lerr := ListenLocalLoggingProxy(); lerr == nil {
+				go func() { _ = RunLocalLoggingProxy(ln, realHost) }()
+				baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+			}
+			token = oaicaLaunchAPIKeyForEnv()
+		}
 	} else {
 		realHost := oaicaResolveHostForModel(model)
 		baseURL = realHost
