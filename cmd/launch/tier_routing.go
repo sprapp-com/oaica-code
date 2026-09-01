@@ -512,7 +512,20 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 			plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
 	}
 
-	cmd := exec.Command(claudePath, c.args(plan.PrimaryName, args)...)
+	// Default model mode: with a tier split configured, launch straight
+	// into opusplan — Claude Code plans on the opus tier (the primary) and
+	// executes on the sonnet tier (the secondary), no /model opusplan
+	// needed after every relaunch. An explicit --model in the user's args
+	// wins (c.args skips ours), and a single-model launch (no secondary)
+	// keeps pinning the primary as before.
+	claudeModel := plan.PrimaryName
+	if plan.SecondaryName != plan.PrimaryName && !hasClaudeModelFlag(args) {
+		claudeModel = "opusplan"
+		fmt.Fprintf(os.Stderr, "model mode: opusplan (plan with %s, execute with %s)\n",
+			plan.PrimaryName, plan.SecondaryName)
+	}
+
+	cmd := exec.Command(claudePath, c.args(claudeModel, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

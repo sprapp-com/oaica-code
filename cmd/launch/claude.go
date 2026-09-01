@@ -17,7 +17,9 @@ func (c *Claude) String() string { return "Claude Code" }
 
 func (c *Claude) args(model string, extra []string) []string {
 	var args []string
-	if model != "" {
+	// An explicit --model in the user's extra args wins (claude CLI takes
+	// the first occurrence, so ours must not be appended at all).
+	if model != "" && !hasClaudeModelFlag(extra) {
 		args = append(args, "--model", model)
 	}
 	args = append(args, extra...)
