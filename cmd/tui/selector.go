@@ -70,7 +70,10 @@ type SelectItem struct {
 	// aggregator (ollama/, openrouter/) — see launch.ModelItem.Remote's
 	// doc. Renders in its own "Remote" section, between "Local" and
 	// "Recommended" — also always-shown/non-scrolling.
-	Remote            bool
+	Remote bool
+	// OllamaCloud marks an Ollama cloud catalog entry — renders in its own
+	// "Ollama Cloud" section (see launch.ModelItem.OllamaCloud's doc).
+	OllamaCloud       bool
 	AvailabilityBadge string
 }
 
@@ -103,6 +106,7 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 			Recommended:       item.Recommended,
 			Local:             item.Local,
 			Remote:            item.Remote,
+			OllamaCloud:       item.OllamaCloud,
 			AvailabilityBadge: item.AvailabilityBadge,
 		}
 	}
@@ -116,11 +120,16 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 // loop re-splits into the four sections from this flat list, so section
 // membership AND within-section order both come from here.
 func ReorderItems(items []SelectItem) []SelectItem {
-	var loc, rec, rem, other []SelectItem
+	var loc, rec, olc, rem, other []SelectItem
 	for _, item := range items {
 		switch {
 		case item.Local:
 			loc = append(loc, item)
+		case item.OllamaCloud:
+			// Checked BEFORE Recommended: Ollama cloud rows are marked
+			// Recommended (they lead the wizard's secondary list) but
+			// render in their own section.
+			olc = append(olc, item)
 		case item.Recommended:
 			// Checked BEFORE Remote — OAICA router models carry both flags
 			// and must land in the OAICA segment (render checks the same
@@ -533,11 +542,13 @@ func (m selectorModel) renderContent() string {
 		// router-catalog entry are never ambiguous with each other, even when
 		// they share a base name. Section order matches ReorderItems' flat
 		// order, so key navigation always tracks the displayed rows.
-		var localItems, remoteItems, recItems, otherItems []int
+		var localItems, ollamaItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.OllamaCloud:
+				ollamaItems = append(ollamaItems, i)
 			case item.Recommended:
 				// Checked BEFORE Remote: OAICA router-catalog models carry
 				// Recommended AND Remote — they belong in "OAICA Models",
@@ -579,6 +590,15 @@ func (m selectorModel) renderContent() string {
 			s.WriteString("\n")
 		}
 
+		if len(ollamaItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Ollama (daemon + cloud)"))
+			s.WriteString("\n")
+			for _, idx := range ollamaItems {
+				m.renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
+		}
+
 		if len(remoteItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
@@ -592,7 +612,7 @@ func (m selectorModel) renderContent() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(remoteItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(ollamaItems) - len(remoteItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
@@ -1216,11 +1236,13 @@ func (m multiSelectorModel) View() string {
 		// Split into pinned local, pinned remote, pinned recommended, and
 		// scrollable others (matches single-select layout — see the doc
 		// comment there).
-		var localItems, remoteItems, recItems, otherItems []int
+		var localItems, ollamaItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
 			case item.Local:
 				localItems = append(localItems, i)
+			case item.OllamaCloud:
+				ollamaItems = append(ollamaItems, i)
 			case item.Recommended:
 				// Checked BEFORE Remote (see single-select block) — OAICA
 				// router models are Recommended AND Remote.
@@ -1257,6 +1279,15 @@ func (m multiSelectorModel) View() string {
 			s.WriteString("\n")
 		}
 
+		if len(ollamaItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Ollama (daemon + cloud)"))
+			s.WriteString("\n")
+			for _, idx := range ollamaItems {
+				renderItem(&s, filtered[idx], idx)
+			}
+			s.WriteString("\n")
+		}
+
 		if len(remoteItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Remote Models"))
 			s.WriteString("\n")
@@ -1270,7 +1301,7 @@ func (m multiSelectorModel) View() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(remoteItems)
+			maxOthers := maxSelectorItems - len(recItems) - len(localItems) - len(ollamaItems) - len(remoteItems)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}

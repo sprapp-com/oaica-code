@@ -265,7 +265,12 @@ type ModelItem struct {
 	// this is copied from. Gets its own "Remote" picker section, distinct
 	// from Local (this box's own `oaica serve`) and the router-sourced
 	// "Recommended"/"More" rows. A model can't be both Local and Remote.
-	Remote          bool
+	Remote bool
+	// OllamaCloud marks an Ollama cloud catalog entry (display id
+	// "ollama/<name>") — renders in its own "Ollama Cloud" section, after
+	// "OAICA Models", with no per-row description (the section header
+	// carries the explanation).
+	OllamaCloud     bool
 	VRAMBytes       int64
 	MaxOutputTokens int
 	RequiredPlan    string
@@ -282,6 +287,7 @@ type SelectionItem struct {
 	Recommended       bool
 	Local             bool
 	Remote            bool
+	OllamaCloud       bool
 	AvailabilityBadge string
 }
 
@@ -1372,6 +1378,11 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 	items := make([]ModelItem, 0, len(modelEntries)+len(loraEntries))
 	for _, m := range modelEntries {
 		isLocal := strings.HasSuffix(m.ID, oaicaLocalTagSuffix)
+		// Everything namespaced "ollama/" that isn't a :local server —
+		// the cloud catalog AND the daemon's own models ("ollama/
+		// glm-5.3-flash:cloud") — reads better grouped under one header
+		// than scattered per-row blurbs.
+		isOllamaCloud := !isLocal && strings.HasPrefix(m.ID, ollamaCloudPickerPrefix)
 		desc := m.Description
 		// No description from the router -> no second line at all (the old
 		// "OAICA model — unrated" filler was noise).
@@ -1383,6 +1394,16 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 		}
 		// Every router-catalog entry is an OAICA model, rated or not — they
 		// all lead the picker's "OAICA Models" section.
+		if isOllamaCloud {
+			// Ollama's cloud catalog: own section, one explanation in the
+			// header instead of the same line repeated on all 18 rows.
+			items = append(items, ModelItem{
+				Name:        m.ID,
+				Recommended: true,
+				OllamaCloud: true,
+			})
+			continue
+		}
 		items = append(items, ModelItem{
 			Name:        m.ID,
 			Description: desc,
