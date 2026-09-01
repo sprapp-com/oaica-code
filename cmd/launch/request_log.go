@@ -41,6 +41,26 @@ type requestLogEntry struct {
 	WouldBeHardByLen bool   `json:"would_be_hard_by_len"` // mirrors classifyFlashplan's length check
 	StatusCode       int    `json:"status_code"`
 	DurationMs       int64  `json:"duration_ms"`
+	// ProxyPort is the local listen port of the launch proxy that handled
+	// this request. Each `oaica launch` session runs its own proxy on an
+	// auto-assigned port, so this is what makes rows from concurrent
+	// sessions on the same machine attributable (a bare ~/.oaica/
+	// requests.log otherwise interleaves every session's rows with no way
+	// to tell them apart).
+	ProxyPort int `json:"proxy_port,omitempty"`
+}
+
+// requestLogProxyPort is the port of the (single, per-process) launch
+// proxy; set once at listener bind time, read by appendRequestLog.
+var requestLogProxyPort int
+
+// setRequestLogProxyPort records ln's port for requestLogProxyPort
+// attribution. Best-effort: a non-TCP listener just leaves the port at 0
+// (omitted from the JSON).
+func setRequestLogProxyPort(ln net.Listener) {
+	if addr, ok := ln.Addr().(*net.TCPAddr); ok {
+		requestLogProxyPort = addr.Port
+	}
 }
 
 func requestLogPath() (string, error) {
@@ -56,6 +76,7 @@ func requestLogPath() (string, error) {
 }
 
 func appendRequestLog(entry requestLogEntry) {
+	entry.ProxyPort = requestLogProxyPort
 	path, err := requestLogPath()
 	if err != nil {
 		return // best-effort — never break a real request over a logging failure
@@ -111,6 +132,7 @@ func extractLastAndTotalMessageLen(body []byte) (lastLen, totalLen int) {
 // this, whether the real destination is the cloud router or a local
 // `oaica serve` instance.
 func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
+	setRequestLogProxyPort(ln)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		body, err := io.ReadAll(r.Body)

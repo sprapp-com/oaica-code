@@ -739,6 +739,7 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 // RunAnthropicOpenAIProxyRoutes is RunAnthropicOpenAIProxy with a routing
 // table; see proxyRouteTable.
 func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error {
+	setRequestLogProxyPort(ln)
 	baseURL := table.Default.BaseURL
 
 	// Breaker/escalation state: created unconditionally. The messages
