@@ -204,6 +204,31 @@ const (
 	ollamaCloudEnvKey  = "OLLAMA_API_KEY"
 )
 
+// catalogProviders is the built-in directory of first-party inference
+// providers (the "comprehensive" list — opencode builds its picker from
+// models.dev, whose catalog has no endpoint URLs; this table is the
+// canonical endpoints each provider's OpenAI- or Anthropic-compatible API
+// lives at). A provider appears in the picker only while its key is in the
+// environment — no key, nothing to route through, no row. A remotes.json
+// entry of the same name overrides (e.g. a proxy URL for openai).
+var catalogProviders = []userRemote{
+	{Name: "anthropic", BaseURL: "https://api.anthropic.com", Wire: "anthropic", APIKeyEnv: "ANTHROPIC_API_KEY"},
+	{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"},
+	{Name: "google", BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKeyEnv: "GEMINI_API_KEY"},
+	{Name: "groq", BaseURL: "https://api.groq.com/openai/v1", APIKeyEnv: "GROQ_API_KEY"},
+	{Name: "mistral", BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY"},
+	{Name: "deepseek", BaseURL: "https://api.deepseek.com", APIKeyEnv: "DEEPSEEK_API_KEY"},
+	{Name: "xai", BaseURL: "https://api.x.ai/v1", APIKeyEnv: "XAI_API_KEY"},
+	{Name: "together", BaseURL: "https://api.together.xyz/v1", APIKeyEnv: "TOGETHER_API_KEY"},
+	{Name: "fireworks", BaseURL: "https://api.fireworks.ai/inference/v1", APIKeyEnv: "FIREWORKS_API_KEY"},
+	{Name: "cerebras", BaseURL: "https://api.cerebras.ai/v1", APIKeyEnv: "CEREBRAS_API_KEY"},
+	{Name: "perplexity", BaseURL: "https://api.perplexity.ai", APIKeyEnv: "PERPLEXITY_API_KEY"},
+	{Name: "alibaba", BaseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", APIKeyEnv: "DASHSCOPE_API_KEY"},
+	{Name: "moonshot", BaseURL: "https://api.moonshot.ai/v1", APIKeyEnv: "MOONSHOT_API_KEY"},
+	{Name: "zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", APIKeyEnv: "ZHIPU_API_KEY"},
+	{Name: "minimax", BaseURL: "https://api.minimax.io/v1", APIKeyEnv: "MINIMAX_API_KEY"},
+}
+
 // builtinRemotes returns remotes that oaica knows about without config, active
 // only while their credential env var is set. A user-defined remote of the
 // same name in remotes.json wins (see loadUserRemotes).
@@ -232,6 +257,20 @@ func builtinRemotes() []userRemote {
 			APIKeyEnv:  ollamaCloudEnvKey,
 			ToolFormat: "tool_calls",
 		})
+	}
+	// First-party catalog providers: active while their key is set, and
+	// only when the user hasn't defined their own remote of that name
+	// (loadUserRemotes dedupes by name, custom wins). Each contributes its
+	// full live /models list to the picker as "<provider>/<id>".
+	configured := map[string]bool{}
+	for _, r := range out {
+		configured[r.Name] = true
+	}
+	for _, p := range catalogProviders {
+		if configured[p.Name] || os.Getenv(p.APIKeyEnv) == "" {
+			continue
+		}
+		out = append(out, p)
 	}
 	return out
 }
@@ -443,7 +482,14 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 		return nil, err
 	}
 	if k := r.key(); k != "" {
-		req.Header.Set("Authorization", "Bearer "+k)
+		if r.Descriptor().Wire == "anthropic" {
+			// Anthropic lists models at /v1/models but authenticates with
+			// x-api-key (+ anthropic-version), not a Bearer header.
+			req.Header.Set("x-api-key", k)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+k)
+		}
 	}
 	resp, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
 	if err != nil {

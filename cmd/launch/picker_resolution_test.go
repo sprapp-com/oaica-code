@@ -150,9 +150,21 @@ func TestFindUserRemoteForModel_OpenRouterVendorIDKeptWhole(t *testing.T) {
 	}
 }
 
-func TestBuiltinRemotes_OpenRouterKeyGate(t *testing.T) {
+// clearCatalogKeys empties every credential env var a built-in remote
+// could key off of — tests asserting an exact builtinRemotes() shape must
+// run against a clean environment (dev boxes often export a dozen keys).
+func clearCatalogKeys(t *testing.T) {
+	t.Helper()
+	for _, r := range catalogProviders {
+		t.Setenv(r.APIKeyEnv, "")
+	}
 	t.Setenv(zaiEnvKey, "")
 	t.Setenv(openrouterEnvKey, "")
+	t.Setenv(ollamaCloudEnvKey, "")
+}
+
+func TestBuiltinRemotes_OpenRouterKeyGate(t *testing.T) {
+	clearCatalogKeys(t)
 	if got := builtinRemotes(); len(got) != 0 {
 		t.Fatalf("builtinRemotes() = %v, want none with no keys", got)
 	}

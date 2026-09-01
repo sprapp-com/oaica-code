@@ -32,6 +32,13 @@ func hermeticTestEnv() {
 	os.Setenv("OAICA_REMOTES_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-remotes.json"))
 	os.Setenv(zaiEnvKey, "")
 	os.Setenv(openrouterEnvKey, "")
+	os.Setenv(ollamaCloudEnvKey, "")
+	// First-party catalog providers (anthropic, openai, deepseek, ...) key
+	// off their own env vars — a dev box exporting a dozen of them would
+	// otherwise leak catalog remotes into every picker test.
+	for _, r := range catalogProviders {
+		os.Setenv(r.APIKeyEnv, "")
+	}
 	os.Setenv("OAICA_HOST", "http://127.0.0.1:1")
 	os.Setenv("OAICA_API_KEY", "")
 }
