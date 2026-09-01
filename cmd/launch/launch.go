@@ -274,6 +274,10 @@ type ModelItem struct {
 	VRAMBytes       int64
 	MaxOutputTokens int
 	RequiredPlan    string
+	// AvailabilityBadge carries a router-reported row status into the
+	// picker ("unhealthy" = the gateway marked the model's backend down).
+	// Empty = no badge.
+	AvailabilityBadge string
 	ToolCapable     bool
 	Capabilities    []modelpkg.Capability
 	Size            int64
@@ -1404,11 +1408,16 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 			})
 			continue
 		}
+		badge := ""
+		if m.Unhealthy {
+			badge = "unhealthy"
+		}
 		items = append(items, ModelItem{
-			Name:        m.ID,
-			Description: desc,
-			Recommended: true,
-			Local:       isLocal,
+			Name:              m.ID,
+			Description:       desc,
+			Recommended:       true,
+			Local:             isLocal,
+			AvailabilityBadge: badge,
 		})
 	}
 	for _, entry := range loraEntries {

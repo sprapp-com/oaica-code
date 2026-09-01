@@ -219,6 +219,11 @@ func (c *launcherClient) accountStateUpdateSource(ctx context.Context) <-chan *A
 }
 
 func availabilityBadge(item ModelItem, state AccountState) string {
+	// Router-reported backend health outranks account state — a dead
+	// upstream is not fixable by signing in.
+	if item.AvailabilityBadge == "unhealthy" {
+		return "unhealthy"
+	}
 	if !isCloudModelName(item.Name) {
 		return ""
 	}

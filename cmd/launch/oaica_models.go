@@ -182,6 +182,10 @@ type oaicaModelEntry struct {
 	ID          string
 	Description string
 	Stars       int
+	// Unhealthy marks a router-advertised model whose backend is currently
+	// down (gateway /v1/models "status":"unhealthy") — surfaced as the
+	// picker's "(unhealthy)" availability badge.
+	Unhealthy bool
 	// Upstream is the name to send to the backend when ID is a
 	// display-only picker name (e.g. ID "ollama/gpt-oss" → Upstream
 	// "gpt-oss:cloud"). Empty = ID is itself the upstream name.
@@ -382,6 +386,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 			ID          string `json:"id"`
 			Description string `json:"description"`
 			Stars       int    `json:"stars"`
+			Status      string `json:"status"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
@@ -389,7 +394,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
-		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars})
+		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars, Unhealthy: m.Status == "unhealthy"})
 	}
 	return entries, respETag, nil
 }

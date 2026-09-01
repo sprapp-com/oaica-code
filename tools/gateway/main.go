@@ -1081,6 +1081,7 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 			"input_modalities":  in,
 			"output_modalities": []string{"text"},
 		}
+		g.annotateHealth(m, entry)
 		data = append(data, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -2077,6 +2078,9 @@ func mux(g *gateway) http.Handler {
 	m.HandleFunc("/v1/pull/", g.pullHandler)
 	m.HandleFunc("/v1/catalog", g.catalogHandler)
 	m.HandleFunc("/v1/chat/completions", g.completionHandler)
+	// Anthropic Messages wire — translated to the OpenAI backend shape and
+	// served through the same metered completion path (see messages.go).
+	m.HandleFunc("/v1/messages", g.messagesHandler)
 	m.HandleFunc("/v1/completions", g.completionHandler)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "unknown route")

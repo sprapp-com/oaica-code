@@ -2664,6 +2664,52 @@ just to see the picker list.`,
 	}
 	planCmd.AddCommand(planSetCmd, planListCmd, planShowCmd, planRemoveCmd)
 
+	configCmd := &cobra.Command{
+		Use:   "config",
+		Short: "Show or set standing launch preferences (~/.oaica/config.json)",
+	}
+	configShowCmd := &cobra.Command{
+		Use:   "show",
+		Short: "Show current preferences",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := launch.UserConfigLoad()
+			if err != nil {
+				return err
+			}
+			path, _ := launch.UserConfigPath()
+			fmt.Printf("config:       %s\n", path)
+			fmt.Printf("sonnet_model: %s\n", orDashStr(c.SonnetModel, "(unset — flag/plan/wizard decide)"))
+			return nil
+		},
+	}
+	configSetCmd := &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a preference (sonnet-model)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch args[0] {
+			case "sonnet-model", "sonnet_model":
+				value := args[1]
+				if value == "-" || strings.EqualFold(value, "none") || strings.EqualFold(value, "unset") {
+					value = ""
+				}
+				if err := launch.UserConfigSetSonnetModel(value); err != nil {
+					return err
+				}
+				if value == "" {
+					fmt.Println("sonnet_model cleared")
+				} else {
+					fmt.Printf("sonnet_model = %s (every `oaica launch claude` without --sonnet-model/--plan now uses this)\n", value)
+				}
+				return nil
+			default:
+				return fmt.Errorf("unknown key %q (known: sonnet-model)", args[0])
+			}
+		},
+	}
+	configCmd.AddCommand(configShowCmd, configSetCmd)
+
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
@@ -2874,6 +2920,7 @@ just to see the picker list.`,
 		modelCmd,
 		remoteCmd,
 		planCmd,
+		configCmd,
 		gpuCleanCmd(),
 		pushCmd,
 		signinCmd,

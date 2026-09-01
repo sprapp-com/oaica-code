@@ -457,6 +457,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		oversizeModel = w.OversizeModel
 		policyArg = w.RoutePolicy
 	}
+	// Standing user preference fills what neither a flag nor a plan set:
+	// ~/.oaica/config.json sonnet_model (user_config.go). Flag > plan >
+	// config > wizard default.
+	if sonnetModel == "" {
+		sonnetModel = UserConfigSonnetModel()
+	}
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
 		// briefModeSystemPrompt's doc for why this exact wording and why
