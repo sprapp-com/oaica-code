@@ -415,3 +415,45 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 		t.Fatalf("PlanLastUsed after removal = %q, want empty", last)
 	}
 }
+
+func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
+	withTempOaicaHome(t)
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	models := testLaunchModels("kat-awq", "kat-awq-7b", "big-box/glm-9")
+	models[2].Recommended = true // big-box/glm-9
+	// First selection = items[0] = "auto" (auto leads the step).
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if title == "Sonnet/subagent tier (secondary model)" {
+			if items[0].Name != "auto" {
+				t.Fatalf("auto must lead the secondary step, got %q", items[0].Name)
+			}
+			return "auto", nil
+		}
+		return items[0].Name, nil // "(same as primary)" / local-first
+	}
+	c, err := runTierWizard(models, "kat-awq")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "big-box/glm-9" {
+		t.Fatalf("auto resolved to %q, want big-box/glm-9", c.SonnetModel)
+	}
+	// No recommended non-primary model: "auto" is dropped, "(same as
+	// primary)" leads, and the default keeps the single-model launch.
+	models2 := testLaunchModels("kat-awq", "kat-awq-7b")
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if title == "Sonnet/subagent tier (secondary model)" && items[0].Name != "(same as primary)" {
+			t.Fatalf("without a recommendation auto must be dropped, got %q", items[0].Name)
+		}
+		return items[0].Name, nil
+	}
+	c, err = runTierWizard(models2, "kat-awq")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "" {
+		t.Fatalf("default with no recommendation = %q, want empty", c.SonnetModel)
+	}
+}

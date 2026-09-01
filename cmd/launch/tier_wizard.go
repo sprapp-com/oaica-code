@@ -28,6 +28,7 @@ package launch
 import (
 	"bufio"
 	"errors"
+	"sort"
 	"fmt"
 	"os"
 	"os/exec"
@@ -221,6 +222,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	// recommendations lead the rest and are marked (the picker's "OAICA
 	// Models" section order, carried over).
 	var sonnetItems []SelectionItem
+	autoSecondary := "" // what "auto" resolves to: the first recommended non-primary model
 	if len(names) > 0 {
 		recommended := map[string]bool{}
 		for _, m := range models {
@@ -228,12 +230,18 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				recommended[m.Name] = true
 			}
 		}
-		sonnetItems = []SelectionItem{{Name: "(same as primary)", Description: "route all tiers to " + primary}}
+		sonnetItems = []SelectionItem{
+			{Name: "auto", Description: "let OAICA pick the secondary (best recommended model) — recommended"},
+			{Name: "(same as primary)", Description: "route all tiers to " + primary},
+		}
 		for _, n := range names {
 			if n == primary {
 				continue
 			}
 			if recommended[n] {
+				if autoSecondary == "" {
+					autoSecondary = n
+				}
 				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)"})
 			}
 		}
@@ -241,6 +249,20 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			if n != primary && !recommended[n] {
 				sonnetItems = append(sonnetItems, SelectionItem{Name: n})
 			}
+		}
+		// Alphabetize the non-recommended tail (recommended rows already
+		// lead); keep the leading auto/same-as-primary rows untouched.
+		lead := 1
+		if autoSecondary != "" {
+			lead = 2 // auto + (same as primary)
+		}
+		sort.SliceStable(sonnetItems[lead:], func(a, b int) bool {
+			return sonnetItems[lead+a].Name < sonnetItems[lead+b].Name
+		})
+		// No recommendation available: "auto" would be a promise it can't
+		// keep — drop it so "(same as primary)" leads instead.
+		if autoSecondary == "" {
+			sonnetItems = sonnetItems[1:]
 		}
 		if len(sonnetItems) <= 1 {
 			sonnetItems = nil // single-model inventory: nothing to choose
@@ -315,7 +337,12 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		}
 		switch i {
 		case 0:
-			if sel != s.items[0].Name {
+			if sel == "auto" {
+				// Resolved here, not downstream: plans store a concrete
+				// model name, and "auto" has no meaning after launch.
+				sel = autoSecondary
+			}
+			if sel != "" && sel != s.items[0].Name {
 				c.SonnetModel = sel
 			}
 		case 1:

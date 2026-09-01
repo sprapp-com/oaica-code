@@ -51,15 +51,15 @@ func mixedItems() []SelectItem {
 	return []SelectItem{
 		{Name: "rec-a", Recommended: true},
 		{Name: "rec-b", Recommended: true},
-		{Name: "other-1"},
-		{Name: "other-2"},
-		{Name: "other-3"},
-		{Name: "other-4"},
-		{Name: "other-5"},
-		{Name: "other-6"},
-		{Name: "other-7"},
-		{Name: "other-8"},
-		{Name: "other-9"},
+		{Name: "other-01"},
+		{Name: "other-02"},
+		{Name: "other-03"},
+		{Name: "other-04"},
+		{Name: "other-05"},
+		{Name: "other-06"},
+		{Name: "other-07"},
+		{Name: "other-08"},
+		{Name: "other-09"},
 		{Name: "other-10"},
 	}
 }
@@ -139,8 +139,8 @@ func TestOtherStart(t *testing.T) {
 			items: []SelectItem{
 				{Name: "rec-a", Recommended: true},
 				{Name: "rec-b", Recommended: true},
-				{Name: "other-1"},
-				{Name: "other-2"},
+				{Name: "other-01"},
+				{Name: "other-02"},
 			},
 			want: 2,
 		},
@@ -153,7 +153,7 @@ func TestOtherStart(t *testing.T) {
 			name: "filtering returns 0",
 			items: []SelectItem{
 				{Name: "rec-a", Recommended: true},
-				{Name: "other-1"},
+				{Name: "other-01"},
 			},
 			filter: "rec",
 			want:   0,
@@ -280,7 +280,7 @@ func TestRenderContent_SectionHeaders(t *testing.T) {
 		title: "Pick:",
 		items: []SelectItem{
 			{Name: "rec-a", Recommended: true},
-			{Name: "other-1"},
+			{Name: "other-01"},
 		},
 	}
 	content := m.renderContent()
@@ -324,7 +324,7 @@ func TestRenderContent_RemoteSectionHeader(t *testing.T) {
 		items: []SelectItem{
 			{Name: "opencode-go/glm-5.3", Remote: true},
 			{Name: "rec-a", Recommended: true},
-			{Name: "other-1"},
+			{Name: "other-01"},
 		},
 	}
 	content := m.renderContent()
@@ -460,8 +460,10 @@ func TestRenderContent_AvailabilityBadgeOnlyOnCursor(t *testing.T) {
 			{Name: "qwen3.5:cloud", AvailabilityBadge: "Sign in required"},
 			{Name: "glm-5:cloud", AvailabilityBadge: "Included"},
 		},
-		cursor: 0,
 	}
+	// ReorderItems alphabetizes the "More" section, so resolve the cursor
+	// against the DISPLAY order, not the raw slice (glm-5 sorts first).
+	m.cursor = cursorForItemName(m.filteredItems(), "kimi-k2.6:cloud", 0)
 	content := m.renderContent()
 
 	if !strings.Contains(content, "(Upgrade required)") {
@@ -818,7 +820,7 @@ func TestMultiUpdateScroll(t *testing.T) {
 func TestMultiView_SectionHeaders(t *testing.T) {
 	m := newMultiSelectorModel("Pick:", []SelectItem{
 		{Name: "rec-a", Recommended: true},
-		{Name: "other-1"},
+		{Name: "other-01"},
 	}, nil)
 	content := m.View()
 

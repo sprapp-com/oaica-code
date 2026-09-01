@@ -110,11 +110,11 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 }
 
 // ReorderItems returns a copy with recommended items first, then non-recommended,
-// preserving relative order within each group. Local/Remote items aren't
-// special-cased here — the render loop (see the Local/Remote/Recommended/
-// other switch below) re-splits into all four sections regardless of this
-// function's order, so this only affects the relative order WITHIN the
-// scrollable "More" section and the underlying data list.
+// each group alphabetized by name (recommended keeps its relative order —
+// the router catalog's own ranking — while local/remote/other rows sort
+// alphabetically so a wall of OpenRouter models is scannable). The render
+// loop re-splits into the four sections from this flat list, so section
+// membership AND within-section order both come from here.
 func ReorderItems(items []SelectItem) []SelectItem {
 	var loc, rec, rem, other []SelectItem
 	for _, item := range items {
@@ -132,12 +132,19 @@ func ReorderItems(items []SelectItem) []SelectItem {
 			other = append(other, item)
 		}
 	}
+	byName := func(a, b SelectItem) bool { return a.Name < b.Name }
 	// Within Remote, builtin aggregators (ollama/, openrouter/) sort first —
 	// the render's Remote section uses the same order, so navigation (which
 	// walks the flat list) always agrees with what's on screen.
 	sort.SliceStable(rem, func(a, b int) bool {
-		return isBuiltinAggregatorProvider(rem[a].Name) && !isBuiltinAggregatorProvider(rem[b].Name)
+		pa, pb := isBuiltinAggregatorProvider(rem[a].Name), isBuiltinAggregatorProvider(rem[b].Name)
+		if pa != pb {
+			return pa
+		}
+		return byName(rem[a], rem[b])
 	})
+	sort.SliceStable(loc, func(a, b int) bool { return byName(loc[a], loc[b]) })
+	sort.SliceStable(other, func(a, b int) bool { return byName(other[a], other[b]) })
 	return append(append(append(loc, rec...), rem...), other...)
 }
 
