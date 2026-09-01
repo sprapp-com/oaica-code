@@ -123,7 +123,12 @@ func (p *tierPlanProfiles) save() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Chmod after the fact too: the 0o600 mode arg only applies at creation,
+	// and a pre-existing looser file (audit 2026-09-01) stayed world-readable.
+	return os.Chmod(path, 0o600)
 }
 
 // PlanSet creates or replaces a named plan.

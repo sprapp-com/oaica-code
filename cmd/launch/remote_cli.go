@@ -68,7 +68,14 @@ func saveUserRemotesFile(f userRemotesFile, path string) error {
 		return err
 	}
 	// 0o600: this file may hold plaintext bearer tokens (--api-key).
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	// Chmod AFTER the write too (2026-09-01 security audit M2): the mode arg
+	// only applies at creation — a pre-existing world-readable file (observed
+	// 0664 live, plaintext api_key inside) stayed readable by every local
+	// user forever.
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 var (

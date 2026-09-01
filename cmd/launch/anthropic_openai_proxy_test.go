@@ -84,7 +84,10 @@ func TestProxyHonorsPerRequestModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go RunAnthropicOpenAIProxy(ln, remote, "glm-5.3")
+	token, err := StartAnthropicOpenAIProxy(ln, remote, "glm-5.3")
+	if err != nil {
+		t.Fatal(err)
+	}
 	proxyURL := "http://" + ln.Addr().String()
 
 	post := func(model string) {
@@ -93,7 +96,9 @@ func TestProxyHonorsPerRequestModel(t *testing.T) {
 			"max_tokens": 10,
 			"messages":   []map[string]any{{"role": "user", "content": "hi"}},
 		})
-		resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+		req2, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(body))
+		req2.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -148,14 +153,19 @@ func TestProxyFallsBackToFixedModelWhenRequestOmitsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go RunAnthropicOpenAIProxy(ln, remote, "deepseek-v4-flash")
+	token, err := StartAnthropicOpenAIProxy(ln, remote, "deepseek-v4-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
 	proxyURL := "http://" + ln.Addr().String()
 
 	body, _ := json.Marshal(map[string]any{
 		"max_tokens": 10,
 		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
 	})
-	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	req2, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +202,9 @@ func TestProxy_SessionIDHeaderForwarded(t *testing.T) {
 	defer upstream.Close()
 
 	table := proxyRouteTable{
-		Default:   proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", Label: "test:kat-awq"},
-		SessionID: "oaica-session-abc123",
+		ClientToken: "test-client-token",
+		Default:     proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", Label: "test:kat-awq"},
+		SessionID:   "oaica-session-abc123",
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -207,7 +218,9 @@ func TestProxy_SessionIDHeaderForwarded(t *testing.T) {
 			"model": "kat-awq", "max_tokens": 10,
 			"messages": []map[string]any{{"role": "user", "content": "hi"}},
 		})
-		resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+		req2, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(body))
+		req2.Header.Set("Authorization", "Bearer test-client-token")
+		resp, err := http.DefaultClient.Do(req2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,7 +288,8 @@ func TestProxyResolveKey_ReReadsEnvVarLive(t *testing.T) {
 	// Table built BEFORE the env var is ever set, matching the incident:
 	// the proxy process starts, THEN the key gets exported.
 	table := proxyRouteTable{
-		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", KeyEnv: envVar, Label: "test:kat-awq"},
+		ClientToken: "test-client-token",
+		Default:     proxyRoute{BaseURL: upstream.URL, UpstreamModel: "kat-awq", KeyEnv: envVar, Label: "test:kat-awq"},
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -289,7 +303,9 @@ func TestProxyResolveKey_ReReadsEnvVarLive(t *testing.T) {
 			"model": "kat-awq", "max_tokens": 10,
 			"messages": []map[string]any{{"role": "user", "content": "hi"}},
 		})
-		resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+		req2, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(body))
+		req2.Header.Set("Authorization", "Bearer test-client-token")
+		resp, err := http.DefaultClient.Do(req2)
 		if err != nil {
 			t.Fatal(err)
 		}

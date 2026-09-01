@@ -708,7 +708,10 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 			onUpstreamError(info, status, "upstream_error", "upstream unavailable: "+err.Error())
 		}
 		w.Header().Set("Retry-After", "2")
-		writeErr(w, status, "upstream_error", "upstream unavailable: "+err.Error())
+		// Client body stays generic (2026-09-01 security audit M2): err.Error()
+		// embeds the full internal upstream URL. The detail already went to
+		// the operator sink above; echoing it to public callers leaks topology.
+		writeErr(w, status, "upstream_error", "upstream unavailable")
 	}
 	return p, nil
 }
@@ -861,6 +864,10 @@ func (g *gateway) apply(cfg gwConfig) error {
 	// goroutine (if any) keeps draining its own now-orphaned channel until
 	// it empties and exits on its own — never killed mid-send, never leaks
 	// past a few pending reports.
+	// meterCh and entitlement are read under RLock by reportUsage and the
+	// completion path, so the writes happen under the same lock (2026-09-01
+	// security audit M4): a SIGHUP reload raced live requests before.
+	g.mu.Lock()
 	if cfg.MeterHubAddr != "" {
 		g.meterCh = make(chan usageReport, 256)
 		go runMeterReporter(g.meterCh, cfg.MeterHubAddr, cfg.MeterHubToken)
@@ -877,6 +884,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 	} else {
 		g.entitlement = nil
 	}
+	g.mu.Unlock()
 
 	// Large-context admission control — see gwConfig.LargeContextTokenThreshold's
 	// doc. A negative threshold disables it; everything else gets sane
@@ -1173,7 +1181,8 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return g.healthFallbackDown(err.Error())
+		log.Printf("health probe failed: %v", err)
+		return g.healthFallbackDown("upstream unavailable")
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
@@ -1714,6 +1723,14 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Authorization", "Bearer "+up)
 	} else {
 		r.Header.Del("Authorization")
+	}
+	// Also strip every other caller-credential header (2026-09-01 security
+	// audit H1): Anthropic-wire clients send the key in X-Api-Key, Azure-style
+	// callers in api-key, and cookies pass through untouched. A model with its
+	// own upstream_addr can point at a third-party endpoint — relaying the
+	// caller's key there would leak it into someone else's logs.
+	for _, h := range []string{"X-Api-Key", "Api-Key", "Cookie"} {
+		r.Header.Del(h)
 	}
 
 	rid := newRequestID()

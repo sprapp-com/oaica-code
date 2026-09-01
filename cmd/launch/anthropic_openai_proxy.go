@@ -457,16 +457,40 @@ func ListenAnthropicOpenAIProxy(remote userRemote, upstreamModel string) (net.Li
 // user-defined remote with the remote's api key. upstreamModel is the bare
 // model id to send to the remote (e.g. "deepseek-v4-flash"). Blocks until the
 // listener closes.
-func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel string) error {
-	// Normalize the base URL (shared with fetchRemoteModels so the picker
-	// and the proxy agree): openAIBase strips a trailing "/v1" from base_url
-	// and re-appends the remote's API version (default "v1", "v4" for z.ai),
-	// so the upstream endpoint is hit exactly once — otherwise a base_url that
-	// already includes /v1 (e.g. https://api.deepseek.com/v1) would produce
-	// /v1/v1/chat/completions and 404.
-	return RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+//
+// A per-launch client token is ALWAYS generated and enforced (2026-09-01
+// security audit H1): the proxy injects the remote's real key upstream, and
+// loopback is shared with every other process/user on the box — an
+// unauthenticated proxy let any local process spend the key. The token is
+// returned so the caller can hand it to its child as the bearer credential
+// (the real remote key never enters a child environment). Callers that
+// genuinely cannot consume a token must not use this entry point.
+func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel string) (string, error) {
+	token, err := newProxyClientToken()
+	if err != nil {
+		return "", fmt.Errorf("generate proxy client token: %w", err)
+	}
+	return token, RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+		ClientToken: token,
 		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
 	})
+}
+
+
+// StartAnthropicOpenAIProxy is the async form of RunAnthropicOpenAIProxy for
+// callers that must keep resolving (the agent shim path): it generates the
+// per-launch client token, starts the serve loop in a goroutine, and returns
+// the token immediately.
+func StartAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel string) (string, error) {
+	token, err := newProxyClientToken()
+	if err != nil {
+		return "", fmt.Errorf("generate proxy client token: %w", err)
+	}
+	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+		ClientToken: token,
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
+	}) }()
+	return token, nil
 }
 
 // proxyRoute is one upstream an Anthropic request can be forwarded to.
@@ -958,7 +982,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// (route_policy.go): consecutive failures escalate the session to
 			// the stronger secondary leg.
 			table.escalations.recordFail(table.SessionID, route.BaseURL)
-			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
+			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
 			return
 		}
 		defer resp.Body.Close()
@@ -1016,7 +1040,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					return
 				}
 			}
-			writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, text))
+			// redactURL the upstream body/transport error before it reaches
+			// the child (audit 2026-09-01 L1): url.Error embeds the full URL
+			// — userinfo in a misconfigured remotes.json base_url would land
+			// in an LLM-driven child's context.
+			writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
 			return
 		}
 
@@ -1269,7 +1297,7 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
 		return
 	}
 	defer resp.Body.Close()
@@ -1324,5 +1352,10 @@ func ServeAnthropicProxyForRemote(remoteName, upstreamModel string, port int) er
 	}
 	chosen := ln.Addr().(*net.TCPAddr).Port
 	fmt.Println(strconv.Itoa(chosen))
-	return RunAnthropicOpenAIProxy(ln, remote, upstreamModel)
+	token, rerr := RunAnthropicOpenAIProxy(ln, remote, upstreamModel)
+	if rerr != nil {
+		return rerr
+	}
+	fmt.Println(token)
+	return nil
 }

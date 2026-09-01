@@ -54,8 +54,10 @@ func TestResolveAgentModelRemote(t *testing.T) {
 	if !strings.HasPrefix(baseURL, "http://127.0.0.1:") {
 		t.Errorf("baseURL = %q, want loopback proxy", baseURL)
 	}
-	if token != "sk-static" {
-		t.Errorf("token = %q, want remote's static key", token)
+	// 2026-09-01 security audit H2: the caller gets the per-launch PROXY
+	// token, never the remote's real key (which stays inside the proxy).
+	if !strings.HasPrefix(token, "oaica-proxy-") {
+		t.Errorf("token = %q, want per-launch proxy token", token)
 	}
 	if upstreamModel != "deepseek-chat" {
 		t.Errorf("upstreamModel = %q, want %q", upstreamModel, "deepseek-chat")
@@ -78,8 +80,10 @@ func TestResolveAgentModelKeyPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveAgentModel: %v", err)
 	}
-	if token != "sk-from-env" {
-		t.Errorf("token = %q, want env-provided key (env beats file)", token)
+	// H2: proxy token, not the remote's real key (api_key_env still wins
+	// INSIDE the proxy — asserted by TestProxyResolveKey*).
+	if !strings.HasPrefix(token, "oaica-proxy-") {
+		t.Errorf("token = %q, want per-launch proxy token", token)
 	}
 	if upstreamModel != "qwen3" {
 		t.Errorf("upstreamModel = %q, want %q", upstreamModel, "qwen3")

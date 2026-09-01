@@ -58,7 +58,10 @@ func writeBackupCopy(srcPath string, integration string) (string, error) {
 		dir = filepath.Join(dir, integration)
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0o700 dir / 0o600 file (2026-09-01 security audit M3): these backups
+	// hold integration configs with plaintext API keys; 0o755 + the source
+	// file's mode left them world-readable.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 
@@ -66,6 +69,7 @@ func writeBackupCopy(srcPath string, integration string) (string, error) {
 	if err := copyFile(srcPath, backupPath); err != nil {
 		return "", err
 	}
+	_ = os.Chmod(backupPath, 0o600)
 	pruneOldBackups(dir, name, maxBackupsPerFile)
 	return backupPath, nil
 }

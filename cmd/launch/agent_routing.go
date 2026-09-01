@@ -265,9 +265,12 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 		if lerr != nil {
 			return "", "", "", AgentModelMeta{}, fmt.Errorf("failed to start translation proxy for remote %q: %w", remote.Name, lerr)
 		}
-		go func() { _ = RunAnthropicOpenAIProxy(ln, remote, bare) }()
+		proxyToken, perr := StartAnthropicOpenAIProxy(ln, remote, bare)
+		if perr != nil {
+			return "", "", "", AgentModelMeta{}, fmt.Errorf("start translation proxy for remote %q: %w", remote.Name, perr)
+		}
 		baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
-		token = remote.key()
+		token = proxyToken
 	} else if !routerSKU {
 		if remote, bare, ok := findUserRemoteForModel(model); ok {
 			if err := gateUserRemoteTools(remote, bare, toolWireAnthropic, opts.ForceTools); err != nil {
@@ -278,9 +281,12 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 			if lerr != nil {
 				return "", "", "", AgentModelMeta{}, fmt.Errorf("failed to start translation proxy for remote %q: %w", remote.Name, lerr)
 			}
-			go func() { _ = RunAnthropicOpenAIProxy(ln, remote, bare) }()
+			proxyToken, perr := StartAnthropicOpenAIProxy(ln, remote, bare)
+			if perr != nil {
+				return "", "", "", AgentModelMeta{}, fmt.Errorf("start translation proxy for remote %q: %w", remote.Name, perr)
+			}
 			baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
-			token = remote.key()
+			token = proxyToken
 		} else {
 			realHost := oaicaResolveHostForModel(model)
 			baseURL = realHost
