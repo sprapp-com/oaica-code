@@ -96,7 +96,14 @@ var tierWizardSelect = func(title string, items []SelectionItem) (string, error)
 		return "", errors.New("no choices offered")
 	}
 	if DefaultSingleSelector != nil {
-		return DefaultSingleSelector(title, items, items[0].Name)
+		sel, err := DefaultSingleSelector(title, items, items[0].Name)
+		// esc / arrow-left cancel the selector: translate to "go back a
+		// step" for the wizard (runTierWizard's navigation), never abort
+		// the launch underneath it.
+		if errors.Is(err, ErrCancelled) {
+			return tierWizardBack, nil
+		}
+		return sel, err
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", title)
 	for i, it := range items {
@@ -195,69 +202,70 @@ func oversizeWindowCandidates(models []string, primary string, resolve func(stri
 
 const tierWizardNoOversize = "(none — fail honestly at the ceiling)"
 
+// tierWizardBack is what tierWizardSelect returns when the user pressed
+// esc/←: go back one step (off the first step = abandon the wizard and
+// launch with the defaults).
+const tierWizardBack = "\x00back"
+
 // runTierWizard runs steps 2-4 on the picker model list. models is the same
 // inventory the picker showed; primary is the already-picked model.
+// Navigation: enter advances, esc/arrow-left steps back (re-asking the
+// previous prompt); esc on the very first step abandons the wizard and the
+// launch continues with the defaults.
 func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, error) {
 	c := tierWizardChoice{RoutePolicy: string(RouteLocalFirst)}
 	names := launchModelNames(models)
 
+	// Step 2 — Sonnet/subagent tier. Same picker vocabulary; "(same as
+	// primary)" first so Enter keeps the single-model launch, OAICA router
+	// recommendations lead the rest and are marked (the picker's "OAICA
+	// Models" section order, carried over).
+	var sonnetItems []SelectionItem
 	if len(names) > 0 {
-		// Step 2 — Sonnet/subagent tier. Same picker vocabulary; "(same as
-		// primary)" first so Enter keeps the single-model launch, OAICA
-		// router recommendations lead the rest and are marked (the picker's
-		// "OAICA Models" section order, carried over).
 		recommended := map[string]bool{}
 		for _, m := range models {
 			if m.Recommended {
 				recommended[m.Name] = true
 			}
 		}
-		items := []SelectionItem{{Name: "(same as primary)", Description: "route all tiers to " + primary}}
+		sonnetItems = []SelectionItem{{Name: "(same as primary)", Description: "route all tiers to " + primary}}
 		for _, n := range names {
 			if n == primary {
 				continue
 			}
 			if recommended[n] {
-				items = append(items, SelectionItem{Name: n, Description: "(Recommended)"})
+				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)"})
 			}
 		}
 		for _, n := range names {
 			if n != primary && !recommended[n] {
-				items = append(items, SelectionItem{Name: n})
+				sonnetItems = append(sonnetItems, SelectionItem{Name: n})
 			}
 		}
-		if len(items) > 1 {
-			sel, err := tierWizardSelect("Sonnet/subagent tier (secondary model)", items)
-			if err != nil {
-				return c, err
-			}
-			if sel != items[0].Name {
-				c.SonnetModel = sel
-			}
+		if len(sonnetItems) <= 1 {
+			sonnetItems = nil // single-model inventory: nothing to choose
 		}
+	}
 
-		// Step 3 — compaction/oversize model. Only models whose PROBED window
-		// is strictly larger than the primary's probed window qualify; with
-		// no such model (or no answered probe) the step offers nothing and
-		// the ceiling fails honestly, as it does today.
+	// Step 3 — compaction/oversize model. Models whose PROBED window is at
+	// least the primary's on a DIFFERENT backend qualify (see
+	// oversizeWindowCandidates); with no such model (or no answered probe)
+	// the step offers nothing and the ceiling fails honestly.
+	var oversizeItems []SelectionItem
+	var oversizeTitle string
+	if len(names) > 0 {
 		cands, primaryWindow := oversizeWindowCandidates(names, primary, tierWizardResolveEndpoint, tierWizardProbeWindow)
 		if len(cands) > 0 {
-			items := []SelectionItem{{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"}}
+			oversizeItems = []SelectionItem{{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"}}
 			for _, n := range cands {
 				w := probedModelWindow(n)
 				desc := ""
 				if w > 0 {
 					desc = fmt.Sprintf("probed window %dk", w/1024)
 				}
-				items = append(items, SelectionItem{Name: n, Description: desc})
+				oversizeItems = append(oversizeItems, SelectionItem{Name: n, Description: desc})
 			}
-			sel, err := tierWizardSelect(fmt.Sprintf("Compaction/oversize model (strictly larger than %s's probed %dk window)", primary, primaryWindow/1024), items)
-			if err != nil {
-				return c, err
-			}
-			if sel != items[0].Name {
-				c.OversizeModel = sel
-			}
+			oversizeTitle = fmt.Sprintf("Compaction/oversize model (at least %s's probed %dk window)", primary, primaryWindow/1024)
 		}
 	}
 
@@ -270,17 +278,72 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		{Name: string(RouteLocalOnly), Description: "never leave local legs — fail visibly rather than cross over"},
 		{Name: string(RouteRemoteOnly), Description: "never leave remote legs — same"},
 	}
-	sel, err := tierWizardSelect("Route policy (what the launch proxy does when a backend fails)", policyItems)
-	if err != nil {
-		return c, err
+
+	type wizardStep struct {
+		title    string
+		items    []SelectionItem
+		optional bool // nil items = skipped entirely, but still a back-stop
 	}
-	c.RoutePolicy = sel
+	steps := []wizardStep{
+		{title: "Sonnet/subagent tier (secondary model)", items: sonnetItems, optional: true},
+		{title: oversizeTitle, items: oversizeItems, optional: true},
+		{title: "Route policy (what the launch proxy does when a backend fails)", items: policyItems},
+	}
+	for i := 0; i < len(steps); i++ {
+		s := steps[i]
+		if s.items == nil {
+			continue
+		}
+		sel, err := tierWizardSelect(s.title, s.items)
+		if err != nil {
+			return c, err
+		}
+		if sel == tierWizardBack {
+			if i == 0 {
+				return c, nil // backed off the first step: launch as-is
+			}
+			// Step back: clear the choice recorded on the step we're
+			// leaving (only steps 1 and 2 write fields; both keep the
+			// default "empty = keep it").
+			if i == 1 {
+				c.OversizeModel = ""
+			} else {
+				c.RoutePolicy = string(RouteLocalFirst)
+			}
+			i -= 2
+			continue
+		}
+		switch i {
+		case 0:
+			if sel != s.items[0].Name {
+				c.SonnetModel = sel
+			}
+		case 1:
+			if sel != s.items[0].Name {
+				c.OversizeModel = sel
+			}
+		case 2:
+			c.RoutePolicy = sel
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "%s\n", tierWizardPreview(primary, c))
 
-	name, err := tierWizardReadLine("Save as plan (name, blank = skip): ")
+	// Plan save: Enter reuses the last saved plan name when there is one
+	// (plans.json last_used), blank only when none exists.
+	last, _ := PlanLastUsed()
+	prompt := "Save as plan (name, blank = skip)"
+	defaultName := ""
+	if last != "" {
+		defaultName = last
+		prompt += ", enter = " + last
+	}
+	name, err := tierWizardReadLine(prompt + ": ")
 	if err != nil && name == "" {
 		return c, err
+	}
+	if name == "" {
+		name = defaultName
 	}
 	if name != "" {
 		desc := "interactive launch wizard"

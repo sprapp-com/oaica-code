@@ -53,6 +53,10 @@ type TierPlanProfile struct {
 type tierPlanProfiles struct {
 	Version  int                        `json:"version"`
 	Profiles map[string]TierPlanProfile `json:"profiles"`
+	// LastUsed is the plan name the wizard last saved (empty in files
+	// written before the field existed) — the plan-save prompt's
+	// Enter-to-reuse default.
+	LastUsed string `json:"last_used,omitempty"`
 }
 
 const tierPlanProfilesVersion = 1
@@ -144,7 +148,20 @@ func PlanSet(name string, profile TierPlanProfile) error {
 		p.Profiles = map[string]TierPlanProfile{}
 	}
 	p.Profiles[name] = profile
+	p.LastUsed = name
 	return p.save()
+}
+
+// PlanLastUsed returns the wizard's most recently saved plan name, or "".
+func PlanLastUsed() (string, error) {
+	p, err := loadTierPlanProfiles()
+	if err != nil {
+		return "", err
+	}
+	if _, ok := p.Profiles[p.LastUsed]; !ok {
+		return "", nil // removed since; no stale Enter default
+	}
+	return p.LastUsed, nil
 }
 
 // PlanRemove deletes a named plan, reporting whether it existed.

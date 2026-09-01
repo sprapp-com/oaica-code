@@ -348,3 +348,70 @@ func TestExtractWizardFlag(t *testing.T) {
 		t.Fatal("no --wizard given")
 	}
 }
+
+func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
+	withTempOaicaHome(t)
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+
+	// 1. Back on the very first step abandons the wizard with defaults.
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		return tierWizardBack, nil
+	}
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "" || c.OversizeModel != "" || c.RoutePolicy != string(RouteLocalFirst) {
+		t.Fatalf("back on first step should leave defaults: %+v", c)
+	}
+
+	// 2. Back mid-flow: enter step2, esc on step3 -> step2 re-asked, then
+	// finish through the policy step.
+	origResolve, origProbe := tierWizardResolveEndpoint, tierWizardProbeWindow
+	t.Cleanup(func() { tierWizardResolveEndpoint, tierWizardProbeWindow = origResolve, origProbe })
+	tierWizardResolveEndpoint = func(m string) (launchEndpoint, error) {
+		return launchEndpoint{RemoteEndpoint: RemoteEndpoint{
+			BaseURL: "http://" + strings.ReplaceAll(m, "/", "-") + ".stub/v1", UpstreamModel: m,
+		}}, nil
+	}
+	tierWizardProbeWindow = func(r proxyRoute) int { return 262144 }
+	var logged []string
+	answers := []string{"kat-awq-7b", tierWizardBack, "kat-awq-7b", "big-box/glm-9", "remote-first"}
+	calls := 0
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		logged = append(logged, title)
+		ans := answers[min(calls, len(answers)-1)]
+		calls++
+		return ans, nil
+	}
+	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "big-box/glm-9"), "kat-awq")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "kat-awq-7b" || c.OversizeModel != "big-box/glm-9" || c.RoutePolicy != "remote-first" {
+		t.Fatalf("unexpected choice: %+v", c)
+	}
+	if len(logged) != 5 {
+		t.Fatalf("step sequence = %d prompts (%v), want 5 (step2, step3, re-ask step2, step3, policy)", len(logged), logged)
+	}
+
+	// 3. Plan save: Enter reuses the last saved plan name.
+	PlanSet("myplan", TierPlanProfile{Model: "kat-awq", RoutePolicy: "auto"})
+	names, _ := PlanSortedNames()
+	if len(names) == 0 || names[0] != "myplan" {
+		t.Fatalf("plans = %v", names)
+	}
+	if last, _ := PlanLastUsed(); last != "myplan" {
+		t.Fatalf("PlanLastUsed = %q, want myplan", last)
+	}
+	PlanSet("other", TierPlanProfile{Model: "kat-awq"})
+	if last, _ := PlanLastUsed(); last != "other" {
+		t.Fatalf("PlanLastUsed after second save = %q, want other", last)
+	}
+	PlanRemove("other")
+	if last, _ := PlanLastUsed(); last != "" {
+		t.Fatalf("PlanLastUsed after removal = %q, want empty", last)
+	}
+}
