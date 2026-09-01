@@ -13,15 +13,52 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // remoteContextWindowFn is swappable so tests can stub the network probe.
-var remoteContextWindowFn = defaultRemoteContextWindow
+var remoteContextWindowFn = cachedRemoteContextWindow
 
 // probeTimeout is intentionally short: this runs on every launch, before the
 // first token. A slow /models must not add seconds of startup latency.
 const probeTimeout = 2 * time.Second
+
+// probeCacheTTL bounds how long a probe result is reused. The wizard's
+// oversize step probes EVERY candidate model, and withContextWindows then
+// re-probes the same upstreams after the wizard — without a cache that's
+// 2s per model per step, all sequential, on every launch.
+const probeCacheTTL = 5 * time.Minute
+
+type probeCacheEntry struct {
+	window    int
+	expiresAt time.Time
+}
+
+// probeCache memoizes defaultRemoteContextWindow per (base URL, model).
+// A negative (0) result is cached too — a dead backend shouldn't cost its
+// full timeout again for every candidate in the same launch.
+var probeCache = struct {
+	sync.Mutex
+	m map[string]probeCacheEntry
+}{m: map[string]probeCacheEntry{}}
+
+func cachedRemoteContextWindow(route proxyRoute) int {
+	key := route.BaseURL + "|" + route.UpstreamModel
+	probeCache.Lock()
+	e, ok := probeCache.m[key]
+	if ok && time.Now().Before(e.expiresAt) {
+		probeCache.Unlock()
+		return e.window
+	}
+	probeCache.Unlock()
+
+	w := defaultRemoteContextWindow(route)
+	probeCache.Lock()
+	probeCache.m[key] = probeCacheEntry{window: w, expiresAt: time.Now().Add(probeCacheTTL)}
+	probeCache.Unlock()
+	return w
+}
 
 type remoteModelMeta struct {
 	ID            string `json:"id"`

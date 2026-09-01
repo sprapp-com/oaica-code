@@ -2,11 +2,14 @@ package launch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	modelpkg "github.com/ollama/ollama/types/model"
@@ -76,5 +79,24 @@ func TestModelInventoryResolveDoesNotRefreshCloudMiss(t *testing.T) {
 	}
 	if got[0].ContextLength <= 0 || got[0].MaxOutputTokens <= 0 {
 		t.Fatalf("cloud limits not applied: %#v", got[0])
+	}
+}
+
+func TestPickerCacheRoundTripAndTTL(t *testing.T) {
+	withTempOaicaHome(t)
+	models := []LaunchModel{{Name: "oaica-35b-a3b-vision", Remote: true}, {Name: "ollama/kat-awq"}}
+	savePickerCache(models)
+	got, ok := loadPickerCache()
+	if !ok || len(got) != 2 || got[0].Name != "oaica-35b-a3b-vision" {
+		t.Fatalf("round trip: ok=%v models=%v", ok, got)
+	}
+	// Stale cache: expired SavedAt must miss.
+	b, _ := json.Marshal(pickerCacheFile{SavedAt: time.Now().Add(-2 * time.Hour), TTLSecond: time.Hour.Seconds(), Models: models})
+	path, _ := pickerCachePath()
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadPickerCache(); ok {
+		t.Fatal("stale cache must not load")
 	}
 }

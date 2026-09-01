@@ -2,10 +2,14 @@ package launch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	modelpkg "github.com/ollama/ollama/types/model"
@@ -107,6 +111,20 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		return cloneLaunchModels(i.models), i.err
 	}
 
+	// Disk fast path: a fresh cache file renders the picker from the last
+	// successful inventory with ZERO network calls. The full load below
+	// probes the local daemon, every configured remote AND the cloud
+	// router — with slow/dead remotes that's seconds of dead latency before
+	// the menu paints. Stale entries simply fall through to the full load.
+	if !force {
+		if models, ok := loadPickerCache(); ok {
+			i.models = models
+			i.err = nil
+			i.loaded = true
+			return cloneLaunchModels(i.models), nil
+		}
+	}
+
 	// LOCAL models first, and independently of the router. A self-hosted user
 	// may have no router at all; a hosted user's router may be down. Neither
 	// should empty the picker -- previously ANY router error set i.models=nil,
@@ -171,8 +189,71 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	i.models = models
 	i.err = nil
 	i.loaded = true
+	savePickerCache(models)
 
 	return cloneLaunchModels(i.models), i.err
+}
+
+// pickerCacheTTL bounds how long the disk cache is trusted. One launch
+// cycle per hour pays the full probe cost; everything in between opens
+// the picker from the file.
+const pickerCacheTTL = time.Hour
+
+type pickerCacheFile struct {
+	SavedAt   time.Time     `json:"saved_at"`
+	TTLSecond float64       `json:"ttl_seconds"`
+	Models    []LaunchModel `json:"models"`
+}
+
+// pickerCachePath lives under ~/.oaica next to plans.json/remotes.json.
+func pickerCachePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica", "picker_cache.json"), nil
+}
+
+func savePickerCache(models []LaunchModel) {
+	path, err := pickerCachePath()
+	if err != nil || len(models) == 0 {
+		return
+	}
+	b, err := json.Marshal(pickerCacheFile{SavedAt: time.Now(), TTLSecond: pickerCacheTTL.Seconds(), Models: models})
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path) // atomic swap: a crash never leaves a half-written cache
+}
+
+func loadPickerCache() ([]LaunchModel, bool) {
+	path, err := pickerCachePath()
+	if err != nil {
+		return nil, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var f pickerCacheFile
+	if json.Unmarshal(b, &f) != nil || len(f.Models) == 0 {
+		return nil, false
+	}
+	ttl := f.TTLSecond
+	if ttl <= 0 {
+		ttl = pickerCacheTTL.Seconds()
+	}
+	if time.Since(f.SavedAt) > time.Duration(ttl*float64(time.Second)) {
+		return nil, false
+	}
+	return f.Models, true
 }
 
 func (i *modelInventory) Resolve(ctx context.Context, names []string) []LaunchModel {
