@@ -473,18 +473,22 @@ func cursorItemSuffix(item SelectItem) string {
 	return " " + selectorDefaultTagStyle.Render("("+item.AvailabilityBadge+")")
 }
 
+// renderItem draws one row: name only — a description line appears ONLY
+// under the cursor row (opencode-style), so a 40-model menu is a clean
+// name column instead of every row dragging its own blurb along.
 func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) {
 	if idx == m.cursor {
 		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
 		s.WriteString(cursorItemSuffix(item))
-	} else {
-		s.WriteString(selectorItemStyle.Render(item.Name))
-	}
-	s.WriteString("\n")
-	if item.Description != "" {
-		s.WriteString(selectorDescLineStyle.Render(item.Description))
 		s.WriteString("\n")
+		if item.Description != "" {
+			s.WriteString(selectorDescLineStyle.Render(item.Description))
+			s.WriteString("\n")
+		}
+		return
 	}
+	s.WriteString(selectorItemStyle.Render(item.Name))
+	s.WriteString("\n")
 }
 
 func (m selectorModel) renderCompactItem(s *strings.Builder, item SelectItem, idx int) {
@@ -1152,14 +1156,15 @@ func (m multiSelectorModel) renderSingleItem(s *strings.Builder, item SelectItem
 	if idx == m.cursor {
 		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
 		s.WriteString(cursorItemSuffix(item))
-	} else {
-		s.WriteString(selectorItemStyle.Render(item.Name))
-	}
-	s.WriteString("\n")
-	if item.Description != "" {
-		s.WriteString(selectorDescLineStyle.Render(item.Description))
 		s.WriteString("\n")
+		if item.Description != "" {
+			s.WriteString(selectorDescLineStyle.Render(item.Description))
+			s.WriteString("\n")
+		}
+		return
 	}
+	s.WriteString(selectorItemStyle.Render(item.Name))
+	s.WriteString("\n")
 }
 
 func (m multiSelectorModel) renderMultiItem(s *strings.Builder, item SelectItem, idx int) {
