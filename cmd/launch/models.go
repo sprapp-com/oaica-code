@@ -586,6 +586,16 @@ func modelItemFromInventory(name string, info modelInfo, item ModelItem) ModelIt
 	item.Size = info.Size
 	item.Details = info.Details
 	item.Remote = info.Remote
+	// OpenRouter's zero-cost models carry the ":free" suffix; label them
+	// inline so they're spottable in the picker without opening the
+	// pricing page (an existing description gets the tag appended).
+	if strings.HasSuffix(name, ":free") && !strings.Contains(item.Description, "free") {
+		if item.Description == "" {
+			item.Description = "(free)"
+		} else {
+			item.Description += " (free)"
+		}
+	}
 	return item
 }
 
