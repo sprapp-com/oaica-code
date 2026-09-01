@@ -231,8 +231,12 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			}
 		}
 		sonnetItems = []SelectionItem{
-			{Name: "auto", Description: "let OAICA pick the secondary (best recommended model) — recommended"},
-			{Name: "(same as primary)", Description: "route all tiers to " + primary},
+			// Recommended flag on the fixed rows: the selector pins them
+			// into the "OAICA Models" section at the top (in this insertion
+			// order — recommended rows keep their relative order), so the
+			// step reads like the primary picker: our options first.
+			{Name: "auto", Description: "let OAICA pick the secondary (best recommended model) — recommended", Recommended: true},
+			{Name: "(same as primary)", Description: "route all tiers to " + primary, Recommended: true},
 		}
 		for _, n := range names {
 			if n == primary {
@@ -242,12 +246,17 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				if autoSecondary == "" {
 					autoSecondary = n
 				}
-				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)"})
+				// Recommended+Remote flags: the selector buckets these into
+				// the pinned "OAICA Models" section at the top (same as the
+				// primary picker's router-catalog rows).
+				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)", Recommended: true, Remote: true})
 			}
 		}
 		for _, n := range names {
 			if n != primary && !recommended[n] {
-				sonnetItems = append(sonnetItems, SelectionItem{Name: n})
+				// Remote flag: "Remote Models" section (alphabetical),
+				// NOT the scrollable "More" bucket.
+				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Remote: true})
 			}
 		}
 		// Alphabetize the non-recommended tail (recommended rows already
@@ -285,7 +294,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				if w > 0 {
 					desc = fmt.Sprintf("probed window %dk", w/1024)
 				}
-				oversizeItems = append(oversizeItems, SelectionItem{Name: n, Description: desc})
+				oversizeItems = append(oversizeItems, SelectionItem{Name: n, Description: desc, Remote: true})
 			}
 			oversizeTitle = fmt.Sprintf("Compaction/oversize model (at least %s's probed %dk window)", primary, primaryWindow/1024)
 		}
