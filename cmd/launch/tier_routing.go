@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -54,12 +55,50 @@ type launchEndpoint struct {
 // daemonHasModel is a package var so tests can stub the local daemon probe.
 var daemonHasModel = daemonHasModelLive
 
+// daemonProbeCache memoizes daemonHasModelLive per (host, model) for
+// daemonProbeTTL. resolveLaunchEndpoint asks the daemon once per resolved
+// model; the oversize step resolves EVERY picker candidate and each miss
+// would otherwise POST /api/show (3s timeout) serially. Tests stub the
+// daemonHasModel var, so they never touch this.
+var daemonProbeCache struct {
+	sync.Mutex
+	m map[string]daemonProbeResult
+}
+
+type daemonProbeResult struct {
+	found     bool
+	reachable bool
+	expiresAt time.Time
+}
+
+const daemonProbeTTL = 5 * time.Minute
+
 // daemonHasModelLive asks the local Ollama daemon (OLLAMA_HOST) whether it
 // knows model, via POST /api/show -- the same call upstream's launcher made
 // (client.Show). /api/tags is not enough: a ":cloud" alias the daemon
 // proxies to ollama.com answers /api/show without appearing in tags.
 // Returns (found, reachable).
 func daemonHasModelLive(model string) (bool, bool) {
+	host := envconfig.Host().String()
+	key := host + "|" + model
+	daemonProbeCache.Lock()
+	if daemonProbeCache.m == nil {
+		daemonProbeCache.m = map[string]daemonProbeResult{}
+	}
+	if r, ok := daemonProbeCache.m[key]; ok && time.Now().Before(r.expiresAt) {
+		daemonProbeCache.Unlock()
+		return r.found, r.reachable
+	}
+	daemonProbeCache.Unlock()
+
+	found, reachable := daemonHasModelLiveUncached(model)
+	daemonProbeCache.Lock()
+	daemonProbeCache.m[key] = daemonProbeResult{found: found, reachable: reachable, expiresAt: time.Now().Add(daemonProbeTTL)}
+	daemonProbeCache.Unlock()
+	return found, reachable
+}
+
+func daemonHasModelLiveUncached(model string) (bool, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	body, _ := json.Marshal(map[string]string{"model": model})

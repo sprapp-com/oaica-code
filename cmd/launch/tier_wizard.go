@@ -28,12 +28,13 @@ package launch
 import (
 	"bufio"
 	"errors"
-	"sort"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 )
 
 // tierWizardChoice is what the wizard collected.
@@ -137,10 +138,35 @@ var tierWizardReadLine = func(prompt string) (string, error) {
 // doorways into endpoint resolution and the /models context probe — both
 // swappable for tests (the probe default is remoteContextWindowFn itself,
 // the same 2s swap point the proxy uses).
+//
+// The resolve default is MEMOIZED per model id for the process lifetime:
+// resolveLaunchEndpoint does live network per call (router GET /v1/models
+// with an 8s timeout, then a daemon POST /api/show with a 3s timeout), and
+// the oversize step resolves EVERY candidate in the picker list — uncached
+// that is minutes of dead latency after the secondary step. A launch
+// process lives seconds-to-minutes; a stale resolution for one launch is
+// not a real risk. Tests overriding the var are unaffected.
 var (
-	tierWizardResolveEndpoint = resolveLaunchEndpoint
+	tierWizardResolveEndpoint = memoizedResolveLaunchEndpoint
 	tierWizardProbeWindow     func(proxyRoute) int // nil = remoteContextWindowFn
 )
+
+var wizardResolveMemo sync.Map // model name -> wizardResolved (endpoint or error)
+
+type wizardResolved struct {
+	ep  launchEndpoint
+	err error
+}
+
+func memoizedResolveLaunchEndpoint(model string) (launchEndpoint, error) {
+	if v, ok := wizardResolveMemo.Load(model); ok {
+		r := v.(wizardResolved)
+		return r.ep, r.err
+	}
+	ep, err := resolveLaunchEndpoint(model)
+	wizardResolveMemo.Store(model, wizardResolved{ep: ep, err: err})
+	return ep, err
+}
 
 // probedModelWindow is a model's live context window (0 = unknown).
 func probedModelWindow(model string) int {

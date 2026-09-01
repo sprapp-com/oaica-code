@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ollama/ollama/envconfig"
@@ -232,8 +233,44 @@ func isOaicaRouterAuthErr(err error) bool {
 	return errors.As(err, &re) && (re.Status == http.StatusUnauthorized || re.Status == http.StatusForbidden)
 }
 
+// cloudEntriesCache memoizes the live router /v1/models list per host for
+// cloudEntriesTTL. resolveLaunchEndpoint consults the router list once per
+// resolved model — the oversize step resolves EVERY picker candidate, and
+// without this each miss on the daemon path refetches the whole list (8s
+// timeout). Tests stub the oaicaFetchCloudModelEntries var, so they never
+// touch this.
+var cloudEntriesCache struct {
+	sync.Mutex
+	entries   []oaicaModelEntry
+	err       error
+	host      string
+	expiresAt time.Time
+}
+
+const cloudEntriesTTL = 5 * time.Minute
+
 func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
-	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/models", nil)
+	host := oaicaLaunchHost()
+	cloudEntriesCache.Lock()
+	if cloudEntriesCache.host == host && time.Now().Before(cloudEntriesCache.expiresAt) {
+		entries, err := cloudEntriesCache.entries, cloudEntriesCache.err
+		cloudEntriesCache.Unlock()
+		return entries, err
+	}
+	cloudEntriesCache.Unlock()
+
+	entries, err := oaicaFetchCloudModelEntriesLiveUncached(host)
+	cloudEntriesCache.Lock()
+	cloudEntriesCache.host = host
+	cloudEntriesCache.entries = entries
+	cloudEntriesCache.err = err
+	cloudEntriesCache.expiresAt = time.Now().Add(cloudEntriesTTL)
+	cloudEntriesCache.Unlock()
+	return entries, err
+}
+
+func oaicaFetchCloudModelEntriesLiveUncached(host string) ([]oaicaModelEntry, error) {
+	req, err := http.NewRequest(http.MethodGet, host+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +293,7 @@ func oaicaFetchCloudModelEntriesLive() ([]oaicaModelEntry, error) {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("bad response from %s: %w", oaicaLaunchHost(), err)
+		return nil, fmt.Errorf("bad response from %s: %w", host, err)
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
