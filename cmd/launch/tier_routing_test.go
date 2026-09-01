@@ -322,3 +322,43 @@ func TestResolveSecondaryEndpoint_RouterSKUBare(t *testing.T) {
 		t.Fatalf("bare daemon secondary = %+v, %v", ep, err)
 	}
 }
+
+// Regression (2026-09-02 .46 fleet): primary on a user remote that MIRRORS
+// router SKUs (opencode zen serves glm-5.3-flash AND oaica-35b-a3b-vision);
+// plan myplan's sonnet_model "oaica-35b-a3b-vision" then hit the "un-namespaced
+// secondary = on the primary's remote" contract and went to zen with zen's
+// key → 401 "Model oaica-35b-a3b-vision is not supported". A bare oaica-*
+// id is the router's own SKU regardless of the primary's source.
+func TestBuildTierPlan_RouterSKUSecondaryOnUserRemotePrimary(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[{"name":"opencode-go","base_url":"https://zen.test/v1","api_key":"zenk","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{"glm-5.3-flash": {"opencode-go/glm-5.3-flash"}})
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk-oaica")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+	stubDaemon(t)
+
+	plan, err := buildTierPlan("glm-5.3-flash", "oaica-35b-a3b-vision", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Secondary.Source != sourceRouter {
+		t.Fatalf("secondary source = %s, want router", plan.Secondary.Source)
+	}
+	if plan.Secondary.BaseURL != "https://api.example.test/v1" || plan.Secondary.Token != "sk-oaica" {
+		t.Fatalf("secondary endpoint = %+v", plan.Secondary)
+	}
+	r, _ := plan.Routes.resolve("oaica-35b-a3b-vision")
+	if r.BaseURL != "https://api.example.test/v1" || r.Key != "sk-oaica" {
+		t.Fatalf("sonnet route = %+v", r)
+	}
+	// Explicit "<remote>/<id>" still keeps the same-remote contract.
+	plan2, err := buildTierPlan("glm-5.3-flash", "opencode-go/other-model", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := plan2.Routes.resolve("opencode-go/other-model")
+	if r2.BaseURL != "https://zen.test/v1" || r2.Key != "zenk" {
+		t.Fatalf("namespaced secondary route = %+v", r2)
+	}
+}

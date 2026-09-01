@@ -457,6 +457,22 @@ func oaicaRouterSKU(model string) bool {
 	return strings.HasPrefix(base, "oaica-") || oaicaModelIsReady(model)
 }
 
+// isBareRouterSKU is the PREFIX-ONLY half of oaicaRouterSKU, used when the
+// question is "whose id is this, unambiguously?" rather than "can the router
+// serve this?": catalog reachability must not decide where a bare secondary
+// routes (zen mirrors catalog ids in its own /models, so a catalog match
+// would hijack a bare id away from the primary's remote — the contract in
+// resolveSecondaryEndpoint). Only the "oaica-" prefix is authoritative.
+func isBareRouterSKU(model string) bool {
+	if strings.Contains(model, "/") {
+		return false
+	}
+	if idx := strings.Index(model, "+"); idx >= 0 {
+		model = model[:idx]
+	}
+	return strings.HasPrefix(model, "oaica-")
+}
+
 // oaicaModelIsReady reports whether name is a real OAICA model, or a valid
 // "<model>+<lora>..." composite of one — the only "readiness" concept that
 // applies to router-served models (see showOrPullWithPolicy's doc comment).

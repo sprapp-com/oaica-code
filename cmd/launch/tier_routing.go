@@ -278,6 +278,18 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 		}
 		return resolveLaunchEndpoint(sonnetModel)
 	}
+	// A bare "oaica-*" id is the router's own SKU even when the primary is
+	// a user remote: opencode zen mirrors our SKUs in its /models, so the
+	// "un-namespaced secondary = on the primary's remote" contract sent the
+	// sonnet tier to zen with zen's key → 401 "Model oaica-35b-a3b-vision is
+	// not supported" (2026-09-02 .46 fleet, plan myplan: primary
+	// glm-5.3-flash on zen). PREFIX-only: a catalog match must not hijack a
+	// bare non-prefixed id away from the primary's remote (the contract
+	// below still governs those). Explicit cross-provider forms
+	// ("<remote>/<id>", "router/<id>", ...) still win further down.
+	if isBareRouterSKU(sonnetModel) {
+		return resolveLaunchEndpoint("router/" + sonnetModel)
+	}
 	explicit := strings.HasSuffix(sonnetModel, oaicaLocalTagSuffix) ||
 		strings.HasPrefix(sonnetModel, "router/") || strings.HasPrefix(sonnetModel, "oaica/") ||
 		strings.HasPrefix(sonnetModel, "ollama/") || strings.HasPrefix(sonnetModel, "daemon/")
