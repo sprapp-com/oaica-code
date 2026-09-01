@@ -276,50 +276,43 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			{Name: "auto", Description: "let OAICA pick the secondary (best recommended model) — recommended", Recommended: true},
 			{Name: "(same as primary)", Description: "route all tiers to " + primary, Recommended: true},
 		}
+		// tierItemName namespaces every secondary row by its provider so the
+		// stored plan is unambiguous at launch (resolveSecondaryEndpoint's
+		// explicit forms): "oaica-*" stays bare (the router's own id),
+		// anything already carrying "<owner>/" stays as-is (a user remote),
+		// everything else is "ollama/<id>" — the local Ollama daemon,
+		// including its ":cloud" catalog models. Bare ambiguous ids are NOT
+		// offered: we don't serve them as OAICA models (2026-09-02).
+		tierItemName := func(n string) string {
+			switch {
+			case strings.HasPrefix(n, "oaica-"), strings.Contains(n, "/"):
+				return n
+			default:
+				return "ollama/" + n
+			}
+		}
 		for _, n := range names {
 			if n == primary {
 				continue
 			}
 			if recommended[n] {
 				if autoSecondary == "" {
-					autoSecondary = n
+					autoSecondary = tierItemName(n)
 				}
 				// Recommended+Remote flags pin the row into the "OAICA
 				// Models" section at the top — router SKUs only; other
 				// recommended rows fall through to the Remote section below
 				// but still count for "auto".
-				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Description: "(Recommended)", Recommended: routerRec[n], Remote: true})
+				sonnetItems = append(sonnetItems, SelectionItem{Name: tierItemName(n), Description: "(Recommended)", Recommended: routerRec[n], Remote: true})
 			}
 		}
 		for _, n := range names {
 			if n != primary && !recommended[n] {
 				// Remote flag: "Remote Models" section (alphabetical),
 				// NOT the scrollable "More" bucket.
-				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Remote: true})
+				sonnetItems = append(sonnetItems, SelectionItem{Name: tierItemName(n), Remote: true})
 			}
 		}
-		// Provider-namespaced forms (resolveSecondaryEndpoint accepts them
-		// explicitly): "ollama/<id>" pins the tier to the local Ollama
-		// daemon — including its ":cloud" catalog models — and "oaica/<id>"
-		// pins it to the OAICA router. Offered alongside the bare ids so a
-		// tier can cross providers even when a bare id is ambiguous.
-		seen := map[string]bool{}
-		for _, it := range sonnetItems {
-			seen[it.Name] = true
-		}
-		var providerItems []SelectionItem
-		for _, n := range names {
-			if n == primary || seen["ollama/"+n] {
-				continue
-			}
-			if strings.HasSuffix(n, ":cloud") {
-				providerItems = append(providerItems, SelectionItem{Name: "ollama/" + n, Description: "via the local Ollama daemon's cloud account", Remote: true})
-			}
-			if strings.HasPrefix(n, "oaica-") {
-				providerItems = append(providerItems, SelectionItem{Name: "oaica/" + n, Description: "via the OAICA router", Remote: true})
-			}
-		}
-		sonnetItems = append(sonnetItems, providerItems...)
 		// Alphabetize the non-recommended tail (recommended rows already
 		// lead); keep the leading auto/same-as-primary rows untouched.
 		lead := 1
