@@ -107,19 +107,30 @@ var nativeClaudePickerModels = []ModelItem{
 	{Name: "claude/opus", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
 	{Name: "claude/sonnet", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
 	{Name: "claude/fable", Description: "Claude Code native (Anthropic login / API key) — bypasses OAICA billing"},
+	// "anthropic/" aliases of the same three entries: OpenRouter's catalog
+	// means typing "anthropic" surfaces a wall of openrouter/anthropic/…
+	// rows; these make the native (subscription) path show up in the same
+	// search instead of hiding behind the "claude/" prefix.
+	{Name: "anthropic/opus", Description: "Claude Code native, Anthropic subscription (alias of claude/opus)"},
+	{Name: "anthropic/sonnet", Description: "Claude Code native, Anthropic subscription (alias of claude/sonnet)"},
+	{Name: "anthropic/fable", Description: "Claude Code native, Anthropic subscription (alias of claude/fable)"},
 }
 
 // isNativeClaudeModel reports whether name selects the native (non-OAICA)
-// Claude Code path: "claude/<tier>", e.g. "claude/opus".
+// Claude Code path: "claude/<tier>" or its "anthropic/<tier>" alias, e.g.
+// "claude/opus" / "anthropic/opus".
 func isNativeClaudeModel(model string) bool {
-	return strings.HasPrefix(model, "claude/")
+	return strings.HasPrefix(model, "claude/") || strings.HasPrefix(model, "anthropic/")
 }
 
-// nativeClaudeModelTier splits "claude/opus" into the Claude Code --model
-// alias ("opus"). ok is false for anything that is not a native entry.
+// nativeClaudeModelTier splits "claude/opus" (or "anthropic/opus") into the
+// Claude Code --model alias ("opus"). ok is false for anything that is not a
+// native entry.
 func nativeClaudeModelTier(model string) (string, bool) {
-	if rest, ok := strings.CutPrefix(model, "claude/"); ok {
-		return rest, true
+	for _, p := range []string{"claude/", "anthropic/"} {
+		if rest, ok := strings.CutPrefix(model, p); ok {
+			return rest, true
+		}
 	}
 	return "", false
 }
