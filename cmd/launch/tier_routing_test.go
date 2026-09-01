@@ -295,3 +295,30 @@ func TestProxyMapsUnpinnedAnthropicIdsToDefault(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveSecondaryEndpoint_RouterSKUBare(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	// A user remote MIRRORS an OAICA router SKU under its bare id (opencode
+	// zen proxies our SKUs). The primary is a daemon model; the sonnet tier
+	// names a bare router SKU. The router must win — the remote mirror must
+	// NOT hijack the bare name (2026-09-01 fleet 401 "Model not supported").
+	stubBareIndex(t, map[string][]string{"oaica-35b-a3b-vision": {"box/oaica-35b-a3b-vision"}})
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+
+	primary, err := resolveLaunchEndpoint("ollama/glm-5.3-flash:cloud")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec, err := resolveSecondaryEndpoint(primary, "oaica-35b-a3b-vision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sec := sec.Source; sec != sourceRouter {
+		t.Fatalf("secondary source = %s, want router (bare router SKU must not be hijacked by a mirroring remote)", sec)
+	}
+	// a bare id NOT on the router keeps the generic path (daemon here)
+	if ep, err := resolveSecondaryEndpoint(primary, "glm-5.3-flash:cloud"); err != nil || ep.Source != sourceDaemon {
+		t.Fatalf("bare daemon secondary = %+v, %v", ep, err)
+	}
+}

@@ -265,6 +265,17 @@ func routeFor(ep launchEndpoint) proxyRoute {
 // When the primary is not a user remote, the generic resolver applies.
 func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launchEndpoint, error) {
 	if primary.Source != sourceUserRemote {
+		// OAICA router SKUs resolve to the router even when a user remote
+		// mirrors the bare id in its own /models (opencode zen proxies our
+		// SKUs): resolveLaunchEndpoint's bare-name fallback found exactly one
+		// remote advertising "oaica-35b-a3b-vision" and sent the sonnet tier
+		// there, which 401'd "Model ... is not supported" (2026-09-01 fleet).
+		// The router is the authority on its own ids — a bare id on the
+		// router catalog always routes there; a bare NON-router id keeps the
+		// generic path (daemon / :local / single-owner remote).
+		if !strings.Contains(sonnetModel, "/") && oaicaModelIsReady(sonnetModel) {
+			return resolveLaunchEndpoint("router/" + sonnetModel)
+		}
 		return resolveLaunchEndpoint(sonnetModel)
 	}
 	explicit := strings.HasSuffix(sonnetModel, oaicaLocalTagSuffix) ||
