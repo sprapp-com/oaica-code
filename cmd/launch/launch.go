@@ -1133,6 +1133,9 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 	// path passes ""). They run Claude Code's own Anthropic auth.
 	if commandName == "claude" {
 		items = append(items, nativeClaudePickerModels...)
+		// Saved tier plans one keystroke away: "plan/<name>" entries resolve
+		// the whole stored choice (primary, secondary, oversize, policy).
+		items = append(items, pickerPlanItems()...)
 	}
 
 	for {
@@ -1154,6 +1157,12 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		selected = stripOllamaPickerNames([]string{selected})[0]
 		if isNativeClaudeModel(selected) {
 			// Native Claude entries bypass OAICA readiness entirely.
+			return selected, nil
+		}
+		if isPlanPickerModel(selected) {
+			// Saved tier plans resolve inside Claude.Run (tier_plan_profiles.go);
+			// the plan's primary model is what needs OAICA readiness, and
+			// buildTierPlan/resolvePlanModels already validate existence.
 			return selected, nil
 		}
 		if ensureReady {
@@ -1541,7 +1550,7 @@ func (c *launcherClient) singleModelUsable(ctx context.Context, name string, inv
 	}
 	// "claude/<tier>" native entries need no OAICA readiness — they route to
 	// Claude Code's own Anthropic auth (see Claude.runNative).
-	if isNativeClaudeModel(name) {
+	if isNativeClaudeModel(name) || isPlanPickerModel(name) {
 		return true
 	}
 	if isCloudModelName(name) {

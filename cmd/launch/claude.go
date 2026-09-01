@@ -319,3 +319,46 @@ func (c *Claude) modelEnvVars(model string) []string {
 // compaction legs from the full inventory, so Run must receive every
 // selectable model, not just the resolved primary (see launch.go).
 func (c *Claude) WantsFullModelChoices() bool { return true }
+
+// planPickerPrefix marks saved tier plans in the launch picker; selecting
+// one replays the whole stored choice (see tier_plan_profiles.go).
+const planPickerPrefix = "plan/"
+
+func isPlanPickerModel(name string) bool {
+	return strings.HasPrefix(name, planPickerPrefix)
+}
+
+// pickerPlanItems builds the saved-plan picker entries ("plan/<name>",
+// freshest summary in the description). Plans saved via the wizard's
+// "Save as plan" step appear here on the next launch.
+func pickerPlanItems() []ModelItem {
+	names, err := PlanSortedNames()
+	if err != nil || len(names) == 0 {
+		return nil
+	}
+	items := make([]ModelItem, 0, len(names))
+	for _, n := range names {
+		prof, err := PlanGet(n)
+		if err != nil {
+			continue
+		}
+		desc := "saved plan"
+		if prof.Description != "" {
+			desc = prof.Description
+		} else {
+			parts := []string{"primary " + prof.Model}
+			if prof.SonnetModel != "" {
+				parts = append(parts, "sonnet "+prof.SonnetModel)
+			}
+			if prof.OversizeModel != "" {
+				parts = append(parts, "oversize "+prof.OversizeModel)
+			}
+			if prof.RoutePolicy != "" {
+				parts = append(parts, "policy "+prof.RoutePolicy)
+			}
+			desc = strings.Join(parts, " · ")
+		}
+		items = append(items, ModelItem{Name: planPickerPrefix + n, Description: desc})
+	}
+	return items
+}

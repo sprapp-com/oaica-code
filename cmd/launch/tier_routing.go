@@ -392,6 +392,11 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		return fmt.Errorf("launch wizard: --wizard requires an interactive session")
 	}
 
+	// "plan/<name>" picker entries enter here as the "model": unwrap to the
+	// plan name and let the plan supply the primary model.
+	if picked, ok := strings.CutPrefix(model, planPickerPrefix); ok && planName == "" {
+		planName, model = picked, ""
+	}
 	if planName != "" {
 		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
 		if err != nil {

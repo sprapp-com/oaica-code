@@ -180,7 +180,11 @@ func oversizeWindowCandidates(models []string, primary string, resolve func(stri
 		if ep.BaseURL == "" || ep.BaseURL == pr.BaseURL {
 			continue
 		}
-		if w := probe(routeFor(ep)); w > primaryWindow {
+		// A leg on a DIFFERENT backend with at least the primary's window
+		// still qualifies: >= (not just >) because the compaction leg's job
+		// is also to survive the primary failing near the ceiling — an
+		// equal-window leg from another failure domain serves exactly that.
+		if w := probe(routeFor(ep)); w >= primaryWindow {
 			cands = append(cands, m)
 		}
 	}

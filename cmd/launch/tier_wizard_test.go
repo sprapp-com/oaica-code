@@ -54,15 +54,19 @@ func TestOversizeWindowCandidates(t *testing.T) {
 		}
 		return launchEndpoint{}, errors.New("not found")
 	}
-	windows := map[string]int{"primary": 262144, "big": 524288, "smaller": 131072, "same leg": 2000000}
+	windows := map[string]int{"primary": 262144, "big": 524288, "smaller": 262144, "same leg": 2000000}
 	probe := func(r proxyRoute) int { return windows[r.UpstreamModel] }
 
+	// "smaller" carries an EQUAL window on a different backend — still a
+	// valid compaction leg (>= qualifier): the leg must also survive the
+	// primary failing near the ceiling, which an equal-window leg from
+	// another failure domain does.
 	cands, pw := oversizeWindowCandidates([]string{"big", "smaller", "same leg", "missing"}, "primary", resolve, probe)
 	if pw != 262144 {
 		t.Fatalf("primary window = %d, want 262144", pw)
 	}
-	if len(cands) != 1 || cands[0] != "big" {
-		t.Fatalf("candidates = %v, want [big] (smaller filtered, same-URL leg not an oversize fix, unknown excluded)", cands)
+	if len(cands) != 2 || cands[0] != "big" || cands[1] != "smaller" {
+		t.Fatalf("candidates = %v, want [big smaller] (equal-window different-URL leg included)", cands)
 	}
 
 	// Unknown primary window: no honest oversize pick exists.

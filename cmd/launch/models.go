@@ -71,6 +71,7 @@ var extraCloudModelLimits = map[string]cloudModelLimit{
 	"glm-4.7":             {Context: 202_752, Output: 131_072},
 	"glm-5":               {Context: 202_752, Output: 131_072},
 	"glm-5.1":             {Context: 202_752, Output: 131_072},
+	"glm-5.3-flash":       {Context: 202_752, Output: 131_072},
 	"gpt-oss:120b":        {Context: 131_072, Output: 131_072},
 	"gpt-oss:20b":         {Context: 131_072, Output: 131_072},
 	"kimi-k2:1t":          {Context: 262_144, Output: 262_144},
