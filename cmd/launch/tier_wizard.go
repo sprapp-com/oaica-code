@@ -1,29 +1,33 @@
 package launch
 
 // tier_wizard.go — the interactive launch tier wizard (2026-08-31 design,
-// option A). Step 1 is the model picker a plain `oaica launch claude`
-// already runs; this file adds the remaining three steps on the same list
-// of picker models:
+// option A; haiku tier added 2026-09-02). Step 1 is the model picker a
+// plain `oaica launch claude` already runs; this file adds the remaining
+// four steps on the same list of picker models:
 //
 //	Step 2  Sonnet/subagent tier (secondary) — same list, "(same as
 //	        primary)" first and the default.
-//	Step 3  Compaction/oversize model — candidates filtered to models whose
+//	Step 3  Haiku/background tier — same list, "(same as primary)" first
+//	        and the default. No "auto": unlike Sonnet, there is no "best
+//	        recommended model" concept for cheap/background requests.
+//	Step 4  Compaction/oversize model — candidates filtered to models whose
 //	        PROBED context window (remoteContextWindowFn, the same 2s /models
 //	        probe the proxy uses) is strictly larger than the primary's;
 //	        "(none — fail honestly at the ceiling)" is the default. A small
 //	        context is never silently oversized to a model that can't hold
 //	        the request either.
-//	Step 4  Route policy — the same five values as --route-policy,
+//	Step 5  Route policy — the same five values as --route-policy,
 //	        local-first the default.
 //
-// After step 4 a one-line preview prints (e.g.
+// After step 5 a one-line preview prints (e.g.
 // `fallback: a <-> b · oversize: c (256k) · policy: local-first`) and the
 // choice can be saved as a named plan (`oaica plan`, tier_plan_profiles.go).
 //
 // The wizard runs ONLY for interactive, picker-driven launches: a launch
 // whose primary came from an explicit --model flag, a non-interactive
-// session, or one that passed --plan/--sonnet-model/--oversize/
-// --route-policy never sees it (flag-only launches stay byte-identical).
+// session, or one that passed --plan/--sonnet-model/--haiku-model/
+// --oversize/--route-policy never sees it (flag-only launches stay
+// byte-identical).
 
 import (
 	"bufio"
@@ -40,6 +44,7 @@ import (
 // tierWizardChoice is what the wizard collected.
 type tierWizardChoice struct {
 	SonnetModel   string // empty = same as primary
+	HaikuModel    string // empty = same as primary
 	OversizeModel string // empty = no oversize leg
 	RoutePolicy   string // always a valid policy after the wizard
 	PlanName      string // non-empty when the user saved the choice
@@ -71,7 +76,7 @@ func extractWizardFlag(args []string) (bool, []string) {
 
 // tierWizardFlags are the launcher-level flags that suppress the wizard: a
 // caller who passed any of them already made (part of) these decisions.
-var tierWizardFlags = []string{"--sonnet-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode"}
+var tierWizardFlags = []string{"--sonnet-model", "--haiku-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode"}
 
 // tierWizardEligible reports whether this launch should run steps 2-4.
 func tierWizardEligible(args []string) bool {
@@ -234,7 +239,98 @@ const tierWizardNoOversize = "(none — fail honestly at the ceiling)"
 // launch with the defaults).
 const tierWizardBack = "\x00back"
 
-// runTierWizard runs steps 2-4 on the picker model list. models is the same
+// tierWizardTierItems builds the item list for one tier-selection step
+// (Sonnet or Haiku) over the same picker model list: "(same as primary)"
+// leads (plus "auto" when withAuto — only the Sonnet step wants it), OAICA
+// router recommendations lead the rest and are marked "OAICA Models"
+// (picker parity), everything else falls into the alphabetized "Remote
+// Models" tail. autoTarget is the first recommended non-primary model in
+// its provider-prefixed form — the "auto" step's Sonnet answer, or "" when
+// withAuto is false or there is no recommendation to resolve to.
+func tierWizardTierItems(models []LaunchModel, names []string, primary string, withAuto bool) (items []SelectionItem, autoTarget string) {
+	if len(names) == 0 {
+		return nil, ""
+	}
+	recommended := map[string]bool{}
+	routerRec := map[string]bool{}
+	for _, m := range models {
+		if !m.Recommended {
+			continue
+		}
+		recommended[m.Name] = true
+		// The picker's "Recommended" set is a curated mix (local
+		// gemma4/qwen3.5, cloud glm/deepseek, router SKUs); the wizard
+		// labels its pinned section "OAICA Models", so only actual
+		// router SKUs may be pinned there — anything else would read as
+		// served by the router when it isn't (2026-09-02 .46: deepseek/
+		// glm/gemma rows under "OAICA Models"). Other recommendations
+		// stay in the general Remote section and still feed "auto".
+		if strings.HasPrefix(m.Name, "oaica-") {
+			routerRec[m.Name] = true
+		}
+	}
+	items = []SelectionItem{{Name: "(same as primary)", Description: "route this tier to " + primary, Recommended: true}}
+	if withAuto {
+		items = append([]SelectionItem{{Name: "auto", Description: "let OAICA pick this tier (best recommended model) — recommended", Recommended: true}}, items...)
+	}
+	// tierItemName namespaces every row by its provider so the stored plan
+	// is unambiguous at launch (resolveSecondaryEndpoint's explicit forms):
+	// "oaica-*" stays bare (the router's own id), anything already carrying
+	// "<owner>/" stays as-is (a user remote), everything else is
+	// "ollama/<id>" — the local Ollama daemon, including its ":cloud"
+	// catalog models. Bare ambiguous ids are NOT offered: we don't serve
+	// them as OAICA models (2026-09-02).
+	tierItemName := func(n string) string {
+		switch {
+		case strings.HasPrefix(n, "oaica-"), strings.Contains(n, "/"):
+			return n
+		default:
+			return "ollama/" + n
+		}
+	}
+	for _, n := range names {
+		if n == primary {
+			continue
+		}
+		if recommended[n] {
+			if withAuto && autoTarget == "" {
+				autoTarget = tierItemName(n)
+			}
+			// Recommended+Remote flags pin the row into the "OAICA
+			// Models" section at the top — router SKUs only; other
+			// recommended rows fall through to the Remote section below
+			// but still count for "auto".
+			items = append(items, SelectionItem{Name: tierItemName(n), Description: "(Recommended)", Recommended: routerRec[n], Remote: true})
+		}
+	}
+	for _, n := range names {
+		if n != primary && !recommended[n] {
+			// Remote flag: "Remote Models" section (alphabetical),
+			// NOT the scrollable "More" bucket.
+			items = append(items, SelectionItem{Name: tierItemName(n), Remote: true})
+		}
+	}
+	// Alphabetize the non-recommended tail (recommended rows already
+	// lead); keep the leading auto/same-as-primary rows untouched.
+	lead := 1
+	if withAuto {
+		lead = 2 // auto + (same as primary)
+	}
+	sort.SliceStable(items[lead:], func(a, b int) bool {
+		return items[lead+a].Name < items[lead+b].Name
+	})
+	// No recommendation available: "auto" would be a promise it can't
+	// keep — drop it so "(same as primary)" leads instead.
+	if withAuto && autoTarget == "" {
+		items = items[1:]
+	}
+	if len(items) <= 1 {
+		return nil, autoTarget // single-model inventory: nothing to choose
+	}
+	return items, autoTarget
+}
+
+// runTierWizard runs steps 2-5 on the picker model list. models is the same
 // inventory the picker showed; primary is the already-picked model.
 // Navigation: enter advances, esc/arrow-left steps back (re-asking the
 // previous prompt); esc on the very first step abandons the wizard and the
@@ -243,96 +339,17 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	c := tierWizardChoice{RoutePolicy: string(RouteAuto)}
 	names := launchModelNames(models)
 
-	// Step 2 — Sonnet/subagent tier. Same picker vocabulary; "(same as
-	// primary)" first so Enter keeps the single-model launch, OAICA router
-	// recommendations lead the rest and are marked (the picker's "OAICA
-	// Models" section order, carried over).
-	var sonnetItems []SelectionItem
-	autoSecondary := "" // what "auto" resolves to: the first recommended non-primary model
-	if len(names) > 0 {
-		recommended := map[string]bool{}
-		routerRec := map[string]bool{}
-		for _, m := range models {
-			if !m.Recommended {
-				continue
-			}
-			recommended[m.Name] = true
-			// The picker's "Recommended" set is a curated mix (local
-			// gemma4/qwen3.5, cloud glm/deepseek, router SKUs); the wizard
-			// labels its pinned section "OAICA Models", so only actual
-			// router SKUs may be pinned there — anything else would read as
-			// served by the router when it isn't (2026-09-02 .46: deepseek/
-			// glm/gemma rows under "OAICA Models"). Other recommendations
-			// stay in the general Remote section and still feed "auto".
-			if strings.HasPrefix(m.Name, "oaica-") {
-				routerRec[m.Name] = true
-			}
-		}
-		sonnetItems = []SelectionItem{
-			// Recommended flag on the fixed rows: the selector pins them
-			// into the "OAICA Models" section at the top (in this insertion
-			// order — recommended rows keep their relative order), so the
-			// step reads like the primary picker: our options first.
-			{Name: "auto", Description: "let OAICA pick the secondary (best recommended model) — recommended", Recommended: true},
-			{Name: "(same as primary)", Description: "route all tiers to " + primary, Recommended: true},
-		}
-		// tierItemName namespaces every secondary row by its provider so the
-		// stored plan is unambiguous at launch (resolveSecondaryEndpoint's
-		// explicit forms): "oaica-*" stays bare (the router's own id),
-		// anything already carrying "<owner>/" stays as-is (a user remote),
-		// everything else is "ollama/<id>" — the local Ollama daemon,
-		// including its ":cloud" catalog models. Bare ambiguous ids are NOT
-		// offered: we don't serve them as OAICA models (2026-09-02).
-		tierItemName := func(n string) string {
-			switch {
-			case strings.HasPrefix(n, "oaica-"), strings.Contains(n, "/"):
-				return n
-			default:
-				return "ollama/" + n
-			}
-		}
-		for _, n := range names {
-			if n == primary {
-				continue
-			}
-			if recommended[n] {
-				if autoSecondary == "" {
-					autoSecondary = tierItemName(n)
-				}
-				// Recommended+Remote flags pin the row into the "OAICA
-				// Models" section at the top — router SKUs only; other
-				// recommended rows fall through to the Remote section below
-				// but still count for "auto".
-				sonnetItems = append(sonnetItems, SelectionItem{Name: tierItemName(n), Description: "(Recommended)", Recommended: routerRec[n], Remote: true})
-			}
-		}
-		for _, n := range names {
-			if n != primary && !recommended[n] {
-				// Remote flag: "Remote Models" section (alphabetical),
-				// NOT the scrollable "More" bucket.
-				sonnetItems = append(sonnetItems, SelectionItem{Name: tierItemName(n), Remote: true})
-			}
-		}
-		// Alphabetize the non-recommended tail (recommended rows already
-		// lead); keep the leading auto/same-as-primary rows untouched.
-		lead := 1
-		if autoSecondary != "" {
-			lead = 2 // auto + (same as primary)
-		}
-		sort.SliceStable(sonnetItems[lead:], func(a, b int) bool {
-			return sonnetItems[lead+a].Name < sonnetItems[lead+b].Name
-		})
-		// No recommendation available: "auto" would be a promise it can't
-		// keep — drop it so "(same as primary)" leads instead.
-		if autoSecondary == "" {
-			sonnetItems = sonnetItems[1:]
-		}
-		if len(sonnetItems) <= 1 {
-			sonnetItems = nil // single-model inventory: nothing to choose
-		}
-	}
+	// Step 2 — Sonnet/subagent tier, and step 3 — Haiku/background tier.
+	// Same picker vocabulary for both; "(same as primary)" first so Enter
+	// keeps the single-model launch, OAICA router recommendations lead the
+	// rest and are marked (the picker's "OAICA Models" section order,
+	// carried over). tierItier builds one step's item list; only the Sonnet
+	// step offers "auto" (a background/haiku tier has no "best recommended
+	// model" concept the product otherwise uses).
+	sonnetItems, autoSecondary := tierWizardTierItems(models, names, primary, true)
+	haikuItems, _ := tierWizardTierItems(models, names, primary, false)
 
-	// Step 3 — compaction/oversize model. Models whose PROBED window is at
+	// Step 4 — compaction/oversize model. Models whose PROBED window is at
 	// least the primary's on a DIFFERENT backend qualify (see
 	// oversizeWindowCandidates); with no such model (or no answered probe)
 	// the step offers nothing and the ceiling fails honestly.
@@ -371,8 +388,21 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	}
 	steps := []wizardStep{
 		{title: "Sonnet/subagent tier (secondary model)", items: sonnetItems, optional: true},
+		{title: "Haiku/background tier", items: haikuItems, optional: true},
 		{title: oversizeTitle, items: oversizeItems, optional: true},
 		{title: "Route policy (what the launch proxy does when a backend fails)", items: policyItems},
+	}
+	// clearStep resets the field the step at index i writes, on stepping
+	// back off of it — every step keeps "empty = keep it" as its default.
+	clearStep := func(i int) {
+		switch i {
+		case 1:
+			c.HaikuModel = ""
+		case 2:
+			c.OversizeModel = ""
+		case 3:
+			c.RoutePolicy = string(RouteAuto)
+		}
 	}
 	for i := 0; i < len(steps); i++ {
 		s := steps[i]
@@ -387,14 +417,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			if i == 0 {
 				return c, nil // backed off the first step: launch as-is
 			}
-			// Step back: clear the choice recorded on the step we're
-			// leaving (only steps 1 and 2 write fields; both keep the
-			// default "empty = keep it").
-			if i == 1 {
-				c.OversizeModel = ""
-			} else {
-				c.RoutePolicy = string(RouteAuto)
-			}
+			clearStep(i)
 			i -= 2
 			continue
 		}
@@ -405,14 +428,18 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				// model name, and "auto" has no meaning after launch.
 				sel = autoSecondary
 			}
-			if sel != "" && sel != s.items[0].Name && sel != "(same as primary)" {
+			if sel != "" && sel != "(same as primary)" {
 				c.SonnetModel = sel
 			}
 		case 1:
+			if sel != "(same as primary)" {
+				c.HaikuModel = sel
+			}
+		case 2:
 			if sel != s.items[0].Name {
 				c.OversizeModel = sel
 			}
-		case 2:
+		case 3:
 			c.RoutePolicy = sel
 		}
 	}
@@ -440,6 +467,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		if err := PlanSet(name, TierPlanProfile{
 			Model:         primary,
 			SonnetModel:   c.SonnetModel,
+			HaikuModel:    c.HaikuModel,
 			OversizeModel: c.OversizeModel,
 			RoutePolicy:   c.RoutePolicy,
 			Description:   desc,
@@ -458,6 +486,9 @@ func tierWizardPreview(primary string, c tierWizardChoice) string {
 	line := "fallback: " + primary
 	if c.SonnetModel != "" {
 		line += " <-> " + c.SonnetModel
+	}
+	if c.HaikuModel != "" {
+		line += " · haiku: " + c.HaikuModel
 	}
 	if c.OversizeModel != "" {
 		line += " · oversize: " + c.OversizeModel

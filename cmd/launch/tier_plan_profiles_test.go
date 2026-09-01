@@ -69,39 +69,39 @@ func TestExtractPlanFlag(t *testing.T) {
 
 func TestResolvePlanModels(t *testing.T) {
 	withTempOaicaHome(t)
-	if err := PlanSet("oaica-full", TierPlanProfile{Model: "kat-awq", SonnetModel: "kat-awq-7b"}); err != nil {
+	if err := PlanSet("oaica-full", TierPlanProfile{Model: "kat-awq", SonnetModel: "kat-awq-7b", HaikuModel: "kat-awq-1.5b"}); err != nil {
 		t.Fatal(err)
 	}
 
-	// No --model/--sonnet-model given: plan fills both.
-	m, s, err := resolvePlanModels("oaica-full", "", "")
+	// No --model/--sonnet-model/--haiku-model given: plan fills all three.
+	m, s, h, err := resolvePlanModels("oaica-full", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m != "kat-awq" || s != "kat-awq-7b" {
-		t.Fatalf("resolvePlanModels = (%q, %q)", m, s)
+	if m != "kat-awq" || s != "kat-awq-7b" || h != "kat-awq-1.5b" {
+		t.Fatalf("resolvePlanModels = (%q, %q, %q)", m, s, h)
 	}
 
-	// Explicit --model overrides the plan's model; --sonnet-model still fills from plan.
-	m, s, err = resolvePlanModels("oaica-full", "explicit-model", "")
+	// Explicit --model overrides the plan's model; --sonnet-model/--haiku-model still fill from plan.
+	m, s, h, err = resolvePlanModels("oaica-full", "explicit-model", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m != "explicit-model" || s != "kat-awq-7b" {
-		t.Fatalf("resolvePlanModels with explicit model = (%q, %q)", m, s)
+	if m != "explicit-model" || s != "kat-awq-7b" || h != "kat-awq-1.5b" {
+		t.Fatalf("resolvePlanModels with explicit model = (%q, %q, %q)", m, s, h)
 	}
 
 	// No plan name: passthrough unchanged.
-	m, s, err = resolvePlanModels("", "some-model", "some-sonnet")
+	m, s, h, err = resolvePlanModels("", "some-model", "some-sonnet", "some-haiku")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m != "some-model" || s != "some-sonnet" {
-		t.Fatalf("resolvePlanModels no-plan passthrough = (%q, %q)", m, s)
+	if m != "some-model" || s != "some-sonnet" || h != "some-haiku" {
+		t.Fatalf("resolvePlanModels no-plan passthrough = (%q, %q, %q)", m, s, h)
 	}
 
 	// Unknown plan name: error.
-	if _, _, err := resolvePlanModels("does-not-exist", "", ""); err == nil {
+	if _, _, _, err := resolvePlanModels("does-not-exist", "", "", ""); err == nil {
 		t.Fatal("expected error for unknown plan")
 	}
 }

@@ -146,7 +146,7 @@ func TestBuildTierPlan_CrossSourceTiers(t *testing.T) {
 	stubDaemon(t, "deepseek-v4-flash:0731-cloud")
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 
-	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "box/kat-awq", false)
+	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "box/kat-awq", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestBuildTierPlan_SingleModelPinsEveryTier(t *testing.T) {
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "kat-awq"}}, nil)
 	stubDaemon(t)
 
-	plan, err := buildTierPlan("kat-awq", "", false)
+	plan, err := buildTierPlan("kat-awq", "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestBuildTierPlan_SecondaryNotFound(t *testing.T) {
 	t.Setenv("OAICA_HOST", "https://api.example.test")
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "kat-awq"}}, nil)
 	stubDaemon(t)
-	_, err := buildTierPlan("kat-awq", "ghost", false)
+	_, err := buildTierPlan("kat-awq", "ghost", "", false)
 	if err == nil || !strings.Contains(err.Error(), "--sonnet-model") || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("err = %v", err)
 	}
@@ -338,7 +338,7 @@ func TestBuildTierPlan_RouterSKUSecondaryOnUserRemotePrimary(t *testing.T) {
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
 	stubDaemon(t)
 
-	plan, err := buildTierPlan("glm-5.3-flash", "oaica-35b-a3b-vision", false)
+	plan, err := buildTierPlan("glm-5.3-flash", "oaica-35b-a3b-vision", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestBuildTierPlan_RouterSKUSecondaryOnUserRemotePrimary(t *testing.T) {
 		t.Fatalf("sonnet route = %+v", r)
 	}
 	// Explicit "<remote>/<id>" still keeps the same-remote contract.
-	plan2, err := buildTierPlan("glm-5.3-flash", "opencode-go/other-model", false)
+	plan2, err := buildTierPlan("glm-5.3-flash", "opencode-go/other-model", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

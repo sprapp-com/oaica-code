@@ -222,6 +222,28 @@ func extractSonnetModel(args []string) (sonnetModel string, rest []string) {
 	return sonnetModel, rest
 }
 
+// extractHaikuModel pulls a launcher-level "--haiku-model <id>" (or
+// "--haiku-model=<id>") out of the passthrough args — the same mechanism as
+// extractSonnetModel, one tier over: pins ANTHROPIC_DEFAULT_HAIKU_MODEL to a
+// model other than the primary (2026-09-02: previously always the primary,
+// no way to send cheap/background requests anywhere else). Not forwarded to
+// the child claude binary.
+func extractHaikuModel(args []string) (haikuModel string, rest []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--haiku-model" && i+1 < len(args):
+			haikuModel = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--haiku-model="):
+			haikuModel = strings.TrimPrefix(a, "--haiku-model=")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return haikuModel, rest
+}
+
 // ResolveAgentModel resolves a picker model name to the Anthropic-native
 // /v1/messages endpoint the agent shim should talk to, the bearer token to
 // send, and the bare upstream model id (picker tag and remote prefix

@@ -236,15 +236,18 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 // so it can be unit-tested: the proxy routing table, the model ids Claude
 // Code will send per tier, and the env vars to set.
 type tierPlan struct {
-	PrimaryName   string // model id Claude Code sends for Opus/Haiku/--model
+	PrimaryName   string // model id Claude Code sends for Opus/--model (and Haiku, without --haiku-model)
 	SecondaryName string // model id for Sonnet/subagents (== PrimaryName without --sonnet-model)
+	HaikuName     string // model id for Haiku-tier requests (== PrimaryName without --haiku-model)
 	Primary       launchEndpoint
 	Secondary     launchEndpoint
+	Haiku         launchEndpoint
 	Routes        proxyRouteTable
 	// Real context windows probed from the upstreams' /models metadata
 	// (context_window_remote.go); 0 = unknown, env stays unset.
 	PrimaryContext   int
 	SecondaryContext int
+	HaikuContext     int
 }
 
 func routeFor(ep launchEndpoint) proxyRoute {
@@ -322,9 +325,9 @@ func sameRemote(primary launchEndpoint, upstreamModel string) launchEndpoint {
 	return ep
 }
 
-// buildTierPlan resolves primary and optional secondary models and gates
-// both for Anthropic-wire tool calling.
-func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error) {
+// buildTierPlan resolves primary and optional secondary/haiku models and
+// gates all three for Anthropic-wire tool calling.
+func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tierPlan, error) {
 	primary, err := resolveLaunchEndpoint(model)
 	if err != nil {
 		return tierPlan{}, err
@@ -332,7 +335,7 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 	if err := gateRemoteToolsEndpoint(primary.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
 		return tierPlan{}, err
 	}
-	plan := tierPlan{PrimaryName: model, SecondaryName: model, Primary: primary, Secondary: primary}
+	plan := tierPlan{PrimaryName: model, SecondaryName: model, HaikuName: model, Primary: primary, Secondary: primary, Haiku: primary}
 	plan.Routes = proxyRouteTable{
 		Default: routeFor(primary),
 		ByModel: map[string]proxyRoute{model: routeFor(primary)},
@@ -358,6 +361,27 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 			plan.Routes.ByModel[secondary.UpstreamModel] = routeFor(secondary)
 		}
 	}
+	if haikuModel != "" && haikuModel != model {
+		// Same "un-namespaced = on the primary's remote, unless it's a bare
+		// router SKU" contract as --sonnet-model: resolveSecondaryEndpoint's
+		// logic doesn't depend on the tier name, only on primary + the
+		// requested id.
+		haiku, err := resolveSecondaryEndpoint(primary, haikuModel)
+		if err != nil {
+			return tierPlan{}, fmt.Errorf("--haiku-model: %w", err)
+		}
+		if err := gateRemoteToolsEndpoint(haiku.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
+			return tierPlan{}, fmt.Errorf("--haiku-model: %w", err)
+		}
+		plan.HaikuName = haikuModel
+		plan.Haiku = haiku
+		if _, taken := plan.Routes.ByModel[haikuModel]; !taken {
+			plan.Routes.ByModel[haikuModel] = routeFor(haiku)
+		}
+		if _, taken := plan.Routes.ByModel[haiku.UpstreamModel]; !taken {
+			plan.Routes.ByModel[haiku.UpstreamModel] = routeFor(haiku)
+		}
+	}
 	// Route-policy fallback legs (route_policy.go): the OTHER legs of the
 	// plan, deduped by base URL. A plan with both legs on one remote has
 	// nothing to fall back onto — the URL is the failure domain — so a
@@ -366,6 +390,9 @@ func buildTierPlan(model, sonnetModel string, forceTools bool) (tierPlan, error)
 	fallbacks := []proxyRoute{plan.Routes.Default}
 	if plan.Secondary.Source != plan.Primary.Source || plan.Secondary.BaseURL != plan.Primary.BaseURL {
 		fallbacks = append(fallbacks, routeFor(plan.Secondary))
+	}
+	if plan.Haiku.Source != plan.Primary.Source || plan.Haiku.BaseURL != plan.Primary.BaseURL {
+		fallbacks = append(fallbacks, routeFor(plan.Haiku))
 	}
 	seenURL := map[string]bool{}
 	plan.Routes.Fallbacks = plan.Routes.Fallbacks[:0]
@@ -397,7 +424,7 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
 		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + p.PrimaryName,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + p.SecondaryName,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + p.PrimaryName,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + p.HaikuName,
 		"CLAUDE_CODE_SUBAGENT_MODEL=" + p.SecondaryName,
 		// See modelEnvVars: Auto mode would address model ids no backend of
 		// ours has.
@@ -442,6 +469,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	}
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
+	haikuModel, args := extractHaikuModel(args)
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
@@ -460,11 +488,11 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		planName, model = picked, ""
 	}
 	if planName != "" {
-		resolvedModel, resolvedSonnet, err := resolvePlanModels(planName, model, sonnetModel)
+		resolvedModel, resolvedSonnet, resolvedHaiku, err := resolvePlanModels(planName, model, sonnetModel, haikuModel)
 		if err != nil {
 			return fmt.Errorf("--plan: %w", err)
 		}
-		model, sonnetModel = resolvedModel, resolvedSonnet
+		model, sonnetModel, haikuModel = resolvedModel, resolvedSonnet, resolvedHaiku
 		// Flags > plan > remotes.json route_policy: the plan only fills what
 		// the flags left empty (tier_plan_profiles.go).
 		policyArg, oversizeModel, err = resolvePlanTier(planName, policyArg, oversizeModel)
@@ -477,6 +505,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 			return fmt.Errorf("launch wizard: %w", err)
 		}
 		sonnetModel = w.SonnetModel
+		haikuModel = w.HaikuModel
 		oversizeModel = w.OversizeModel
 		policyArg = w.RoutePolicy
 	}
@@ -498,7 +527,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		return err
 	}
 
-	plan, err := buildTierPlan(model, sonnetModel, forceTools)
+	plan, err := buildTierPlan(model, sonnetModel, haikuModel, forceTools)
 	if err != nil {
 		return err
 	}
@@ -568,9 +597,9 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, plan.Routes) }()
 	anthropicBaseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 
-	if plan.SecondaryName != plan.PrimaryName {
-		fmt.Fprintf(os.Stderr, "tiers: opus/haiku -> %s (%s)  sonnet/subagents -> %s (%s)\n",
-			plan.PrimaryName, plan.Primary.Source, plan.SecondaryName, plan.Secondary.Source)
+	if plan.SecondaryName != plan.PrimaryName || plan.HaikuName != plan.PrimaryName {
+		fmt.Fprintf(os.Stderr, "tiers: opus -> %s (%s)  sonnet/subagents -> %s (%s)  haiku -> %s (%s)\n",
+			plan.PrimaryName, plan.Primary.Source, plan.SecondaryName, plan.Secondary.Source, plan.HaikuName, plan.Haiku.Source)
 	}
 	if len(plan.Routes.Fallbacks) > 1 {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)

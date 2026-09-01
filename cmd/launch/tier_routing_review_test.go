@@ -47,7 +47,7 @@ func TestSecondary_BareIDPassesThroughToPrimaryRemote(t *testing.T) {
 	stubDaemon(t)
 
 	for _, sonnet := range []string{"muse-spark-1.2", "openai/gpt-5"} {
-		plan, err := buildTierPlan("box/kat-awq", sonnet, false)
+		plan, err := buildTierPlan("box/kat-awq", sonnet, "", false)
 		if err != nil {
 			t.Fatalf("%s: %v", sonnet, err)
 		}
@@ -72,7 +72,7 @@ func TestSecondary_BareIDNeverSilentlyLeavesPrimaryRemote(t *testing.T) {
 	t.Setenv("OAICA_API_KEY", "sk-oaica")
 
 	for _, sonnet := range []string{"deepseek-chat", "only-box2", "kat-awq"} {
-		plan, err := buildTierPlan("box/kat-awq", sonnet, false)
+		plan, err := buildTierPlan("box/kat-awq", sonnet, "", false)
 		if err != nil {
 			t.Fatalf("%s: %v", sonnet, err)
 		}
@@ -81,21 +81,21 @@ func TestSecondary_BareIDNeverSilentlyLeavesPrimaryRemote(t *testing.T) {
 		}
 	}
 	// explicit forms DO leave the primary's remote
-	plan, err := buildTierPlan("box/kat-awq", "box2/only-box2", false)
+	plan, err := buildTierPlan("box/kat-awq", "box2/only-box2", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r, _ := plan.Routes.resolve("box2/only-box2"); r.BaseURL != "http://box2:8080/v1" || r.Key != "k2" {
 		t.Fatalf("namespaced secondary = %+v", r)
 	}
-	plan, err = buildTierPlan("box/kat-awq", "router/deepseek-chat", false)
+	plan, err = buildTierPlan("box/kat-awq", "router/deepseek-chat", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r, _ := plan.Routes.resolve("router/deepseek-chat"); r.BaseURL != "https://api.example.test/v1" || r.Key != "sk-oaica" {
 		t.Fatalf("router/ secondary = %+v", r)
 	}
-	plan, err = buildTierPlan("box/kat-awq", "ollama/deepseek-chat", false)
+	plan, err = buildTierPlan("box/kat-awq", "ollama/deepseek-chat", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestPlanEnv_NoRealKeyInChildEnvironment(t *testing.T) {
 	remoteBox(t, map[string][]string{"kat-awq": {"box/kat-awq"}})
 	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
 	stubDaemon(t)
-	plan, err := buildTierPlan("box/kat-awq", "", false)
+	plan, err := buildTierPlan("box/kat-awq", "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

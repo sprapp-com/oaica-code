@@ -134,26 +134,26 @@ func withStubbedWizardUI(t *testing.T, selectLog *[]string, picks []string, save
 func TestRunTierWizard_SavesPlan(t *testing.T) {
 	withTempOaicaHome(t)
 	var selectLog []string
-	withStubbedWizardUI(t, &selectLog, []string{"kat-awq-7b", "big-box/glm-9", "remote-first"}, "daily-driver")
+	withStubbedWizardUI(t, &selectLog, []string{"kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9", "remote-first"}, "daily-driver")
 
-	plan, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "big-box/glm-9"), "kat-awq")
+	plan, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
-	if plan.SonnetModel != "kat-awq-7b" || plan.OversizeModel != "big-box/glm-9" || plan.RoutePolicy != "remote-first" {
+	if plan.SonnetModel != "kat-awq-7b" || plan.HaikuModel != "kat-awq-1.5b" || plan.OversizeModel != "big-box/glm-9" || plan.RoutePolicy != "remote-first" {
 		t.Fatalf("unexpected choice: %+v", plan)
 	}
 	if plan.PlanName != "daily-driver" {
 		t.Fatalf("plan name = %q", plan.PlanName)
 	}
-	if len(selectLog) != 3 {
-		t.Fatalf("steps run = %d (%v), want 3 (sonnet, oversize, policy)", len(selectLog), selectLog)
+	if len(selectLog) != 4 {
+		t.Fatalf("steps run = %d (%v), want 4 (sonnet, haiku, oversize, policy)", len(selectLog), selectLog)
 	}
 	prof, err := PlanGet("daily-driver")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prof.Model != "kat-awq" || prof.SonnetModel != "kat-awq-7b" ||
+	if prof.Model != "kat-awq" || prof.SonnetModel != "kat-awq-7b" || prof.HaikuModel != "kat-awq-1.5b" ||
 		prof.OversizeModel != "big-box/glm-9" || prof.RoutePolicy != "remote-first" {
 		t.Fatalf("stored plan: %+v", prof)
 	}
@@ -378,7 +378,7 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 	}
 	tierWizardProbeWindow = func(r proxyRoute) int { return 262144 }
 	var logged []string
-	answers := []string{"kat-awq-7b", tierWizardBack, "kat-awq-7b", "big-box/glm-9", "remote-first"}
+	answers := []string{"kat-awq-7b", tierWizardBack, "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9", "remote-first"}
 	calls := 0
 	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
 		logged = append(logged, title)
@@ -386,15 +386,15 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 		calls++
 		return ans, nil
 	}
-	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "big-box/glm-9"), "kat-awq")
+	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
-	if c.SonnetModel != "kat-awq-7b" || c.OversizeModel != "big-box/glm-9" || c.RoutePolicy != "remote-first" {
+	if c.SonnetModel != "kat-awq-7b" || c.HaikuModel != "kat-awq-1.5b" || c.OversizeModel != "big-box/glm-9" || c.RoutePolicy != "remote-first" {
 		t.Fatalf("unexpected choice: %+v", c)
 	}
-	if len(logged) != 5 {
-		t.Fatalf("step sequence = %d prompts (%v), want 5 (step2, step3, re-ask step2, step3, policy)", len(logged), logged)
+	if len(logged) != 6 {
+		t.Fatalf("step sequence = %d prompts (%v), want 6 (step2, step3, re-ask step2, step3, step4, policy)", len(logged), logged)
 	}
 
 	// 3. Plan save: Enter reuses the last saved plan name.

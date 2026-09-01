@@ -41,6 +41,10 @@ const maxPlanNameLength = 64
 type TierPlanProfile struct {
 	Model       string `json:"model"`
 	SonnetModel string `json:"sonnet_model,omitempty"`
+	// HaikuModel extends the schema (2026-09-02) the same way SonnetModel
+	// did: optional, missing = empty = today's default (Haiku pinned to
+	// Model), so plan files written before this change load unchanged.
+	HaikuModel string `json:"haiku_model,omitempty"`
 	// OversizeModel and RoutePolicy extend the schema (2026-08-31) the same
 	// way the launch flags did: both optional, missing = empty = today's
 	// defaults (no oversize leg, local-first policy), so plan files written
@@ -259,13 +263,13 @@ func extractPlanFlag(args []string) (plan string, rest []string) {
 // signal than a stored default) — but if the caller passed no model at all
 // (model == ""), the plan supplies one. --sonnet-model, if explicitly
 // passed, always wins over the plan's SonnetModel the same way.
-func resolvePlanModels(planName, model, sonnetModel string) (resolvedModel, resolvedSonnet string, err error) {
+func resolvePlanModels(planName, model, sonnetModel, haikuModel string) (resolvedModel, resolvedSonnet, resolvedHaiku string, err error) {
 	if planName == "" {
-		return model, sonnetModel, nil
+		return model, sonnetModel, haikuModel, nil
 	}
 	prof, err := PlanGet(planName)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	resolvedModel = model
 	if resolvedModel == "" {
@@ -275,7 +279,11 @@ func resolvePlanModels(planName, model, sonnetModel string) (resolvedModel, reso
 	if resolvedSonnet == "" {
 		resolvedSonnet = prof.SonnetModel
 	}
-	return resolvedModel, resolvedSonnet, nil
+	resolvedHaiku = haikuModel
+	if resolvedHaiku == "" {
+		resolvedHaiku = prof.HaikuModel
+	}
+	return resolvedModel, resolvedSonnet, resolvedHaiku, nil
 }
 
 // resolvePlanTier layers a plan's stored oversize model + route policy over
