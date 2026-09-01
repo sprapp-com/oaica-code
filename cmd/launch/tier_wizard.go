@@ -240,7 +240,7 @@ const tierWizardBack = "\x00back"
 // previous prompt); esc on the very first step abandons the wizard and the
 // launch continues with the defaults.
 func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, error) {
-	c := tierWizardChoice{RoutePolicy: string(RouteLocalFirst)}
+	c := tierWizardChoice{RoutePolicy: string(RouteAuto)}
 	names := launchModelNames(models)
 
 	// Step 2 — Sonnet/subagent tier. Same picker vocabulary; "(same as
@@ -329,9 +329,9 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	// Step 4 — route policy. Every value --route-policy accepts; local-first
 	// first (the default), same ordering as `oaica doctor`'s legend.
 	policyItems := []SelectionItem{
-		{Name: string(RouteLocalFirst), Description: "on failure prefer a local backend, else any healthy alternate (default)"},
+		{Name: string(RouteAuto), Description: "let OAICA route on failure — recommended (today: local-first, prefer a local backend, else any healthy alternate)"},
+		{Name: string(RouteLocalFirst), Description: "on failure prefer a local backend, else any healthy alternate"},
 		{Name: string(RouteRemoteFirst), Description: "on failure prefer a remote backend, else any healthy alternate"},
-		{Name: string(RouteAuto), Description: "alias of local-first for now (per-request escalation ships later)"},
 		{Name: string(RouteLocalOnly), Description: "never leave local legs — fail visibly rather than cross over"},
 		{Name: string(RouteRemoteOnly), Description: "never leave remote legs — same"},
 	}
@@ -365,7 +365,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			if i == 1 {
 				c.OversizeModel = ""
 			} else {
-				c.RoutePolicy = string(RouteLocalFirst)
+				c.RoutePolicy = string(RouteAuto)
 			}
 			i -= 2
 			continue
@@ -439,7 +439,7 @@ func tierWizardPreview(primary string, c tierWizardChoice) string {
 	}
 	policy := c.RoutePolicy
 	if policy == "" {
-		policy = string(RouteLocalFirst)
+		policy = string(RouteAuto)
 	}
 	return line + " · policy: " + policy
 }

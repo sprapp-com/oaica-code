@@ -170,7 +170,7 @@ func TestRunTierWizard_DefaultsLeaveEverythingUnset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
-	if c.SonnetModel != "" || c.OversizeModel != "" || c.RoutePolicy != string(RouteLocalFirst) || c.PlanName != "" {
+	if c.SonnetModel != "" || c.OversizeModel != "" || c.RoutePolicy != string(RouteAuto) || c.PlanName != "" {
 		t.Fatalf("unexpected choice: %+v", c)
 	}
 }
@@ -363,7 +363,7 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
-	if c.SonnetModel != "" || c.OversizeModel != "" || c.RoutePolicy != string(RouteLocalFirst) {
+	if c.SonnetModel != "" || c.OversizeModel != "" || c.RoutePolicy != string(RouteAuto) {
 		t.Fatalf("back on first step should leave defaults: %+v", c)
 	}
 
