@@ -292,6 +292,8 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 	var configFlag bool
 	var yesFlag bool
 	var restoreFlag bool
+	var planFlag, sonnetFlag, oversizeFlag, policyFlag string
+	var wizardFlag bool
 
 	cmd := &cobra.Command{
 		Use:   "launch [INTEGRATION] [-- [EXTRA_ARGS...]]",
@@ -365,12 +367,34 @@ Examples:
 			}
 
 			if name == "" {
-				if cmd.Flags().Changed("model") || cmd.Flags().Changed("config") || cmd.Flags().Changed("yes") || cmd.Flags().Changed("restore") || len(passArgs) > 0 {
+				if cmd.Flags().Changed("model") || cmd.Flags().Changed("config") || cmd.Flags().Changed("yes") || cmd.Flags().Changed("restore") ||
+					cmd.Flags().Changed("plan") || cmd.Flags().Changed("sonnet-model") || cmd.Flags().Changed("oversize") || cmd.Flags().Changed("route-policy") || cmd.Flags().Changed("wizard") || len(passArgs) > 0 {
 					return fmt.Errorf("flags and extra args require an integration name, for example: 'ollama launch claude --model qwen3.5'")
 				}
 				runTUI(cmd)
 				return nil
 			}
+
+			// Tier flags travel as passthrough (tier_routing.go consumes
+			// them from the extra args); copy passArgs first — it aliases
+			// args' backing array, and append could clobber it.
+			tierPrepend := passArgs[:0:0]
+			if planFlag != "" {
+				tierPrepend = append(tierPrepend, "--plan", planFlag)
+			}
+			if sonnetFlag != "" {
+				tierPrepend = append(tierPrepend, "--sonnet-model", sonnetFlag)
+			}
+			if oversizeFlag != "" {
+				tierPrepend = append(tierPrepend, "--oversize", oversizeFlag)
+			}
+			if policyFlag != "" {
+				tierPrepend = append(tierPrepend, "--route-policy", policyFlag)
+			}
+			if wizardFlag {
+				tierPrepend = append(tierPrepend, "--wizard")
+			}
+			passArgs = append(tierPrepend, passArgs...)
 
 			if !restoreFlag && launchCommandIsClaudeDesktop(name) {
 				return errClaudeDesktopUnsupported()
@@ -414,6 +438,17 @@ Examples:
 	cmd.Flags().BoolVar(&configFlag, "config", false, "Configure without launching")
 	cmd.Flags().BoolVar(&restoreFlag, "restore", false, "Restore an integration to its default profile")
 	cmd.Flags().BoolVarP(&yesFlag, "yes", "y", false, "Automatically answer yes to confirmation prompts")
+	// Tier-routing flags (--plan/--sonnet-model/--oversize/--route-policy/
+	// --wizard): the launch wizard reuses them in its "reuse with" hint, so
+	// they must exist at the TOP level, not only after '--'. Registered as
+	// passthrough: RunE prepends them to the extra args, where
+	// extractPlanFlag & co. (tier_routing.go) already consume them — one
+	// parsing path, both spellings work.
+	cmd.Flags().StringVar(&planFlag, "plan", "", "Reuse a saved tier plan (see 'oaica plan')")
+	cmd.Flags().StringVar(&sonnetFlag, "sonnet-model", "", "Secondary (sonnet/subagent) tier model")
+	cmd.Flags().StringVar(&oversizeFlag, "oversize", "", "Compaction/oversize-tier model for requests past the primary's window")
+	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: local-first, remote-first, auto, local-only, remote-only")
+	cmd.Flags().BoolVar(&wizardFlag, "wizard", false, "Force the interactive launch-tier wizard")
 	return cmd
 }
 
