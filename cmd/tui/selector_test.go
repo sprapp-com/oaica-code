@@ -1171,6 +1171,51 @@ func TestMultiSelectorLeftArrowCancelsWhenFiltering(t *testing.T) {
 	}
 }
 
+func TestSelectorEscCancelsWhenNoFilter(t *testing.T) {
+	m := selectorModelWithCurrent("Pick:", items("a", "b", "c"), "")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(selectorModel)
+	if !got.cancelled {
+		t.Error("esc with empty filter should cancel")
+	}
+}
+
+func TestSelectorEscClearsFilterInstead(t *testing.T) {
+	m := selectorModelWithCurrent("Pick:", items("a", "b", "c"), "")
+	m.filter = "a"
+	m.cursor = 2
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(selectorModel)
+	if got.cancelled {
+		t.Error("esc with active filter should clear it, not cancel")
+	}
+	if got.filter != "" {
+		t.Errorf("filter = %q, want cleared", got.filter)
+	}
+	if got.cursor != 0 {
+		t.Errorf("cursor = %d, want reset to 0", got.cursor)
+	}
+	// A second Esc on the now-empty filter does cancel.
+	updated2, _ := got.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got2 := updated2.(selectorModel)
+	if !got2.cancelled {
+		t.Error("esc again on empty filter should cancel")
+	}
+}
+
+func TestMultiSelectorEscClearsFilterInstead(t *testing.T) {
+	m := newMultiSelectorModel("Pick:", items("a", "b", "c"), nil)
+	m.filter = "a"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(multiSelectorModel)
+	if got.cancelled {
+		t.Error("esc with active filter should clear it, not cancel")
+	}
+	if got.filter != "" {
+		t.Errorf("filter = %q, want cleared", got.filter)
+	}
+}
+
 // Key message helpers for testing
 
 type keyType = int

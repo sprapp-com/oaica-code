@@ -2714,6 +2714,62 @@ just to see the picker list.`,
 	}
 	configCmd.AddCommand(configShowCmd, configSetCmd)
 
+	// usage — reads ~/.oaica/requests.log (request_log.go/usage_stats.go).
+	// No token counts locally (see request_log.go's doc): reports request
+	// counts, status/error counts, and message char-length sums per
+	// (model, backend) pair. Real token/$ cost lives server-side on the
+	// gateway's usage ledger, out of scope for a purely local command.
+	usageCmd := &cobra.Command{
+		Use:   "usage",
+		Short: "Summarize this machine's launch traffic (~/.oaica/requests.log): requests, errors, and routing per model/backend",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sinceStr, _ := cmd.Flags().GetString("since")
+			model, _ := cmd.Flags().GetString("model")
+			asJSON, _ := cmd.Flags().GetBool("json")
+
+			var filter launch.UsageStatsFilter
+			filter.Model = model
+			if sinceStr != "" {
+				d, err := time.ParseDuration(sinceStr)
+				if err != nil {
+					return fmt.Errorf("--since %q: %w (examples: 1h, 30m, 24h)", sinceStr, err)
+				}
+				filter.Since = time.Now().Add(-d)
+			}
+
+			rows, err := launch.LoadUsageStats(filter)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rows)
+			}
+			if len(rows) == 0 {
+				path, _ := launch.RequestLogPath()
+				fmt.Printf("No launch traffic logged yet (%s).\n", path)
+				return nil
+			}
+			var totalReqs, totalErrs int
+			var totalChars int64
+			fmt.Printf("%-28s %-45s %8s %8s %6s %14s\n", "MODEL", "BACKEND", "REQS", "OK", "ERR", "CHARS")
+			for _, r := range rows {
+				fmt.Printf("%-28s %-45s %8d %8d %6d %14d\n", r.Model, r.Backend, r.Requests, r.OK, r.Errors, r.CharsSum)
+				totalReqs += r.Requests
+				totalErrs += r.Errors
+				totalChars += r.CharsSum
+			}
+			fmt.Printf("\ntotal requests: %d  errors: %d  chars: %d\n", totalReqs, totalErrs, totalChars)
+			fmt.Println("(request counts and message char-length only — no token counts locally; real token/$ cost lives on the gateway's usage ledger)")
+			return nil
+		},
+	}
+	usageCmd.Flags().String("since", "", "Only count requests newer than this (e.g. 1h, 30m, 24h)")
+	usageCmd.Flags().String("model", "", "Only count requests for this exact model id")
+	usageCmd.Flags().Bool("json", false, "Print the raw aggregate rows as JSON instead of a table")
+
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
@@ -2925,6 +2981,7 @@ just to see the picker list.`,
 		remoteCmd,
 		planCmd,
 		configCmd,
+		usageCmd,
 		gpuCleanCmd(),
 		pushCmd,
 		signinCmd,

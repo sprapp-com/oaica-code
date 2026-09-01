@@ -347,6 +347,9 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		plan.Routes.ByModel[primary.UpstreamModel] = routeFor(primary)
 	}
 	if sonnetModel != "" && sonnetModel != model {
+		if isNativeClaudeModel(sonnetModel) {
+			return tierPlan{}, fmt.Errorf("--sonnet-model %q: native Anthropic (claude/*, anthropic/*) can only be the primary model — it bypasses the OAICA translation proxy entirely, so it has no way to serve one tier of a split", sonnetModel)
+		}
 		secondary, err := resolveSecondaryEndpoint(primary, sonnetModel)
 		if err != nil {
 			return tierPlan{}, fmt.Errorf("--sonnet-model: %w", err)
@@ -362,6 +365,9 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		}
 	}
 	if haikuModel != "" && haikuModel != model {
+		if isNativeClaudeModel(haikuModel) {
+			return tierPlan{}, fmt.Errorf("--haiku-model %q: native Anthropic (claude/*, anthropic/*) can only be the primary model — it bypasses the OAICA translation proxy entirely, so it has no way to serve one tier of a split", haikuModel)
+		}
 		// Same "un-namespaced = on the primary's remote, unless it's a bare
 		// router SKU" contract as --sonnet-model: resolveSecondaryEndpoint's
 		// logic doesn't depend on the tier name, only on primary + the

@@ -63,6 +63,10 @@ func setRequestLogProxyPort(ln net.Listener) {
 	}
 }
 
+// RequestLogPath is requestLogPath, exported for `oaica usage` (cmd.go) to
+// print in its "no traffic logged yet" message.
+func RequestLogPath() (string, error) { return requestLogPath() }
+
 func requestLogPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

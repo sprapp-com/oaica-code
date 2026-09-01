@@ -444,7 +444,24 @@ func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
+			m.cancelled = true
+			return m, tea.Quit
+
+		case tea.KeyEsc:
+			// A live filter narrows the "back" step: clear it and show the
+			// full list again (opencode-style — the "menu" one Esc away is
+			// the unfiltered picker, not the launch itself) before Esc
+			// actually cancels on an empty filter (2026-09-02: previously
+			// Esc always aborted the whole launch instantly, even mid-typo).
+			// Left arrow keeps the old always-cancel contract (wizard step
+			// navigation depends on it, tier_wizard.go's tierWizardBack).
+			if m.filter != "" {
+				m.filter = ""
+				m.cursor = 0
+				m.scrollOffset = 0
+				return m, nil
+			}
 			m.cancelled = true
 			return m, tea.Quit
 
@@ -1104,7 +1121,19 @@ func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		filtered := m.filteredItems()
 
 		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
+			m.cancelled = true
+			return m, tea.Quit
+
+		case tea.KeyEsc:
+			// Same filter-clears-first step as the single selector above;
+			// Left keeps the always-cancel contract below.
+			if m.filter != "" {
+				m.filter = ""
+				m.cursor = 0
+				m.scrollOffset = 0
+				return m, nil
+			}
 			m.cancelled = true
 			return m, tea.Quit
 

@@ -362,3 +362,26 @@ func TestBuildTierPlan_RouterSKUSecondaryOnUserRemotePrimary(t *testing.T) {
 		t.Fatalf("namespaced secondary route = %+v", r2)
 	}
 }
+
+// Native Anthropic (claude/*, anthropic/*) bypasses the OAICA translation
+// proxy entirely (runNative, tier_routing.go's Run) -- it has no way to
+// serve one tier of a split, so --sonnet-model/--haiku-model must refuse it
+// with a clear message instead of the generic "not found" resolveLaunchEndpoint
+// produces for an unrecognized id (2026-09-02).
+func TestBuildTierPlan_NativeClaudeRejectedAsSecondaryTier(t *testing.T) {
+	noRemotes(t)
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk-cust")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+	stubDaemon(t)
+
+	_, err := buildTierPlan("oaica-35b-a3b-vision", "claude/opus", "", false)
+	if err == nil || !strings.Contains(err.Error(), "--sonnet-model") || !strings.Contains(err.Error(), "primary model") {
+		t.Fatalf("--sonnet-model claude/opus error = %v, want a primary-only explanation", err)
+	}
+
+	_, err = buildTierPlan("oaica-35b-a3b-vision", "", "anthropic/haiku", false)
+	if err == nil || !strings.Contains(err.Error(), "--haiku-model") || !strings.Contains(err.Error(), "primary model") {
+		t.Fatalf("--haiku-model anthropic/haiku error = %v, want a primary-only explanation", err)
+	}
+}
