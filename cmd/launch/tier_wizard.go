@@ -285,6 +285,28 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				sonnetItems = append(sonnetItems, SelectionItem{Name: n, Remote: true})
 			}
 		}
+		// Provider-namespaced forms (resolveSecondaryEndpoint accepts them
+		// explicitly): "ollama/<id>" pins the tier to the local Ollama
+		// daemon — including its ":cloud" catalog models — and "oaica/<id>"
+		// pins it to the OAICA router. Offered alongside the bare ids so a
+		// tier can cross providers even when a bare id is ambiguous.
+		seen := map[string]bool{}
+		for _, it := range sonnetItems {
+			seen[it.Name] = true
+		}
+		var providerItems []SelectionItem
+		for _, n := range names {
+			if n == primary || seen["ollama/"+n] {
+				continue
+			}
+			if strings.HasSuffix(n, ":cloud") {
+				providerItems = append(providerItems, SelectionItem{Name: "ollama/" + n, Description: "via the local Ollama daemon's cloud account", Remote: true})
+			}
+			if strings.HasPrefix(n, "oaica-") {
+				providerItems = append(providerItems, SelectionItem{Name: "oaica/" + n, Description: "via the OAICA router", Remote: true})
+			}
+		}
+		sonnetItems = append(sonnetItems, providerItems...)
 		// Alphabetize the non-recommended tail (recommended rows already
 		// lead); keep the leading auto/same-as-primary rows untouched.
 		lead := 1
