@@ -55,8 +55,15 @@ type tierPlanProfiles struct {
 	Profiles map[string]TierPlanProfile `json:"profiles"`
 	// LastUsed is the plan name the wizard last saved (empty in files
 	// written before the field existed) — the plan-save prompt's
-	// Enter-to-reuse default.
+	// Enter-to-reuse default. Kept (and still written) for files before
+	// LastUsedByRepo existed; PlanLastUsed now prefers the per-repo entry.
 	LastUsed string `json:"last_used,omitempty"`
+	// LastUsedByRepo keys the wizard's Enter-to-reuse default by the
+	// directory the launch ran from, so repo A's last-saved plan is not
+	// offered as repo B's default. Profiles themselves stay global — a plan
+	// name is still resolvable everywhere via --plan — only the default
+	// is scoped.
+	LastUsedByRepo map[string]string `json:"last_used_by_repo,omitempty"`
 }
 
 const tierPlanProfilesVersion = 1
@@ -149,19 +156,36 @@ func PlanSet(name string, profile TierPlanProfile) error {
 	}
 	p.Profiles[name] = profile
 	p.LastUsed = name
+	if cwd, err := os.Getwd(); err == nil {
+		if p.LastUsedByRepo == nil {
+			p.LastUsedByRepo = map[string]string{}
+		}
+		p.LastUsedByRepo[cwd] = name
+	}
 	return p.save()
 }
 
-// PlanLastUsed returns the wizard's most recently saved plan name, or "".
+// PlanLastUsed returns the plan name to offer as the wizard's
+// Enter-to-reuse default: the last plan saved FROM THIS DIRECTORY (plans
+// are per-repo in practice — each repo's launches share a model split
+// that another repo's shouldn't inherit). Falls back to the legacy global
+// LastUsed when no per-repo entry exists yet (or getwd failed), so files
+// written before LastUsedByRepo keep their old behavior.
 func PlanLastUsed() (string, error) {
 	p, err := loadTierPlanProfiles()
 	if err != nil {
 		return "", err
 	}
-	if _, ok := p.Profiles[p.LastUsed]; !ok {
+	name := p.LastUsed
+	if cwd, err := os.Getwd(); err == nil {
+		if n, ok := p.LastUsedByRepo[cwd]; ok {
+			name = n
+		}
+	}
+	if _, ok := p.Profiles[name]; !ok {
 		return "", nil // removed since; no stale Enter default
 	}
-	return p.LastUsed, nil
+	return name, nil
 }
 
 // PlanRemove deletes a named plan, reporting whether it existed.
