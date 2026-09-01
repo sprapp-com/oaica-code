@@ -145,11 +145,27 @@ func ollamaCloudEntries() []oaicaModelEntry {
 	entries := make([]oaicaModelEntry, 0, len(ids))
 	for _, id := range ids {
 		entries = append(entries, oaicaModelEntry{
-			ID:          id + ":cloud",
+			ID:          ollamaCloudPickerPrefix + id,
+			Upstream:    id + ":cloud",
 			Description: "Ollama cloud — served via the Ollama daemon's own account",
 		})
 	}
 	return entries
+}
+
+// ollamaCloudPickerPrefix names ollama-cloud catalog models in the picker:
+// the provider sits IN FRONT ("ollama/gpt-oss") instead of a ":cloud" tag
+// hanging off the back, so non-OAICA entries read "<provider>/<model>" like
+// user remotes do. ollamaCloudUpstreamFor maps such a display id back to
+// the daemon's tagged name; "" for anything else.
+const ollamaCloudPickerPrefix = "ollama/"
+
+func ollamaCloudUpstreamFor(displayID string) string {
+	rest, ok := strings.CutPrefix(displayID, ollamaCloudPickerPrefix)
+	if !ok || rest == "" || strings.Contains(rest, "/") {
+		return ""
+	}
+	return rest + ":cloud"
 }
 
 // mustMarshal is json.Marshal with the error collapsed — cache writes are

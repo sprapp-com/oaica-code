@@ -182,6 +182,10 @@ type oaicaModelEntry struct {
 	ID          string
 	Description string
 	Stars       int
+	// Upstream is the name to send to the backend when ID is a
+	// display-only picker name (e.g. ID "ollama/gpt-oss" → Upstream
+	// "gpt-oss:cloud"). Empty = ID is itself the upstream name.
+	Upstream string
 }
 
 // oaicaLiveModelEntries fetches /v1/models including each model's

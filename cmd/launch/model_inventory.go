@@ -36,6 +36,10 @@ type LaunchModel struct {
 	Wire         string
 	ToolFormat   string
 	ToolReliable bool
+	// Upstream is the name the backend actually knows when Name is a
+	// display-only picker id (ollama-cloud catalog: "ollama/gpt-oss" →
+	// upstream "gpt-oss:cloud"). Empty = Name is itself upstream.
+	Upstream string
 }
 
 type modelInfo = LaunchModel
@@ -191,8 +195,15 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 		if e.ID == "" || seen[e.ID] {
 			continue
 		}
+		// An ollama-cloud catalog entry duplicates a model we already have
+		// under its bare upstream id (the router list added "glm-5.3:cloud"
+		// first) or under the daemon's own "ollama/<name>:cloud" entry
+		// (local List processed before us): keep the earlier entry.
+		if up := ollamaCloudUpstreamFor(e.ID); up != "" && (seen[up] || seen[e.ID+":cloud"]) {
+			continue
+		}
 		seen[e.ID] = true
-		models = append(models, LaunchModel{Name: e.ID, Remote: true}.WithCloudLimits())
+		models = append(models, LaunchModel{Name: e.ID, Remote: true, Upstream: e.Upstream}.WithCloudLimits())
 	}
 
 	i.models = models
