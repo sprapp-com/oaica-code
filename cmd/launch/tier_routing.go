@@ -40,10 +40,11 @@ import (
 type endpointSource string
 
 const (
-	sourceUserRemote endpointSource = "remote"
-	sourceRouter     endpointSource = "router"
-	sourceLocalServe endpointSource = "local-serve"
-	sourceDaemon     endpointSource = "daemon"
+	sourceUserRemote      endpointSource = "remote"
+	sourceRouter          endpointSource = "router"
+	sourceLocalServe      endpointSource = "local-serve"
+	sourceDaemon          endpointSource = "daemon"
+	sourceNativeAnthropic endpointSource = "native-anthropic"
 )
 
 // launchEndpoint is where one picker model actually lives.
@@ -145,6 +146,18 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 	// waits on discovery/refresh).
 	if target, ok := resolveModelAlias(model); ok {
 		model = target
+	}
+	// claude/*, anthropic/* — native Anthropic, forwarded raw to
+	// api.anthropic.com by nativeAnthropicPassthrough
+	// (anthropic_openai_proxy.go). Checked before the user-remote lookup so
+	// a remote literally named "claude" or "anthropic" can never shadow
+	// this reserved prefix. UpstreamModel carries the Claude Code --model
+	// alias (opus/sonnet/fable/...); BaseURL/Token are unused for this
+	// source (see proxyRoute.NativePassthrough).
+	if tier, ok := nativeClaudeModelTier(model); ok {
+		return launchEndpoint{Source: sourceNativeAnthropic, RemoteEndpoint: RemoteEndpoint{
+			Name: "native-anthropic", UpstreamModel: tier, Wire: "anthropic", ToolFormat: "tool_calls", ToolReliable: true,
+		}}, nil
 	}
 	if ep, ok := resolveRemoteEndpoint(model); ok {
 		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
@@ -251,7 +264,11 @@ type tierPlan struct {
 }
 
 func routeFor(ep launchEndpoint) proxyRoute {
-	return proxyRoute{BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel, Label: string(ep.Source) + ":" + ep.Name}
+	return proxyRoute{
+		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel,
+		Label:             string(ep.Source) + ":" + ep.Name,
+		NativePassthrough: ep.Source == sourceNativeAnthropic,
+	}
 }
 
 // resolveSecondaryEndpoint resolves --sonnet-model relative to the primary.
@@ -347,9 +364,6 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		plan.Routes.ByModel[primary.UpstreamModel] = routeFor(primary)
 	}
 	if sonnetModel != "" && sonnetModel != model {
-		if isNativeClaudeModel(sonnetModel) {
-			return tierPlan{}, fmt.Errorf("--sonnet-model %q: native Anthropic (claude/*, anthropic/*) can only be the primary model — it bypasses the OAICA translation proxy entirely, so it has no way to serve one tier of a split", sonnetModel)
-		}
 		secondary, err := resolveSecondaryEndpoint(primary, sonnetModel)
 		if err != nil {
 			return tierPlan{}, fmt.Errorf("--sonnet-model: %w", err)
@@ -365,9 +379,6 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		}
 	}
 	if haikuModel != "" && haikuModel != model {
-		if isNativeClaudeModel(haikuModel) {
-			return tierPlan{}, fmt.Errorf("--haiku-model %q: native Anthropic (claude/*, anthropic/*) can only be the primary model — it bypasses the OAICA translation proxy entirely, so it has no way to serve one tier of a split", haikuModel)
-		}
 		// Same "un-namespaced = on the primary's remote, unless it's a bare
 		// router SKU" contract as --sonnet-model: resolveSecondaryEndpoint's
 		// logic doesn't depend on the tier name, only on primary + the
@@ -468,11 +479,6 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 // Run launches Claude Code against the plan: one local translation proxy,
 // routing per request model id.
 func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
-	// "claude/<tier>" picker entries take the native path: the REAL Claude
-	// Code binary, clean env, Anthropic's own auth — no OAICA proxy.
-	if tier, ok := nativeClaudeModelTier(model); ok {
-		return c.runNative(tier, args)
-	}
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
@@ -526,6 +532,22 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		// briefModeSystemPrompt's doc for why this exact wording and why
 		// not "--compact".
 		args = append(args, "--append-system-prompt", briefModeSystemPrompt)
+	}
+
+	// "claude/<tier>" picker entries with NO tier split requested take the
+	// fully-untouched native path: the REAL Claude Code binary, clean env,
+	// zero proxy involvement — the strongest privacy/simplicity guarantee,
+	// kept as the default for the common case (a plain native launch).
+	// Checked here, after --plan/wizard/config have all had a chance to
+	// fill in sonnetModel/haikuModel, not at entry — a native primary
+	// reached via `--plan` with a sonnet leg must still get the split.
+	// Requesting a split on a native primary instead routes through the
+	// local proxy (nativeAnthropicPassthrough, anthropic_openai_proxy.go):
+	// a native leg forwards straight to api.anthropic.com with the user's
+	// own credential and incurs no OAICA billing either way — see
+	// proxyRoute.NativePassthrough's doc for what that skips (2026-09-02).
+	if tier, ok := nativeClaudeModelTier(model); ok && sonnetModel == "" && haikuModel == "" {
+		return c.runNative(tier, args)
 	}
 
 	claudePath, err := ensureClaudeInstalled()

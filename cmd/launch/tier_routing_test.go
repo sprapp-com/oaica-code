@@ -368,20 +368,64 @@ func TestBuildTierPlan_RouterSKUSecondaryOnUserRemotePrimary(t *testing.T) {
 // serve one tier of a split, so --sonnet-model/--haiku-model must refuse it
 // with a clear message instead of the generic "not found" resolveLaunchEndpoint
 // produces for an unrecognized id (2026-09-02).
-func TestBuildTierPlan_NativeClaudeRejectedAsSecondaryTier(t *testing.T) {
+// Native Anthropic (claude/*, anthropic/*) resolves as a real endpoint for
+// --sonnet-model/--haiku-model too (2026-09-02: previously rejected — the
+// proxy grew a native-passthrough leg, anthropic_openai_proxy.go's
+// nativeAnthropicPassthrough, specifically so a split with a native tier
+// can exist at all). Both legs go through the SAME local proxy as any
+// other split; buildTierPlan itself never needs to know a leg is native —
+// that's entirely proxyRoute.NativePassthrough's concern downstream.
+func TestBuildTierPlan_NativeClaudeUsableAsSecondaryTier(t *testing.T) {
 	noRemotes(t)
 	t.Setenv("OAICA_HOST", "https://api.example.test")
 	t.Setenv("OAICA_API_KEY", "sk-cust")
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
 	stubDaemon(t)
 
-	_, err := buildTierPlan("oaica-35b-a3b-vision", "claude/opus", "", false)
-	if err == nil || !strings.Contains(err.Error(), "--sonnet-model") || !strings.Contains(err.Error(), "primary model") {
-		t.Fatalf("--sonnet-model claude/opus error = %v, want a primary-only explanation", err)
+	plan, err := buildTierPlan("oaica-35b-a3b-vision", "claude/opus", "", false)
+	if err != nil {
+		t.Fatalf("--sonnet-model claude/opus: %v", err)
+	}
+	if plan.Secondary.Source != sourceNativeAnthropic {
+		t.Fatalf("secondary source = %s, want native-anthropic", plan.Secondary.Source)
+	}
+	if plan.Secondary.UpstreamModel != "opus" {
+		t.Fatalf("secondary upstream model = %q, want opus (the Claude Code --model alias)", plan.Secondary.UpstreamModel)
+	}
+	r, _ := plan.Routes.resolve("claude/opus")
+	if !r.NativePassthrough {
+		t.Fatalf("resolved route NativePassthrough = false, want true: %+v", r)
 	}
 
-	_, err = buildTierPlan("oaica-35b-a3b-vision", "", "anthropic/haiku", false)
-	if err == nil || !strings.Contains(err.Error(), "--haiku-model") || !strings.Contains(err.Error(), "primary model") {
-		t.Fatalf("--haiku-model anthropic/haiku error = %v, want a primary-only explanation", err)
+	plan2, err := buildTierPlan("oaica-35b-a3b-vision", "", "anthropic/haiku", false)
+	if err != nil {
+		t.Fatalf("--haiku-model anthropic/haiku: %v", err)
+	}
+	if plan2.Haiku.Source != sourceNativeAnthropic || plan2.Haiku.UpstreamModel != "haiku" {
+		t.Fatalf("haiku endpoint = %+v", plan2.Haiku)
+	}
+}
+
+// A plain native launch (no split requested) must stay on the fully-
+// untouched runNative path — Run() checks this at the model level before
+// buildTierPlan is ever called, so it isn't exercised here; this test only
+// guards the resolution buildTierPlan itself would produce if it WERE
+// called with no split, in case Run()'s gate is ever bypassed by a future
+// caller.
+func TestResolveLaunchEndpoint_NativeClaude(t *testing.T) {
+	noRemotes(t)
+	ep, err := resolveLaunchEndpoint("claude/fable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep.Source != sourceNativeAnthropic || ep.UpstreamModel != "fable" {
+		t.Fatalf("resolveLaunchEndpoint(claude/fable) = %+v", ep)
+	}
+	ep2, err := resolveLaunchEndpoint("anthropic/sonnet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep2.Source != sourceNativeAnthropic || ep2.UpstreamModel != "sonnet" {
+		t.Fatalf("resolveLaunchEndpoint(anthropic/sonnet) = %+v", ep2)
 	}
 }

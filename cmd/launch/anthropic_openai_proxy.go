@@ -509,6 +509,15 @@ type proxyRoute struct {
 	// clamp an outgoing request's max_tokens so prompt+max_tokens never
 	// exceeds it -- see the context-fit clamp in the /v1/messages handler.
 	ContextWindow int
+	// NativePassthrough marks a route as native Anthropic (claude/*,
+	// anthropic/*) forwarded raw to api.anthropic.com — see
+	// native_anthropic_auth.go and the /v1/messages handler's early branch.
+	// When true, BaseURL/Key/KeyEnv/UpstreamModel are unused: the handler
+	// skips OpenAI translation, the context-fit clamp, and usage logging
+	// entirely (no OAICA cost is incurred on this leg, nothing to meter —
+	// 2026-09-02 decision) and sends the ORIGINAL request body through
+	// untouched, with the model id Claude Code sent, unchanged.
+	NativePassthrough bool
 }
 
 // resolveKey returns the bearer to send upstream, live: KeyEnv wins whenever
@@ -830,6 +839,21 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		var anthReq anthropic.MessagesRequest
 		if err := json.Unmarshal(body, &anthReq); err != nil {
 			writeAnthropicError(w, http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
+			return
+		}
+
+		// Native Anthropic passthrough (claude/*, anthropic/* tiers,
+		// proxyRoute.NativePassthrough) branches out here, before OpenAI
+		// translation — a native leg speaks Anthropic wire already, so
+		// there is nothing to convert, no context-fit clamp to apply (we
+		// don't know its real window and don't need to — Anthropic
+		// enforces its own), and no usage/cost to log (no OAICA billing on
+		// this leg at all, see nativeAnthropicPassthrough's doc). Routed on
+		// the SAME anthReq.Model lookup every other tier uses, so opusplan
+		// mixing a native primary with a native secondary still lands each
+		// request on the right upstream model.
+		if route, _, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
+			nativeAnthropicPassthrough(w, r, body)
 			return
 		}
 
@@ -1308,6 +1332,89 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// nativeAnthropicUpstream is api.anthropic.com's own /v1/messages endpoint
+// — a var so tests can point it at a fixture server.
+var nativeAnthropicUpstream = "https://api.anthropic.com/v1/messages"
+
+// nativeAnthropicPassthrough forwards an Anthropic-wire request straight to
+// api.anthropic.com, byte-for-byte: no OpenAI translation (there is nothing
+// to translate — the wire format already matches), no context-fit clamp,
+// no usage/cost ledger entry (see proxyRoute.NativePassthrough's doc — this
+// leg is not OAICA-billed, so there is nothing to meter). The credential is
+// resolved fresh on every call via resolveNativeAnthropicAuth
+// (native_anthropic_auth.go) — an OAuth session from `claude /login` or a
+// plain ANTHROPIC_API_KEY, exactly what native mode would have used
+// running unproxied.
+//
+// Streaming responses are relayed as they arrive (Flush after every write)
+// rather than buffered — Claude Code's own SSE parsing depends on timely
+// chunk delivery, not just eventual byte-for-byte correctness.
+func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte) {
+	auth, ok := resolveNativeAnthropicAuth()
+	if !ok {
+		writeAnthropicError(w, http.StatusUnauthorized,
+			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, nativeAnthropicUpstream, bytes.NewReader(body))
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
+		return
+	}
+	// Forward the client's own Anthropic-protocol headers (anthropic-
+	// version, anthropic-beta, content-type, ...) verbatim — Claude Code
+	// set these correctly already, this proxy has no opinion on them. Only
+	// the credential is ours to inject; anything the client sent under
+	// these two header names is replaced, never merged, so a stale or
+	// wrong client-side auth header can never leak through.
+	for k, vs := range r.Header {
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") {
+			continue
+		}
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set(auth.Header, auth.Value)
+
+	// Long timeout, not proxyPassThrough's 30s: this carries real
+	// completions, which can run minutes on a large request (same
+	// reasoning as tier_routing.go's API_TIMEOUT_MS for the OAICA-routed
+	// path — a chat completion is not a quick metadata call).
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	flusher, canFlush := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 // writeAnthropicError emits an Anthropic-shaped error response.
