@@ -521,3 +521,74 @@ func TestContextFitClamp_ClientProxy_SmallPromptUnaffected(t *testing.T) {
 		t.Errorf("expected max_tokens to pass through unclamped for a small request, got %d", gotMaxTokens)
 	}
 }
+
+// TestProxyRewritesResponseModelWhenDisplayModelSet is the wire-level check
+// for proxyRoute.DisplayModel (tier_routing.go's routeForDisguised): the
+// UPSTREAM request must carry the real model id (what the backend actually
+// runs), while the response Claude Code receives must carry DisplayModel
+// instead — this is the whole fix for "Session model ... could not be
+// restored" on a native-primary + OAICA-secondary split (2026-09-02).
+func TestProxyRewritesResponseModelWhenDisplayModelSet(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	var gotUpstreamModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &req)
+		gotUpstreamModel = req.Model
+		w.Header().Set("Content-Type", "application/json")
+		// The upstream echoes ITS OWN real model back — this is what a real
+		// vLLM backend does, and exactly the value the client must NOT see.
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-1",
+			"model":   req.Model,
+			"choices": []map[string]any{{"index": 0, "finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	}))
+	defer upstream.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := proxyRouteTable{
+		Default: proxyRoute{BaseURL: upstream.URL, UpstreamModel: "oaica-35b-a3b-vision", ContextWindow: 262144},
+		ByModel: map[string]proxyRoute{
+			"oaica-35b-a3b-vision": {
+				BaseURL: upstream.URL, UpstreamModel: "oaica-35b-a3b-vision", ContextWindow: 262144,
+				DisplayModel: "claude-sonnet-5-oaica",
+			},
+		},
+	}
+	go RunAnthropicOpenAIProxyRoutes(ln, table)
+	proxyURL := "http://" + ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":      "oaica-35b-a3b-vision",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	resp, err := http.Post(proxyURL+"/v1/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if gotUpstreamModel != "oaica-35b-a3b-vision" {
+		t.Errorf("upstream request model = %q, want the REAL model (DisplayModel must never change what's actually requested)", gotUpstreamModel)
+	}
+
+	var parsed struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		t.Fatalf("response not valid JSON: %v (%s)", err, respBody)
+	}
+	if parsed.Model != "claude-sonnet-5-oaica" {
+		t.Errorf("response model = %q, want DisplayModel %q — the client must never see the real oaica id when DisplayModel is set", parsed.Model, "claude-sonnet-5-oaica")
+	}
+}

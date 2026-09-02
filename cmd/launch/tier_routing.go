@@ -271,6 +271,30 @@ func routeFor(ep launchEndpoint) proxyRoute {
 	}
 }
 
+// nativeSonnetDisplayModel is the id Claude Code's own restore validation
+// currently accepts for the sonnet slot (observed directly: "Session model
+// oaica-35b-a3b-vision could not be restored ... using claude-sonnet-5
+// instead", 2026-09-02) with oaicaDisplayModelSuffix appended so the label
+// stays distinguishable from Anthropic's real Sonnet in a transcript a
+// human reads later — see proxyRoute.DisplayModel's doc for why this
+// exists at all and why the distinction matters despite nothing being
+// presented to Anthropic itself.
+const nativeSonnetDisplayModel = "claude-sonnet-5" + oaicaDisplayModelSuffix
+
+// routeForDisguised is routeFor, but sets DisplayModel when primary is
+// native Anthropic and leg is not (see DisplayModel's doc: only THIS
+// combination hits Claude Code's real session-restore validation, because
+// only a native primary owns real Claude Code session persistence — every
+// other primary re-injects env vars fresh each launch and Claude Code's own
+// stale restored id never matters).
+func routeForDisguised(primary, leg launchEndpoint) proxyRoute {
+	r := routeFor(leg)
+	if primary.Source == sourceNativeAnthropic && leg.Source != sourceNativeAnthropic {
+		r.DisplayModel = nativeSonnetDisplayModel
+	}
+	return r
+}
+
 // resolveSecondaryEndpoint resolves --sonnet-model relative to the primary.
 //
 // When the primary is a user remote, an un-namespaced secondary means "on
@@ -373,9 +397,9 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		}
 		plan.SecondaryName = sonnetModel
 		plan.Secondary = secondary
-		plan.Routes.ByModel[sonnetModel] = routeFor(secondary)
+		plan.Routes.ByModel[sonnetModel] = routeForDisguised(primary, secondary)
 		if _, taken := plan.Routes.ByModel[secondary.UpstreamModel]; !taken {
-			plan.Routes.ByModel[secondary.UpstreamModel] = routeFor(secondary)
+			plan.Routes.ByModel[secondary.UpstreamModel] = routeForDisguised(primary, secondary)
 		}
 	}
 	if haikuModel != "" && haikuModel != model {
@@ -393,10 +417,10 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 		plan.HaikuName = haikuModel
 		plan.Haiku = haiku
 		if _, taken := plan.Routes.ByModel[haikuModel]; !taken {
-			plan.Routes.ByModel[haikuModel] = routeFor(haiku)
+			plan.Routes.ByModel[haikuModel] = routeForDisguised(primary, haiku)
 		}
 		if _, taken := plan.Routes.ByModel[haiku.UpstreamModel]; !taken {
-			plan.Routes.ByModel[haiku.UpstreamModel] = routeFor(haiku)
+			plan.Routes.ByModel[haiku.UpstreamModel] = routeForDisguised(primary, haiku)
 		}
 	}
 	// Route-policy fallback legs (route_policy.go): the OTHER legs of the

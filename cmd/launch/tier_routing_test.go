@@ -406,6 +406,71 @@ func TestBuildTierPlan_NativeClaudeUsableAsSecondaryTier(t *testing.T) {
 	}
 }
 
+// TestBuildTierPlan_NativePrimaryDisguisesOaicaSecondary covers the OTHER
+// direction from TestBuildTierPlan_NativeClaudeUsableAsSecondaryTier: a
+// NATIVE primary with an OAICA secondary/haiku. This is exactly the
+// combination that hit Claude Code's real session-restore validation
+// ("Session model oaica-35b-a3b-vision could not be restored ... using
+// claude-sonnet-5 instead", 2026-09-02) — routeForDisguised must set
+// DisplayModel on the oaica leg so a resumed session validates cleanly,
+// while the REAL upstream model (UpstreamModel) stays untouched: only the
+// id echoed back to Claude Code changes, not what actually gets requested.
+func TestBuildTierPlan_NativePrimaryDisguisesOaicaSecondary(t *testing.T) {
+	noRemotes(t)
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk-cust")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+	stubDaemon(t)
+
+	plan, err := buildTierPlan("claude/fable", "oaica-35b-a3b-vision", "oaica-35b-a3b-vision", false)
+	if err != nil {
+		t.Fatalf("native primary + oaica split: %v", err)
+	}
+	if plan.Secondary.Source == sourceNativeAnthropic {
+		t.Fatalf("secondary should resolve to the real oaica endpoint, not native: %+v", plan.Secondary)
+	}
+	if plan.Secondary.UpstreamModel != "oaica-35b-a3b-vision" {
+		t.Fatalf("secondary UpstreamModel = %q, want the REAL model — DisplayModel must never change what's actually requested", plan.Secondary.UpstreamModel)
+	}
+
+	r, upstream := plan.Routes.resolve("oaica-35b-a3b-vision")
+	if r.NativePassthrough {
+		t.Fatalf("the oaica leg's own route must not be NativePassthrough (that's the primary's route, not this one): %+v", r)
+	}
+	if r.DisplayModel != nativeSonnetDisplayModel {
+		t.Fatalf("DisplayModel = %q, want %q (Claude Code's own recognized sonnet id, marked distinguishable)", r.DisplayModel, nativeSonnetDisplayModel)
+	}
+	if !strings.Contains(r.DisplayModel, oaicaDisplayModelSuffix) {
+		t.Fatalf("DisplayModel %q must carry the OAICA-distinguishing suffix — never present an unmarked Anthropic id", r.DisplayModel)
+	}
+	if upstream != "oaica-35b-a3b-vision" {
+		t.Fatalf("resolve() upstream model = %q, want the real model unaffected by DisplayModel", upstream)
+	}
+}
+
+// TestBuildTierPlan_NonNativePrimaryNeverSetsDisplayModel guards the
+// byte-identical-when-unaffected contract: DisplayModel must stay empty for
+// every ordinary (non-native-primary) split — Claude Code only owns real
+// session-restore validation when running as the actual native binary, so
+// disguising the model id anywhere else would be pure noise with no bug to
+// fix and a real cost (a human reading that transcript loses the true model
+// label for no reason).
+func TestBuildTierPlan_NonNativePrimaryNeverSetsDisplayModel(t *testing.T) {
+	noRemotes(t)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubDaemon(t, "glm-5.3-flash:cloud")
+
+	plan, err := buildTierPlan("glm-5.3-flash:cloud", "box/kat-awq", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := plan.Routes.resolve("box/kat-awq")
+	if r.DisplayModel != "" {
+		t.Fatalf("DisplayModel = %q on a non-native primary, want empty", r.DisplayModel)
+	}
+}
+
 // A plain native launch (no split requested) must stay on the fully-
 // untouched runNative path — Run() checks this at the model level before
 // buildTierPlan is ever called, so it isn't exercised here; this test only

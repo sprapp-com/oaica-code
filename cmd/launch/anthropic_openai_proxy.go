@@ -518,7 +518,32 @@ type proxyRoute struct {
 	// 2026-09-02 decision) and sends the ORIGINAL request body through
 	// untouched, with the model id Claude Code sent, unchanged.
 	NativePassthrough bool
+	// DisplayModel, when set, is the model id echoed back to Claude Code in
+	// every response instead of the requested id — the real request still
+	// goes upstream under the actual OAICA model. Exists because Claude
+	// Code persists the model id a past response claimed per-turn, and on
+	// `--resume` VALIDATES that recorded id against its own hardcoded
+	// model catalog: a custom id like "oaica-35b-a3b-vision" fails that
+	// check and gets silently replaced with "claude-sonnet-5" ("Session
+	// model ... could not be restored", 2026-09-02) — this only bites a
+	// native Anthropic primary, where Claude Code owns real session
+	// persistence (every other primary re-injects our env vars fresh each
+	// launch, so its own stale record never matters). DisplayModel fixes
+	// the restore by presenting an id Claude Code already recognizes, kept
+	// deliberately distinguishable from the real thing (see
+	// oaicaDisplayModelSuffix) rather than a bare "claude-sonnet-5" — this
+	// is our own client talking to our own backend, nothing is presented
+	// to Anthropic, but a human reading the transcript later should still
+	// be able to tell the response didn't come from Anthropic's Sonnet.
+	DisplayModel string
 }
+
+// oaicaDisplayModelSuffix marks a DisplayModel id as OAICA's own, not
+// Anthropic's, while still being a suffix Claude Code's model-recognition
+// tolerates on ids it already knows (unlike an unrecognized prefix, which
+// would just trigger the exact restore failure DisplayModel exists to
+// avoid) — see DisplayModel's doc.
+const oaicaDisplayModelSuffix = "-oaica"
 
 // resolveKey returns the bearer to send upstream, live: KeyEnv wins whenever
 // it is set and currently non-empty in the environment (so exporting or
@@ -1077,10 +1102,18 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// context_calibration.go). Never from an error, never a guess.
 		recordUsage := func(promptTokens int) { calib.record(calibKey, len(body), promptTokens) }
 
+		// The response echoes DisplayModel when the route sets one (see its
+		// doc — native+split session restore) instead of the real
+		// upstream model id; the REAL id already went upstream above via
+		// reqModel in chatRequestToOpenAI, unaffected by this.
+		displayModel := reqModel
+		if route.DisplayModel != "" {
+			displayModel = route.DisplayModel
+		}
 		if anthReq.Stream {
-			handleStreamResponse(w, resp.Body, reqModel, recordUsage)
+			handleStreamResponse(w, resp.Body, displayModel, recordUsage)
 		} else {
-			handleNonStreamResponse(w, resp.Body, reqModel, recordUsage)
+			handleNonStreamResponse(w, resp.Body, displayModel, recordUsage)
 		}
 	})
 
