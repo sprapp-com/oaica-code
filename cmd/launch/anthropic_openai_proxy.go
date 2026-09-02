@@ -43,6 +43,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ollama/ollama/anthropic"
@@ -1013,10 +1014,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// PRIMARY, just reached via the oversize swap instead.
 						// The body's own "model" field still carries the
 						// OAICA leg's id (the client sent it for THAT
-						// tier) — rewrite to the native alias before
-						// forwarding, or Anthropic's real API rejects an
-						// id it doesn't know.
-						nativeBody, rerr := rewriteAnthropicRequestModel(body, over.UpstreamModel)
+						// tier) — rewrite to the REAL Anthropic model id
+						// before forwarding (resolveNativeModelAlias:
+						// over.UpstreamModel is the CLI alias, "fable",
+						// which Anthropic's wire API does not accept on
+						// its own — confirmed live, "model: fable" not
+						// found, 2026-09-02).
+						realModel := resolveNativeModelAlias(over.UpstreamModel)
+						nativeBody, rerr := rewriteAnthropicRequestModel(body, realModel)
 						if rerr != nil {
 							writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for oversize crossover: "+rerr.Error())
 							return
@@ -1456,6 +1461,108 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// nativeModelAliasCache memoizes resolveNativeModelAlias's real-model-id
+// lookups. A short TTL, not "forever": Anthropic's catalog is the source of
+// truth for which id "fable"/"opus"/etc currently means, and that mapping
+// can change (a new point release) without this process restarting.
+var nativeModelAliasCache struct {
+	sync.Mutex
+	m map[string]nativeAliasCacheEntry
+}
+
+type nativeAliasCacheEntry struct {
+	resolved  string
+	expiresAt time.Time
+}
+
+const nativeModelAliasCacheTTL = 10 * time.Minute
+
+// resolveNativeModelAlias turns a Claude Code CLI alias ("fable", "opus",
+// "sonnet", "haiku" — what nativeClaudeModelTier extracts from "claude/fable"
+// etc, and what ANTHROPIC_DEFAULT_*_MODEL / --model already accept) into the
+// REAL model id Anthropic's wire API expects (e.g. "claude-fable-5-1").
+//
+// Why this exists: Claude Code's own client resolves these aliases
+// internally before ever putting them on the wire — running claude/fable
+// via runNative (fully untouched native mode) works because THAT
+// resolution happens inside the real binary, which we never see. Our own
+// passthrough paths (nativeAnthropicPassthrough for a native tier, and the
+// oversize-to-native crossover) build/forward the wire request ourselves
+// and send the bare alias — Anthropic's real API returned "model: fable"
+// not found the first time this was tested live (2026-09-02, an oversize
+// crossover to claude/fable actually reaching production). No local alias
+// table is hardcoded (a specific version string like "claude-fable-5-1"
+// would silently go stale on the next model bump); this queries the same
+// real /v1/models this proxy already forwards
+// (nativeAnthropicModelsPassthrough) and matches on "Claude <Alias>" as a
+// case-insensitive prefix of display_name, taking the FIRST match --
+// verified live that Anthropic's catalog lists the newest point release of
+// a family first (claude-fable-5-1 before claude-fable-5).
+//
+// If model is not a bare alias (nativeClaudeModelTier's caller already
+// stripped "claude/"/"anthropic/", so this only ever receives the bare
+// tier name) or resolution fails for any reason, model is returned
+// unchanged — the caller's own request still goes out, worst case with
+// the same "not found" Anthropic already gives for an unknown id, no worse
+// than not attempting this at all.
+func resolveNativeModelAlias(model string) string {
+	nativeModelAliasCache.Lock()
+	if e, ok := nativeModelAliasCache.m[model]; ok && time.Now().Before(e.expiresAt) {
+		nativeModelAliasCache.Unlock()
+		return e.resolved
+	}
+	nativeModelAliasCache.Unlock()
+
+	resolved := resolveNativeModelAliasUncached(model)
+
+	nativeModelAliasCache.Lock()
+	if nativeModelAliasCache.m == nil {
+		nativeModelAliasCache.m = map[string]nativeAliasCacheEntry{}
+	}
+	nativeModelAliasCache.m[model] = nativeAliasCacheEntry{resolved: resolved, expiresAt: time.Now().Add(nativeModelAliasCacheTTL)}
+	nativeModelAliasCache.Unlock()
+	return resolved
+}
+
+func resolveNativeModelAliasUncached(model string) string {
+	auth, ok := resolveNativeAnthropicAuth()
+	if !ok {
+		return model
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nativeAnthropicModelsUpstream, nil)
+	if err != nil {
+		return model
+	}
+	req.Header.Set(auth.Header, auth.Value)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return model
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return model
+	}
+	var catalog struct {
+		Data []struct {
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		return model
+	}
+	want := "claude " + strings.ToLower(model)
+	for _, m := range catalog.Data {
+		if strings.HasPrefix(strings.ToLower(m.DisplayName), want) {
+			return m.ID
+		}
+	}
+	return model
 }
 
 // rewriteAnthropicRequestModel returns body with its top-level "model"

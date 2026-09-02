@@ -308,3 +308,94 @@ func TestOversizeSwap_CrossesOverToNativeWhenOaicaLegOverflows(t *testing.T) {
 		t.Errorf("X-Oaica-Route = %q, want the oversize leg's label", route)
 	}
 }
+
+// TestOversizeSwap_ResolvesBareAliasAgainstRealCatalog verifies the bug
+// found by live-testing against the real Anthropic API: a bare CLI alias
+// like "fable" is NOT a valid wire model id (real Anthropic rejects it with
+// not_found_error), it only works when Claude Code's own SDK resolves it
+// internally. On the oversize-crossover leg we forward raw bytes ourselves,
+// so resolveNativeModelAlias must look the alias up against the real
+// /v1/models catalog (display_name prefix match) and rewrite the request's
+// "model" field to the resolved wire id before forwarding.
+func TestOversizeSwap_ResolvesBareAliasAgainstRealCatalog(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-alias-test")
+	nativeModelAliasCache.Lock()
+	nativeModelAliasCache.m = nil
+	nativeModelAliasCache.Unlock()
+
+	oaicaUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer oaicaUpstream.Close()
+
+	modelsUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[
+			{"id":"claude-fable-5-1","display_name":"Claude Fable 5.1"},
+			{"id":"claude-fable-5","display_name":"Claude Fable 5"},
+			{"id":"claude-opus-5","display_name":"Claude Opus 5"}
+		]}`))
+	}))
+	defer modelsUpstream.Close()
+	origModels := nativeAnthropicModelsUpstream
+	nativeAnthropicModelsUpstream = modelsUpstream.URL
+	t.Cleanup(func() { nativeAnthropicModelsUpstream = origModels })
+
+	var gotNativeModel string
+	nativeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &req)
+		gotNativeModel = req.Model
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_alias","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer nativeUpstream.Close()
+	origMsg := nativeAnthropicUpstream
+	nativeAnthropicUpstream = nativeUpstream.URL
+	t.Cleanup(func() { nativeAnthropicUpstream = origMsg })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := newProxyClientToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallRoute := proxyRoute{BaseURL: oaicaUpstream.URL, UpstreamModel: "oaica-35b-a3b-vision", Label: "router:oaica", ContextWindow: 100}
+	nativeOversize := proxyRoute{Label: "native-anthropic:oversize", UpstreamModel: "fable", NativePassthrough: true}
+	table := proxyRouteTable{
+		ClientToken: token,
+		Default:     smallRoute,
+		ByModel:     map[string]proxyRoute{"oaica-35b-a3b-vision": smallRoute},
+		Oversize:    nativeOversize,
+	}
+	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, table) }()
+	t.Cleanup(func() { ln.Close() })
+	proxyURL := "http://" + ln.Addr().String()
+
+	longContent := strings.Repeat("padding content to exceed a tiny context window ", 50)
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":      "oaica-35b-a3b-vision",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": longContent}},
+	})
+	req, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy returned %d: %s", resp.StatusCode, respBody)
+	}
+	if gotNativeModel != "claude-fable-5-1" {
+		t.Errorf("native upstream saw model=%q, want %q (resolveNativeModelAlias must resolve the bare alias against the real catalog, newest point release first)", gotNativeModel, "claude-fable-5-1")
+	}
+}
