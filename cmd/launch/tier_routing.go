@@ -640,21 +640,35 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--oversize: %w", err)
 		}
-		if over.BaseURL == plan.Primary.BaseURL {
+		// Two native-passthrough endpoints (both BaseURL=="") would compare
+		// equal here even when they're genuinely different tiers -- e.g.
+		// --oversize claude/fable alongside a native claude/fable PRIMARY
+		// is exactly the intended setup (2026-09-02: swap the OAICA
+		// sonnet/haiku leg to the native primary's own real 1M+ window when
+		// it overflows), not a same-backend error. Only reject the
+		// same-backend case for two ORDINARY (non-native) endpoints, where
+		// an identical BaseURL really does mean "no larger leg exists."
+		if over.Source != sourceNativeAnthropic && over.BaseURL == plan.Primary.BaseURL {
 			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, over.BaseURL)
 		}
 		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
 			return fmt.Errorf("--oversize: %w", err)
 		}
 		plan.Routes.Oversize = routeFor(over)
-		// The oversize leg is a full route leg: it can also serve as the
-		// breaker fallback for the other legs (and it gets health-probed).
-		urlSeen := map[string]bool{}
-		for _, f := range plan.Routes.Fallbacks {
-			urlSeen[f.BaseURL] = true
-		}
-		if !urlSeen[plan.Routes.Oversize.BaseURL] {
-			plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, plan.Routes.Oversize)
+		if oversizeSource := over.Source; oversizeSource != sourceNativeAnthropic {
+			// The oversize leg is a full route leg: it can also serve as the
+			// breaker fallback for the other legs (and it gets
+			// health-probed). A native leg has no BaseURL to probe/dedup on
+			// this way — nativeOversizeBreakerKey (route_policy.go) is its
+			// own separate breaker identity, checked directly in
+			// oversizeSwap instead.
+			urlSeen := map[string]bool{}
+			for _, f := range plan.Routes.Fallbacks {
+				urlSeen[f.BaseURL] = true
+			}
+			if !urlSeen[plan.Routes.Oversize.BaseURL] {
+				plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, plan.Routes.Oversize)
+			}
 		}
 	}
 	// Real context window from the upstreams' /models metadata (claude.go's

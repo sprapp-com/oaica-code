@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -216,5 +217,94 @@ func TestNativeAnthropicPassthrough_NoUsageLogged(t *testing.T) {
 	}
 	if parsed["id"] != "msg_1" {
 		t.Errorf("response body was rewritten, want passthrough: %s", body)
+	}
+}
+
+// TestOversizeSwap_CrossesOverToNativeWhenOaicaLegOverflows is the
+// end-to-end wire-level test for the whole feature (2026-09-02): a small
+// OAICA leg that cannot hold the request crosses over to a native
+// Anthropic oversize leg instead of 400ing. Confirms three things in one
+// real request: (1) the oversized request that would have 400'd on the
+// small leg instead reaches the native upstream, (2) the request body's
+// "model" field is rewritten from the OAICA id to the native alias before
+// forwarding (rewriteAnthropicRequestModel), (3) the OAICA upstream is
+// NEVER contacted for this request at all.
+func TestOversizeSwap_CrossesOverToNativeWhenOaicaLegOverflows(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-oversize-test")
+
+	oaicaHit := false
+	oaicaUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oaicaHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer oaicaUpstream.Close()
+
+	var gotNativeModel string
+	nativeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &req)
+		gotNativeModel = req.Model
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"msg_oversize","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer nativeUpstream.Close()
+	origMsg := nativeAnthropicUpstream
+	nativeAnthropicUpstream = nativeUpstream.URL
+	t.Cleanup(func() { nativeAnthropicUpstream = origMsg })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := newProxyClientToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately tiny ContextWindow so a modest body already overflows it
+	// — no need to construct an actual 256k-token request to exercise the
+	// swap path.
+	smallRoute := proxyRoute{BaseURL: oaicaUpstream.URL, UpstreamModel: "oaica-35b-a3b-vision", Label: "router:oaica", ContextWindow: 100}
+	nativeOversize := proxyRoute{Label: "native-anthropic:oversize", UpstreamModel: "fable", NativePassthrough: true}
+	table := proxyRouteTable{
+		ClientToken: token,
+		Default:     smallRoute,
+		ByModel:     map[string]proxyRoute{"oaica-35b-a3b-vision": smallRoute},
+		Oversize:    nativeOversize,
+	}
+	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, table) }()
+	t.Cleanup(func() { ln.Close() })
+	proxyURL := "http://" + ln.Addr().String()
+
+	// A few hundred chars is already well past a 100-token window.
+	longContent := strings.Repeat("padding content to exceed a tiny context window ", 50)
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":      "oaica-35b-a3b-vision",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": longContent}},
+	})
+	req, _ := http.NewRequest("POST", proxyURL+"/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy returned %d, want 200 (oversize crossover should have saved this request): %s", resp.StatusCode, respBody)
+	}
+	if oaicaHit {
+		t.Error("the small OAICA leg was contacted — the whole point of the swap is to never send an already-doomed request there")
+	}
+	if gotNativeModel != "fable" {
+		t.Errorf("native upstream saw model=%q, want %q (rewriteAnthropicRequestModel must replace the OAICA id)", gotNativeModel, "fable")
+	}
+	route := resp.Header.Get("X-Oaica-Route")
+	if route != "native-anthropic:oversize" {
+		t.Errorf("X-Oaica-Route = %q, want the oversize leg's label", route)
 	}
 }

@@ -467,12 +467,41 @@ const minViableCompletionTokens = 16
 // user's reason (residency, cost cap) outranks a marginal success. Any
 // condition failing returns the original route, whose caller then fails
 // visibly with the existing "prompt is too long" 400.
+//
+// A NATIVE PASSTHROUGH oversize leg (t.Oversize.NativePassthrough) is a
+// special case, checked first and separately: it carries no BaseURL/
+// ContextWindow by design (proxyRoute.NativePassthrough's doc) — Anthropic
+// enforces its own real window (1M+ for a modern model), which is always
+// assumed large enough to be worth trying rather than failing the request
+// outright. 2026-09-02: added because a native primary configured
+// alongside a small-window OAICA sonnet/haiku split had NOTHING to swap to
+// when that tier overflowed — --oversize only ever pointed at another
+// OAICA/remote leg, so a genuinely large model already running (the native
+// primary itself) was never reachable as a compaction leg. Breaker/pin
+// checks use a fixed native-anthropic key (routeLocality has no meaning
+// for an empty BaseURL) rather than being skipped outright.
 func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (proxyRoute, bool) {
 	// Precondition: the current leg must actually be unable to hold the
 	// request (the handler's only caller guarantees this; kept inside so the
 	// function is honest standalone).
 	if route.ContextWindow-estTokens-margin >= minViableCompletionTokens {
 		return route, false
+	}
+	if t.Oversize.NativePassthrough {
+		if route.NativePassthrough {
+			return route, false // already on it — nothing to swap to
+		}
+		if pin := t.Policy.pinned(); pin != "" && pin != "remote" {
+			// Native is always a remote call to api.anthropic.com — a
+			// local-only pin must never cross to it, same reasoning as the
+			// BaseURL-based check below for an ordinary oversize leg
+			// (routeLocality returns the same "local"/"remote" strings).
+			return route, false
+		}
+		if t.breakers.open(nativeOversizeBreakerKey) {
+			return route, false
+		}
+		return t.Oversize, true
 	}
 	if route.ContextWindow <= 0 || t.Oversize.BaseURL == "" ||
 		t.Oversize.BaseURL == route.BaseURL ||
@@ -490,6 +519,11 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (
 	}
 	return t.Oversize, true
 }
+
+// nativeOversizeBreakerKey is the breaker identity for a native-Anthropic
+// oversize leg — a stable string standing in for the (deliberately empty)
+// BaseURL every other route's breaker state is keyed on.
+const nativeOversizeBreakerKey = "native-anthropic-oversize"
 
 // startRouteHealthPoll probes every distinct fallback base URL every
 // pollInterval until ctx is cancelled, recording the outcome so breakers

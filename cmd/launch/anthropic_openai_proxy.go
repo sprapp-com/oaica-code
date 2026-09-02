@@ -1001,6 +1001,30 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// --oversize leg exists → serve on it instead of rejecting.
 				// Re-derive the budget against the new leg's window.
 				if over, swapped := table.oversizeSwap(route, estTokens, margin); swapped {
+					if over.NativePassthrough {
+						// A native oversize leg has no probed ContextWindow
+						// (it's always 0 — see oversizeSwap's doc) and no
+						// clamp of ours applies: Anthropic enforces its own
+						// real window. Redirect here, with the ORIGINAL
+						// Anthropic-shaped body (not oaiReq, which only
+						// exists for the OpenAI-translation path this leg
+						// skips entirely) — same branch nativeAnthropicPassthrough
+						// takes at the top of this handler for a native
+						// PRIMARY, just reached via the oversize swap instead.
+						// The body's own "model" field still carries the
+						// OAICA leg's id (the client sent it for THAT
+						// tier) — rewrite to the native alias before
+						// forwarding, or Anthropic's real API rejects an
+						// id it doesn't know.
+						nativeBody, rerr := rewriteAnthropicRequestModel(body, over.UpstreamModel)
+						if rerr != nil {
+							writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for oversize crossover: "+rerr.Error())
+							return
+						}
+						w.Header().Set("X-Oaica-Route", over.Label)
+						nativeAnthropicPassthrough(w, r, nativeBody)
+						return
+					}
 					route = over
 					oaiReq.Model = route.UpstreamModel
 					w.Header().Set("X-Oaica-Route", route.Label)
@@ -1432,6 +1456,25 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// rewriteAnthropicRequestModel returns body with its top-level "model"
+// field replaced by newModel, preserving every other field and their
+// ordering-independent JSON encoding — used only for the oversize-to-native
+// crossover (anthropic_openai_proxy.go's /v1/messages handler): the
+// client's original body names the OAICA leg that overflowed, not the
+// native alias it's being redirected to.
+func rewriteAnthropicRequestModel(body []byte, newModel string) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(newModel)
+	if err != nil {
+		return nil, err
+	}
+	m["model"] = encoded
+	return json.Marshal(m)
 }
 
 // nativeAnthropicPassthrough forwards an Anthropic-wire request straight to
