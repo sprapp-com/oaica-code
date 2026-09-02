@@ -302,7 +302,7 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 	var configFlag bool
 	var yesFlag bool
 	var restoreFlag bool
-	var planFlag, sonnetFlag, oversizeFlag, policyFlag string
+	var planFlag, sonnetFlag, haikuFlag, oversizeFlag, policyFlag string
 	var wizardFlag bool
 
 	cmd := &cobra.Command{
@@ -378,7 +378,7 @@ Examples:
 
 			if name == "" {
 				if cmd.Flags().Changed("model") || cmd.Flags().Changed("config") || cmd.Flags().Changed("yes") || cmd.Flags().Changed("restore") ||
-					cmd.Flags().Changed("plan") || cmd.Flags().Changed("sonnet-model") || cmd.Flags().Changed("oversize") || cmd.Flags().Changed("route-policy") || cmd.Flags().Changed("wizard") || len(passArgs) > 0 {
+					cmd.Flags().Changed("plan") || cmd.Flags().Changed("sonnet-model") || cmd.Flags().Changed("haiku-model") || cmd.Flags().Changed("oversize") || cmd.Flags().Changed("route-policy") || cmd.Flags().Changed("wizard") || len(passArgs) > 0 {
 					return fmt.Errorf("flags and extra args require an integration name, for example: 'ollama launch claude --model qwen3.5'")
 				}
 				runTUI(cmd)
@@ -394,6 +394,9 @@ Examples:
 			}
 			if sonnetFlag != "" {
 				tierPrepend = append(tierPrepend, "--sonnet-model", sonnetFlag)
+			}
+			if haikuFlag != "" {
+				tierPrepend = append(tierPrepend, "--haiku-model", haikuFlag)
 			}
 			if oversizeFlag != "" {
 				tierPrepend = append(tierPrepend, "--oversize", oversizeFlag)
@@ -456,6 +459,7 @@ Examples:
 	// parsing path, both spellings work.
 	cmd.Flags().StringVar(&planFlag, "plan", "", "Reuse a saved tier plan (see 'oaica plan')")
 	cmd.Flags().StringVar(&sonnetFlag, "sonnet-model", "", "Secondary (sonnet/subagent) tier model")
+	cmd.Flags().StringVar(&haikuFlag, "haiku-model", "", "Haiku/background tier model")
 	cmd.Flags().StringVar(&oversizeFlag, "oversize", "", "Compaction/oversize-tier model for requests past the primary's window")
 	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: local-first, remote-first, auto, local-only, remote-only")
 	cmd.Flags().BoolVar(&wizardFlag, "wizard", false, "Force the interactive launch-tier wizard")

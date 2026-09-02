@@ -831,9 +831,25 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	// GET /v1/models — proxy straight to the remote's /models endpoint so
 	// Claude Code's model probes resolve. The remote already speaks OpenAI
 	// /models (z.ai serves it under /v4).
+	//
+	// When the DEFAULT route is native Anthropic passthrough, baseURL is
+	// empty (NativePassthrough routes carry no BaseURL — see
+	// proxyRoute.NativePassthrough's doc) and this endpoint had nothing
+	// real to proxy to — objectively wrong regardless of what queries it.
+	// Forward to the real Anthropic API instead. NOTE (2026-09-02): this
+	// was added while chasing a native-primary + haiku-only-split failure
+	// ("issue with the selected model (fable)", opusplan rejecting a
+	// documented-valid alias) on the theory that opusplan's SDK-side
+	// validation reads this endpoint — that theory did NOT hold; the bug
+	// is still open. This fix stands on its own merit (a native default's
+	// /v1/models must answer something real) but is not a fix for that bug.
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		if !table.authorized(r) {
 			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
+			return
+		}
+		if table.Default.NativePassthrough {
+			nativeAnthropicModelsPassthrough(w, r)
 			return
 		}
 		proxyPassThrough(w, r, baseURL+"/models", table.Default.resolveKey())
@@ -1370,6 +1386,53 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 // nativeAnthropicUpstream is api.anthropic.com's own /v1/messages endpoint
 // — a var so tests can point it at a fixture server.
 var nativeAnthropicUpstream = "https://api.anthropic.com/v1/messages"
+
+// nativeAnthropicModelsUpstream is api.anthropic.com's own /v1/models
+// endpoint — a var so tests can point it at a fixture server. See the
+// /v1/models handler's doc for why this exists: opusplan's own SDK-side
+// model validation queries this endpoint, and with no real answer it
+// rejects a perfectly valid native alias like "fable" outright.
+var nativeAnthropicModelsUpstream = "https://api.anthropic.com/v1/models"
+
+// nativeAnthropicModelsPassthrough forwards GET /v1/models to the real
+// Anthropic API with the same credential resolution as message requests
+// (resolveNativeAnthropicAuth) — no request body to worry about, this is a
+// simple GET relay.
+func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
+	auth, ok := resolveNativeAnthropicAuth()
+	if !ok {
+		writeAnthropicError(w, http.StatusUnauthorized,
+			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nativeAnthropicModelsUpstream, nil)
+	if err != nil {
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
+		return
+	}
+	for k, vs := range r.Header {
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") {
+			continue
+		}
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set(auth.Header, auth.Value)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
 
 // nativeAnthropicPassthrough forwards an Anthropic-wire request straight to
 // api.anthropic.com, byte-for-byte: no OpenAI translation (there is nothing

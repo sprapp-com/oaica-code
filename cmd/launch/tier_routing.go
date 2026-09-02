@@ -446,6 +446,29 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 	return plan, nil
 }
 
+// claudeCodeModelAlias strips our own "claude/"/"anthropic/" picker prefix
+// before a value goes into an ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_*
+// env var: those are read by the REAL Claude Code binary, which only knows
+// its own bare aliases (opus/sonnet/fable/...), not our namespaced picker
+// syntax. Every non-native model id (the normal OAICA/remote/daemon case)
+// passes through completely unchanged -- this only ever touches the
+// claude/anthropic prefix.
+//
+// Why this matters even outside opusplan: a haiku-only split (sonnet ==
+// primary, so opusplan's own opus/sonnet slots have nothing distinctive to
+// resolve, but haiku differs) still sends the primary's raw picker string
+// as --model or ANTHROPIC_DEFAULT_OPUS_MODEL, and Claude Code rejected
+// "claude/fable" outright ("issue with the selected model", 2026-09-02) --
+// this is the actual fix; the opusplan-trigger widening above only gets
+// the SONNET slot right, not opus/haiku, which read this env var directly
+// regardless of mode.
+func claudeCodeModelAlias(model string) string {
+	if tier, ok := nativeClaudeModelTier(model); ok {
+		return tier
+	}
+	return model
+}
+
 // envVars is the Claude Code environment for a plan. ANTHROPIC_AUTH_TOKEN is
 // the per-launch proxy token (see proxyRouteTable.ClientToken): the proxy
 // attaches each route's real key upstream, so no real key enters the child
@@ -463,14 +486,14 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 		"DISABLE_ERROR_REPORTING=1",
 		"DISABLE_FEEDBACK_COMMAND=1",
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
-		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + p.PrimaryName,
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + p.SecondaryName,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + p.HaikuName,
-		"CLAUDE_CODE_SUBAGENT_MODEL=" + p.SecondaryName,
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + claudeCodeModelAlias(p.PrimaryName),
+		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + claudeCodeModelAlias(p.SecondaryName),
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + claudeCodeModelAlias(p.HaikuName),
+		"CLAUDE_CODE_SUBAGENT_MODEL=" + claudeCodeModelAlias(p.SecondaryName),
 		// See modelEnvVars: Auto mode would address model ids no backend of
 		// ours has.
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
-		"CLAUDE_CODE_AUTO_MODE_MODEL=" + p.PrimaryName,
+		"CLAUDE_CODE_AUTO_MODE_MODEL=" + claudeCodeModelAlias(p.PrimaryName),
 		// Long-prefill backends (262k ctx on vLLM) can take minutes to first
 		// token on big system prompts. Claude Code's default request timeout
 		// aborts and retries, showing "Waiting for API response · will retry
@@ -667,11 +690,22 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// needed after every relaunch. An explicit --model in the user's args
 	// wins (c.args skips ours), and a single-model launch (no secondary)
 	// keeps pinning the primary as before.
-	claudeModel := plan.PrimaryName
-	if plan.SecondaryName != plan.PrimaryName && !hasClaudeModelFlag(args) {
+	// A NATIVE primary especially needs this: ANTHROPIC_DEFAULT_OPUS_MODEL
+	// carries our own picker-namespaced string ("claude/fable"), which the
+	// real Claude Code binary does not recognize as a --model value on its
+	// own -- opusplan mode is a fixed built-in preset that Claude Code
+	// resolves its opus/haiku slots from internally, bypassing that env
+	// var for those two tiers (only the sonnet slot is actually overridden
+	// in opusplan mode). Without opusplan, a haiku-only split (sonnet ==
+	// primary, haiku != primary) sent claude/fable straight to --model and
+	// failed ("issue with the selected model (claude/fable)", 2026-09-02) —
+	// this condition previously checked SecondaryName only, so it never
+	// caught that case.
+	claudeModel := claudeCodeModelAlias(plan.PrimaryName)
+	if (plan.SecondaryName != plan.PrimaryName || plan.HaikuName != plan.PrimaryName) && !hasClaudeModelFlag(args) {
 		claudeModel = "opusplan"
-		fmt.Fprintf(os.Stderr, "model mode: opusplan (plan with %s, execute with %s)\n",
-			plan.PrimaryName, plan.SecondaryName)
+		fmt.Fprintf(os.Stderr, "model mode: opusplan (plan with %s, sonnet %s, haiku %s)\n",
+			plan.PrimaryName, plan.SecondaryName, plan.HaikuName)
 	}
 
 	cmd := exec.Command(claudePath, c.args(claudeModel, args)...)

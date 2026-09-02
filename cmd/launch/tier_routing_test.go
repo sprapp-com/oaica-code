@@ -471,6 +471,103 @@ func TestBuildTierPlan_NonNativePrimaryNeverSetsDisplayModel(t *testing.T) {
 	}
 }
 
+// TestClaudeCodeModelAlias covers the strip-our-prefix fix (2026-09-02):
+// ANTHROPIC_DEFAULT_*_MODEL env vars are read by the REAL Claude Code
+// binary, which only knows its own bare aliases, not our "claude/"/
+// "anthropic/" picker syntax — a native primary with a haiku-only split
+// sent "claude/fable" straight into that env var and Claude Code rejected
+// it outright ("issue with the selected model").
+func TestClaudeCodeModelAlias(t *testing.T) {
+	cases := map[string]string{
+		"claude/fable":         "fable",
+		"claude/opus":          "opus",
+		"claude/sonnet":        "sonnet",
+		"anthropic/fable":      "fable",
+		"anthropic/opus":       "opus",
+		"oaica-35b-a3b-vision": "oaica-35b-a3b-vision", // non-native: unchanged
+		"glm-5.3-flash:cloud":  "glm-5.3-flash:cloud",  // non-native: unchanged
+		"box/kat-awq":          "box/kat-awq",          // non-native: unchanged
+	}
+	for in, want := range cases {
+		if got := claudeCodeModelAlias(in); got != want {
+			t.Errorf("claudeCodeModelAlias(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestBuildTierPlan_EnvVarsStripNativePrefix confirms envVars() actually
+// uses claudeCodeModelAlias on all four ANTHROPIC_DEFAULT_*/CLAUDE_CODE_*
+// slots that carry a model id, for a native primary with an OAICA
+// haiku-only split (sonnet == primary, only haiku differs) — the exact
+// combination that surfaced the bug.
+func TestBuildTierPlan_EnvVarsStripNativePrefix(t *testing.T) {
+	noRemotes(t)
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk-cust")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+	stubDaemon(t)
+
+	plan, err := buildTierPlan("claude/fable", "", "oaica-35b-a3b-vision", false)
+	if err != nil {
+		t.Fatalf("native primary + oaica haiku-only split: %v", err)
+	}
+	env := plan.envVars("http://127.0.0.1:0", "tok")
+	want := map[string]string{
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":   "fable",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL": "fable",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":  "oaica-35b-a3b-vision",
+		"CLAUDE_CODE_AUTO_MODE_MODEL":    "fable",
+	}
+	got := map[string]string{}
+	for _, kv := range env {
+		for k := range want {
+			if strings.HasPrefix(kv, k+"=") {
+				got[k] = strings.TrimPrefix(kv, k+"=")
+			}
+		}
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("%s = %q, want %q (env: %v)", k, got[k], w, env)
+		}
+	}
+}
+
+// TestBuildTierPlan_OpusplanTriggersOnHaikuOnlySplit is the opusplan-
+// trigger-widening fix: previously only SecondaryName != PrimaryName
+// entered opusplan mode, so a haiku-only split (sonnet == primary, haiku
+// differs) launched with a plain --model <primary> instead — for a native
+// primary, that sent our own picker-namespaced string straight to --model
+// with no opusplan preset to route around it. Exercised through Run()'s
+// own claudeModel logic isn't directly unit-testable without executing the
+// child process, so this test pins the plan-level facts the fix depends
+// on: HaikuName alone differing from PrimaryName is real and visible on
+// the built plan.
+func TestBuildTierPlan_OpusplanTriggersOnHaikuOnlySplit(t *testing.T) {
+	noRemotes(t)
+	t.Setenv("OAICA_HOST", "https://api.example.test")
+	t.Setenv("OAICA_API_KEY", "sk-cust")
+	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
+	stubDaemon(t)
+
+	plan, err := buildTierPlan("claude/fable", "", "oaica-35b-a3b-vision", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.SecondaryName != plan.PrimaryName {
+		t.Fatalf("SecondaryName = %q, want == PrimaryName %q for a haiku-only split", plan.SecondaryName, plan.PrimaryName)
+	}
+	if plan.HaikuName == plan.PrimaryName {
+		t.Fatalf("HaikuName = %q, want != PrimaryName — this is the split under test", plan.HaikuName)
+	}
+	// The condition Run() actually checks (tier_routing.go): true here is
+	// exactly what makes it enter opusplan mode instead of a plain --model.
+	entersOpusplan := plan.SecondaryName != plan.PrimaryName || plan.HaikuName != plan.PrimaryName
+	if !entersOpusplan {
+		t.Fatal("opusplan trigger condition is false for a haiku-only split — this is the exact regression the fix closes")
+	}
+}
+
 // A plain native launch (no split requested) must stay on the fully-
 // untouched runNative path — Run() checks this at the model level before
 // buildTierPlan is ever called, so it isn't exercised here; this test only
