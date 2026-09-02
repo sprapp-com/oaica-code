@@ -527,12 +527,39 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 		recRank[rec.Name] = i + 1
 	}
 
+	// Pin a user's most-frequently-picked models above everything else,
+	// including the OAICA recommendation section — that's the whole point
+	// of surfacing them (fastest path back to what you actually use).
+	freqRank := make(map[string]int)
+	for i, name := range topFrequentModels(5) {
+		freqRank[name] = i + 1
+	}
+	for i := range items {
+		if freqRank[items[i].Name] > 0 && !strings.Contains(items[i].Description, "frequently used") {
+			if items[i].Description != "" {
+				items[i].Description = "frequently used · " + items[i].Description
+			} else {
+				items[i].Description = "frequently used"
+			}
+		}
+	}
+
 	if hasLocalModel || hasCloudModel {
 		// Keep the Recommended section pinned to recommendation order. Checked
 		// and default-model priority only apply within the More section.
 		slices.SortStableFunc(items, func(a, b ModelItem) int {
 			ac, bc := isChecked(a.Name), isChecked(b.Name)
 			aNew, bNew := notInstalled[a.Name], notInstalled[b.Name]
+			aFreq, bFreq := freqRank[a.Name] > 0, freqRank[b.Name] > 0
+			if aFreq != bFreq {
+				if aFreq {
+					return -1
+				}
+				return 1
+			}
+			if aFreq && bFreq {
+				return freqRank[a.Name] - freqRank[b.Name]
+			}
 			aRec, bRec := recRank[a.Name] > 0, recRank[b.Name] > 0
 			if aRec != bRec {
 				if aRec {

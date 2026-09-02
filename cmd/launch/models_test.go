@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ollama/ollama/api"
@@ -62,6 +63,71 @@ func TestBuildModelList_UsesInventoryMetadataForInstalledModels(t *testing.T) {
 	}
 	if got.Description != "" {
 		t.Fatalf("Description = %q, want empty for installed model without recommendation copy", got.Description)
+	}
+}
+
+func TestBuildModelList_PinsFrequentlyPickedModelsAboveRecommendations(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	recordModelPick("rare-pick")
+	for i := 0; i < 5; i++ {
+		recordModelPick("hot-model")
+	}
+	for i := 0; i < 3; i++ {
+		recordModelPick("warm-model")
+	}
+
+	recommendations := []ModelItem{
+		{Name: "recommended-a", Recommended: true},
+		{Name: "recommended-b", Recommended: true},
+	}
+	existing := []modelInfo{
+		{Name: "hot-model:latest"},
+		{Name: "warm-model:latest"},
+		{Name: "rare-pick:latest"},
+	}
+
+	items, _, _, _ := buildModelListWithRecommendations(existing, recommendations, nil, "")
+	if len(items) < 4 {
+		t.Fatalf("got %d items, want at least 4", len(items))
+	}
+	if items[0].Name != "hot-model" {
+		t.Fatalf("items[0] = %q, want %q (most-picked first)", items[0].Name, "hot-model")
+	}
+	if items[1].Name != "warm-model" {
+		t.Fatalf("items[1] = %q, want %q (second most-picked)", items[1].Name, "warm-model")
+	}
+	if !strings.Contains(items[0].Description, "frequently used") {
+		t.Errorf("items[0].Description = %q, want it to mention frequently used", items[0].Description)
+	}
+	// A single pick shouldn't outrank an actual OAICA recommendation once
+	// the top-5-by-count bar isn't clearly met by volume — but with only 3
+	// distinct picked names here all three land in the top 5, so rare-pick
+	// (count 1) still sits above the recommendations, just after hot/warm.
+	if items[2].Name != "rare-pick" {
+		t.Fatalf("items[2] = %q, want %q (still in top 5 by count)", items[2].Name, "rare-pick")
+	}
+	if items[3].Name != "recommended-a" && items[3].Name != "recommended-b" {
+		t.Fatalf("items[3] = %q, want a recommendation (frequently-used names exhausted)", items[3].Name)
+	}
+}
+
+func TestTopFrequentModels_OrdersByCountThenName(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	recordModelPick("b-model")
+	recordModelPick("a-model")
+	recordModelPick("a-model")
+	recordModelPick("c-model")
+	recordModelPick("c-model")
+
+	got := topFrequentModels(5)
+	want := []string{"a-model", "c-model", "b-model"}
+	if len(got) != len(want) {
+		t.Fatalf("topFrequentModels = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("topFrequentModels = %v, want %v", got, want)
+		}
 	}
 }
 

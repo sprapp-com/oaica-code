@@ -1234,12 +1234,14 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		selected = stripOllamaPickerNames([]string{selected})[0]
 		if isNativeClaudeModel(selected) {
 			// Native Claude entries bypass OAICA readiness entirely.
+			recordModelPick(selected)
 			return selected, nil
 		}
 		if isPlanPickerModel(selected) {
 			// Saved tier plans resolve inside Claude.Run (tier_plan_profiles.go);
 			// the plan's primary model is what needs OAICA readiness, and
 			// buildTierPlan/resolvePlanModels already validate existence.
+			recordModelPick(selected)
 			return selected, nil
 		}
 		if ensureReady {
@@ -1255,6 +1257,7 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 				return "", err
 			}
 		}
+		recordModelPick(selected)
 		return selected, nil
 	}
 }
