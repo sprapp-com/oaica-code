@@ -646,6 +646,17 @@ func billingPlanLabel(name string) string {
 	if rest, ok := strings.CutPrefix(name, "zai/"); ok && strings.HasPrefix(rest, "glm-") {
 		return "API Plan (Z.AI — per-token key)"
 	}
+	// moonshot (Kimi) and minimax are built-in catalog providers
+	// (user_remotes.go's catalogProviders) — same per-token-key auth as
+	// zai above, just a different vendor. Labeled the same way so a
+	// "kimi-k3"/minimax row in the picker doesn't look billing-agnostic
+	// (2026-09-03, requested alongside the zai label already here).
+	if _, ok := strings.CutPrefix(name, "moonshot/"); ok {
+		return "API Plan (Moonshot/Kimi — per-token key)"
+	}
+	if _, ok := strings.CutPrefix(name, "minimax/"); ok {
+		return "API Plan (MiniMax — per-token key)"
+	}
 	return ""
 }
 

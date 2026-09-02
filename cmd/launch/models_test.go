@@ -14,6 +14,8 @@ func TestBillingPlanLabel(t *testing.T) {
 		"opencode-go/glm-5.3-flash": "Coding Plan (zen — shared subscription)",
 		"opencode-go/glm-5.1":       "Coding Plan (zen — shared subscription)",
 		"zai/glm-5.3":               "API Plan (Z.AI — per-token key)",
+		"moonshot/kimi-k3":          "API Plan (Moonshot/Kimi — per-token key)",
+		"minimax/minimax-m2.7":      "API Plan (MiniMax — per-token key)",
 		"opencode-go/kimi-k2.6":     "",
 		"glm-5.3-flash":             "",
 		"box/glm-5.3-flash":         "",

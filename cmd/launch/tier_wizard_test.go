@@ -416,6 +416,57 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 	}
 }
 
+// TestRunTierWizard_BackSkipsOverNilStep verifies the fix for a real
+// reported bug: with no oversize candidates (a common case — oversizeItems
+// is nil whenever nothing probes larger than the primary), backing off the
+// Route policy step must land on Haiku, not bounce right back to Route
+// policy. Before the fix, i-=2 followed by the loop's forward-skip-if-nil
+// check landed back on the same nil step and re-advanced past it to the
+// exact step the user just backed off of — Esc/Left looked like it did
+// nothing (2026-09-03).
+func TestRunTierWizard_BackSkipsOverNilStep(t *testing.T) {
+	withTempOaicaHome(t)
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	// No tierWizardResolveEndpoint/ProbeWindow stub set up: probedModelWindow
+	// fails closed (real network lookup in a test sandbox), so
+	// oversizeWindowCandidates returns nil and the oversize step is skipped
+	// entirely — exactly the common real-world case this bug hit.
+	var logged []string
+	answers := []string{"kat-awq-7b", "kat-awq-1.5b", tierWizardBack, "kat-awq-1.5b", "remote-first"}
+	calls := 0
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		logged = append(logged, title)
+		ans := answers[min(calls, len(answers)-1)]
+		calls++
+		return ans, nil
+	}
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b"), "kat-awq")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "kat-awq-7b" || c.HaikuModel != "kat-awq-1.5b" || c.RoutePolicy != "remote-first" {
+		t.Fatalf("unexpected choice: %+v", c)
+	}
+	want := []string{
+		"Sonnet/subagent tier (secondary model)",
+		"Haiku/background tier",
+		"Route policy (what the launch proxy does when a backend fails)",
+		"Haiku/background tier", // back from policy must re-ask Haiku, skipping the nil oversize step
+		"Route policy (what the launch proxy does when a backend fails)",
+	}
+	if len(logged) != len(want) {
+		t.Fatalf("step sequence = %v, want %v", logged, want)
+	}
+	for i := range want {
+		if logged[i] != want[i] {
+			t.Fatalf("step %d = %q, want %q (full sequence: %v)", i, logged[i], want[i], logged)
+		}
+	}
+}
+
 func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
 	withTempOaicaHome(t)
 	origSelect, origRead := tierWizardSelect, tierWizardReadLine

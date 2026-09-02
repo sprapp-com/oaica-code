@@ -404,9 +404,10 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 			c.RoutePolicy = string(RouteAuto)
 		}
 	}
-	for i := 0; i < len(steps); i++ {
+	for i := 0; i < len(steps); {
 		s := steps[i]
 		if s.items == nil {
+			i++
 			continue
 		}
 		sel, err := tierWizardSelect(s.title, s.items)
@@ -418,7 +419,16 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				return c, nil // backed off the first step: launch as-is
 			}
 			clearStep(i)
-			i -= 2
+			i--
+			// Walk back past any skipped (nil-items) steps too — a plain
+			// i-- landed on a skipped step forward-skips it right back to
+			// where we started, making Esc/Left look like it does nothing
+			// (2026-09-03, reported: oversize step is nil whenever no
+			// candidate qualifies, which is common, so backing off Route
+			// policy silently no-oped almost every time).
+			for i > 0 && steps[i].items == nil {
+				i--
+			}
 			continue
 		}
 		switch i {
@@ -442,6 +452,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		case 3:
 			c.RoutePolicy = sel
 		}
+		i++
 	}
 
 	fmt.Fprintf(os.Stderr, "%s\n", tierWizardPreview(primary, c))
