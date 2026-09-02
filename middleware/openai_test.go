@@ -20,6 +20,10 @@ import (
 	"github.com/ollama/ollama/openai"
 )
 
+func testIntPtr(v int) *int {
+	return &v
+}
+
 // testPropsMap creates a ToolPropertiesMap from a map (convenience function for tests)
 func testPropsMap(m map[string]api.ToolProperty) *api.ToolPropertiesMap {
 	props := api.NewToolPropertiesMap()

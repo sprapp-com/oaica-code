@@ -214,7 +214,8 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 	})
 
 	t.Run("api chat", func(t *testing.T) {
-		upstream, capture := newUpstream(t, `{"message":{"role":"assistant","content":"ok"},"done":true}`)
+		upstreamResponse := `{"message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":12,"prompt_eval_cached_count":9}`
+		upstream, capture := newUpstream(t, upstreamResponse)
 		defer upstream.Close()
 
 		original := cloudProxyBaseURL
@@ -245,6 +246,9 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if got := string(body); got != upstreamResponse {
+			t.Fatalf("cloud response changed: got %q, want %q", got, upstreamResponse)
 		}
 
 		if capture.path != "/api/chat" {
@@ -386,7 +390,8 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 	})
 
 	t.Run("v1 chat completions bypasses conversion", func(t *testing.T) {
-		upstream, capture := newUpstream(t, `{"id":"chatcmpl_test","object":"chat.completion"}`)
+		upstreamResponse := `{"id":"chatcmpl_test","object":"chat.completion","usage":{"prompt_tokens":12,"prompt_tokens_details":{"cached_tokens":9},"completion_tokens":3,"total_tokens":15}}`
+		upstream, capture := newUpstream(t, upstreamResponse)
 		defer upstream.Close()
 
 		original := cloudProxyBaseURL
@@ -418,6 +423,9 @@ func TestExplicitCloudPassthroughAPIAndV1(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("expected status 200, got %d (%s)", resp.StatusCode, string(body))
+		}
+		if got := string(body); got != upstreamResponse {
+			t.Fatalf("cloud response changed: got %q, want %q", got, upstreamResponse)
 		}
 
 		if capture.path != "/v1/chat/completions" {

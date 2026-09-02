@@ -277,9 +277,31 @@ type MessagesResponse struct {
 // reporting 0 (what the streaming path did before 2026-08-30) never
 // compacts at all and the session runs into the context wall.
 type Usage struct {
-	InputTokens          int `json:"input_tokens"`
-	OutputTokens         int `json:"output_tokens"`
-	CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
+	InputTokens          int  `json:"input_tokens"`
+	CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
+	OutputTokens         int  `json:"output_tokens"`
+}
+
+// UsageFromMetrics separates total prompt tokens into uncached and cache-read counts.
+func UsageFromMetrics(metrics api.Metrics) Usage {
+	total := max(0, metrics.PromptEvalCount)
+	var cached *int
+	if metrics.PromptEvalCachedCount != nil {
+		count := min(max(0, *metrics.PromptEvalCachedCount), total)
+		cached = &count
+	}
+	return Usage{
+		InputTokens:          total - intValue(cached),
+		CacheReadInputTokens: cached,
+		OutputTokens:         metrics.EvalCount,
+	}
+}
+
+func intValue(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // Streaming event types
@@ -336,9 +358,9 @@ type MessageDelta struct {
 // the Anthropic SDKs merge these into the final message's usage, which is
 // where streaming clients read the prompt size from).
 type DeltaUsage struct {
-	InputTokens          int `json:"input_tokens"`
-	OutputTokens         int `json:"output_tokens"`
-	CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
+	InputTokens          int  `json:"input_tokens"`
+	CacheReadInputTokens *int `json:"cache_read_input_tokens,omitempty"`
+	OutputTokens         int  `json:"output_tokens"`
 }
 
 // MessageStopEvent signals the end of the message
@@ -935,10 +957,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		Model:      r.Model,
 		Content:    content,
 		StopReason: stopReason,
-		Usage: Usage{
-			InputTokens:  r.Metrics.PromptEvalCount,
-			OutputTokens: r.Metrics.EvalCount,
-		},
+		Usage:      UsageFromMetrics(r.Metrics),
 	}
 }
 
@@ -986,6 +1005,7 @@ type StreamConverter struct {
 	firstWrite           bool
 	contentIndex         int
 	inputTokens          int
+	cacheReadTokens      *int
 	outputTokens         int
 	estimatedInputTokens int // Estimated tokens from request (used when actual metrics are 0)
 	thinkingStarted      bool
@@ -1017,8 +1037,10 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 	if c.firstWrite {
 		c.firstWrite = false
 		// Use actual metrics if available, otherwise use estimate
-		c.inputTokens = r.Metrics.PromptEvalCount
-		if c.inputTokens == 0 && c.estimatedInputTokens > 0 {
+		usage := UsageFromMetrics(r.Metrics)
+		c.inputTokens = usage.InputTokens
+		c.cacheReadTokens = usage.CacheReadInputTokens
+		if c.inputTokens == 0 && intValue(c.cacheReadTokens) == 0 && c.estimatedInputTokens > 0 {
 			c.inputTokens = c.estimatedInputTokens
 		}
 
@@ -1033,8 +1055,9 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 					Model:   c.Model,
 					Content: []ContentBlock{},
 					Usage: Usage{
-						InputTokens:  c.inputTokens,
-						OutputTokens: 0,
+						InputTokens:          c.inputTokens,
+						CacheReadInputTokens: c.cacheReadTokens,
+						OutputTokens:         0,
 					},
 				},
 			},
@@ -1249,14 +1272,17 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 
 		// A done event carrying no metrics must not ERASE what message_start
 		// already told the client. The client SDK accumulates input_tokens
-		// (and cache_read_input_tokens) off message_delta whenever the field
-		// is present, so a hard 0 here overwrites a real count — or the
-		// estimate seeded via NewStreamConverter's estimatedInputTokens —
-		// and the session's context accounting silently resets to empty
-		// (2026-09-26 audit). Output is genuinely unknown if absent, so it
-		// still takes the done value.
-		if r.Metrics.PromptEvalCount > 0 {
-			c.inputTokens = r.Metrics.PromptEvalCount
+		// (and cache_read_input_tokens) off message_delta whenever the field is
+		// present, so a metrics-less done must leave both alone — a hard 0 here
+		// overwrites a real count, or the estimate seeded via NewStreamConverter's
+		// estimatedInputTokens, and the session's context accounting silently
+		// resets to empty (2026-09-26 audit, round 38). Output is genuinely
+		// unknown if absent, so it still takes the done value. A prompt served
+		// entirely from cache reports input 0 WITH cache_read set, which is why
+		// the cache field is part of the test rather than a "> 0" on input.
+		if usage := UsageFromMetrics(r.Metrics); usage.InputTokens > 0 || usage.CacheReadInputTokens != nil {
+			c.inputTokens = usage.InputTokens
+			c.cacheReadTokens = usage.CacheReadInputTokens
 		}
 		c.outputTokens = r.Metrics.EvalCount
 		stopReason := mapStopReason(r.DoneReason, len(c.toolCallsSent) > 0)
@@ -1269,8 +1295,9 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 					StopReason: stopReason,
 				},
 				Usage: DeltaUsage{
-					InputTokens:  c.inputTokens,
-					OutputTokens: c.outputTokens,
+					InputTokens:          c.inputTokens,
+					CacheReadInputTokens: c.cacheReadTokens,
+					OutputTokens:         c.outputTokens,
 				},
 			},
 		})

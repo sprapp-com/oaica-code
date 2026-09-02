@@ -281,6 +281,22 @@ func (u *openAIUsage) statedPromptTokens() bool {
 	return u != nil && u.PromptTokens > 0
 }
 
+// cacheReadPtr renders a measured cache-read count as the optional field the
+// Anthropic wire carries (api.Metrics.PromptEvalCachedCount is *int): nil when
+// the upstream stated no cache measurement at all, so a response with no
+// reading keeps the shape it had, and a stated count — including a stated 0 —
+// travels as the measurement it is.
+func cacheReadPtr(u *openAIUsage) *int {
+	if u == nil || (u.PromptTokensDetails == nil && u.PromptCacheHitTokens == 0) {
+		return nil
+	}
+	return intPtr(u.cachedTokens())
+}
+
+// intPtr is a fresh *int per call: handing out the address of a loop variable
+// would publish one cell to every site that reads it.
+func intPtr(v int) *int { return &v }
+
 // mergeUsage folds a later chunk's usage object into the accumulated one FIELD
 // BY FIELD. SSE usage is not cumulative: a build may narrate the running counts
 // per chunk and state only what it has just measured, so assigning each chunk
@@ -2157,8 +2173,13 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 			chatResp.Metrics.EvalCount = produced/4 + 1
 		}
 	}
+	// The cache-read count travels as METRICS, not as a patch on the finished
+	// response: ToMessagesResponse derives input_tokens as the UNCACHED prompt
+	// (total minus cache reads, Anthropic's own semantics — see UsageFromMetrics),
+	// and assigning cache_read after the fact left input_tokens at the full
+	// total, so a client summing the two read twice the real prompt.
+	chatResp.Metrics.PromptEvalCachedCount = cacheReadPtr(oaiResp.Usage)
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
-	anthResp.Usage.CacheReadInputTokens = oaiResp.Usage.cachedTokens()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
@@ -2623,7 +2644,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		for i := range events {
 			if d, ok := events[i].Data.(anthropic.MessageDeltaEvent); ok {
 				d.Usage.InputTokens = finalUsage.PromptTokens - cached
-				d.Usage.CacheReadInputTokens = cached
+				d.Usage.CacheReadInputTokens = intPtr(cached)
 				events[i].Data = d
 			}
 		}
