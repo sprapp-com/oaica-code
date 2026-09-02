@@ -144,6 +144,8 @@ func ApplyAccountStateToSelectionItems(items []ModelItem, state AccountState) []
 			Remote:            item.Remote,
 			OllamaCloud:       item.OllamaCloud,
 			AvailabilityBadge: availabilityBadge(item, state),
+			Size:              item.Size,
+			Details:           item.Details,
 		}
 	}
 	return out

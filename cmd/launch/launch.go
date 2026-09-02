@@ -278,10 +278,10 @@ type ModelItem struct {
 	// picker ("unhealthy" = the gateway marked the model's backend down).
 	// Empty = no badge.
 	AvailabilityBadge string
-	ToolCapable     bool
-	Capabilities    []modelpkg.Capability
-	Size            int64
-	Details         api.ModelDetails
+	ToolCapable       bool
+	Capabilities      []modelpkg.Capability
+	Size              int64
+	Details           api.ModelDetails
 }
 
 // SelectionItem represents a model row after launch has derived selector-only UI state.
@@ -293,6 +293,13 @@ type SelectionItem struct {
 	Remote            bool
 	OllamaCloud       bool
 	AvailabilityBadge string
+	// Size and Details feed the right-hand metadata column of the picker's
+	// two-column table. Size is the on-disk bytes of an installed model
+	// (0 when unknown); Details carries sizing metadata (ParameterSize,
+	// QuantizationLevel, ContextLength) propagated from model inventory. A
+	// row with neither renders a name-only row.
+	Size    int64
+	Details api.ModelDetails
 }
 
 // LaunchCmd returns the cobra command for launching integrations.

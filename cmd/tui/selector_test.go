@@ -5,8 +5,70 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/launch"
+	"github.com/ollama/ollama/format"
 )
+
+func TestConvertItems_PropagatesSizeAndDetails(t *testing.T) {
+	out := ConvertItems([]launch.SelectionItem{
+		{
+			Name: "qwen3.5",
+			Size: 14 * format.GigaByte,
+			Details: api.ModelDetails{
+				ParameterSize:     "14B",
+				QuantizationLevel: "Q4_K_M",
+			},
+		},
+	})
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if out[0].Size != 14*format.GigaByte {
+		t.Fatalf("Size = %d, want %d", out[0].Size, 14*format.GigaByte)
+	}
+	if out[0].Details.ParameterSize != "14B" || out[0].Details.QuantizationLevel != "Q4_K_M" {
+		t.Fatalf("Details = %+v, want ParameterSize=14B QuantizationLevel=Q4_K_M", out[0].Details)
+	}
+}
+
+func TestModelSizeLabel_PrefersParamQuantThenBytes(t *testing.T) {
+	// Param + quant preferred over raw bytes.
+	withDetails := SelectItem{Size: 99, Details: api.ModelDetails{ParameterSize: "14B", QuantizationLevel: "Q4_K_M"}}
+	if got := modelSizeLabel(withDetails); got != "14B · Q4_K_M" {
+		t.Fatalf("with details = %q, want %q", got, "14B · Q4_K_M")
+	}
+	// No param but bytes present -> human bytes.
+	withBytes := SelectItem{Size: 3 * format.GigaByte}
+	if got := modelSizeLabel(withBytes); got == "" {
+		t.Fatalf("expected bytes fallback to produce a label")
+	}
+	// Neither -> empty. Badge still appended when present.
+	withBadge := SelectItem{AvailabilityBadge: "Upgrade required"}
+	if got := modelSizeLabel(withBadge); got != "Upgrade required" {
+		t.Fatalf("badge only = %q, want %q", got, "Upgrade required")
+	}
+}
+
+func TestRenderContent_TwoColumnMetaColumn(t *testing.T) {
+	m := selectorModel{
+		title: "Pick:",
+		items: []SelectItem{
+			{Name: "qwen3.5", Details: api.ModelDetails{ParameterSize: "14B", QuantizationLevel: "Q4_K_M"}},
+			{Name: "custom-tools"},
+		},
+		cursor: 0,
+	}
+	content := m.renderContent()
+	// Meta appears inline after the name, right-aligned in the same row.
+	if !strings.Contains(content, "14B · Q4_K_M") {
+		t.Fatalf("expected meta cell in content:\n%s", content)
+	}
+	// A row with no metadata still renders its name.
+	if !strings.Contains(content, "custom-tools") {
+		t.Fatalf("expected bare row to render name:\n%s", content)
+	}
+}
 
 func TestConvertItems_PropagatesRemote(t *testing.T) {
 	out := ConvertItems([]launch.SelectionItem{
@@ -452,7 +514,7 @@ func TestRenderContent_SelectedItemIndicator(t *testing.T) {
 	}
 }
 
-func TestRenderContent_AvailabilityBadgeOnlyOnCursor(t *testing.T) {
+func TestRenderContent_AvailabilityBadgeInMetaColumn(t *testing.T) {
 	m := selectorModel{
 		title: "Pick:",
 		items: []SelectItem{
@@ -466,14 +528,16 @@ func TestRenderContent_AvailabilityBadgeOnlyOnCursor(t *testing.T) {
 	m.cursor = cursorForItemName(m.filteredItems(), "kimi-k2.6:cloud", 0)
 	content := m.renderContent()
 
-	if !strings.Contains(content, "(Upgrade required)") {
+	// /status-style: the availability badge is right-hand metadata shown on
+	// every row, not just the cursor row (2026-09-03).
+	if !strings.Contains(content, "Upgrade required") {
 		t.Fatalf("cursor badge missing:\n%s", content)
 	}
-	if strings.Contains(content, "(Sign in required)") {
-		t.Fatalf("non-cursor badge should not render:\n%s", content)
+	if !strings.Contains(content, "Sign in required") {
+		t.Fatalf("non-cursor badge should render in meta column:\n%s", content)
 	}
-	if strings.Contains(content, "Included") {
-		t.Fatalf("included badge should not render:\n%s", content)
+	if !strings.Contains(content, "Included") {
+		t.Fatalf("included badge should render in meta column:\n%s", content)
 	}
 }
 
@@ -492,7 +556,7 @@ func TestSelectorModel_ItemsUpdatedPreservesCursorAndRendersBadge(t *testing.T) 
 		t.Fatalf("cursor = %d, want 0", fm.cursor)
 	}
 	content := fm.renderContent()
-	if !strings.Contains(content, "(Upgrade required)") {
+	if !strings.Contains(content, "Upgrade required") {
 		t.Fatalf("updated badge missing:\n%s", content)
 	}
 }

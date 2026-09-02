@@ -5,10 +5,13 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/launch"
+	"github.com/ollama/ollama/format"
 )
 
 var (
@@ -51,6 +54,13 @@ var (
 				PaddingLeft(2).
 				Bold(true).
 				Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "249"})
+
+	// selectorMetaStyle renders the right-hand metadata column of the
+	// two-column picker (parameter size / quantization / bytes / status).
+	// Dimmed so it reads as secondary to the model name, in the /status
+	// spirit: name carries the row, meta is context.
+	selectorMetaStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "242", Dark: "246"})
 )
 
 const maxSelectorItems = 10
@@ -76,6 +86,11 @@ type SelectItem struct {
 	// "Ollama Cloud" section (see launch.ModelItem.OllamaCloud's doc).
 	OllamaCloud       bool
 	AvailabilityBadge string
+	// Size and Details carry installed-model sizing into the two-column
+	// table's right-hand metadata column (parameter size, quantization,
+	// on-disk bytes). Empty when unknown — the row renders name-only.
+	Size    int64
+	Details api.ModelDetails
 }
 
 type SelectorModel = selectorModel
@@ -109,6 +124,8 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 			Remote:            item.Remote,
 			OllamaCloud:       item.OllamaCloud,
 			AvailabilityBadge: item.AvailabilityBadge,
+			Size:              item.Size,
+			Details:           item.Details,
 		}
 	}
 	return out
@@ -179,6 +196,11 @@ type selectorModel struct {
 	helpText     string
 	width        int
 	rankFiltered bool
+	// nameWidth is the aligned width of the left-hand name column in the
+	// two-column table, computed once per render from the longest visible
+	// name. Kept on the model so renderItem (which receives only one item
+	// at a time via renderSectionRows) can right-align the metadata column.
+	nameWidth int
 }
 
 func selectorModelWithCurrent(title string, items []SelectItem, current string) selectorModel {
@@ -491,6 +513,28 @@ func cursorItemSuffix(item SelectItem) string {
 	return " " + selectorDefaultTagStyle.Render("("+item.AvailabilityBadge+")")
 }
 
+// modelSizeLabel renders the right-hand metadata cell for a row — the
+// installed-model sizing (parameter count + quantization, else on-disk
+// bytes), plus the availability badge when the router reports one. Claude
+// Code's /status shows this kind of status on the right edge of each row,
+// so the picker mirrors it: name left, metadata right-aligned.
+func modelSizeLabel(item SelectItem) string {
+	var parts []string
+	if params := item.Details.ParameterSize; params != "" {
+		parts = append(parts, params)
+	}
+	if quant := item.Details.QuantizationLevel; quant != "" {
+		parts = append(parts, quant)
+	}
+	if len(parts) == 0 && item.Size > 0 {
+		parts = append(parts, format.HumanBytes(item.Size))
+	}
+	if item.AvailabilityBadge != "" {
+		parts = append(parts, item.AvailabilityBadge)
+	}
+	return strings.Join(parts, " · ")
+}
+
 // pinnedSectionCap bounds the rows shown for each pinned (non-"More")
 // section. These sections render fully otherwise, so the 16-row Ollama
 // cloud catalog + Local + OAICA + Remote sections overflow a normal
@@ -529,13 +573,41 @@ func renderSectionRows(s *strings.Builder, cursor int, filtered []SelectItem, id
 	}
 }
 
-// renderItem draws one row: name only — a description line appears ONLY
-// under the cursor row (opencode-style), so a 40-model menu is a clean
-// name column instead of every row dragging its own blurb along.
+// selectorNameWidth returns the display width of the longest name in the
+// row set, used to align the two-column table's right-hand metadata column.
+// Names render in monospace-ish terminal cells, so plain len() is a close
+// enough alignment; the column just needs to be consistent row-to-row.
+func selectorNameWidth(items []SelectItem) int {
+	w := 0
+	for _, it := range items {
+		if n := utf8.RuneCountInString(it.Name); n > w {
+			w = n
+		}
+	}
+	return w
+}
+
+// renderItem draws one two-column row: the model name left-aligned, and the
+// sizing/availability metadata right-aligned in the same line (Claude Code's
+// /status row shape). A description line still appears ONLY under the cursor
+// row (opencode-style), so a 40-model menu stays a clean two-column table
+// instead of every row dragging its own blurb along (2026-09-03).
 func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) {
+	// Metadata column only meaningful when there's a name to pair it with.
+	meta := modelSizeLabel(item)
+	if m.nameWidth > 0 && meta != "" {
+		pad := m.nameWidth - utf8.RuneCountInString(item.Name)
+		if pad < 2 {
+			pad = 2
+		}
+		meta = strings.Repeat(" ", pad) + meta
+	}
+
 	if idx == m.cursor {
 		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
-		s.WriteString(cursorItemSuffix(item))
+		if meta != "" {
+			s.WriteString(selectorMetaStyle.Render(meta))
+		}
 		s.WriteString("\n")
 		if item.Description != "" {
 			s.WriteString(selectorDescLineStyle.Render(item.Description))
@@ -544,6 +616,9 @@ func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) 
 		return
 	}
 	s.WriteString(selectorItemStyle.Render(item.Name))
+	if meta != "" {
+		s.WriteString(selectorMetaStyle.Render(meta))
+	}
 	s.WriteString("\n")
 }
 
@@ -573,6 +648,12 @@ func (m selectorModel) renderContent() string {
 	s.WriteString("\n\n")
 
 	filtered := m.filteredItems()
+
+	// Align the right-hand metadata column to the longest currently visible
+	// name. Computed per render (not once at construction) so the column
+	// tightens when type-to-filter narrows the list (2026-09-03,
+	// /status-style two-column picker).
+	m.nameWidth = selectorNameWidth(filtered)
 
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
