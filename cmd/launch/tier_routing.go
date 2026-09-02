@@ -520,6 +520,25 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 	if p.PrimaryContext > 0 && !isCloudModelName(p.PrimaryName) {
 		env = append(env, p.contextEnvVars()...)
 	}
+	// A native primary has no probed PrimaryContext (native bypasses our
+	// context-window probing entirely — see context_window_remote.go's
+	// doc) and isn't a cloud model name either, so neither branch above
+	// ever fires for it: Claude Code prints "isn't described by this
+	// version's model catalog ... auto-compact keeps this session within
+	// 200k tokens" for the SONNET/HAIKU tier's real (usually larger, e.g.
+	// 262144) window (2026-09-02 — benign, same class of warning
+	// documented for glm-5.3-flash:cloud/deepseek-v4-flash elsewhere, but
+	// worth silencing when we do know the real number). Fall back to
+	// whichever OAICA leg's probed window is known, since that's the
+	// backend actually generating tokens under auto-compact's window
+	// guess.
+	if isNativeClaudeModel(p.PrimaryName) && p.PrimaryContext == 0 {
+		if v := p.SecondaryContext; v > 0 {
+			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(v), "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(v))
+		} else if v := p.HaikuContext; v > 0 {
+			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(v), "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(v))
+		}
+	}
 	return env
 }
 
@@ -642,7 +661,17 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// cloud-alias map covers :cloud; this covers user remotes and the
 	// router). Probed here, not in buildTierPlan: unit tests build plans
 	// against fake/unroutable URLs and must not wait on network.
-	if s := plan.Primary.Source; s == sourceUserRemote || s == sourceRouter {
+	//
+	// Checked on ALL THREE legs, not just Primary (2026-09-02): a native
+	// primary (sourceNativeAnthropic) is neither a user remote nor router,
+	// so this gate always skipped probing entirely for a native-primary +
+	// OAICA-split launch — SecondaryContext/HaikuContext stayed 0 no
+	// matter what fixes touched withContextWindows/
+	// applyContextWindowsToRoutes, and both envVars' native-primary
+	// context-window fallback and the proxy's context-fit clamp had
+	// nothing to work with for that combination.
+	probeSource := func(s endpointSource) bool { return s == sourceUserRemote || s == sourceRouter }
+	if probeSource(plan.Primary.Source) || probeSource(plan.Secondary.Source) || probeSource(plan.Haiku.Source) {
 		plan.withContextWindows().applyContextWindowsToRoutes()
 	}
 	clientToken, err := newProxyClientToken()

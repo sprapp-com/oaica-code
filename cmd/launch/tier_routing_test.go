@@ -591,3 +591,61 @@ func TestResolveLaunchEndpoint_NativeClaude(t *testing.T) {
 		t.Fatalf("resolveLaunchEndpoint(anthropic/sonnet) = %+v", ep2)
 	}
 }
+
+// TestWithContextWindows_ProbesHaiku is the fix for HaikuContext never
+// being probed at all (2026-09-02) — withContextWindows only handled
+// Primary/Secondary before this; a haiku-only-differing split (sonnet ==
+// primary) always saw HaikuContext == 0 no matter what the haiku leg's
+// real window was, so envVars' native-primary context-window fallback had
+// nothing to fall back to for that specific combination.
+func TestWithContextWindows_ProbesHaiku(t *testing.T) {
+	orig := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = orig })
+	remoteContextWindowFn = func(r proxyRoute) int {
+		if r.BaseURL == "http://haiku.test/v1" {
+			return 262144
+		}
+		return 0
+	}
+
+	plan := &tierPlan{
+		PrimaryName: "claude/fable", SecondaryName: "claude/fable", HaikuName: "oaica-35b-a3b-vision",
+		Primary: launchEndpoint{Source: sourceNativeAnthropic},
+		Haiku:   launchEndpoint{Source: sourceRouter, RemoteEndpoint: RemoteEndpoint{UpstreamModel: "oaica-35b-a3b-vision"}},
+		Routes: proxyRouteTable{
+			Default: proxyRoute{}, // native primary: no BaseURL
+			ByModel: map[string]proxyRoute{
+				"oaica-35b-a3b-vision": {BaseURL: "http://haiku.test/v1", UpstreamModel: "oaica-35b-a3b-vision"},
+			},
+		},
+	}
+	plan.withContextWindows()
+	if plan.HaikuContext != 262144 {
+		t.Fatalf("HaikuContext = %d, want 262144 (the probed window)", plan.HaikuContext)
+	}
+	if plan.SecondaryContext != 0 {
+		t.Fatalf("SecondaryContext = %d, want 0 (sonnet == primary, nothing to probe)", plan.SecondaryContext)
+	}
+}
+
+// TestApplyContextWindowsToRoutes_SetsHaikuClamp is the companion fix:
+// applyContextWindowsToRoutes never touched Haiku's own route at all
+// before 2026-09-02 — the context-fit CLAMP (not just the advisory env
+// var) needs ContextWindow set on the haiku route for a haiku-only split
+// to be protected the same way sonnet always was.
+func TestApplyContextWindowsToRoutes_SetsHaikuClamp(t *testing.T) {
+	plan := &tierPlan{
+		PrimaryName: "claude/fable", HaikuName: "oaica-35b-a3b-vision", HaikuContext: 262144,
+		Haiku: launchEndpoint{RemoteEndpoint: RemoteEndpoint{UpstreamModel: "oaica-35b-a3b-vision"}},
+		Routes: proxyRouteTable{
+			ByModel: map[string]proxyRoute{
+				"oaica-35b-a3b-vision": {UpstreamModel: "oaica-35b-a3b-vision"},
+			},
+		},
+	}
+	plan.applyContextWindowsToRoutes()
+	r := plan.Routes.ByModel["oaica-35b-a3b-vision"]
+	if r.ContextWindow != 262144 {
+		t.Fatalf("haiku route ContextWindow = %d, want 262144 — the clamp has nothing to enforce without this", r.ContextWindow)
+	}
+}

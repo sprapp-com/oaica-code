@@ -423,7 +423,13 @@ Examples:
 			}
 
 			headlessYes := yesFlag && !isInteractiveSession()
-			forceConfigure := configFlag || (modelFlag == "" && !headlessYes)
+			// `--plan <name>` alone (no --model) used to force the picker
+			// here unconditionally -- "requires an interactive terminal" --
+			// even though the plan itself already names a primary model.
+			// resolveSingleIntegrationTarget's own --plan lookup (below)
+			// can only matter if forceConfigure doesn't already force the
+			// picker before ExtraArgs is even consulted; this is that gate.
+			forceConfigure := configFlag || (modelFlag == "" && planFlag == "" && !headlessYes)
 			if forceConfigure && !configFlag && modelFlag == "" {
 				if _, runner, err := LookupIntegration(name); err == nil {
 					if _, ok := runner.(ManagedAutodiscoveryIntegration); ok {
@@ -1088,6 +1094,21 @@ func (c *launcherClient) managedSingleConfigureModels(ctx context.Context, manag
 
 func (c *launcherClient) resolveSingleIntegrationTarget(ctx context.Context, name string, runner Runner, current string, req IntegrationLaunchRequest) (string, bool, error) {
 	target := req.ModelOverride
+	// `--plan <name>` alone (no --model) used to fall through to the
+	// picker below — "requires an interactive terminal" — even though the
+	// plan itself already names a primary model and needs no picker at
+	// all. extractPlanFlag/PlanGet are the exact same lookup
+	// Claude.Run does downstream (tier_routing.go); doing it here too,
+	// read-only, lets --plan alone resolve headlessly. Claude.Run still
+	// does its own (idempotent) resolvePlanModels call later — this is
+	// purely so THIS function doesn't force the picker on the way there.
+	if target == "" {
+		if planName, _ := extractPlanFlag(req.ExtraArgs); planName != "" {
+			if prof, err := PlanGet(planName); err == nil {
+				target = prof.Model
+			}
+		}
+	}
 	needsConfigure := req.ForceConfigure
 	skipReadiness := false
 	if skipper, ok := runner.(ManagedModelReadinessSkipper); ok {

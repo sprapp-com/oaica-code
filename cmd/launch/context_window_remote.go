@@ -148,6 +148,26 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 			}
 		}
 	}
+	// HaikuContext was never probed here before 2026-09-02 -- a haiku-only
+	// split (sonnet == primary, only haiku differs) always saw
+	// HaikuContext == 0, so envVars' native-primary fallback (see its doc)
+	// had nothing to fall back to for that specific combination even
+	// though the haiku leg's real window IS knowable, same as secondary's.
+	if p.HaikuName != p.PrimaryName && p.HaikuName != p.SecondaryName {
+		if r, _ := p.Routes.resolve(p.HaikuName); r.BaseURL != "" &&
+			r.BaseURL != p.Routes.Default.BaseURL {
+			p.HaikuContext = remoteContextWindowFn(r)
+		}
+		if p.HaikuContext <= 0 {
+			if v, ok := contextWindowFromManifest(p.HaikuName); ok {
+				p.HaikuContext = v
+			}
+		}
+	} else if p.HaikuName == p.SecondaryName {
+		// Same leg as sonnet — reuse what was already probed instead of
+		// hitting the upstream a second time for an identical answer.
+		p.HaikuContext = p.SecondaryContext
+	}
 	if p.Routes.Oversize.BaseURL != "" && p.Routes.Oversize.BaseURL != p.Routes.Default.BaseURL {
 		p.Routes.Oversize.ContextWindow = remoteContextWindowFn(p.Routes.Oversize)
 	}
@@ -185,6 +205,23 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 		if r, ok := p.Routes.ByModel[p.Secondary.UpstreamModel]; ok && r.ContextWindow == 0 {
 			r.ContextWindow = p.SecondaryContext
 			p.Routes.ByModel[p.Secondary.UpstreamModel] = r
+		}
+	}
+	// Haiku's route never got its ContextWindow set here before 2026-09-02
+	// -- a haiku-only split's real proxy route had no clamp ceiling at all,
+	// only the advisory env var (once withContextWindows also started
+	// probing HaikuContext, same date). The clamp is what actually
+	// prevents an outgoing request from exceeding the upstream's window;
+	// without it a haiku-tier request near the edge would 400 instead of
+	// auto-compacting first.
+	if p.HaikuContext > 0 {
+		if r, ok := p.Routes.ByModel[p.HaikuName]; ok {
+			r.ContextWindow = p.HaikuContext
+			p.Routes.ByModel[p.HaikuName] = r
+		}
+		if r, ok := p.Routes.ByModel[p.Haiku.UpstreamModel]; ok && r.ContextWindow == 0 {
+			r.ContextWindow = p.HaikuContext
+			p.Routes.ByModel[p.Haiku.UpstreamModel] = r
 		}
 	}
 	return p
