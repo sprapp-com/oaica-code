@@ -1439,6 +1439,25 @@ func (c *launcherClient) ensureModelsReadyFor(ctx context.Context, models []stri
 	if len(models) == 0 {
 		return nil
 	}
+	// "claude/<tier>"/"anthropic/<tier>" native entries need no OAICA
+	// readiness — they route to Claude Code's own Anthropic auth (see
+	// Claude.runNative), never showOrPullWithPolicy/ensureCloudModelAccess.
+	// singleModelUsable (below) already had this bypass for the picker's
+	// own "is this saved model still usable" check; ensureModelsReadyFor
+	// (what a headless `--model claude/fable` actually calls) didn't,
+	// so `oaica launch claude --model claude/fable` failed with "model
+	// ... not found; run 'ollama pull ...'" outside the interactive picker
+	// (2026-09-02) even though the picker path always worked.
+	pending := models[:0:0]
+	for _, model := range models {
+		if !isNativeClaudeModel(model) {
+			pending = append(pending, model)
+		}
+	}
+	models = pending
+	if len(models) == 0 {
+		return nil
+	}
 	cloudRec, localRec := c.agentCapableRecommendations(ctx)
 
 	cloudModels := make(map[string]bool, len(models))
