@@ -528,13 +528,20 @@ func TestProxy_NormalizesUpstreamErrors_StripsTopology(t *testing.T) {
 // A client that disconnects mid-stream still produces a ledger row (marked
 // aborted) -- previously the GPU work was unmetered.
 func TestCompletion_ClientAbortIsLedgered(t *testing.T) {
-	release := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		f := w.(http.Flusher)
 		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
 		f.Flush()
-		<-release // hold the stream open until the client is gone
+		// Hold the stream open until the client disconnects. Blocking on
+		// r.Context().Done() (not a manual channel) is deterministic: the
+		// proxy cancels the upstream context only AFTER it has detected the
+		// client disconnect and panicked with http.ErrAbortHandler, so the
+		// aborted flag is always set before the upstream returns. A manual
+		// release channel raced the proxy's disconnect detection and made
+		// this test flaky (upstream could return first -> no panic -> row
+		// not flagged aborted).
+		<-r.Context().Done()
 	}))
 	defer up.Close()
 	g, ledger := newTestGateway(t, up.URL)
@@ -550,7 +557,6 @@ func TestCompletion_ClientAbortIsLedgered(t *testing.T) {
 	buf := make([]byte, 64)
 	resp.Body.Read(buf) // got first chunk
 	resp.Body.Close()   // client aborts
-	close(release)
 	e := waitLedger(t, ledger, 1)
 	if len(e) != 1 {
 		t.Fatalf("aborted stream must still be ledgered, got %d rows", len(e))
