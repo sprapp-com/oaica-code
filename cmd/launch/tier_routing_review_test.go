@@ -368,4 +368,36 @@ func TestEnvVars_ProbedContextWindowSet(t *testing.T) {
 	}
 }
 
+func TestEnvVars_CloudPrimaryWithLargerSecondaryContext(t *testing.T) {
+	// Cloud-primary + router-secondary: the cloud primary's limit is
+	// smaller than the router leg's real window. envVars must take the
+	// max so the subagent session isn't silently clamped to the cloud
+	// limit (the "unknown model, assuming 200k" warning scenario).
+	plan := tierPlan{
+		PrimaryName:    "glm-5.2:cloud",
+		SecondaryName:  "oaica-35b-a3b-vision",
+		HaikuName:      "oaica-35b-a3b-vision",
+		PrimaryContext: 202752, // from lookupCloudModelLimit
+		SecondaryContext: 262144,
+		HaikuContext:   262144,
+		Routes:         proxyRouteTable{Default: proxyRoute{BaseURL: "http://x/v1"}},
+	}
+	env := plan.envVars("http://127.0.0.1:1", "tok")
+	var maxCtx, compact string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") {
+			maxCtx = kv
+		}
+		if strings.HasPrefix(kv, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=") {
+			compact = kv
+		}
+	}
+	if maxCtx != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
+		t.Fatalf("expected max=262144 (max of cloud 202752 + router 262144), got %s", maxCtx)
+	}
+	if compact != "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144" {
+		t.Fatalf("expected compact=262144, got %s", compact)
+	}
+}
+
 func got0(v, zero int) int { return v }

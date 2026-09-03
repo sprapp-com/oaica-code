@@ -539,6 +539,53 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(v), "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(v))
 		}
 	}
+	// Cloud-primary + non-native secondary/haiku: the branch above only
+	// knows the cloud primary's limit (e.g. glm-5.2's 202752) and never
+	// checks the router/user-remote legs' probed windows. That window is
+	// what the SONNET/HAIKU subagent sessions actually run against, so
+	// Claude Code still warns about an "unknown model" and clamps to 200k
+	// even though the router (oaica-35b-a3b-vision) exposes 262144.
+	// Take the max of the cloud-primary limit and any probed non-native
+	// leg windows so every session gets the correct ceiling.
+	for _, v := range []int{p.SecondaryContext, p.HaikuContext} {
+		if v > 0 && !isCloudModelName(p.PrimaryName) && p.PrimaryContext > 0 {
+			// native-primary + probed-router case: env already set by the
+			// native-primary fallback above, and the max equals or exceeds
+			// it — skip to avoid redundant noise.
+			continue
+		}
+		if v > 0 {
+			v = max(v, p.PrimaryContext)
+			if l, ok := lookupCloudModelLimit(p.PrimaryName); ok && v < l.Context {
+				v = l.Context
+			}
+			// Find the current value in env and update it if our v is larger.
+			updated := false
+			for i, kv := range env {
+				if !strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") {
+					continue
+				}
+				old, _ := strconv.Atoi(strings.TrimPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="))
+				if v > old {
+					s := strconv.Itoa(v)
+					env[i] = "CLAUDE_CODE_MAX_CONTEXT_TOKENS=" + s
+					// Update the paired AUTO_COMPACT_WINDOW at the same index +1.
+					if i+1 < len(env) && strings.HasPrefix(env[i+1], "CLAUDE_CODE_AUTO_COMPACT_WINDOW=") {
+						env[i+1] = "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" + s
+					}
+					updated = true
+				}
+				break
+			}
+			if !updated {
+				s := strconv.Itoa(v)
+				env = append(env,
+					"CLAUDE_CODE_MAX_CONTEXT_TOKENS="+s,
+					"CLAUDE_CODE_AUTO_COMPACT_WINDOW="+s,
+				)
+			}
+		}
+	}
 	return env
 }
 
