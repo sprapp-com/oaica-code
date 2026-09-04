@@ -960,6 +960,24 @@ func oaicaEnsureSignedIn(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// composeLaunchPrecondition chains PreRunE-shaped checks into the single
+// function LaunchCmd accepts (see its doc: "whatever's passed here" is the
+// actual precondition, not literally a server heartbeat). Runs each check
+// in order and stops at the first error — oaicaEnsureSignedIn never
+// returns one (see its own doc), so in practice this only ever blocks on
+// launch.RequireLicense, but the composition stays check-order-agnostic on
+// purpose in case that changes.
+func composeLaunchPrecondition(checks ...func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		for _, check := range checks {
+			if err := check(cmd, args); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 func SignoutHandler(cmd *cobra.Command, args []string) error {
 	if oaicaSavedAPIKey() == "" {
 		fmt.Println("Not signed in (no saved key).")
@@ -3000,8 +3018,9 @@ just to see the picker list.`,
 		// passed here before every launch subcommand (barring restore/
 		// skip-heartbeat cases), so this is the actual precondition that
 		// applies (a configured OAICA key), not an Ollama server heartbeat.
-		launch.LaunchCmd(oaicaEnsureSignedIn, runInteractiveTUI),
+		launch.LaunchCmd(composeLaunchPrecondition(oaicaEnsureSignedIn, launch.RequireLicense), runInteractiveTUI),
 		launch.DoctorCmd(),
+		launch.ActivateCmd(),
 		// Optional add-on; see cmd/site.go and internal/sitebuilder.
 		siteCmd(),
 	)
