@@ -76,7 +76,7 @@ func extractWizardFlag(args []string) (bool, []string) {
 
 // tierWizardFlags are the launcher-level flags that suppress the wizard: a
 // caller who passed any of them already made (part of) these decisions.
-var tierWizardFlags = []string{"--sonnet-model", "--haiku-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode"}
+var tierWizardFlags = []string{"--sonnet-model", "--haiku-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode", "--shard"}
 
 // tierWizardEligible reports whether this launch should run steps 2-4.
 func tierWizardEligible(args []string) bool {

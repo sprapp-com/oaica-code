@@ -714,3 +714,48 @@ func extractOversizeModel(args []string) (string, []string) {
 	return "", args
 }
 
+// extractShardFlags pulls every repeatable "--shard <model>:<weight>" (or
+// "--shard=<model>:<weight>") out of the passthrough args — the CLI surface
+// for RouteWeighted (route_policy.go): sets a route's Weight for THIS
+// launch without editing remotes.json. <model> uses the same picker
+// vocabulary as --sonnet-model ("<remote>/<id>", "router/<id>", bare id);
+// <weight> is a positive integer. Repeat the flag once per leg, e.g.
+// `--shard gateway46/oaica-35b-a3b-vision:3 --shard kat-91:1
+// --route-policy weighted`. A malformed entry (no ":weight", non-positive,
+// non-integer) is dropped rather than failing the launch — a typo here
+// should degrade to "that leg gets no shard weight", not block the whole
+// launch, since --route-policy weighted already degrades gracefully to
+// plain failover when fewer than 2 legs end up weighted. Not forwarded to
+// the child binary.
+func extractShardFlags(args []string) (map[string]int, []string) {
+	var shards map[string]int
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		var spec string
+		switch {
+		case a == "--shard" && i+1 < len(args):
+			spec = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--shard="):
+			spec = strings.TrimPrefix(a, "--shard=")
+		default:
+			rest = append(rest, a)
+			continue
+		}
+		model, weightStr, ok := strings.Cut(spec, ":")
+		if !ok {
+			continue
+		}
+		weight, err := strconv.Atoi(weightStr)
+		if err != nil || weight <= 0 {
+			continue
+		}
+		if shards == nil {
+			shards = map[string]int{}
+		}
+		shards[model] = weight
+	}
+	return shards, rest
+}
+

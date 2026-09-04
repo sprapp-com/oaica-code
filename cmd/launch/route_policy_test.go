@@ -540,3 +540,40 @@ func TestWeightedPolicy_ExcludesOpenBreakerAndUnweighted(t *testing.T) {
 		t.Errorf("expected failover to unweighted fallback when weighted ring is empty, got %s fallback=%v", r.BaseURL, fb)
 	}
 }
+
+// TestExtractShardFlags covers the repeatable "--shard model:weight" /
+// "--shard=model:weight" forms, malformed-entry dropping, and that
+// unrelated args pass through untouched (order preserved).
+func TestExtractShardFlags(t *testing.T) {
+	args := []string{
+		"--foo", "bar",
+		"--shard", "gateway46/oaica-35b-a3b-vision:3",
+		"--shard=kat-91:1",
+		"--shard", "bad-no-colon",
+		"--shard=zero-weight:0",
+		"--shard=negative:-1",
+		"--shard=not-an-int:abc",
+		"--baz",
+	}
+	shards, rest := extractShardFlags(args)
+
+	want := map[string]int{"gateway46/oaica-35b-a3b-vision": 3, "kat-91": 1}
+	if len(shards) != len(want) {
+		t.Fatalf("shards = %v, want %v", shards, want)
+	}
+	for k, v := range want {
+		if shards[k] != v {
+			t.Errorf("shards[%q] = %d, want %d", k, shards[k], v)
+		}
+	}
+
+	wantRest := []string{"--foo", "bar", "--baz"}
+	if len(rest) != len(wantRest) {
+		t.Fatalf("rest = %v, want %v", rest, wantRest)
+	}
+	for i := range wantRest {
+		if rest[i] != wantRest[i] {
+			t.Errorf("rest[%d] = %q, want %q", i, rest[i], wantRest[i])
+		}
+	}
+}

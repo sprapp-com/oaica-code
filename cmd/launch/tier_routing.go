@@ -600,6 +600,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
 	oversizeModel, args := extractOversizeModel(args)
+	shardWeights, args := extractShardFlags(args)
 	// --wizard forces steps 2-4 even when the eligibility gate would skip
 	// them (a --model launch, mainly); it cannot rescue a non-interactive
 	// session, where the selectors have nowhere to draw.
@@ -683,6 +684,30 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only, weighted", policyArg)
 	}
 	plan.Routes.Policy = policy
+	// --shard <model>:<weight>: resolve each named model to its BaseURL and
+	// stamp that Weight onto every existing route (Default/Fallbacks) on
+	// that base URL. Applied AFTER Fallbacks are built (buildTierPlan,
+	// above) so this only ever weights legs the plan already has — it
+	// cannot introduce a new leg on its own, matching --oversize's model
+	// (resolve, don't invent). An id that doesn't resolve to any existing
+	// leg is silently a no-op: --route-policy weighted's own doc already
+	// covers "fewer than 2 weighted legs" degrading to plain failover, so a
+	// typo'd --shard target just leaves you in that same safe state rather
+	// than failing the launch.
+	for shardModel, weight := range shardWeights {
+		ep, err := resolveLaunchEndpoint(shardModel)
+		if err != nil || ep.BaseURL == "" {
+			continue
+		}
+		if plan.Routes.Default.BaseURL == ep.BaseURL {
+			plan.Routes.Default.Weight = weight
+		}
+		for i := range plan.Routes.Fallbacks {
+			if plan.Routes.Fallbacks[i].BaseURL == ep.BaseURL {
+				plan.Routes.Fallbacks[i].Weight = weight
+			}
+		}
+	}
 	if oversizeModel != "" {
 		over, err := resolveLaunchEndpoint(oversizeModel)
 		if err != nil {
