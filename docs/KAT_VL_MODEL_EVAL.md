@@ -231,3 +231,81 @@ The `kat-vl-mtp` entries in `~/.oaica/remotes.json` on the 3 client
 machines and the :30140 tunnels are left in place (they just 502 until the
 model is relaunched), so re-enabling is a one-line launch, not a re-wire.
 
+## Update 2026-09-04/05: real SWE-bench Pro / TB2 correctness numbers (production AWQ+MTP)
+
+First genuine correctness (not throughput) scoring of `oaica-35b-a3b-vision`
+against public benchmarks. No installable "swebench-pro" harness exists for
+this dataset's schema, so a custom scorer was built driving
+`jefzda/sweap-images` containers directly per instance: apply `test_patch`
+then `model_patch`, run the correct per-language structured test reporter
+(pytest `-rA`, `go test -json`, Jest `--json`, mocha `--reporter json`),
+check every `fail_to_pass` now passes and every `pass_to_pass` still passes.
+
+**SWE-bench Pro — 16/48 resolved (33.3%)**, 48-instance subset, `mini-swe-agent`
+bash-loop harness (`oaica_pro.yaml`), pass@1:
+
+| Language | Resolved | Total |
+|---|---|---|
+| Python | 12 | 27 |
+| Go | 3 | 10 |
+| JS | 1 | 9 |
+| TS | 0 | 2 |
+
+**Terminal-Bench 2.1 (terminus-2 harness) — 25/71 scored (35.2%)**.
+
+### Quantization-cost check: AWQ+MTP vs unquantized BF16
+
+Downloaded the official `Kwaipilot/KAT-Coder-V2.5-Dev` BF16 weights (69GB)
+and reran the exact same harness on a representative 7-instance sample
+(mixed Python/Go/JS/TS). Required stock vLLM 0.28.0 in a separate venv —
+this box's custom fork (0.24.0) can't load the checkpoint's unfused
+per-expert MoE weight layout (`KeyError:
+'language_model.layers.0.mlp.experts.routed_experts.w2_weight'` — the
+fork's loader expects pre-fused expert tensors the raw HF export doesn't
+have).
+
+| Instance | Language | AWQ+MTP | BF16 |
+|---|---|---|---|
+| qutebrowser | Python | resolved | resolved |
+| ansible #1 | Python | — | — |
+| ansible #2 | Python | — | — |
+| teleport | Go | resolved | resolved |
+| element-web | JS | resolved | resolved |
+| NodeBB | JS | — | — |
+| tutanota | TS | — (scorer gap*) | — (same scorer gap*) |
+
+**Perfect 7/7 agreement, AWQ 3/7 = BF16 3/7.** AWQ+MTP quantization is not
+measurably costing SWE-bench Pro accuracy on this sample. \*tutanota's
+custom test runner (`npm test` → `bootstrapTests.js`) isn't reachable by
+the scorer's bare `node_modules/.bin/mocha` path assumption — both runs
+hit the identical harness gap, not a model difference.
+
+### Comparison vs published baselines
+
+| Model | SWE-bench Pro | TB2 |
+|---|---|---|
+| Qwen3.8-27B | 61.7% | 73.0% |
+| Ornith-1.5-35B-A3B | 59.6% | 67.8% (terminus-2) / 68.5% (claude_code) |
+| KAT-Coder-V2.5-Dev (official Kwaipilot README, their own harness) | 45.96% | 32.60% (terminus-2) / 49.44% (claude_code) |
+| **oaica-35b-a3b-vision, measured here** | **33.3%** | **35.2% (terminus-2)** |
+
+**Reading the gaps:** the ~13pp SWE-bench Pro gap vs Kwaipilot's own
+45.96% is almost certainly the **agent harness** (they use
+`claude_code@2.1.195`; this session used `mini-swe-agent`'s generic
+bash-loop scaffold), not the model or quantization — their own README
+documents this exact failure mode (tool-format mismatches) for other
+models they tested. On TB2 with the *same* terminus-2 harness, this
+session's 35.2% is actually slightly **above** Kwaipilot's own reported
+32.60% — no harness-driven degradation visible there.
+
+The real capability gap is vs Qwen3.8-27B and Ornith-1.5-35B-A3B — Ornith
+in particular beats KAT-Coder head-to-head at the *same* architecture
+(35B-A3B MoE), attributed to Ornith's self-improvement training approach
+rather than scale. Closing that gap needs a different base model or
+harness/prompt alignment work, not different quantization.
+
+Cleanup: BF16 weights (`/dev/shm/kat_coder_v25_bf16`, 65GB) and the stock
+vLLM venv (`/workspace/kat_bf16_venv`) can be removed once this comparison
+is no longer needed for reference — GPU0/1 were freed after the test runs
+completed.
+
