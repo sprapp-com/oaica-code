@@ -87,9 +87,17 @@ go to the same model as `--model`. `--oversize` is the larger-context leg
 that serves requests the primary cannot hold (the auto-compaction call
 near the context ceiling: it must have a strictly larger probed context
 window); `--route-policy` is one of local-first (default), remote-first,
-auto (failover + failure escalation), local-only, remote-only. Policy
-precedence per launch: CLI flag > plan > the remote's `route_policy` in
-remotes.json > local-first.
+auto (failover + failure escalation), local-only, remote-only, weighted
+(splits HEALTHY traffic across legs by weight instead of only failing over
+— see CLAUDE_TIERS.md's "Route policies" section). Policy precedence per
+launch: CLI flag > plan > the remote's `route_policy` in remotes.json >
+local-first.
+
+`weighted` needs per-leg weights, set either on the remote
+(`remotes.json`'s `"weight": N`) or per-launch with the repeatable
+`--shard <model>:<weight>` flag — `--shard` is not currently a saved plan
+field, so a `--plan` launch that wants weighting still needs `--shard` (or
+`remotes.json` weights) passed alongside `--plan` on the command line.
 
 The same setup can be built interactively: a plain `oaica launch claude`
 (no flags) walks a wizard — primary, Sonnet tier, compaction model

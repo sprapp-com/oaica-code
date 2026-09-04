@@ -56,11 +56,14 @@ Multi-model launches (v0.5.0+): a plain interactive
 `oaica launch claude` walks a wizard — primary, then Sonnet/execution
 tier, then a compaction/oversize model (only models with a probed LARGER
 context window are offered), then a route
-policy (`--route-policy local-first|remote-first|auto|local-only|remote-only`)
+policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)
 with cross-leg failover via a health circuit breaker — and can save the
 whole setup as a named plan. Same knobs exist as flags
 (`--sonnet-model`, `--oversize`, `--route-policy`) and are validated by
-`oaica doctor`. Details: docs/CLAUDE_TIERS.md.
+`oaica doctor`. `weighted` splits HEALTHY traffic across legs by weight
+(session-sticky consistent hash) instead of only failing over — set
+weights via `remotes.json`'s `"weight"` or the repeatable
+`--shard <model>:<weight>` flag. Details: docs/CLAUDE_TIERS.md.
 
 ## Self-host quick start (free, offline)
 

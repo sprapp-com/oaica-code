@@ -114,6 +114,7 @@ byte-identically no matter the policy.
 | `auto` | like `local-first`, PLUS session escalation — see below |
 | `local-only` | never leave local — request fails visibly rather than crossing |
 | `remote-only` | never leave remote — same |
+| `weighted` | splits HEALTHY traffic across every leg carrying a `Weight` — see below; not a failure policy |
 
 ### `auto`: session escalation (2026-08-31, v1.1)
 
@@ -141,6 +142,51 @@ count) open the circuit for 90 s; any success or a healthy `/models` probe
 `X-Oaica-Route: <label>` naming the leg that actually served it, so a silent
 failover is diagnosable and (at the gateway) attributable.
 
+### `weighted`: consistent-hash traffic split (2026-09-04)
+
+Every other policy above is failure-driven: `Fallbacks` sit idle serving
+nothing until the selected leg's breaker opens. `weighted` is different —
+it can steer HEALTHY traffic away from the base leg on purpose, splitting
+it across every route (base + `Fallbacks` + `Oversize`) that carries a
+nonzero `Weight`, in proportion to that weight.
+
+Session-sticky: the proxy hashes each launch's `SessionID` onto a
+consistent-hash ring built from the weighted, currently-healthy legs (an
+`open` breaker removes a leg from the ring, same as ordinary failover), so
+one conversation always lands on the same replica for the life of the
+session — its prefix cache keeps getting reused turn-to-turn, exactly like
+plain `X-Session-Id` pinning above. Only the split ACROSS DIFFERENT
+sessions follows the weights. A route with `Weight` 0 (every route, unless
+opted in) is excluded from the ring; with fewer than 2 weighted legs the
+policy has nothing to split and silently falls through to ordinary
+failover-only behavior — so turning `weighted` on is never a regression by
+itself, it only changes anything once ≥2 legs are actually weighted.
+
+**Setting weights** — two ways, flag wins for the launch it's given on:
+
+- `remotes.json` per remote: `"weight": 3` (0/omitted = opt-out, the
+  default for every existing remote).
+- `--shard <model>:<weight>` (repeatable, same picker vocabulary as
+  `--sonnet-model` — `<remote>/<id>`, `router/<id>`, bare id): resolves
+  `<model>` to its `BaseURL` and stamps `<weight>` onto whichever existing
+  route (base or a fallback) already sits on that URL, for THIS launch
+  only. Does not create a new leg — a `--shard` id that doesn't match any
+  existing base/fallback route is a silent no-op, same as "fewer than 2
+  weighted legs" above. Malformed entries (no `:weight`, non-positive,
+  non-integer) are also dropped rather than failing the launch.
+
+```
+oaica launch claude \
+  --sonnet-model gateway46/oaica-35b-a3b-vision \
+  --shard gateway46/oaica-35b-a3b-vision:3 \
+  --shard <other-remote>/<model>:1 \
+  --route-policy weighted -- --dangerously-skip-permissions
+```
+
+Requires at least 2 genuinely healthy backends on different base URLs to
+have any effect — `oaica doctor` shows which remotes are actually
+reachable before you weight them.
+
 ### Oversize crossover + remotes.json defaults (2026-08-31, v0.5.0)
 
 `--oversize <model>` (same picker vocabulary as `--sonnet-model`): the
@@ -155,9 +201,12 @@ serves as a breaker fallback leg and gets the 30s health probe.
 `X-Oaica-Route` always names the leg that actually served.
 
 remotes.json now accepts `"route_policy": "local-first|remote-first|auto|
-local-only|remote-only"` per remote as the default for launches using it;
-the `--route-policy` flag wins. `oaica doctor` prints every remote's
-reachability + wire + route_policy and the daemon leg — exit 1 on any
+local-only|remote-only|weighted"` per remote as the default for launches
+using it, plus `"weight": N` (see `weighted`, above) to opt that remote
+into consistent-hash traffic distribution; the `--route-policy` flag wins
+over the remote's own default, and `--shard` overrides `weight` for a
+single launch without editing the file. `oaica doctor` prints every
+remote's reachability + wire + route_policy and the daemon leg — exit 1 on any
 failing probe, so cron/scripts can grep.
 
 ## Interactive launch wizard (2026-08-31)
@@ -173,7 +222,9 @@ picker:
    (the same 2s `/models` probe the proxy uses) is strictly larger than the
    primary's qualify; `(none — fail honestly at the ceiling)` is the default.
    With no probe answer and no larger model, the step offers nothing.
-4. **Route policy** — the five `--route-policy` values, `local-first` default.
+4. **Route policy** — the six `--route-policy` values, `local-first` default
+   (`weighted` is available here too, but the wizard has no step for setting
+   per-leg weights — use `--shard`/`remotes.json` `weight` for that).
 
 A one-line preview prints (e.g. `fallback: a <-> b · oversize: c (256k) ·
 policy: remote-first`) and the choice can be saved as a named plan (blank
