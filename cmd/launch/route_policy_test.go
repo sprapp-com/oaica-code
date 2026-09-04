@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -459,5 +460,83 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	}
 	if r, _, fb := table4.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
 		t.Errorf("nil escalations must not escalate (got %s, fallback=%v)", r.BaseURL, fb)
+	}
+}
+
+// TestWeightedPolicy_SplitsBySessionAndWeight builds a 3-weight/1-weight
+// pair of healthy routes and checks that (a) many distinct sessions split
+// roughly 3:1 across them, and (b) any one session ID always lands on the
+// same leg across repeated resolves.
+func TestWeightedPolicy_SplitsBySessionAndWeight(t *testing.T) {
+	heavy := proxyRoute{BaseURL: "http://heavy", UpstreamModel: "m", Weight: 3}
+	light := proxyRoute{BaseURL: "http://light", UpstreamModel: "m", Weight: 1}
+
+	counts := map[string]int{}
+	const sessions = 2000
+	for i := 0; i < sessions; i++ {
+		table := proxyRouteTable{
+			Policy:    RouteWeighted,
+			Default:   heavy,
+			Fallbacks: []proxyRoute{light},
+			SessionID: "session-" + strconv.Itoa(i),
+			breakers:  &routeBreakers{},
+		}
+		r, _, _ := table.selectRoute("m")
+		counts[r.BaseURL]++
+	}
+
+	ratio := float64(counts["http://heavy"]) / float64(counts["http://light"])
+	if ratio < 2.0 || ratio > 4.5 {
+		t.Errorf("weighted split ratio = %.2f, want roughly 3.0 (heavy=%d light=%d)",
+			ratio, counts["http://heavy"], counts["http://light"])
+	}
+
+	// Same session ID must always resolve to the same leg.
+	table := proxyRouteTable{
+		Policy:    RouteWeighted,
+		Default:   heavy,
+		Fallbacks: []proxyRoute{light},
+		SessionID: "sticky-session",
+		breakers:  &routeBreakers{},
+	}
+	first, _, _ := table.selectRoute("m")
+	for i := 0; i < 20; i++ {
+		r, _, _ := table.selectRoute("m")
+		if r.BaseURL != first.BaseURL {
+			t.Fatalf("session stickiness broke: got %s, want %s", r.BaseURL, first.BaseURL)
+		}
+	}
+}
+
+// TestWeightedPolicy_ExcludesOpenBreakerAndUnweighted checks that a leg
+// with an OPEN breaker is never picked even if weighted, and that a leg
+// with Weight 0 never enters the ring — falling through to ordinary
+// failover behavior when fewer than 2 weighted legs remain healthy.
+func TestWeightedPolicy_ExcludesOpenBreakerAndUnweighted(t *testing.T) {
+	heavy := proxyRoute{BaseURL: "http://heavy", UpstreamModel: "m", Weight: 3}
+	unweighted := proxyRoute{BaseURL: "http://unweighted", UpstreamModel: "m"} // Weight 0
+
+	breakers := &routeBreakers{}
+	breakers.recordFail("http://heavy")
+	breakers.recordFail("http://heavy")
+	breakers.recordFail("http://heavy")
+	if !breakers.open("http://heavy") {
+		t.Fatal("test setup: expected heavy's breaker to be open")
+	}
+
+	table := proxyRouteTable{
+		Policy:    RouteWeighted,
+		Default:   heavy,
+		Fallbacks: []proxyRoute{unweighted},
+		SessionID: "s1",
+		breakers:  breakers,
+	}
+	// heavy is OPEN, unweighted has Weight 0: nothing qualifies for the
+	// ring, and unweighted also isn't a candidate for ordinary failover
+	// (Weight doesn't gate failover) — but here it's the only Fallback, so
+	// it should still be used via the pre-existing failover path.
+	r, _, fb := table.selectRoute("m")
+	if r.BaseURL != "http://unweighted" || !fb {
+		t.Errorf("expected failover to unweighted fallback when weighted ring is empty, got %s fallback=%v", r.BaseURL, fb)
 	}
 }

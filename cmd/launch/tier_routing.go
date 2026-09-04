@@ -268,6 +268,7 @@ func routeFor(ep launchEndpoint) proxyRoute {
 		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel,
 		Label:             string(ep.Source) + ":" + ep.Name,
 		NativePassthrough: ep.Source == sourceNativeAnthropic,
+		Weight:            ep.Weight,
 	}
 }
 
@@ -679,7 +680,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	}
 	policy, err := parseRoutePolicy(policyArg)
 	if err != nil {
-		return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only", policyArg)
+		return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only, weighted", policyArg)
 	}
 	plan.Routes.Policy = policy
 	if oversizeModel != "" {

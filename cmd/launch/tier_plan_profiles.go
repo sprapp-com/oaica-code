@@ -153,7 +153,7 @@ func PlanSet(name string, profile TierPlanProfile) error {
 	}
 	if profile.RoutePolicy != "" {
 		if _, err := parseRoutePolicy(profile.RoutePolicy); err != nil {
-			return fmt.Errorf("route_policy %q is not one of local-first, remote-first, auto, local-only, remote-only", profile.RoutePolicy)
+			return fmt.Errorf("route_policy %q is not one of local-first, remote-first, auto, local-only, remote-only, weighted", profile.RoutePolicy)
 		}
 	}
 	p, err := loadTierPlanProfiles()

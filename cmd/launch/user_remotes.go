@@ -106,6 +106,13 @@ type userRemote struct {
 	// | local-only | remote-only. The launch flag wins when both are set.
 	// Invalid values fail loudly AT LAUNCH, not silently.
 	RoutePolicy string `json:"route_policy,omitempty"`
+	// Weight opts this remote into RouteWeighted's consistent-hash traffic
+	// split (route_policy.go) when --route-policy weighted is used: higher
+	// relative to other legs' weights means a larger share of DIFFERENT
+	// sessions land here, session-sticky (one conversation stays on one
+	// leg). 0 (the default) means this remote is never chosen by weighted
+	// distribution — it stays failover-only, unaffected by this field.
+	Weight int `json:"weight,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -419,6 +426,7 @@ type RemoteEndpoint struct {
 	ToolReliable    bool
 	ForceTools      bool   // remote.ForceTools — skip the capability gate's refusal for this remote
 	RoutePolicy     string // remote.RoutePolicy — default --route-policy for launches using this endpoint
+	Weight          int    // remote.Weight — this leg's share under --route-policy weighted
 	PriceInputPerM  float64
 	PriceOutputPerM float64
 }
@@ -445,6 +453,7 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		ToolReliable:    d.ToolReliable,
 		ForceTools:      remote.ForceTools,
 		RoutePolicy:     remote.RoutePolicy,
+		Weight:          remote.Weight,
 		PriceInputPerM:  remote.PriceInputPerM,
 		PriceOutputPerM: remote.PriceOutputPerM,
 	}, true

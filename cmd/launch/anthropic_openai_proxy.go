@@ -537,6 +537,15 @@ type proxyRoute struct {
 	// to Anthropic, but a human reading the transcript later should still
 	// be able to tell the response didn't come from Anthropic's Sonnet.
 	DisplayModel string
+	// Weight, when >0, makes this route eligible for RouteWeighted's
+	// consistent-hash distribution across ALL healthy legs (base +
+	// Fallbacks) instead of the normal failover-only behavior where
+	// Fallbacks sit idle until the base route's breaker opens — see
+	// weightedRing in route_policy.go. 0 (the default for every existing
+	// plan) opts a route OUT of weighted distribution: it stays a
+	// failover-only leg, so this field is additive and changes nothing
+	// for callers that never set it.
+	Weight int
 }
 
 // oaicaDisplayModelSuffix marks a DisplayModel id as OAICA's own, not

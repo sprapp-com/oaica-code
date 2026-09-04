@@ -39,9 +39,12 @@ package launch
 
 import (
 	"context"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +57,16 @@ const (
 	RouteAuto        routePolicy = "auto"
 	RouteLocalOnly   routePolicy = "local-only"
 	RouteRemoteOnly  routePolicy = "remote-only"
+	// RouteWeighted splits HEALTHY traffic across every route (base +
+	// Fallbacks) that carries a nonzero Weight, instead of leaving
+	// Fallbacks idle until the base route's breaker opens. Session-sticky
+	// (a consistent hash of SessionID picks the leg), so one conversation's
+	// prefix-cache reuse on its replica isn't broken by weighting — only
+	// the split across DIFFERENT sessions follows the weights. A route
+	// with Weight 0 (every route, unless the user opts it in) is excluded
+	// from the ring; with no weighted routes this degrades to ordinary
+	// failover, same as every other policy.
+	RouteWeighted routePolicy = "weighted"
 )
 
 type routePolicy string
@@ -67,7 +80,7 @@ func parseRoutePolicy(s string) (routePolicy, error) {
 	case "":
 		return RouteLocalFirst, nil
 	case string(RouteLocalFirst), string(RouteRemoteFirst), string(RouteAuto),
-		string(RouteLocalOnly), string(RouteRemoteOnly):
+		string(RouteLocalOnly), string(RouteRemoteOnly), string(RouteWeighted):
 		return routePolicy(s), nil
 	}
 	return "", os.ErrInvalid
@@ -380,6 +393,77 @@ func (t proxyRouteTable) escalationTarget(base proxyRoute) (proxyRoute, bool) {
 	return best, best.BaseURL != ""
 }
 
+// weightedRingVpointsPerUnit sets the granularity of the hash ring: each
+// route gets Weight*weightedRingVpointsPerUnit points on the ring, so a
+// weight-3 route gets ~3x the ring coverage (and therefore ~3x the traffic
+// share) of a weight-1 route. Consistent-hash arc lengths are the gaps
+// between adjacent SORTED points, not the point count directly — with too
+// few points those gaps have high variance and the traffic split drifts
+// well off the nominal weight ratio (observed ~2x error at 100/unit in
+// testing). 1000 keeps that variance small even for a 2-3 route ring,
+// without making ring construction (O(routes*vpoints), rebuilt only when
+// the healthy set changes) meaningfully expensive.
+const weightedRingVpointsPerUnit = 1000
+
+// weightedRingPoint is one virtual node on a weightedPick hash ring.
+type weightedRingPoint struct {
+	route proxyRoute
+	hash  uint32
+}
+
+// weightedPick selects a leg for RouteWeighted: build the ring from base +
+// every Fallback (plus Oversize) that carries Weight>0 and whose breaker is
+// currently closed, pinned-policy-permitting, then hash SessionID onto it.
+// Same SessionID always lands on the same leg while the healthy/weighted
+// set doesn't change (session-sticky, for prefix-cache reuse — see
+// RouteWeighted's doc), but the split ACROSS sessions follows the weights.
+// Returns false when fewer than 2 distinct base URLs qualify — nothing to
+// weight, caller falls through to ordinary failover.
+func (t proxyRouteTable) weightedPick(base proxyRoute) (proxyRoute, bool) {
+	var candidates []proxyRoute
+	seen := map[string]bool{}
+	add := func(rs ...proxyRoute) {
+		for _, r := range rs {
+			if r.BaseURL == "" || r.Weight <= 0 || seen[r.BaseURL] {
+				continue
+			}
+			if pin := t.Policy.pinned(); pin != "" && routeLocality(r.BaseURL) != pin {
+				continue
+			}
+			if t.breakers.open(r.BaseURL) {
+				continue
+			}
+			seen[r.BaseURL] = true
+			candidates = append(candidates, r)
+		}
+	}
+	add(base)
+	add(t.Fallbacks...)
+	add(t.Oversize)
+	if len(candidates) < 2 {
+		return proxyRoute{}, false
+	}
+
+	var ring []weightedRingPoint
+	for _, r := range candidates {
+		for i := 0; i < r.Weight*weightedRingVpointsPerUnit; i++ {
+			h := fnv.New32a()
+			h.Write([]byte(r.BaseURL + "#" + strconv.Itoa(i)))
+			ring = append(ring, weightedRingPoint{route: r, hash: h.Sum32()})
+		}
+	}
+	sort.Slice(ring, func(i, j int) bool { return ring[i].hash < ring[j].hash })
+
+	kh := fnv.New32a()
+	kh.Write([]byte(t.SessionID))
+	key := kh.Sum32()
+	idx := sort.Search(len(ring), func(i int) bool { return ring[i].hash >= key })
+	if idx == len(ring) {
+		idx = 0 // wrap past the last point to the first
+	}
+	return ring[idx].route, true
+}
+
 // selectRoute resolves the requested model id and applies the policy:
 // the ByModel/Default route is used whenever it has no OPEN breaker; only a
 // failing route is replaced, by the first policy-ordered healthy fallback on
@@ -407,6 +491,17 @@ func (t proxyRouteTable) resolveRoute(requested string) (proxyRoute, string, boo
 	if t.Policy == RouteAuto && t.escalations.escalated(t.SessionID) {
 		if r, ok := t.escalationTarget(base); ok {
 			return r, r.UpstreamModel, true
+		}
+	}
+
+	// `weighted`: unlike every other policy, this one can steer HEALTHY
+	// traffic away from base — Fallbacks are not failover-only here, they're
+	// live capacity. Only kicks in when at least 2 distinct base URLs carry
+	// a nonzero Weight; otherwise there is nothing to split and this falls
+	// through to the ordinary failover path below.
+	if t.Policy == RouteWeighted {
+		if r, ok := t.weightedPick(base); ok {
+			return r, r.UpstreamModel, r.BaseURL != base.BaseURL
 		}
 	}
 
