@@ -311,6 +311,7 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 	var restoreFlag bool
 	var planFlag, sonnetFlag, haikuFlag, oversizeFlag, policyFlag string
 	var wizardFlag bool
+	var shardFlags []string
 
 	cmd := &cobra.Command{
 		Use:   "launch [INTEGRATION] [-- [EXTRA_ARGS...]]",
@@ -414,6 +415,9 @@ Examples:
 			if wizardFlag {
 				tierPrepend = append(tierPrepend, "--wizard")
 			}
+			for _, s := range shardFlags {
+				tierPrepend = append(tierPrepend, "--shard", s)
+			}
 			passArgs = append(tierPrepend, passArgs...)
 
 			if !restoreFlag && launchCommandIsClaudeDesktop(name) {
@@ -474,8 +478,9 @@ Examples:
 	cmd.Flags().StringVar(&sonnetFlag, "sonnet-model", "", "Secondary (sonnet/subagent) tier model")
 	cmd.Flags().StringVar(&haikuFlag, "haiku-model", "", "Haiku/background tier model")
 	cmd.Flags().StringVar(&oversizeFlag, "oversize", "", "Compaction/oversize-tier model for requests past the primary's window")
-	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: local-first, remote-first, auto, local-only, remote-only")
+	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: local-first, remote-first, auto, local-only, remote-only, weighted")
 	cmd.Flags().BoolVar(&wizardFlag, "wizard", false, "Force the interactive launch-tier wizard")
+	cmd.Flags().StringArrayVar(&shardFlags, "shard", nil, "model:weight — repeatable, sets a route's traffic weight for --route-policy weighted")
 	return cmd
 }
 
