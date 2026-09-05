@@ -508,3 +508,52 @@ func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
 		t.Fatalf("default with no recommendation = %q, want empty", c.SonnetModel)
 	}
 }
+
+// TestRunTierWizard_NativeClaudeSelectableForHaikuTier reproduces the
+// reported bug (2026-09-05: "can't select an Anthropic plan for the
+// tertiary model") — the Haiku/background tier step must offer the same
+// "claude/*"/"anthropic/*" native-passthrough entries the primary picker
+// does, mirroring how Claude.Run (tier_routing.go) now builds wizardModels
+// before calling runTierWizard.
+func TestRunTierWizard_NativeClaudeSelectableForHaikuTier(t *testing.T) {
+	withTempOaicaHome(t)
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	models := []LaunchModel{{Name: "solo-model"}}
+	for _, m := range nativeClaudePickerModels {
+		models = append(models, LaunchModel{Name: m.Name, Remote: true})
+	}
+
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		switch {
+		case strings.HasPrefix(title, "Haiku/background tier"):
+			for _, it := range items {
+				if it.Name == "claude/opus" {
+					return it.Name, nil
+				}
+			}
+			t.Fatalf("Haiku/background tier step did not offer claude/opus: %+v", items)
+		case strings.HasPrefix(title, "Sonnet/subagent tier"):
+			for _, it := range items {
+				if it.Name == "anthropic/sonnet" {
+					return it.Name, nil
+				}
+			}
+			t.Fatalf("Sonnet/subagent tier step did not offer anthropic/sonnet: %+v", items)
+		}
+		return items[0].Name, nil
+	}
+
+	c, err := runTierWizard(models, "solo-model")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.HaikuModel != "claude/opus" {
+		t.Fatalf("HaikuModel = %q, want claude/opus", c.HaikuModel)
+	}
+	if c.SonnetModel != "anthropic/sonnet" {
+		t.Fatalf("SonnetModel = %q, want anthropic/sonnet", c.SonnetModel)
+	}
+}

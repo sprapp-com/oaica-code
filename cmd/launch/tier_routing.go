@@ -627,7 +627,19 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 			return fmt.Errorf("--plan: %w", err)
 		}
 	} else if wizardForced || tierWizardEligible(args) {
-		w, err := runTierWizard(models, model)
+		// Sonnet/Haiku tier steps must offer the same "claude/*" and
+		// "anthropic/*" native-passthrough entries the primary picker step
+		// does (launch.go's selectSingleModelWithSelectorReady) — the
+		// routing layer (nativeClaudeModelTier) already supports using one
+		// as a secondary or haiku leg, the wizard just never listed them
+		// (2026-09-05: "can't select an Anthropic plan for the tertiary
+		// model"). Only this Claude-specific wizard needs them, so inject
+		// here rather than in the shared LaunchModel inventory.
+		wizardModels := append([]LaunchModel{}, models...)
+		for _, m := range nativeClaudePickerModels {
+			wizardModels = append(wizardModels, LaunchModel{Name: m.Name, Remote: true})
+		}
+		w, err := runTierWizard(wizardModels, model)
 		if err != nil {
 			return fmt.Errorf("launch wizard: %w", err)
 		}

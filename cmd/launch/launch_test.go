@@ -3563,6 +3563,7 @@ func TestLaunchIntegration_ClaudeModelOverrideSkipsSelector(t *testing.T) {
 		// prompt; answer their default (Enter keeps it). Only the
 		// PRIMARY model picker is forbidden.
 		if strings.HasPrefix(title, "Sonnet/subagent tier") ||
+			strings.HasPrefix(title, "Haiku/background tier") ||
 			strings.HasPrefix(title, "Compaction/oversize model") ||
 			strings.HasPrefix(title, "Route policy") {
 			if len(items) == 0 {
