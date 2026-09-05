@@ -309,3 +309,115 @@ vLLM venv (`/workspace/kat_bf16_venv`) can be removed once this comparison
 is no longer needed for reference — GPU0/1 were freed after the test runs
 completed.
 
+## Update 2026-09-05: EschaLabs/Qwen3.8-27B-Escha-W2 (2-bit "escha" quant)
+
+Source: https://huggingface.co/EschaLabs/Qwen3.8-27B-Escha-W2 — a
+proprietary 2-bit-mixed-precision quant of the base `Qwen3.8-27B` (own
+Alibaba release), genuinely multimodal (vision_config populated with real
+weight tensors, unlike the KAT-Coder BF16 vestigial case above). The HF
+model card only reports Commonsense-6/GPQA-Diamond/LiveCodeBench v6 — no
+SWE-bench Pro/TB2 numbers published for this specific quantized
+derivative, so this session ran SWE-bench Pro directly.
+
+**Runtime**: not stock vLLM/SGLang — Escha ships its own compiled kernel
+wheel (`EschaLabs/escha-runtime-qwen3dense`, a vendored SGLang fork,
+`torch.ops.escha.escham_decode_gemv`), Ampere ("lovelace" route,
+auto-selected on A100), Python 3.12 exact, torch 2.9.x/cu12.8 exact match.
+Served on GPU7 (a100b), CTXLEN=262144 (256k), MEM=0.90, THINK=1.
+
+Two real infra issues hit and fixed during setup (both now permanent
+scars on this box, documented for the next person):
+1. `serve.sh`'s own GPU-occupancy warning check pipes
+   `nvidia-smi | head -1 | tr ...` under `set -e -o pipefail` — `head -1`
+   closing early on a multi-GPU box SIGPIPEs `nvidia-smi`, `pipefail`
+   propagates the 141 exit code, and `set -e` kills the whole script
+   before it ever reaches `exec sglang.launch_server`, with **zero output
+   difference** in the log (just stops after the harmless overcommit
+   note). Worked around by patching that one line in this box's copy of
+   `serve.sh` (`-i "${CUDA_VISIBLE_DEVICES:-0}"` + `|| true`).
+2. Root overlay fs (`/`) on this container is permanently 100% full, 0
+   bytes free — Triton's JIT kernel-compile step writes its `.so` to
+   `$TMPDIR` (defaults under `/`), and a full-disk write truncates the
+   `.so`, producing a **silent-looking crash** at CUDA-graph-capture time:
+   `ImportError: ... __triton_launcher...so: failed to map segment from
+   shared object` with no OOM/error context. Fix: point
+   `TMPDIR`/`TRITON_CACHE_DIR`/`TORCHINDUCTOR_CACHE_DIR` at `/workspace`
+   (xfs, exec-capable) instead — `/dev/shm` is `noexec` on this box and
+   cannot host these caches at all (confirmed via `mount`), so it is not
+   a substitute when `/workspace` itself gets tight.
+
+The server also crashed twice more, silently (no traceback, GPU memory
+just drops to 0 a few seconds after `#full token` climbs to ~129k across
+4 concurrent full-256k-context streams) at `MEM=0.90`/no concurrency cap —
+reproducible, not random. Mitigated by capping `MAXREQ=3` and dropping to
+`MEM=0.85` for the SWE-bench Pro eval run itself (root cause unconfirmed:
+`dmesg` is blocked in this container, consistent with the box's known
+cgroup-OOM-kills-look-silent pattern).
+
+### SWE-bench Pro results (same 48-instance subset, same custom scorer)
+
+47/48 instances completed generation (1 never converged after exhausting
+mini-swe-agent's 10-attempt retry budget against repeated 600s timeouts on
+long re-prefills — `--disable-radix-cache` means every agent turn
+re-prefills the full growing transcript from scratch, so per-turn cost
+grows with trajectory depth; excluded below, not scored). Of the 47
+scored, 1 further instance hit a genuine harness/dataset issue (the
+dataset's own `test_patch` failed to apply, independent of the model) and
+is excluded from the denominator as an infra error, not a model failure.
+
+**19/46 resolved = 41.3%** (empty-patch failures — the model producing no
+usable diff — are counted as failures, not excluded: 4 such instances).
+
+| Language | Resolved | Total |
+|---|---|---|
+| Go | 6 | 10 (60.0%) |
+| Python | 12 | 26 (46.2%) |
+| JS | 1 | 9 (11.1%) |
+| TS | 0 | 1 (0.0%) |
+
+For reference against the earlier table in this doc: 41.3% sits between
+oaica-35b-a3b-vision's measured 33.3% and Ornith-1.5's published 59.6% —
+a genuinely competitive result for a 2-bit-quantized 27B-dense model
+against 35B-A3B-MoE competition, though the two runs used different agent
+harnesses (mini-swe-agent here vs whatever each baseline used) so this is
+directional, not a controlled comparison.
+
+### TB2 — blocked, not attempted
+
+The `harbor` CLI's session/API-key auth to the Harbor Hub registry is
+invalid on this box: `harbor dataset access terminal-bench/terminal-bench`
+returns `permission denied for function get_package_access`, and both
+`terminal-bench@2.1` and `terminal-bench@2.0` dataset tags resolve to
+empty regardless of which is requested — consistent with an expired/
+invalid credential, not a wrong tag. Needs a fresh `harbor login` (or
+API key) on this box before TB2 can run for any model, not just this one.
+
+### Throughput/concurrency sweep (256k ctx, GPU2, MEM=0.85, no MAXREQ cap)
+
+Fixed ~2k-token prompt, `max_tokens=300`, N concurrent non-streaming
+requests, measuring per-request and aggregate decode tok/s:
+
+| N | min per-user tok/s | aggregate tok/s | pass (≥10 / ≥30)? |
+|---|---|---|---|
+| 1 | 20.7 | 20.7 | fail (agg, expected — single stream) |
+| 2 | 30.6 | 61.2 | pass |
+| 3 | 29.3 | 87.9 | pass |
+| 4 | 27.3 | 109.3 | pass |
+| 6 | 23.7 | 141.9 | pass |
+| 8 | 22.5 | 179.8 | pass |
+| 12 | 17.1 | 205.7 | pass |
+| 16 | 15.6 | 250.0 | pass |
+| 20 | 8.7 | 173.7 | **fail** (per-user floor) |
+| 24 | 8.2 | 197.2 | fail |
+
+**Max concurrent users at 256k context satisfying both floors (≥10 tok/s
+per-user, ≥30 tok/s aggregate): N = 16**, at ~15.6 tok/s/user and ~250
+tok/s aggregate. Aggregate throughput itself peaks around N=16-24; the
+per-user floor is the binding constraint, not aggregate saturation.
+
+Cleanup: GPU7 and GPU2 were temporarily pulled from the production
+`oaica-35b-a3b-vision` fleet for this eval (see `/dev/shm/gpus.md` on
+a100b); GPU2 has been restored (`fleetctl.sh add 2:30110`), GPU7 pending
+restoration once its last SWE-bench Pro straggler instance is confirmed
+stopped.
+
