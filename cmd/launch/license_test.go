@@ -77,6 +77,36 @@ func TestActivateLicenseLive_EmptyKey(t *testing.T) {
 	}
 }
 
+func TestActivateLicenseLive_TestKeyNeverHitsNetwork(t *testing.T) {
+	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("testLicenseKey must not call the license server")
+	})
+
+	f, err := activateLicenseLive(testLicenseKey, "")
+	if err != nil {
+		t.Fatalf("activateLicenseLive(testLicenseKey): %v", err)
+	}
+	if f.Key != testLicenseKey || f.ValidatedAt.IsZero() || f.ActivatedAt.IsZero() {
+		t.Errorf("got %+v", f)
+	}
+}
+
+func TestRequireLicenseLive_TestKeyNeverRevalidates(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("testLicenseKey must not call the license server, even on a stale cache")
+	})
+
+	stale := time.Now().Add(-licenseRevalidateTTL - time.Hour)
+	if err := saveLicenseFile(licenseFile{Key: testLicenseKey, InstanceID: "test", ValidatedAt: stale}); err != nil {
+		t.Fatalf("saveLicenseFile: %v", err)
+	}
+
+	if err := requireLicenseLive(nil, nil); err != nil {
+		t.Errorf("testLicenseKey should always pass requireLicenseLive: %v", err)
+	}
+}
+
 func TestRequireLicenseLive_NoLicenseFile(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 	err := requireLicenseLive(nil, nil)

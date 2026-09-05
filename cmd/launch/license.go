@@ -53,6 +53,17 @@ var lemonSqueezyLicenseAPI = "https://api.lemonsqueezy.com/v1/licenses"
 // the one place to update.
 const oaicaPurchaseURL = "https://oaica.lemonsqueezy.com/buy/oaica-code"
 
+// testLicenseKey is a dev/test-only key that activates and revalidates
+// entirely locally, with no Lemon Squeezy network call — for verifying the
+// launch/license flow on a machine without spending a real purchase (e.g.
+// a one-off install test on a public/cybercafe PC). Not a secret: it is
+// visible in source, matching this project's own stated stance (see the
+// package doc comment above) that the license gate is a convenience paywall
+// on the prebuilt binary, not DRM. Anyone building from source could add
+// their own bypass anyway; this just gives the maintainer one without
+// touching real Lemon Squeezy activation state.
+const testLicenseKey = "OAICA-TEST-DEV-FREE"
+
 const (
 	// licenseRevalidateTTL: how long a successful validate is trusted
 	// before the next launch re-checks live. Short enough that a revoked/
@@ -169,6 +180,10 @@ func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 	if key == "" {
 		return licenseFile{}, errors.New("empty license key")
 	}
+	if key == testLicenseKey {
+		now := time.Now()
+		return licenseFile{Key: key, ActivatedAt: now, ValidatedAt: now, InstanceName: "test", InstanceID: "test"}, nil
+	}
 	if instanceName == "" {
 		instanceName, _ = os.Hostname()
 		if instanceName == "" {
@@ -233,6 +248,10 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 			"oaica-code needs a one-time license — get one at %s, then run `oaica activate <key>`",
 			oaicaPurchaseURL,
 		)
+	}
+
+	if f.Key == testLicenseKey {
+		return nil // dev/test key — never revalidates over the network
 	}
 
 	age := time.Since(f.ValidatedAt)
