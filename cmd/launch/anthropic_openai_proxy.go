@@ -143,6 +143,12 @@ type openAIChatResponse struct {
 			Role             string `json:"role"`
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content,omitempty"`
+			// Reasoning is an alias some vLLM reasoning-parser configs (e.g.
+			// the qwen3 parser as of vLLM 0.24) emit instead of
+			// reasoning_content. Same meaning, different key name; see
+			// reasoningText() below for the field that call sites should
+			// actually read.
+			Reasoning        string `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -171,6 +177,18 @@ type openAIUsage struct {
 	} `json:"prompt_tokens_details,omitempty"`
 }
 
+// reasoningOf returns whichever of reasoning_content / reasoning is
+// non-empty. Different vLLM reasoning-parser configs emit different key
+// names for the same concept (see the field comments above); this is the
+// one place that ambiguity is resolved so every call site reads a single
+// value instead of re-deriving it.
+func reasoningOf(reasoningContent, reasoning string) string {
+	if reasoningContent != "" {
+		return reasoningContent
+	}
+	return reasoning
+}
+
 // cachedTokens returns the prefix-cache hit count, clamped to the prompt
 // size so a malformed upstream can never yield a negative input_tokens.
 func (u *openAIUsage) cachedTokens() int {
@@ -195,6 +213,9 @@ type openAIStreamChunk struct {
 			Role             string `json:"role,omitempty"`
 			Content          string `json:"content,omitempty"`
 			ReasoningContent string `json:"reasoning_content,omitempty"`
+			// Reasoning: see the identical field on openAIChatResponse's
+			// Message struct above for why this alias exists.
+			Reasoning        string `json:"reasoning,omitempty"`
 			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id,omitempty"`
@@ -425,7 +446,7 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 		chatResp.Message = api.Message{
 			Role:      c.Message.Role,
 			Content:   c.Message.Content,
-			Thinking:  c.Message.ReasoningContent,
+			Thinking:  reasoningOf(c.Message.ReasoningContent, c.Message.Reasoning),
 			ToolCalls: nil,
 		}
 		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls)
@@ -1311,8 +1332,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			d := choice.Delta
 
 			// Reasoning content → thinking delta.
-			if d.ReasoningContent != "" {
-				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Thinking: d.ReasoningContent}}
+			if reasoning := reasoningOf(d.ReasoningContent, d.Reasoning); reasoning != "" {
+				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Thinking: reasoning}}
 				emit(conv.Process(cr))
 			}
 
