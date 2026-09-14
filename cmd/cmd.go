@@ -2408,7 +2408,78 @@ just to see the picker list.`,
 			return nil
 		},
 	}
-	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd)
+	modelSyncCmd := &cobra.Command{
+		Use:   "sync",
+		Short: "Pull the hosted model catalog and upsert it into the local manifest",
+		Long: `Fetches the canonical model catalog (same shape as ~/.oaica/models.json)
+from the OAICA-hosted URL and upserts its entries into the local manifest,
+so model-config changes from us reach you with one command — never a
+reinstall. Offline falls back to the last good copy; local notes are
+preserved unless the catalog ships its own. Hand-added ('oaica model
+add') and scanned ('oaica model scan') entries are never removed unless
+they were sync-sourced and --prune is set.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			url, _ := cmd.Flags().GetString("url")
+			prune, _ := cmd.Flags().GetBool("prune")
+			rep, err := launch.ModelSync(url, prune)
+			if err != nil {
+				return err
+			}
+			src := "fresh"
+			if rep.FromCache {
+				src = "cached/304"
+			}
+			fmt.Printf("synced from %s (%s): %d added, %d updated, %d pruned, %d skipped\n",
+				rep.URL, src, len(rep.Added), len(rep.Updated), len(rep.Pruned), len(rep.Skipped))
+			for _, id := range rep.Added {
+				fmt.Printf("  + %s\n", id)
+			}
+			for _, id := range rep.Updated {
+				fmt.Printf("  ~ %s\n", id)
+			}
+			for _, id := range rep.Pruned {
+				fmt.Printf("  - %s\n", id)
+			}
+			for _, s := range rep.Skipped {
+				fmt.Printf("  ! %s\n", s)
+			}
+			return nil
+		},
+	}
+	modelSyncCmd.Flags().String("url", "", "Catalog URL (default: the OAICA-hosted catalog; file:// paths accepted)")
+	modelSyncCmd.Flags().Bool("prune", false, "Also remove sync-sourced entries that dropped out of the catalog")
+
+	modelScanCmd := &cobra.Command{
+		Use:   "scan [DIR...]",
+		Short: "Register local .pqm / .gguf model files into the manifest",
+		Long: `Walks the given directories (default: $OAICA_MODELS_DIR then
+~/.oaica/models) for .pqm (prism-engine) and .gguf (llama.cpp) files and
+registers each as a manifest entry — the same auto-detection the Ollama
+daemon does for GGUF. 'oaica model list' runs this scan automatically.
+The scan never overwrites config you already declared; it only adds new
+files or fills in a model_path on a pathless entry.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			rep, err := launch.ModelScan(args)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("scanned %d dir(s): %d added, %d updated, %d already known\n",
+				len(rep.Dirs), len(rep.Added), len(rep.Updated), len(rep.Ignored))
+			for _, id := range rep.Added {
+				fmt.Printf("  + %s\n", id)
+			}
+			for _, id := range rep.Updated {
+				fmt.Printf("  ~ %s\n", id)
+			}
+			for _, s := range rep.Invalid {
+				fmt.Printf("  ! %s\n", s)
+			}
+			return nil
+		},
+	}
+	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd, modelSyncCmd, modelScanCmd)
 
 	// remote — CRUD over ~/.oaica/remotes.json (see cmd/launch/user_remotes.go),
 	// the OpenAI/Anthropic-compatible boxes the launch picker offers alongside

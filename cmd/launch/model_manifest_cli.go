@@ -87,7 +87,13 @@ func ModelShow(id string) (ModelManifestEntry, error) {
 }
 
 // WriteModelList prints every manifest entry as an aligned table to w.
+// Before listing it runs the local .pqm/.gguf directory scan — same
+// "just know what's in the models dir" behavior as the Ollama daemon —
+// best-effort: a scan failure never blocks listing.
 func WriteModelList(w io.Writer) error {
+	if _, err := ModelScan(nil); err != nil {
+		fmt.Fprintf(w, "(local model scan failed: %v)\n", err)
+	}
 	m, err := loadModelManifest()
 	if err != nil {
 		return err

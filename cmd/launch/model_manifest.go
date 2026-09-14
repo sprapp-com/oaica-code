@@ -95,6 +95,13 @@ type ModelManifestEntry struct {
 	// Not used by daemon/user-remote entries.
 	LaunchFlags []string `json:"launch_flags,omitempty"`
 
+	// Source records how this entry arrived: "sync" (pulled from the
+	// hosted catalog by `oaica model sync`), "local-scan" (registered by
+	// the .pqm/.gguf directory scan), or empty (hand-added with
+	// `oaica model add`). sync --prune only removes "sync"-sourced ids;
+	// hand-added entries are never touched by automation.
+	Source string `json:"source,omitempty"`
+
 	// ModelPath is where the weights live locally (a directory for vLLM/
 	// HF-format, a single file for llama.cpp GGUF / prism-engine .pqm).
 	// Empty for daemon/user-remote entries, which resolve through their
