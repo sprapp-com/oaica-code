@@ -118,8 +118,9 @@ func init() {
 }
 
 var (
-	errRequired    = errors.New("is required")
-	errBadTemplate = errors.New("template error")
+	errRequired            = errors.New("is required")
+	errBadTemplate         = errors.New("template error")
+	errTypicalPUnsupported = errors.New("typical_p is no longer supported")
 )
 
 func (s *Server) modelOptions(model *Model, requestOpts map[string]any) (api.Options, error) {
@@ -211,6 +212,11 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 
 	if slices.Contains(model.Config.ModelFamilies, "mllama") && len(model.ProjectorPaths) > 0 {
 		return nil, nil, nil, fmt.Errorf("'llama3.2-vision' is no longer compatible with your version of Ollama and has been replaced by a newer version. To re-download, run 'ollama pull llama3.2-vision'")
+	}
+
+	// null is unset, as in Options.FromMap
+	if requestOpts["typical_p"] != nil {
+		return nil, nil, nil, errTypicalPUnsupported
 	}
 
 	if err := model.CheckCapabilities(caps...); err != nil {
@@ -3115,7 +3121,7 @@ func countChatImages(msgs []api.Message) int {
 
 func handleScheduleError(c *gin.Context, name string, err error) {
 	switch {
-	case errors.Is(err, errCapabilities), errors.Is(err, errRequired):
+	case errors.Is(err, errCapabilities), errors.Is(err, errRequired), errors.Is(err, errTypicalPUnsupported):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, context.Canceled):
 		c.JSON(499, gin.H{"error": "request canceled"})

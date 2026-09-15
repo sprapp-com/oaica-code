@@ -152,6 +152,15 @@ func ensureThinkingSupport(ctx context.Context, client *api.Client, name string)
 
 var errModelfileNotFound = errors.New("specified Modelfile wasn't found")
 
+// errTypicalPUnsupported refuses a NEW model that sets typical_p (upstream
+// #18448): the sampling option is deprecated, and the server rejects both a
+// create carrying the parameter and a request that passes it. Refusing here
+// too means the failure lands before the model's blobs are uploaded rather
+// than after. Models that already carry the parameter keep working — the
+// stored value is still honored, only fresh creates are refused. Both legs
+// share the wording so the two say the same thing (server.errTypicalPUnsupported).
+var errTypicalPUnsupported = errors.New("typical_p is no longer supported")
+
 func getModelfileName(cmd *cobra.Command) (string, error) {
 	filename, _ := cmd.Flags().GetString("file")
 
@@ -215,6 +224,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 	modelfile, err := parser.ParseFile(reader)
 	if err != nil {
 		return err
+	}
+
+	// Before any blob is uploaded: a deprecated parameter is knowable from the
+	// Modelfile alone, and the uploads below are the expensive part.
+	if slices.ContainsFunc(modelfile.Commands, func(c parser.Command) bool { return c.Name == "typical_p" }) {
+		return errTypicalPUnsupported
 	}
 
 	status := "gathering model components"

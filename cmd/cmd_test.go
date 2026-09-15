@@ -2429,3 +2429,46 @@ func TestLoadOrUnloadModel_CloudModelAuth(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateHandlerRejectsTypicalPBeforeUpload pins the deprecated-parameter
+// refusal at the earliest point a Modelfile can be judged (upstream #18448).
+// The guard must fire on the PARSED commands and before any blob is uploaded:
+// the handler builds its API client further down, so a refusal that reaches
+// the network at all would hang this test on a daemon that is not there.
+func TestCreateHandlerRejectsTypicalPBeforeUpload(t *testing.T) {
+	dir := t.TempDir()
+	modelfile := filepath.Join(dir, "Modelfile")
+	if err := os.WriteFile(modelfile, []byte("FROM base\nPARAMETER typical_p 0.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.Flags().String("file", modelfile, "")
+	cmd.Flags().String("draft-quantize", "", "")
+
+	err := CreateHandler(cmd, []string{"typical-p-test-model"})
+	if !errors.Is(err, errTypicalPUnsupported) {
+		t.Fatalf("error = %v, want %v", err, errTypicalPUnsupported)
+	}
+}
+
+// TestCreateHandlerKeepsEveryOtherParameter is the other half: a Modelfile
+// whose parameters are all still supported must not be refused by the guard.
+// The run stops at the API client (no daemon in the test), which is exactly
+// the evidence wanted — the guard let it through.
+func TestCreateHandlerKeepsEveryOtherParameter(t *testing.T) {
+	dir := t.TempDir()
+	modelfile := filepath.Join(dir, "Modelfile")
+	if err := os.WriteFile(modelfile, []byte("FROM base\nPARAMETER temperature 0.7\nPARAMETER top_p 0.9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.Flags().String("file", modelfile, "")
+	cmd.Flags().String("draft-quantize", "", "")
+
+	t.Setenv("OLLAMA_HOST", "127.0.0.1:0")
+	if err := CreateHandler(cmd, []string{"ordinary-model"}); errors.Is(err, errTypicalPUnsupported) {
+		t.Fatalf("a Modelfile without typical_p was refused: %v", err)
+	}
+}
