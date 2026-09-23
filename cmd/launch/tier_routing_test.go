@@ -1297,3 +1297,40 @@ func TestRun_EmptyTierValueIsRefusedNotInherited(t *testing.T) {
 		}
 	}
 }
+
+// TestTierPlanEnvDefaultsAutoModeServer pins upstream 01c0fbfd3 (#18596) at the
+// fork's own env builder: no backend of ours answers Anthropic's SERVER-side
+// auto-mode checks, so the child must get Claude Code's client-side classifier
+// — and an explicit setting of the user's must survive, since the child
+// environment is the user's own (scrubbed) plus this list. An unconditional
+// literal entry would shadow what they exported.
+func TestTierPlanEnvDefaultsAutoModeServer(t *testing.T) {
+	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "deepseek-v4-flash:0731-cloud", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := func() (string, bool) {
+		for _, kv := range plan.envVars("http://127.0.0.1:1", "tok") {
+			if k, v, ok := strings.Cut(kv, "="); ok && k == "CLAUDE_CODE_AUTO_MODE_SERVER" {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
+	t.Setenv("CLAUDE_CODE_AUTO_MODE_SERVER", "")
+	if err := os.Unsetenv("CLAUDE_CODE_AUTO_MODE_SERVER"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := value(); !ok || v != "0" {
+		t.Errorf("with the variable unset: got %q (present %v), want \"0\"", v, ok)
+	}
+
+	// Set by the user: the entry must NOT appear. This list is APPENDED to the
+	// user's own scrubbed environment (tier_routing.go:938), so the value they
+	// exported reaches the child on its own; adding "=0" here would shadow it.
+	t.Setenv("CLAUDE_CODE_AUTO_MODE_SERVER", "1")
+	if v, ok := value(); ok {
+		t.Errorf("with the variable already set: got %q in the plan env, want no entry — it would shadow the user's own export", v)
+	}
+}

@@ -1050,6 +1050,15 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 		// in Nm · check your network" churn. Give it room instead.
 		"API_TIMEOUT_MS=600000",
 	}
+	// No backend of ours answers Anthropic's server-side auto-mode checks, so
+	// Claude Code's own client-side classifier is the default — and an explicit
+	// setting of the user's is preserved rather than overwritten (upstream
+	// 01c0fbfd3, #18596). A guarded append rather than a literal entry: the
+	// child environment is the user's own (scrubbed) plus this list, so an
+	// unconditional entry would shadow what they exported.
+	if _, ok := os.LookupEnv("CLAUDE_CODE_AUTO_MODE_SERVER"); !ok {
+		env = append(env, "CLAUDE_CODE_AUTO_MODE_SERVER=0")
+	}
 	if isCloudModelName(p.PrimaryName) {
 		if l, ok := lookupCloudModelLimit(p.PrimaryName); ok {
 			// Full window (no reserved-output subtraction): the cloud
