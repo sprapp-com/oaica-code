@@ -158,6 +158,10 @@ func ModelAliasSortedNames() ([]string, error) {
 // ModelAliasGet resolves one alias, or an error naming the aliases file if
 // not found.
 func ModelAliasGet(name string) (string, error) {
+	// ModelAliasSet stores the trimmed name, so the reader has to look it up
+	// trimmed too — otherwise `oaica model alias show "  glm  "` names nothing
+	// while `alias set`/`alias rm` with the same argument both work.
+	name = strings.TrimSpace(name)
 	a, err := loadModelAliases()
 	if err != nil {
 		return "", err

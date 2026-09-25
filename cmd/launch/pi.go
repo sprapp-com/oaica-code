@@ -63,6 +63,29 @@ func ensureNpmInstalled() error {
 	return nil
 }
 
+// confirmPiNpmMutation is the consent gate every npm write in this file passes
+// through. ENTERPRISE.md's network table (row 6) tells the user "none of these
+// installers run unprompted" — a promise only the final install branch kept:
+// the legacy-package migration and the "official package present, `pi` not on
+// PATH" reinstall both reached `npm install -g` with no prompt at all, so
+// declining a prompt the user was never shown could not keep npm out
+// (2026-09-26 audit). The other npm agents (cline, dsh, openclaw) already
+// prompt; pi's two extra paths were the whole gap.
+//
+// A decline returns an error rather than a soft "carry on without the binary":
+// `oaica launch pi` cannot run without pi, and falling through would print the
+// misleading "pi was installed but the binary was not found on PATH".
+func confirmPiNpmMutation(action string) error {
+	ok, err := ConfirmPrompt(action + " with npm?")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("pi installation cancelled")
+	}
+	return nil
+}
+
 func ensurePiInstalled() (string, error) {
 	if _, err := exec.LookPath("pi"); err == nil {
 		install, pkgErr := installedPiPackageInfo()
@@ -73,6 +96,9 @@ func ensurePiInstalled() (string, error) {
 		}
 
 		if install.packageName == piLegacyNpmPackage {
+			if err := confirmPiNpmMutation("Update Pi"); err != nil {
+				return "", err
+			}
 			fmt.Fprintf(os.Stderr, "%sUpdating Pi...%s\n", ansiGray, ansiReset)
 			if err := migrateLegacyPiPackage(install.npmPrefix); err != nil {
 				return "", err
@@ -90,6 +116,9 @@ func ensurePiInstalled() (string, error) {
 
 	install, pkgErr := installedPiPackageInfo()
 	if pkgErr == nil && install.packageName == piLegacyNpmPackage {
+		if err := confirmPiNpmMutation("Update Pi"); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(os.Stderr, "%sUpdating Pi...%s\n", ansiGray, ansiReset)
 		if err := migrateLegacyPiPackage(install.npmPrefix); err != nil {
 			return "", err
@@ -100,6 +129,9 @@ func ensurePiInstalled() (string, error) {
 		return "pi", nil
 	}
 	if pkgErr == nil && install.packageName == piNpmPackage {
+		if err := confirmPiNpmMutation("Reinstall Pi"); err != nil {
+			return "", err
+		}
 		fmt.Fprintf(os.Stderr, "%sInstalling Pi...%s\n", ansiGray, ansiReset)
 		if err := installPiPackageWithPrefix(install.npmPrefix); err != nil {
 			return "", err
@@ -110,12 +142,8 @@ func ensurePiInstalled() (string, error) {
 		return "pi", nil
 	}
 
-	ok, err := ConfirmPrompt("Install Pi with npm?")
-	if err != nil {
+	if err := confirmPiNpmMutation("Install Pi"); err != nil {
 		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("pi installation cancelled")
 	}
 
 	fmt.Fprintf(os.Stderr, "\nInstalling Pi...\n")

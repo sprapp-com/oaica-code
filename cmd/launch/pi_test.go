@@ -261,15 +261,18 @@ exit 0
 		t.Cleanup(func() { DefaultConfirmPrompt = oldConfirm })
 	}
 
-	// approveWebSearchConfirm answers the one prompt this integration owns —
-	// the web-search npm install/update, which it used to run unprompted
-	// (2026-09-26 audit) — and fails on any other prompt, so a launch that
-	// starts asking new questions still gets caught.
-	approveWebSearchConfirm := func(t *testing.T) {
+	// approvePiConfirm answers the prompts this integration owns and fails on
+	// any other, so a launch that starts asking new questions still gets
+	// caught. The set grew deliberately: the web-search npm install/update,
+	// and then pi's own install/migration gate — the legacy-package migration
+	// and the reinstall both used to reach npm unprompted, which is the
+	// opposite of what ENTERPRISE.md row 6 promises ("none of these
+	// installers run unprompted") (2026-09-26 audit).
+	approvePiConfirm := func(t *testing.T) {
 		t.Helper()
 		withConfirm(t, func(prompt string) (bool, error) {
 			lower := strings.ToLower(prompt)
-			if !strings.Contains(lower, "web search") && !strings.Contains(lower, "pi-web-search") {
+			if !strings.Contains(lower, "web search") && !strings.Contains(lower, "pi-web-search") && !strings.Contains(lower, "with npm") {
 				t.Fatalf("did not expect confirmation prompt, got %q", prompt)
 				return false, nil
 			}
@@ -421,7 +424,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedLegacyPiNpm(t, tmpDir)
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -479,7 +482,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedBothPiPackagesNpm(t, tmpDir)
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -572,7 +575,7 @@ exit 0
 		writeScript(t, filepath.Join(commandDir, "npm"), npmScript)
 		t.Setenv("PATH", commandDir+string(os.PathListSeparator)+filepath.Join(prefix, "bin"))
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -609,7 +612,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedLegacyPiNpm(t, tmpDir)
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		err := p.Run("ignored", nil, nil)
@@ -639,7 +642,7 @@ exit 0
 		setNpmRegistryVersion(t, "1.0.0")
 		seedPiScript(t, tmpDir)
 		seedBrokenPiProbeNpm(t, tmpDir)
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {
@@ -677,7 +680,7 @@ exit 0
 		}
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"session"}); err != nil {
@@ -741,7 +744,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"doctor"}); err != nil {
@@ -772,7 +775,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
 
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {
@@ -804,7 +807,7 @@ exit 0
 		}
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
-		approveWebSearchConfirm(t)
+		approvePiConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {

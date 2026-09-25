@@ -98,18 +98,23 @@ var credentialQueryParam = regexp.MustCompile(`(?i)^(?:api[_-]?key|key|token|acc
 
 // queryCredentialValue finds one credential-looking query parameter anywhere in
 // text and captures its value, so both the redactor and the leak scan can agree
-// on what a URL carries. The "[?&]" prefix is deliberate: a bare "?key=" inside
+// on what a URL carries. The "[?&;]" prefix is deliberate: a bare "?key=" inside
 // prose is matched only when something before it looks like a URL… which is not
-// something a regexp can decide, so callers pass single URLs.
-var queryCredentialValue = regexp.MustCompile(`(?i)[?&]([^=&#\s]+)=(\s*[^&#\s]*)`)
+// something a regexp can decide, so callers pass single URLs. ";" is included
+// because RFC 3986 lets it separate query parameters: with only "[?&]" the
+// scanner matched the FIRST parameter, consumed the rest of the query as its
+// value, and never looked at "key=…" again — so a ";"-separated credential was
+// neither hidden nor known to the leak scan ("?seed=1;api_key=sk-…", 2026-09-26
+// audit). The value class excludes ";" for the same reason.
+var queryCredentialValue = regexp.MustCompile(`(?i)[?&;]([^=&#;\s]+)=(\s*[^&#;\s]*)`)
 
 // queryCredentialValueAll is queryCredentialValue for a string that IS one URL
-// (a remote's base_url, never free prose): the value runs to the next "&" or
-// "#" even across whitespace, so a key pasted with a space in it is captured
+// (a remote's base_url, never free prose): the value runs to the next "&", ";"
+// or "#" even across whitespace, so a key pasted with a space in it is captured
 // WHOLE rather than only up to the space. The whitespace-bounded rule above is
 // for error text, where running past a space would swallow the diagnostic that
 // follows the URL; this one is only used where the string is the URL.
-var queryCredentialValueAll = regexp.MustCompile(`(?i)[?&]([^=&#\s]+)=([^&#]*)`)
+var queryCredentialValueAll = regexp.MustCompile(`(?i)[?&;]([^=&#;\s]+)=([^&#;]*)`)
 
 // querySecrets returns every credential value text's query strings carry.
 // Ordered left to right for stable error text and stable test assertions.

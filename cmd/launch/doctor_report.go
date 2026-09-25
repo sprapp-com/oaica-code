@@ -196,18 +196,25 @@ func describeFile(w io.Writer, path string, sensitive bool) {
 		fmt.Fprintf(w, "  unreadable (%v)  %s\n", err, path)
 		return
 	}
-	if fi.IsDir() {
-		fmt.Fprintf(w, "  directory         %s\n", path)
-		return
-	}
+	// The bits are printed for directories too. docs/ENTERPRISE.md's checklist
+	// item 4 sends a reviewer to `ls -la ~/.oaica/` to confirm the 0700/0600
+	// layout — and most of that layout is the DIRECTORY the credential files
+	// sit in (a 0755 ~/.oaica makes them reachable whatever their own mode
+	// says). The directory branch returned before the mode note, so the
+	// bundle could not answer the one question the layout check asks
+	// (2026-09-26 audit).
 	note := ""
 	if sensitive {
 		mode := fi.Mode().Perm()
 		note = fmt.Sprintf("  mode %04o", mode)
-		// 0o077 = any group/other bit: the file is readable beyond its owner.
+		// 0o077 = any group/other bit: the path is reachable beyond its owner.
 		if mode&0o077 != 0 {
 			note += "  <-- readable by other users"
 		}
+	}
+	if fi.IsDir() {
+		fmt.Fprintf(w, "  directory%s  %s\n", note, path)
+		return
 	}
 	fmt.Fprintf(w, "  present%s  %s\n", note, path)
 }
@@ -230,9 +237,18 @@ func buildDoctorReport() (string, bool) {
 		describeFile(&b, filepath.Join(home, ".oaica", "api_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license.json"), true)
-		describeFile(&b, filepath.Join(home, ".oaica", "config.json"), false)
+		// sensitive=true: config.json is where OAICA_HOST lives, and that
+		// value may carry a key in its userinfo (see SplitUserinfoCredential)
+		// — the same shape the file's own mode decides whether other users
+		// can read, which is exactly what the bits are printed for
+		// (2026-09-26 audit).
+		describeFile(&b, filepath.Join(home, ".oaica", "config.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "local_servers.json"), true)
-		describeFile(&b, filepath.Join(home, ".oaica", "cache"), false)
+		// sensitive=true so the directory's own bits print (see describeFile):
+		// the cache holds the picker's fetched rows, not credentials, but a
+		// world-writable cache dir is still a layout fact the 0700/0600 check
+		// asks about and the report was silent on (2026-09-26 audit).
+		describeFile(&b, filepath.Join(home, ".oaica", "cache"), true)
 	} else {
 		fmt.Fprintln(&b, "  (no home directory — cannot list configuration files)")
 	}

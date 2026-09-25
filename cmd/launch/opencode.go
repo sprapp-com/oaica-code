@@ -228,6 +228,21 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 		return nil
 	}
 
+	// The state entries must name the block that DECLARES the model, and the
+	// id it is declared under — the picker name is not that id for a user
+	// remote, and "ollama" is not the daemon's block once a remote claims the
+	// name. OpenCode.Edit used to write a hardcoded "ollama"/<picker name>,
+	// blind to buildInlineConfig's partition (2026-09-26 audit).
+	daemonID := opencodeDaemonProviderID(models)
+	pairs := make([][2]string, 0, len(models))
+	pairSet := make(map[[2]string]bool, len(models))
+	for _, m := range models {
+		pid, mid := opencodeProviderFor(m, daemonID)
+		p := [2]string{pid, mid}
+		pairs = append(pairs, p)
+		pairSet[p] = true
+	}
+
 	content, err := buildInlineConfig(models[0], models)
 	if err != nil {
 		return err
@@ -259,21 +274,31 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 		modelSet[m] = true
 	}
 
-	// Filter out existing Ollama models we're about to re-add
+	// Filter out the models we're about to re-add: the exact pairs below, plus
+	// any entry naming a daemon block (either spelling) by one of these
+	// models' picker names — the shape an earlier config wrote before the
+	// daemon id was renamed.
 	newRecent := slices.DeleteFunc(slices.Clone(recent), func(entry any) bool {
 		e, ok := entry.(map[string]any)
-		if !ok || e["providerID"] != "ollama" {
+		if !ok {
 			return false
 		}
+		pid, _ := e["providerID"].(string)
 		modelID, _ := e["modelID"].(string)
-		return modelSet[modelID]
+		if pairSet[[2]string{pid, modelID}] {
+			return true
+		}
+		if pid == "ollama" || pid == "ollama-local" {
+			return modelSet[modelID]
+		}
+		return false
 	})
 
 	// Prepend models in reverse order so first model ends up first
-	for _, model := range slices.Backward(modelList) {
+	for i := len(pairs) - 1; i >= 0; i-- {
 		newRecent = slices.Insert(newRecent, 0, any(map[string]any{
-			"providerID": "ollama",
-			"modelID":    model,
+			"providerID": pairs[i][0],
+			"modelID":    pairs[i][1],
 		}))
 	}
 
@@ -302,6 +327,31 @@ func opencodeModelID(m LaunchModel) string {
 		return ep.UpstreamModel
 	}
 	return m.Name
+}
+
+// opencodeDaemonProviderID is the provider-block id of the local daemon:
+// "ollama", renamed to "ollama-local" when a user remote claims that name —
+// see buildInlineConfig's comment on why two groups under one id must not
+// happen. The config partition and the state file both answer to it.
+func opencodeDaemonProviderID(models []LaunchModel) string {
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok && ep.Name == "ollama" {
+			return "ollama-local"
+		}
+	}
+	return "ollama"
+}
+
+// opencodeProviderFor reports which provider block declares m and the model id
+// it is declared under — the same partition buildInlineConfig writes, so the
+// state file's "<providerID>/<modelID>" entries name a block that exists and
+// declares that id (a picker name is not a model id for a user remote: the
+// remote's /v1 knows the bare upstream id).
+func opencodeProviderFor(m LaunchModel, daemonID string) (providerID, modelID string) {
+	if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+		return ep.Name, ep.UpstreamModel
+	}
+	return daemonID, m.Name
 }
 
 // buildInlineConfig produces the JSON string for OPENCODE_CONFIG_CONTENT.
@@ -333,13 +383,7 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 	// model pointed at the daemon (2026-09-26 audit). The rename applies only
 	// when such a remote is actually present, so the ordinary config stays
 	// byte-identical.
-	localID := "ollama"
-	for _, m := range models {
-		if ep, ok := resolveRemoteEndpoint(m.Name); ok && ep.Name == localID {
-			localID = "ollama-local"
-			break
-		}
-	}
+	localID := opencodeDaemonProviderID(models)
 
 	var groups []*providerGroup
 	byID := map[string]*providerGroup{}
@@ -414,7 +458,8 @@ func readModelJSONModels() []string {
 		if !ok {
 			continue
 		}
-		if e["providerID"] != "ollama" {
+		// Either spelling of the daemon block (see opencodeDaemonProviderID).
+		if pid, _ := e["providerID"].(string); pid != "ollama" && pid != "ollama-local" {
 			continue
 		}
 		if id, ok := e["modelID"].(string); ok && id != "" {

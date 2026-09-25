@@ -8,12 +8,20 @@ package launch
 // deny a request" so the actual policy can be added later without another
 // pass through the proxy's request-handling code.
 //
-// Why here, not somewhere else: this is the one place every request to a
-// self-hosted or user-remote model already passes through (POST
-// /v1/messages in RunAnthropicOpenAIProxyRoutes), after routing is resolved
-// (route, reqModel) but before the upstream call is made — so a denial
-// never spends upstream GPU time, and the check sees exactly what a real
-// entitlement decision would need: which model, which route/backend label.
+// Why here, not somewhere else: every request to a self-hosted or user-remote
+// model passes through POST /v1/messages in RunAnthropicOpenAIProxyRoutes,
+// after routing is resolved (route, reqModel) but before the upstream call is
+// made — so a denial never spends upstream GPU time, and the check sees
+// exactly what a real entitlement decision would need: which model, which
+// route/backend label. "Every" means the two call sites in that handler: the
+// OpenAI-translated path and the Anthropic-wire remote inside the
+// NativePassthrough branch. The native claude/* leg is deliberately NOT
+// gated — it is api.anthropic.com under the user's own credential, so it is
+// neither self-hosted nor user-remote, and the rule above is about the
+// requests that spend an OAICA-side or self-hosted leg. When the gate was
+// called from the translated path alone, an Anthropic-wire remote — exactly
+// the self-hosted class named here — bypassed it entirely (2026-09-26 audit:
+// a deny-all gate armed let a zai-coding-plan request reach its upstream).
 //
 // Enable/disable: entitlementCheckEnabled defaults to false. Turning it on
 // without also setting entitlementCheckFn to something real would deny

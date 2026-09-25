@@ -47,33 +47,37 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	}
 
 	entry, known := knownAuthProvider(provider)
-	if !known {
-		// Not in the catalog: only worth accepting if the name actually
-		// matches a configured remote, otherwise this is a typo that would
-		// silently write an entry nothing ever reads.
-		remotes, err := loadUserRemotes()
-		if err != nil {
-			return err
-		}
-		matched := ""
+	remotes, rerr := loadUserRemotes()
+	if rerr != nil && !known {
+		// Not in the catalog, and the remotes cannot be read either: only a
+		// configured remote can make this name resolvable.
+		return rerr
+	}
+	// A configured remote's OWN spelling wins, whether or not the catalog
+	// knows the name: the read path is a case-SENSITIVE map lookup on
+	// remote.Name (auth_store.go via storedAuthKey/user_remotes.go), so
+	// anything else is a credential nothing ever looks up. `oaica auth login
+	// MyBox` used to store "mybox" — success printed, and the very next launch
+	// still demanded a key, with no error anywhere. The catalog branch had the
+	// same hole from the other side: a remote added as "ZAI" matched catalog
+	// "zai", so the key was stored under "zai" and the remote's own lookup
+	// found nothing (2026-09-26 audit, both branches).
+	matched := ""
+	if rerr == nil {
 		for _, r := range remotes {
 			if strings.EqualFold(r.Name, provider) {
 				matched = r.Name
 				break
 			}
 		}
-		if matched == "" {
-			return fmt.Errorf("%q is not a provider oaica knows (neither in the provider catalog nor in ~/.oaica/remotes.json). Run `oaica auth list` to see the catalog, or `oaica remote add %s --base-url ...` first", provider, provider)
-		}
-		// Store under the name the remote was ADDED with. The read path is a
-		// case-SENSITIVE map lookup on remote.Name (auth_store.go via
-		// storedAuthKey/user_remotes.go), so the lowercased copy this used to
-		// write was a credential nothing ever looked up: `oaica auth login
-		// MyBox` printed success, stored "mybox", and the very next launch
-		// still demanded a key — with no error anywhere (2026-09-26 audit).
+	}
+	switch {
+	case matched != "":
 		provider = matched
-	} else {
+	case known:
 		provider = entry.Name
+	default:
+		return fmt.Errorf("%q is not a provider oaica knows (neither in the provider catalog nor in ~/.oaica/remotes.json). Run `oaica auth list` to see the catalog, or `oaica remote add %s --base-url ...` first", provider, provider)
 	}
 
 	if key == "" {

@@ -308,11 +308,24 @@ fi
 
 # Function to download, verify and extract with fallback from zst to tgz.
 # The archive is downloaded to TEMP_DIR and checked against SHA256SUMS
-# (fetch_archive) before anything is extracted into dest_dir.
+# (fetch_archive) before anything is extracted, and it is unpacked into
+# unpack_dir — a directory under TEMP_DIR, owned by the user running the
+# script. The caller then installs bin/oaica from there.
+#
+# Nothing is extracted as root any more. The Linux branch used to pass the
+# install PREFIX as the destination and unpack with `$SUDO tar -xf -C`, so the
+# archive was written straight into /usr/local as root — which is not what
+# docs/ENTERPRISE.md tells a reviewer this installer does ("extract bin/oaica
+# into a temporary directory, then install it as /usr/local/bin/oaica (mode
+# 755)"), and which leaves a half-written tree in the prefix when a download
+# is truncated mid-stream (2026-09-26 audit).
 download_and_extract() {
     local url_base="$1"
-    local dest_dir="$2"
+    local unpack_dir="$2"
     local filename="$3"
+
+    rm -rf "$unpack_dir"
+    mkdir -p "$unpack_dir"
 
     # Check if .tar.zst is available
     if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst" >/dev/null 2>&1; then
@@ -326,14 +339,14 @@ download_and_extract() {
 
         status "Downloading ${filename}.tar.zst"
         fetch_archive "$url_base" "${filename}.tar.zst" "$TEMP_DIR/${filename}.tar.zst"
-        zstd -dc "$TEMP_DIR/${filename}.tar.zst" | $SUDO tar -xf - -C "${dest_dir}"
+        zstd -dc "$TEMP_DIR/${filename}.tar.zst" | tar -xf - -C "${unpack_dir}"
         return 0
     fi
 
     # Fall back to .tgz for older versions
     status "Downloading ${filename}.tgz"
     fetch_archive "$url_base" "${filename}.tgz" "$TEMP_DIR/${filename}.tgz"
-    $SUDO tar -xzf - -C "${dest_dir}" < "$TEMP_DIR/${filename}.tgz"
+    tar -xzf "$TEMP_DIR/${filename}.tgz" -C "${unpack_dir}"
 }
 
 for BINDIR in /usr/local/bin /usr/bin /bin; do
@@ -345,17 +358,17 @@ if [ -d "$OAICA_INSTALL_DIR/lib/oaica" ] ; then
     status "Cleaning up old version at $OAICA_INSTALL_DIR/lib/oaica"
     $SUDO rm -rf "$OAICA_INSTALL_DIR/lib/oaica"
 fi
-status "Installing oaica to $OAICA_INSTALL_DIR"
+status "Installing oaica to $BINDIR/oaica"
 $SUDO install -o0 -g0 -m755 -d $BINDIR
 # No $OAICA_INSTALL_DIR/lib/oaica: upstream Ollama unpacked a server there,
 # this fork ships one binary in bin/. The cleanup directly above removes the
 # directory older versions of this installer left behind (2026-09-26 audit).
-download_and_extract "$DOWNLOAD_BASE" "$OAICA_INSTALL_DIR" "oaica-linux-${ARCH}"
-
-if [ "$OAICA_INSTALL_DIR/bin/oaica" != "$BINDIR/oaica" ] ; then
-    status "Making oaica accessible in the PATH in $BINDIR"
-    $SUDO ln -sf "$OAICA_INSTALL_DIR/bin/oaica" "$BINDIR/oaica"
+UNPACK_DIR="$TEMP_DIR/oaica-unpack"
+download_and_extract "$DOWNLOAD_BASE" "$UNPACK_DIR" "oaica-linux-${ARCH}"
+if [ ! -f "$UNPACK_DIR/bin/oaica" ]; then
+    error "the archive did not contain bin/oaica"
 fi
+$SUDO install -o0 -g0 -m755 "$UNPACK_DIR/bin/oaica" "$BINDIR/oaica"
 
 
 # OAICA is a thin CLI (talks to api.oaica.com — OAICA_FORK_PLAN.md

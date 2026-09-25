@@ -1153,9 +1153,26 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// the SAME anthReq.Model lookup every other tier uses, so opusplan
 		// mixing a native primary with a native secondary still lands each
 		// request on the right upstream model.
-		if route, _, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
+		if route, reqModel, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
+			// Set BEFORE either branch returns. A passthrough leg is answered
+			// here and never reaches the assignment below, so the header was
+			// missing on exactly the legs a silent swap is hardest to see —
+			// while the comment there promises it is "always" answered
+			// (2026-09-26 audit).
+			w.Header().Set("X-Oaica-Route", route.Label)
 			if route.Wire == "anthropic" && route.BaseURL != "" {
-				// An Anthropic-wire REMOTE (a plan row like zai-coding-plan).
+				// An Anthropic-wire REMOTE (a plan row like zai-coding-plan)
+				// is the self-hosted/user-remote class entitlement.go's rule
+				// names, so it goes through the same gate as every other
+				// remote; returning above that call meant the one class the
+				// rule promised it covers never reached it (2026-09-26
+				// audit). The native claude/* leg below stays ungated: it is
+				// api.anthropic.com under the user's own credential, neither
+				// self-hosted nor user-remote.
+				if allowed, reason := checkEntitlement(r, route.Label, reqModel); !allowed {
+					writeAnthropicError(w, http.StatusForbidden, reason)
+					return
+				}
 				// Its upstream wants the plan's own model id, not the picker
 				// string Claude Code sent ("zai-coding-plan/glm-5.3" →
 				// "glm-5.3"); everything else in the body goes through
@@ -1201,7 +1218,8 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// Always answer with the leg that will actually serve this request:
 		// our gateway logs it as routed_to for spend attribution, and it
 		// makes a silent --sonnet-model/fallback swap diagnosable from the
-		// client side.
+		// client side. A NativePassthrough leg returns before this line, so
+		// it sets the same header at its own entry (2026-09-26 audit).
 		w.Header().Set("X-Oaica-Route", route.Label)
 
 		// Off by default (see entitlement.go) — a hook point for a future

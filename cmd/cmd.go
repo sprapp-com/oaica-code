@@ -2244,14 +2244,21 @@ func NewCLI() *cobra.Command {
 
 	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
 	runCmd.Flags().Bool("verbose", false, "Show timings for response")
-	runCmd.Flags().Bool("insecure", false, "Use an insecure registry")
 	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
 	runCmd.Flags().String("format", "", "Response format (e.g. json)")
-	runCmd.Flags().String("think", "", "Enable thinking mode: true/false or high/medium/low for supported models")
+	runCmd.Flags().String("think", "", "Enable thinking mode: true/false, or high/medium/low/max for supported models")
 	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
 	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
-	runCmd.Flags().Bool("truncate", false, "For embedding models: truncate inputs exceeding context length (default: true). Set --truncate=false to error instead")
-	runCmd.Flags().Int("dimensions", 0, "Truncate output embeddings to specified dimension (embedding models only)")
+	// `run` used to carry --insecure, --truncate and --dimensions, inherited
+	// from upstream Ollama, where they feed the embedding path. This fork's
+	// run never sends an embed request (RunHandler has no embedding branch,
+	// and docs/api.md documents `truncate` as the SERVER's /api/embed
+	// parameter), so all three parsed fine and did nothing — including
+	// --insecure, whose name promises a security posture the flag never
+	// changed (2026-09-26 audit). Removed rather than silently accepted: an
+	// ollama-migrating script now fails loudly on the flag instead of
+	// believing it took effect. `push`, `pull` and `serve` keep their own
+	// --insecure, which those flows do read.
 
 	stopCmd := &cobra.Command{
 		Use:     "stop MODEL",
@@ -2577,7 +2584,7 @@ instead (see cmd/launch/model_manifest.go).`,
 	remoteAddCmd.Flags().String("api-key", "", "Bearer token, stored in remotes.json (prefer --api-key-env)")
 	remoteAddCmd.Flags().String("api-key-env", "", "Name of an environment variable holding the bearer token, read at use time")
 	remoteAddCmd.Flags().String("wire", "", "Protocol the endpoint speaks: openai (default) or anthropic")
-	remoteAddCmd.Flags().String("tool-format", "", "How the model emits tool calls: tool_calls (default for openai) or none")
+	remoteAddCmd.Flags().String("tool-format", "", "How the model emits tool calls: tool_calls, freeform, xml or none (default: tool_calls for the openai wire, xml for the anthropic wire)")
 	remoteAddCmd.Flags().String("api-version", "", "API version path segment appended to base-url (default \"v1\"; z.ai uses \"v4\")")
 	remoteShowCmd := &cobra.Command{
 		Use:   "show NAME",
