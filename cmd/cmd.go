@@ -2612,6 +2612,49 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 
 	remoteCmd.AddCommand(remoteAddCmd, remoteListCmd, remoteShowCmd, remoteRemoveCmd, remoteSyncCmd)
 
+	// provider — stored provider credentials (~/.oaica/auth.json), so a paid
+	// plan is usable without exporting an env var first. Env vars still win.
+	// Named `provider`, NOT `auth`: authCmd (below) already owns `oaica auth`
+	// for the api.oaica.com router's operator-only provider registry, which
+	// is a different thing entirely — that edits what the ROUTER serves, this
+	// holds the credential THIS machine sends.
+	providerCmd := &cobra.Command{
+		Use:   "provider",
+		Short: "Log in to model providers (~/.oaica/auth.json)",
+	}
+	providerLoginCmd := &cobra.Command{
+		Use:   "login [PROVIDER]",
+		Short: "Store an API key for a provider or plan",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key, _ := cmd.Flags().GetString("key")
+			provider := ""
+			if len(args) > 0 {
+				provider = args[0]
+			}
+			return launch.AuthLogin(os.Stdout, provider, key)
+		},
+	}
+	providerLoginCmd.Flags().String("key", "", "API key (otherwise prompted for, hidden). Visible in shell history — prefer the prompt")
+	providerListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List providers and whether they can authenticate",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.AuthList(os.Stdout)
+		},
+	}
+	providerLogoutCmd := &cobra.Command{
+		Use:     "logout PROVIDER",
+		Aliases: []string{"rm"},
+		Short:   "Remove a provider's stored credential",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return launch.AuthLogout(os.Stdout, args[0])
+		},
+	}
+	providerCmd.AddCommand(providerLoginCmd, providerListCmd, providerLogoutCmd)
+
 	// model alias — user shortcuts (~/.oaica/aliases.json), resolved first
 	// in resolveLaunchEndpoint, entirely independent of discovery/refresh —
 	// the "don't wait for anyone to fix/rename anything" escape hatch.
@@ -3126,6 +3169,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		serveAnthropicProxyCmd,
 		modelCmd,
 		remoteCmd,
+		providerCmd,
 		planCmd,
 		configCmd,
 		usageCmd,

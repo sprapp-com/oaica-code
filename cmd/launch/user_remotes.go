@@ -120,13 +120,18 @@ type userRemotesFile struct {
 	Remotes []userRemote `json:"remotes"`
 }
 
-// key resolves the bearer, preferring the environment so secrets need not be
-// written to disk.
+// key resolves the bearer: the environment first (a secret stays off disk),
+// then the `oaica provider login` store (auth_store.go), then an api_key written
+// inline in remotes.json. Every credential path ends here, so a provider
+// logged in interactively works everywhere an env var does.
 func (r userRemote) key() string {
 	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
 		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
 			return v
 		}
+	}
+	if v := storedAuthKey(r.Name); v != "" {
+		return v
 	}
 	return strings.TrimSpace(r.APIKey)
 }
@@ -176,22 +181,25 @@ func userRemotesPath() string {
 }
 
 // builtinRemotes returns remotes that oaica knows about without config,
-// active only while their credential env var is set — no key, nothing to
-// route through, no row. Sourced entirely from providerCatalog()
-// (provider_catalog.go): the embedded default (cmd/launch/providers/
-// providers.json) plus whatever `oaica provider sync` has pulled down.
-// Adding a provider, adding a new billing plan for an existing one (e.g.
-// z.ai's Coding Plan alongside its pay-per-token API), relabeling, or
-// fixing an endpoint is a providers.json change — never a change here. A
-// user-defined remote of the same name in remotes.json still wins (see
-// loadUserRemotes).
+// active while a credential exists — either the catalog row's own env var or
+// an `oaica provider login` entry. No key, nothing to route through, no row.
+// Sourced entirely from providerCatalog() (provider_catalog.go): the
+// embedded default (cmd/launch/providers/providers.json) plus whatever
+// `oaica remote sync` has pulled down. Adding a provider, adding a new
+// billing plan for an existing one (e.g. z.ai's Coding Plan alongside its
+// pay-per-token API), relabeling, or fixing an endpoint is a providers.json
+// change — never a change here. A user-defined remote of the same name in
+// remotes.json still wins (see loadUserRemotes).
 func builtinRemotes() []userRemote {
 	var out []userRemote
 	for _, p := range providerCatalogAsUserRemotes() {
-		if os.Getenv(p.APIKeyEnv) == "" {
+		if p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "" {
+			out = append(out, p)
 			continue
 		}
-		out = append(out, p)
+		if hasStoredAuth(p.Name) {
+			out = append(out, p)
+		}
 	}
 	return out
 }

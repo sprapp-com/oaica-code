@@ -23,6 +23,9 @@ import (
 //     unreachable", the same fail-open branch an offline CI box exercises)
 //     without leaving the machine.
 //   - OAICA_API_KEY → empty, so no test's output depends on a shell key.
+//   - OAICA_AUTH_FILE → a path that does not exist, so a credential stored by
+//     `oaica provider login` on the developer's box cannot make a
+//     gate-on-no-credential assertion pass for the wrong reason.
 //
 // Tests that need any of these still opt in explicitly (writeRemotes,
 // writeDescriptorRemotesFile, t.Setenv("Z_AI_API_KEY", ...), t.Setenv(
@@ -43,4 +46,5 @@ func hermeticTestEnv() {
 	}
 	os.Setenv("OAICA_HOST", "http://127.0.0.1:1")
 	os.Setenv("OAICA_API_KEY", "")
+	os.Setenv("OAICA_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-auth.json"))
 }

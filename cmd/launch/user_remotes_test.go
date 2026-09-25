@@ -61,6 +61,9 @@ func TestOpenAIBase(t *testing.T) {
 // builtinRemotes() shape isn't at the mercy of the developer's own shell.
 func clearAllCatalogKeys(t *testing.T) {
 	t.Helper()
+	// Builtins are gated on an env var OR a stored credential (auth_store.go);
+	// hermeticTestEnv points OAICA_AUTH_FILE at a nonexistent path, so this
+	// loop only has to handle the env half.
 	for _, p := range providerCatalog() {
 		if p.APIKeyEnv == "" {
 			continue // a catalog row with no credential (e.g. a reference-only entry) is never a builtin
