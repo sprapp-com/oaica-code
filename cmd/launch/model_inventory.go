@@ -366,6 +366,32 @@ func mergeLiveRows(ctx context.Context, client *api.Client, cached []LaunchModel
 			out = append(out, m)
 		}
 	}
+
+	// The ollama-cloud catalogue is file-backed, not live — but it is one of
+	// the picker cache's own fingerprint inputs (ollama_cloud.json), and a
+	// model the daemon stopped serving may still be offered there under the
+	// same name. The FULL load adds the daemon's row before the catalogue's,
+	// so the name cached for such a model was the daemon's copy: dropping it
+	// above left the row missing for up to pickerCacheTTL, invisible to the
+	// picker's own inputs and restored only by a forced load (`ollama rm
+	// gpt-oss` → the `ollama/gpt-oss` row vanished for an hour). Re-derive
+	// the catalogue rows here under the same duplicate rule the full load
+	// applies (model_inventory.go's entry loop).
+	for _, e := range ollamaCloudEntries() {
+		if e.ID == "" || seen[e.ID] {
+			continue
+		}
+		if up := ollamaCloudUpstreamFor(e.ID); up != "" && (seen[up] || seen[e.ID+":cloud"]) {
+			continue
+		}
+		seen[e.ID] = true
+		out = append(out, LaunchModel{
+			Name:       e.ID,
+			Remote:     true,
+			Upstream:   e.Upstream,
+			LiveSource: liveSourceForEntry(e.ID),
+		}.WithCloudLimits())
+	}
 	return out
 }
 
@@ -709,6 +735,42 @@ func stripOllamaPickerNames(names []string) []string {
 		names[i] = rest
 	}
 	return names
+}
+
+// launchNameForPickerName maps a picker selection to the name the launch path
+// must carry. Stripping the display prefix is right for a daemon row ("ollama/
+// gpt-oss" is a local model the daemon knows by its bare id), but NOT for an
+// ollama-cloud catalogue row: that row is named "ollama/gpt-oss" and documents
+// the daemon-side name "gpt-oss:cloud" in LaunchModel.Upstream, and sending the
+// stripped bare id asked the daemon for a LOCAL model instead — failing "not
+// pulled on the local daemon" (with a multi-GB pull offer) or silently running
+// a local model of the same name, while the cloud alias right there in the row
+// launched fine (2026-09-26 audit). Only the ROW can say which it is, so the
+// row decides; a user remote literally named "ollama" keeps its namespace.
+func launchNameForPickerName(models []LaunchModel, name string) string {
+	if _, _, isRemote := findUserRemoteForModel(name); isRemote {
+		return name
+	}
+	if row, ok := findLaunchModel(models, name); ok && row.Upstream != "" {
+		return row.Upstream
+	}
+	return stripOllamaPickerNames([]string{name})[0]
+}
+
+// launchNamesForPickerSelections applies launchNameForPickerName to a whole
+// selection, reading the inventory the picker was built from. The inventory is
+// already loaded (and cached) by the time a selection is made, so this costs
+// no probe; if it cannot be read, the lexical strip is the fallback.
+func (c *launcherClient) launchNamesForPickerSelections(ctx context.Context, names []string) []string {
+	models, err := c.modelInventory().Load(ctx)
+	if err != nil || len(models) == 0 {
+		return stripOllamaPickerNames(names)
+	}
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = launchNameForPickerName(models, name)
+	}
+	return out
 }
 
 func resolveLaunchModels(names []string, models []LaunchModel) ([]LaunchModel, bool) {

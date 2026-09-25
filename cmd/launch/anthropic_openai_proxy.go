@@ -1306,8 +1306,19 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// ("glm-5.3"), not a claude-tier alias, so it goes
 						// through unchanged and out to the remote's own
 						// /messages with the remote's key.
+						// BaseURL, not Wire, is the discriminator: the plan
+						// builds the NATIVE leg with Wire == "anthropic"
+						// too (tier_routing.go's sourceNativeAnthropic
+						// branch), so keying the rewrite on Wire skipped
+						// resolveNativeModelAlias for the one leg it
+						// exists for and forwarded "fable" to
+						// api.anthropic.com (the 2026-09-02 incident
+						// above, re-opened on the oversize crossover).
+						// A remote anthropic-wire leg is the leg WITH a
+						// BaseURL; the native passthrough is the one
+						// without.
 						realModel := over.UpstreamModel
-						if over.Wire != "anthropic" {
+						if over.BaseURL == "" {
 							realModel = resolveNativeModelAlias(over.UpstreamModel)
 						}
 						nativeBody, rerr := rewriteAnthropicRequestModel(body, realModel)

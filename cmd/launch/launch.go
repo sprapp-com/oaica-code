@@ -1310,9 +1310,11 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		if selected == "" {
 			return "", ErrCancelled
 		}
-		// "ollama/<name>" is picker display only; the daemon and every
-		// saved config know the bare id.
-		selected = stripOllamaPickerNames([]string{selected})[0]
+		// "ollama/<name>" is picker display only; the daemon and every saved
+		// config know the bare id — except for an ollama-cloud catalogue row,
+		// whose daemon-side name is its Upstream ("gpt-oss:cloud"), which the
+		// inventory row is the only thing that knows.
+		selected = c.launchNamesForPickerSelections(ctx, []string{selected})[0]
 		if isNativeModel(selected) {
 			// Native entries bypass OAICA readiness entirely — Codex's own
 			// ChatGPT login spends itself, so there is nothing to prepare.
@@ -1366,9 +1368,9 @@ func (c *launcherClient) selectMultiModelsForIntegration(ctx context.Context, na
 		if err != nil {
 			return nil, err
 		}
-		// Strip the ollama/ picker prefix before readiness/config saving —
-		// display-level only (see stripOllamaPickerNames).
-		selected = stripOllamaPickerNames(selected)
+		// Resolve the ollama/ picker prefix before readiness/config saving —
+		// display-level only (see launchNameForPickerName).
+		selected = c.launchNamesForPickerSelections(ctx, selected)
 		accepted, skipped, err := c.selectReadyModelsForSave(ctx, selected, runner.String(), name)
 		if err != nil {
 			if errors.Is(err, errUpgradeCancelled) {

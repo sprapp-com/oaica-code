@@ -173,8 +173,19 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 			Name: "native-anthropic", UpstreamModel: tier, Wire: "anthropic", ToolFormat: "tool_calls", ToolReliable: true,
 		}}, nil
 	}
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
+	// A bare "oaica-*" id is the router's own SKU: opencode zen mirrors our
+	// SKUs in its /models, so the single-owner bare-id match inside
+	// resolveRemoteEndpoint hijacked the primary leg onto zen with zen's key
+	// — 401 "Model ... is not supported" while the OAICA key sat unused.
+	// resolveSecondaryEndpoint and ResolveAgentModelWithOpts already carry
+	// this guard (see isBareRouterSKU's doc); the primary slot, the one leg
+	// every launch resolves, did not. PREFIX-only and bare-only: an explicit
+	// "<remote>/<id>" or "router/<id>" is untouched, so a remote can still
+	// name any id it likes except the reserved router prefix.
+	if !isBareRouterSKU(model) {
+		if ep, ok := resolveRemoteEndpoint(model); ok {
+			return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
+		}
 	}
 
 	base, wasLocal := oaicaStripLocalTag(model)

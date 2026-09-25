@@ -49,6 +49,8 @@ package launch
 // is asleep should cost you its own entry, not the whole menu.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -741,10 +743,22 @@ type remoteModelsCacheFile struct {
 	IDs       []string  `json:"ids,omitempty"`
 }
 
-// remoteModelsCachePath is one file per remote under ~/.oaica/cache/models/.
-// A section cache, not a bundle cache: one dead remote no longer invalidates
-// (or re-triggers) every other source's fetch.
-func remoteModelsCachePath(remoteName string) (string, error) {
+// remoteModelsCachePath is one file per remote ENDPOINT under
+// ~/.oaica/cache/models/. A section cache, not a bundle cache: one dead remote
+// no longer invalidates (or re-triggers) every other source's fetch.
+//
+// The key is the remote's NAME **and** its base_url, because base_url is the
+// only input that decides which host the sweep talks to and `oaica remote add`
+// is documented as "add or replace": keyed on the name alone, repointing a box
+// at a new host kept serving the previous host's /models rows for up to
+// remoteModelsCacheTTL, and the row resolved against the CURRENT base_url, so
+// selecting it sent the old host's model id to the new host (2026-09-26 audit).
+//
+// The readable part of the name is kept for a human poking at the cache
+// directory; the hash is what makes the key injective — the sanitizer alone is
+// lossy, so "my box" and "my_box" (both legal remote names) collided on one
+// file and each was served the other's model list.
+func remoteModelsCachePath(remoteName, baseURL string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -755,7 +769,12 @@ func remoteModelsCachePath(remoteName string) (string, error) {
 		}
 		return '_'
 	}, remoteName)
-	return filepath.Join(home, ".oaica", "cache", "models", "remote-"+safe+".json"), nil
+	if len(safe) > 40 {
+		safe = safe[:40]
+	}
+	sum := sha256.Sum256([]byte(remoteName + "\x00" + baseURL))
+	return filepath.Join(home, ".oaica", "cache", "models",
+		"remote-"+safe+"-"+hex.EncodeToString(sum[:])[:12]+".json"), nil
 }
 
 // fetchRemoteModelsCached wraps fetchRemoteModels with a per-remote disk
@@ -764,7 +783,7 @@ func remoteModelsCachePath(remoteName string) (string, error) {
 // launch), refetched otherwise. Atomic rename, best-effort — a cache write
 // failure just means the next launch re-probes.
 func fetchRemoteModelsCached(r userRemote) ([]string, error) {
-	path, err := remoteModelsCachePath(r.Name)
+	path, err := remoteModelsCachePath(r.Name, r.BaseURL)
 	if err != nil {
 		return fetchRemoteModels(r)
 	}
