@@ -646,6 +646,72 @@ func TestRun_TypedPolicyAndOversizeSurviveTheWizard(t *testing.T) {
 	}
 }
 
+// A remote's own remotes.json route_policy governs the launch, and the wizard
+// must not silently outrank it. The policy step pre-selects "auto" and any
+// Enter answers it — and the wizard's answer beats everything (the caller
+// assigns policyArg from it), so a primary on a remote declaring local-only
+// ran `auto` instead, which escalates to remote legs on accumulated failures
+// (route_policy.go's autoEscalateAfterFails) — exactly what local-only
+// forbids. The step now leads with the policy actually in effect for this
+// launch (the typed flag, else the primary's own remotes.json value), so
+// Enter keeps that rather than answering the wizard's default over it
+// (2026-09-26 audit).
+func TestRun_WizardPolicyStepKeepsTheRemotesRoutePolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, true)
+	withWizardEligibleLaunch(t)
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls","route_policy":"local-only"},
+		{"name":"zai","base_url":"http://zai:8080/v1","api_key":"k2","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	var policyLead string
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		switch {
+		case strings.Contains(title, "policy"):
+			if len(items) > 0 {
+				policyLead = items[0].Name
+				return items[0].Name, nil // the Enter key
+			}
+			return "", nil
+		case strings.Contains(title, "Sonnet"):
+			// A cross-source secondary, so the launch has fallback legs and
+			// prints the policy it is actually using.
+			return "zai/glm-4.6", nil
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	models := []LaunchModel{{Name: "box/kat-awq", Remote: true}, {Name: "zai/glm-4.6", Remote: true}}
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--wizard"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if policyLead != "local-only" {
+		t.Errorf("the primary remote's route_policy does not lead the policy step (got %q) — Enter answers the wizard's auto over it", policyLead)
+	}
+	if !strings.Contains(stderr, "route policy: local-only") {
+		t.Errorf("the launch did not run the remote's route_policy (stderr: %s)", stderr)
+	}
+}
+
 // A native primary with a native --oversize leg is the documented setup (swap
 // to your own Anthropic login's real window when the primary's overflow needs
 // it). Its banner must say that, and must NOT talk about a size comparison it

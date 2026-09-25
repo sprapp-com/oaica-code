@@ -1048,11 +1048,22 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		// made the preview and the saved plan name a tier the launch then
 		// discarded (2026-09-26 audit).
 		cfgSonnet, cfgHaiku, fromFileSonnet, fromFileHaiku := standingTierModels(sonnetModel, haikuModel)
-		// The typed --oversize/--route-policy lead their steps as "keep" rows:
-		// the flag wins either way (below), so a step defaulting anywhere else
-		// would make the wizard's closing preview name a leg this launch is
-		// not going to use.
-		w, err := runTierWizard(wizardModels, model, cfgSonnet, cfgHaiku, oversizeModel, policyArg)
+		// The --oversize/--route-policy values this launch already has lead
+		// their steps as "keep" rows: they win either way (below), so a step
+		// defaulting anywhere else would make the wizard's closing preview name
+		// a leg this launch is not going to use.
+		//
+		// For the policy that means the flag, or — with none typed — the
+		// primary's own remotes.json route_policy, which line 1215 below is
+		// what would otherwise apply. Handing the wizard only the typed flag
+		// made its pre-selected "auto" the step's default, and the step's Enter
+		// counts as an answer: a remote declaring local-only ran auto, which
+		// escalates to remote legs on accumulated failures (2026-09-26 audit).
+		policyForWizard := policyArg
+		if policyForWizard == "" {
+			policyForWizard = primaryRoutePolicy(model)
+		}
+		w, err := runTierWizard(wizardModels, model, cfgSonnet, cfgHaiku, oversizeModel, policyForWizard)
 		if err != nil {
 			return fmt.Errorf("launch wizard: %w", err)
 		}

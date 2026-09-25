@@ -717,6 +717,32 @@ func extractRoutePolicy(args []string) (string, []string) {
 	return "", args
 }
 
+// primaryRoutePolicy is the route_policy a user remote declares for the
+// primary in remotes.json, or "" when the primary is not a user remote
+// (router, daemon, ":local", native).
+//
+// It is the policy this launch would use with no --route-policy flag, because
+// tier_routing.go fills the empty flag from plan.Primary.RoutePolicy — so
+// anything that "answers" the policy on the user's behalf must lead with this
+// value rather than with a default of its own. The wizard's policy step did
+// the latter, and its Enter (which answers the step) silently turned a remote's
+// local-only into auto (2026-09-26 audit).
+//
+// Only the "<remote>/<id>" spelling is looked up: a bare id needs the
+// bareRemoteModelIndex sweep (a per-process network sweep this path must not
+// pay for a menu label), and bare ownership is ambiguous by definition —
+// resolveLaunchEndpoint refuses the ambiguous ones outright.
+func primaryRoutePolicy(model string) string {
+	if !strings.Contains(model, "/") {
+		return ""
+	}
+	r, _, ok := findUserRemoteForModel(model)
+	if !ok {
+		return ""
+	}
+	return r.RoutePolicy
+}
+
 // extractOversizeModel pulls "--oversize <model>" (or "--oversize=<model>"),
 // the larger-context leg that serves requests the current leg cannot hold
 // (the auto-compaction call near a ceiling, mostly). Same picker vocabulary

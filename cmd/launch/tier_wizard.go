@@ -514,8 +514,10 @@ func planNameItems(names []string) []SelectionItem {
 // runTierWizard runs the wizard's steps on the picker model list. models is
 // the same inventory the picker showed; primary is the already-picked model;
 // keepSonnet/keepHaiku are the standing config tiers (~/.oaica/config.json) and
-// keepOversize/keepPolicy the --oversize/--route-policy values typed on this
-// command line — each leads its step as a selectable "keep" row so Enter means
+// keepOversize/keepPolicy the values this launch already has — the typed
+// --oversize/--route-policy, and for the policy (which the caller resolves as
+// flag > the primary's own remotes.json route_policy) whatever would apply with
+// no flag at all. Each leads its step as a selectable "keep" row so Enter means
 // what it looks like it means, and each is "" when nothing is set. Navigation:
 // enter advances, esc/arrow-left steps back (re-asking the previous prompt);
 // esc on the very first step abandons the wizard and the launch continues with
