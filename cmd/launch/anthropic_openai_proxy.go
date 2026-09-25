@@ -1494,8 +1494,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	// The 200 is deliberately NOT written here. An upstream that fails before
+	// producing a single frame (a JSON error body over HTTP 200, a refused
+	// prefill) can still be reported with a real error status, which is what
+	// makes the client SDK retry instead of accepting an empty turn
+	// (2026-09-26 audit). Headers go out with the first event.
+	started := false
 
 	conv := anthropic.NewStreamConverter(anthropic.GenerateMessageID(), upstreamModel, 0)
 
@@ -1513,7 +1517,32 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	finishReason := ""
 	var finalUsage *openAIUsage
 
+	emitErr := func(msg string) {
+		// Mid-stream: the status is already 200 and bytes are already sent,
+		// so the only honest signal left is the protocol's own error event.
+		// Claude Code surfaces it and retries the turn; a silent
+		// message_stop would leave a truncated answer looking complete
+		// (2026-09-26 audit).
+		ev := anthropic.StreamErrorEvent{
+			Type:  "error",
+			Error: anthropic.Error{Type: "api_error", Message: msg},
+		}
+		data, err := json.Marshal(ev)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
 	emit := func(events []anthropic.StreamEvent) {
+		if len(events) == 0 {
+			return
+		}
+		if !started {
+			started = true
+			w.WriteHeader(http.StatusOK)
+		}
 		for _, e := range events {
 			data, err := json.Marshal(e.Data)
 			if err != nil {
@@ -1564,6 +1593,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		toolAccums = map[int]*toolAccum{}
 	}
 
+	// A stream is COMPLETE only when the upstream said so: a finish_reason on
+	// a choice, or the [DONE] sentinel. Without one of those we have no idea
+	// whether the answer we relayed was the whole answer, so the tail below
+	// reports a failure instead of a clean turn (2026-09-26 audit).
+	completed := false
+	upstreamErr := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -1571,15 +1606,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			continue
 		}
 		if !strings.HasPrefix(line, "data:") {
+			// Not every failure arrives as an SSE frame: a 200 whose body is
+			// a plain JSON error object has no "data:" prefix at all, and
+			// used to be skipped line by line until the stream "ended"
+			// cleanly with nothing in it.
+			if m := upstreamErrorMessage(line); m != "" {
+				upstreamErr = m
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			completed = true
 			break
 		}
 
 		var chunk openAIStreamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			// Some upstreams report a mid-stream failure as an SSE frame
+			// carrying an error object rather than a choice.
+			if m := upstreamErrorMessage(payload); m != "" {
+				upstreamErr = m
+			}
 			continue
 		}
 
@@ -1618,6 +1666,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
+				completed = true
 			}
 		}
 
@@ -1638,6 +1687,44 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				onUsage(chunk.Usage.PromptTokens)
 			}
 		}
+	}
+
+	// The stream did not finish. Say so, and do NOT flush tool calls: partial
+	// argument JSON accumulated from the deltas is what the non-streaming
+	// path deliberately keeps as {"_raw": ...} for a model that emits
+	// freeform arguments — but mid-stream that fallback cannot tell
+	// "freeform" from "the connection died between two argument fragments",
+	// and it emitted a COMPLETE, executable tool_use with
+	// stop_reason=tool_use either way. An agent then runs the fabricated
+	// call instead of retrying the turn (2026-09-26 audit).
+	if !completed {
+		msg := upstreamErr
+		if msg == "" {
+			if err := scanner.Err(); err != nil {
+				msg = "upstream stream failed: " + err.Error()
+			} else {
+				msg = "upstream stream ended before the response was complete"
+			}
+		}
+		if !started {
+			// Nothing has been sent yet, so the caller gets a status it can
+			// act on (and retry) rather than an empty successful message.
+			writeAnthropicError(w, http.StatusBadGateway, msg)
+			return
+		}
+		emitErr(msg)
+		return
+	}
+	if upstreamErr != "" {
+		// A completion marker arrived after an error object: the error is
+		// still the truth about the turn. Nothing was lost by preferring it
+		// over a fabricated stop_reason.
+		if !started {
+			writeAnthropicError(w, http.StatusBadGateway, upstreamErr)
+			return
+		}
+		emitErr(upstreamErr)
+		return
 	}
 
 	// Flush any pending tool calls before the done event so StreamConverter
@@ -1669,6 +1756,37 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 	}
 	emit(events)
+}
+
+// upstreamErrorMessage extracts the message from an OpenAI-shaped error
+// payload — {"error": {...}} — and returns "" when the line is not one.
+//
+// It is how a stream's failure is RECOGNISED: an upstream can report a
+// mid-stream error as an SSE frame carrying an error object instead of a
+// choice (vLLM and the fleet's own gateway do), and can answer with a JSON
+// error body over HTTP 200 with no SSE frames at all. Both used to be read as
+// "nothing to do on this line" (2026-09-26 audit).
+func upstreamErrorMessage(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{") {
+		return ""
+	}
+	var probe struct {
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(s), &probe); err != nil || probe.Error == nil {
+		return ""
+	}
+	if m := strings.TrimSpace(probe.Error.Message); m != "" {
+		return m
+	}
+	if t := strings.TrimSpace(probe.Error.Type); t != "" {
+		return "upstream reported " + t
+	}
+	return "upstream reported an error"
 }
 
 // proxyPassThrough forwards a request verbatim to the target URL, streaming
