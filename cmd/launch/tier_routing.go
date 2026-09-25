@@ -1161,20 +1161,33 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
 	}
 	if plan.Routes.Oversize.BaseURL != "" {
-		// The crossover is decided against the SERVING leg's window
-		// (oversizeSwap bails when route.ContextWindow <= 0, and the handler
-		// skips its whole clamp block for such a route), so a named threshold
-		// only exists once the primary's window is known. A native primary is
-		// never probed, so it has none: printing ">0k-token requests" reads as
-		// a bug, and promising the crossover would be false — the primary's own
-		// requests cannot trigger it. Say which legs it does cover instead of
-		// naming a threshold that does not exist.
-		if plan.PrimaryContext > 0 {
-			fmt.Fprintf(os.Stderr, "oversize: >%dk-token requests -> %s (%s)\n",
-				plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
+		// The crossover compares the oversize leg with the window of the leg
+		// that would otherwise serve, and each tier route carries its own
+		// (applyContextWindowsToRoutes) — so the primary's window is NOT "the"
+		// threshold: a small split tier crosses over far below it, and a leg no
+		// larger than the route it would replace never crosses at all
+		// (oversizeSwap requires strictly larger, and bails outright when the
+		// serving route's window is 0, as a native or unprobed remote primary's
+		// always is). Name the leg, then say so when the PRIMARY's own requests
+		// are outside its reach — rather than printing ">0k-token requests" or
+		// a number that is only right when the primary is the leg overflowing.
+		over := plan.Routes.Oversize
+		if over.ContextWindow > 0 {
+			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> %s (%s, %dk window)\n",
+				over.Label, over.UpstreamModel, over.ContextWindow/1024)
 		} else {
-			fmt.Fprintf(os.Stderr, "oversize: %s covers split tiers only — the primary's context window is unknown (a native primary is never probed), so a primary request can never trigger the crossover\n",
-				plan.Routes.Oversize.Label)
+			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> %s (%s; its own window is unprobed, and the crossover needs it)\n",
+				over.Label, over.UpstreamModel)
+		}
+		// The leg is still a breaker fallback for the primary (the route table
+		// appends it), so this warns about the crossover only, never about the
+		// leg being useless.
+		switch {
+		case plan.PrimaryContext <= 0:
+			fmt.Fprintf(os.Stderr, "oversize: the primary's own requests cannot cross over — its context window is unknown (nothing answered the probe; a native primary is never probed at all)\n")
+		case over.ContextWindow > 0 && over.ContextWindow <= plan.PrimaryContext:
+			fmt.Fprintf(os.Stderr, "oversize: the primary's own requests cannot cross over — this leg is not larger than the primary's %dk window\n",
+				plan.PrimaryContext/1024)
 		}
 	}
 

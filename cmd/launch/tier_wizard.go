@@ -12,15 +12,19 @@ package launch
 //	        recommended model" concept for cheap/background requests.
 //	Step 4  Compaction/oversize model — candidates filtered to models whose
 //	        PROBED context window (remoteContextWindowFn, the same 2s /models
-//	        probe the proxy uses) is strictly larger than the primary's;
+//	        probe the proxy uses) is at least the primary's (">=" is
+//	        deliberate: an equal-window independent backend can still take
+//	        over when the primary fails near the ceiling — only the size
+//	        crossover itself needs strictly larger);
 //	        "(none — fail honestly at the ceiling)" is the default. A small
 //	        context is never silently oversized to a model that can't hold
 //	        the request either.
-//	Step 5  Route policy — the same five values as --route-policy,
-//	        local-first the default.
+//	Step 5  Route policy — five of the six --route-policy values, "auto"
+//	        pre-selected (weighted is absent: the wizard has no step for
+//	        per-leg weights).
 //
 // After step 5 a one-line preview prints (e.g.
-// `fallback: a <-> b · oversize: c (256k) · policy: local-first`) and the
+// `fallback: a <-> b · oversize: c (256k) · policy: auto`) and the
 // choice can be saved as a named plan (`oaica plan`, tier_plan_profiles.go).
 //
 // The wizard runs ONLY for interactive, picker-driven launches: a launch
@@ -186,11 +190,13 @@ func probedModelWindow(model string) int {
 }
 
 // oversizeWindowCandidates filters the picker model list down to models whose
-// probed context window is STRICTLY larger than the primary's — the honest
-// definition of an oversize leg for the primary. resolve/probe are nil-able
-// (defaults: resolveLaunchEndpoint / remoteContextWindowFn). The primary's
-// window is returned too, for display; 0 when unknown, in which case no
-// candidate is offered (a "larger" pick would be guesswork).
+// probed context window is at least the primary's (">=" — see the ">=" note at
+// the filter itself: only the size crossover needs strictly larger, while an
+// equal-window independent backend is still usable as a failure fallback).
+// resolve/probe are nil-able (defaults: resolveLaunchEndpoint /
+// remoteContextWindowFn). The primary's window is returned too, for display; 0
+// when unknown, in which case no candidate is offered (a "larger" pick would be
+// guesswork).
 func oversizeWindowCandidates(models []string, primary string, resolve func(string) (launchEndpoint, error), probe func(proxyRoute) int) ([]string, int) {
 	if resolve == nil {
 		resolve = resolveLaunchEndpoint
@@ -527,7 +533,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 }
 
 // tierWizardPreview is the one-line summary printed before the save prompt,
-// e.g. `fallback: a <-> b · oversize: c (256k) · policy: local-first`.
+// e.g. `fallback: a <-> b · oversize: c (256k) · policy: auto`.
 func tierWizardPreview(primary string, c tierWizardChoice) string {
 	line := "fallback: " + primary
 	if c.SonnetModel != "" {
