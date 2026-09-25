@@ -33,8 +33,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/cmd/launch"
-
 	"github.com/spf13/cobra"
 )
 
@@ -165,14 +165,12 @@ func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		return err
-	}
-	// WriteFile's mode applies only when it creates the file, and this entry
-	// carries the server's --api-key. A hand-created or copied file keeps
-	// whatever mode it had — so re-assert, like the auth store, remotes.json
-	// and the api_key file already do (2026-09-26 audit).
-	return os.Chmod(path, 0o600)
+	// Atomic, not os.WriteFile (2026-09-26 audit): every `oaica serve`
+	// registers itself here and every `oaica serve --stop` unregisters, so
+	// two servers starting at once wrote through one live path. The file
+	// carries each server's --api-key, and it is read by a DIFFERENT command
+	// (`oaica pull` / the picker) than the one that writes it.
+	return fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 func oaicaUnregisterLocalServer(model string) {
@@ -191,10 +189,10 @@ func oaicaUnregisterLocalServer(model string) {
 	if err != nil {
 		return
 	}
-	if os.WriteFile(path, b, 0o600) != nil {
-		return
-	}
-	os.Chmod(path, 0o600)
+	// Best-effort (this is a teardown path), but still atomic: a partial
+	// write here would strand the OTHER running servers' entries
+	// (2026-09-26 audit).
+	_ = fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {

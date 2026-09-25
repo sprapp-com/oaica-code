@@ -43,6 +43,66 @@ func copyFile(src, dst string) error {
 	return os.WriteFile(dst, data, info.Mode().Perm())
 }
 
+// WriteFileAtomic writes data to path so that no reader ever sees a partial
+// or absent file: a UNIQUE temp file in the same directory, fsynced, then
+// renamed over the target. Use this — not os.WriteFile — for any state file a
+// different process reads (2026-09-26 audit).
+//
+// Two properties, each of which was a live bug:
+//
+//   - The rename. os.WriteFile truncates the live path (O_TRUNC), so a crash,
+//     a power loss, or a concurrent writer inside that window leaves a
+//     zero-byte or half-written file. For ~/.oaica/remotes.json that is not
+//     "unset", it is a parse error that kills the remote sweep — every user
+//     remote and any inline api_key gone, with no backup copy.
+//
+//   - The UNIQUE temp name. A fixed "<path>.tmp" is a shared write buffer:
+//     two processes open it with O_TRUNC, the first rename publishes whatever
+//     that path holds at that instant (including the other writer's
+//     half-written bytes) and the second rename fails ENOENT. Reached in
+//     practice by two terminals — `oaica plan set` while a launch wizard
+//     saves a plan, or `oaica auth login` for two providers at once.
+//
+// perm is applied to the temp before the rename AND re-asserted on the target
+// afterwards: a pre-existing looser file (observed 0664 live, plaintext key
+// inside) is replaced by a new inode, but the target is what callers stat.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Chmod(path, perm)
+}
+
 // BackupDir returns the shared backup root used before overwriting files.
 func BackupDir() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {

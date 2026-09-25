@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/cmd/launch"
 )
 
@@ -128,14 +129,12 @@ func oaicaSaveAPIKey(key string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(key+"\n"), 0o600); err != nil {
-		return err
-	}
-	// WriteFile's mode only applies when it creates the file. The usual way
-	// this file comes into being is a hand-created one (or a copy from another
-	// box), which keeps whatever mode it had — so re-assert, the same way the
-	// auth store and remotes.json already do.
-	return os.Chmod(path, 0o600)
+	// Atomic: this file IS the credential (the oaica.com API key), and it is
+	// read by every oaica invocation while `oaica auth login` may be
+	// rewriting it — an in-place O_TRUNC leaves readers an empty key
+	// (2026-09-26 audit). WriteFileAtomic also re-asserts the mode, which
+	// os.WriteFile never did for a hand-created or copied file.
+	return fileutil.WriteFileAtomic(path, []byte(key+"\n"), 0o600)
 }
 
 func oaicaClearAPIKey() error {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 	modelpkg "github.com/ollama/ollama/types/model"
 )
 
@@ -252,11 +253,10 @@ func savePickerCache(models []LaunchModel) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path) // atomic swap: a crash never leaves a half-written cache
+	// Unique temp + rename: the swap is what keeps a crash from leaving a
+	// half-written cache, and the unique name is what keeps two oaica
+	// processes from writing through ONE temp buffer (2026-09-26 audit).
+	_ = fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 func loadPickerCache() ([]LaunchModel, bool, bool) {

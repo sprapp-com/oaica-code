@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // modelPickHistoryPath lives under ~/.oaica next to plans.json/remotes.json/
@@ -57,11 +59,9 @@ func recordModelPick(name string) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	// Unique temp + rename (2026-09-26 audit) — same reason as the picker
+	// cache: one fixed temp name is a shared buffer between processes.
+	_ = fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // topFrequentModels returns up to n model names ordered by pick count

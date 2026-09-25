@@ -24,8 +24,8 @@ import (
 
 // ensureRemoteAPIKeyForModel checks whether modelName resolves to a user
 // remote with no key yet, and if so prompts for one (hidden input) and
-// persists it to ~/.oaica/remotes.json via RemoteAdd so future launches
-// don't ask again. modelName is the full picker name
+// persists it to ~/.oaica/remotes.json via savePromptedRemoteKey so future
+// launches don't ask again. modelName is the full picker name
 // ("zai-coding-plan/glm-5.3"); anything else (local models, a remote that
 // already has a key, an integration with no model argument) is a no-op.
 func ensureRemoteAPIKeyForModel(modelName string) error {
@@ -60,13 +60,7 @@ func ensureRemoteAPIKeyForModel(modelName string) error {
 		return fmt.Errorf("%s requires an API key", remote.Name)
 	}
 
-	if _, err := RemoteAdd(RemoteAddOptions{
-		Name:    remote.Name,
-		BaseURL: remote.BaseURL,
-		APIKey:  key,
-		Wire:    remote.Wire,
-		Version: remote.Version,
-	}); err != nil {
+	if err := savePromptedRemoteKey(remote.Name, key); err != nil {
 		return fmt.Errorf("saving %s API key: %w", remote.Name, err)
 	}
 	fmt.Fprintf(os.Stderr, "%sSaved %s API key to ~/.oaica/remotes.json%s\n", ansiGreen, remote.Name, ansiReset)

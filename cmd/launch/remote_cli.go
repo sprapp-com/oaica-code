@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // RemoteAddOptions is the parsed form of `oaica remote add`'s flags.
@@ -68,14 +70,14 @@ func saveUserRemotesFile(f userRemotesFile, path string) error {
 		return err
 	}
 	// 0o600: this file may hold plaintext bearer tokens (--api-key).
-	// Chmod AFTER the write too (2026-09-01 security audit M2): the mode arg
-	// only applies at creation — a pre-existing world-readable file (observed
-	// 0664 live, plaintext api_key inside) stayed readable by every local
-	// user forever.
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Chmod(path, 0o600)
+	// Through the atomic writer, NOT os.WriteFile (2026-09-26 audit): an
+	// in-place O_TRUNC write makes the truncation window visible to every
+	// other oaica process, and a crash inside it leaves a zero-byte file —
+	// which loadUserRemotes reports as a parse error, losing every remote
+	// and every inline api_key. WriteFileAtomic also re-asserts the mode on
+	// the target (2026-09-01 security audit M2: a pre-existing 0664 file
+	// with a plaintext key inside stayed world-readable forever).
+	return fileutil.WriteFileAtomic(path, append(b, '\n'), 0o600)
 }
 
 var (
@@ -135,14 +137,26 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 	replaced := false
 	for i := range f.Remotes {
 		if strings.TrimSpace(f.Remotes[i].Name) == name {
-			// Preserve fields this CLI does not expose (tool_reliable,
-			// force_tools, prices) so `remote add` on an existing entry is
-			// an edit, not a silent reset of hand-tuned settings.
+			// Preserve every field this command has NO FLAG FOR, so
+			// `remote add` on an existing entry is an edit, not a silent
+			// reset. The rule is exact: a field with a flag is whatever you
+			// passed (absent means cleared), a field without one is left
+			// alone — anything else silently destroys a setting the user
+			// cannot type back (2026-09-26 audit).
+			//
+			// route_policy, weight and auth_via had no flag at all, and each
+			// one changes routing: weight 0 drops the leg from a weighted
+			// split entirely, a lost route_policy reverts remote-only to
+			// local-first, a lost auth_via re-prompts for a credential
+			// another tool already owns.
 			existing := f.Remotes[i]
 			r.ToolReliable = existing.ToolReliable
 			r.ForceTools = existing.ForceTools
 			r.PriceInputPerM = existing.PriceInputPerM
 			r.PriceOutputPerM = existing.PriceOutputPerM
+			r.RoutePolicy = existing.RoutePolicy
+			r.Weight = existing.Weight
+			r.AuthVia = existing.AuthVia
 			f.Remotes[i] = r
 			replaced = true
 			break
@@ -155,6 +169,33 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 		return userRemote{}, err
 	}
 	return r, nil
+}
+
+// savePromptedRemoteKey stores a key the user just typed for a remote that
+// already exists, and changes NOTHING else on the entry.
+//
+// It exists instead of a RemoteAdd call because RemoteAdd cannot express
+// "this credential, keep the rest": it refuses APIKey and APIKeyEnv together
+// (mutually exclusive by design), so persisting a typed key to a row that
+// declares api_key_env necessarily DELETED the indirection and baked the
+// secret into remotes.json — in a file the user had deliberately kept the
+// secret out of, right after a prompt that had just told them to set that
+// variable instead (2026-09-26 audit). Leaving the row's other fields alone
+// is the same contract as RemoteAdd's flagless-field rule: a write that
+// knows about one field must not silently reset the other eleven.
+func savePromptedRemoteKey(name, key string) error {
+	name = strings.TrimSpace(name)
+	f, path, err := loadUserRemotesFileRaw()
+	if err != nil {
+		return err
+	}
+	for i := range f.Remotes {
+		if strings.TrimSpace(f.Remotes[i].Name) == name {
+			f.Remotes[i].APIKey = key
+			return saveUserRemotesFile(f, path)
+		}
+	}
+	return fmt.Errorf("remote %q is not in %s — cannot save its API key", name, path)
 }
 
 // RemoteRemove deletes an entry from remotes.json. Returns whether it existed.

@@ -60,6 +60,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 type userRemote struct {
@@ -634,15 +636,12 @@ func fetchRemoteModelsCached(r userRemote) ([]string, error) {
 	return ids, nil
 }
 
+// writeAtomic publishes b at path through a unique temp + rename. Callers are
+// the auth store, the remote model cache and the license file — all read by a
+// different command than the one that writes them, which is why the temp name
+// must be unique per writer rather than "<path>.tmp" (2026-09-26 audit).
 func writeAtomic(path string, b []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // remoteLaunchModels turns one remote's swept model ids into picker rows,

@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 type modelAliases struct {
@@ -82,11 +84,9 @@ func (a *modelAliases) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// Unique temp + rename (2026-09-26 audit): the aliases file is read by
+	// every launch and written by `oaica alias set`.
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // ModelAliasSet creates or replaces an alias. target is stored verbatim

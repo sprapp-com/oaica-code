@@ -38,6 +38,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // ModelEngine is which runtime a manifest entry launches through.
@@ -158,14 +160,12 @@ func loadModelManifest() (*modelManifest, error) {
 	return &m, nil
 }
 
-// save writes the manifest atomically (temp file + rename) so a crash
-// mid-write can't corrupt an existing manifest.
+// save writes the manifest atomically (unique temp file + rename) so a crash
+// mid-write can't corrupt an existing manifest — and so two processes writing
+// it do not share one temp buffer (2026-09-26 audit).
 func (m *modelManifest) save() error {
 	path, err := modelManifestPath()
 	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	if m.Version == 0 {
@@ -175,11 +175,7 @@ func (m *modelManifest) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // Get returns the entry for id and whether it was found.

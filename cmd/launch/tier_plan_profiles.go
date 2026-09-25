@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // maxPlanNameLength bounds a plan name entering plans.json (see PlanSet).
@@ -123,16 +125,11 @@ func (p *tierPlanProfiles) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// Chmod after the fact too: the 0o600 mode arg only applies at creation,
-	// and a pre-existing looser file (audit 2026-09-01) stayed world-readable.
-	return os.Chmod(path, 0o600)
+	// A unique temp + rename: two `oaica` processes both write plans.json
+	// (a launch wizard saving a plan while `oaica plan set` runs), and a
+	// fixed "<path>.tmp" let one publish the other's half-written buffer
+	// while the loser's rename failed ENOENT (2026-09-26 audit).
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // PlanSet creates or replaces a named plan.

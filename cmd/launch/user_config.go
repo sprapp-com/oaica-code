@@ -27,6 +27,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // UserConfig is the user's standing launch preference file.
@@ -104,16 +106,9 @@ func userConfigSet(mutate func(*UserConfig)) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	// Chmod after the fact too: the 0o600 mode arg only applies at creation,
-	// and a pre-existing looser file (audit 2026-09-01) stayed world-readable.
-	return os.Chmod(path, 0o600)
+	// Unique temp + rename: config.json is written by the wizard and by
+	// `oaica config set`, read by every launch (2026-09-26 audit).
+	return fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // UserConfigSonnetModel returns the standing sonnet tier ("" when unset) —
