@@ -158,6 +158,11 @@ func TestOMPRun_WebSearchPluginLifecycle(t *testing.T) {
 		t.Setenv("OLLAMA_LAUNCH_OMP_TEST_LOG", logPath)
 		setCloudStatus(t, cloudDisabled)
 		seedOMPHelperBinary(t, tmpDir)
+		// The plugin install now goes through the same consent gate every
+		// other agent installer uses (2026-09-26 audit). These cases are
+		// about the lifecycle AFTER that decision, so they answer yes — the
+		// gate itself is driven by omp_consent_gate_test.go.
+		approveOMPTestConfirm(t)
 		return logPath, &OMP{}
 	}
 

@@ -201,7 +201,7 @@ Environment variables:
 |---|---|
 | `OAICA_API_KEY` | Hosted API key (overrides the saved one) |
 | `OAICA_ADMIN_KEY` | Operator admin key — `oaica router`'s provider-registry commands require it, and `OAICA_API_KEY` will not do ("auth commands need the operator admin key"); `oaica auth` writes the local store and needs no admin key |
-| `OAICA_LICENSE_KEY` | License key for gated models |
+| `OAICA_LICENSE_KEY` | License key for gated models. Read in preference to `~/.oaica/license.json`, for a deployment that injects the key from a secret manager; `~/.oaica/license_env.json` records only a hash of it and when it was last validated |
 | `OAICA_HOST` | Override the hosted API base URL |
 | `OAICA_NO_UPDATE_CHECK` | Set to disable the update-check notice |
 | `OAICA_LLAMA_SERVER` | Path to `llama-server` if it's not on `PATH` |

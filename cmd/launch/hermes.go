@@ -114,6 +114,21 @@ func (h *HermesDesktop) ensureHermesDesktopMinVersion(bin string) error {
 	if semver.Compare(version, hermesDesktopMinVersion) >= 0 {
 		return nil
 	}
+	// `hermes update` reaches out and replaces the installed hermes — the same
+	// class of unprompted network install that ENTERPRISE.md row 6 promises
+	// does not happen ("none of these installers run unprompted"). The
+	// version floor is real and the update is usually wanted, but "usually"
+	// is not consent: ask, and on a decline say how to do it by hand instead
+	// of failing the launch (2026-09-26 audit, second round).
+	ok, cerr := ConfirmPrompt(fmt.Sprintf("Hermes %s is older than the minimum (%s) for `hermes desktop`; update now?", version, hermesDesktopMinVersion))
+	if cerr != nil {
+		return fmt.Errorf("hermes %s is older than the minimum version (%s) for `hermes desktop`, and the update prompt could not be shown (%v) — run `hermes update` yourself and retry",
+			version, hermesDesktopMinVersion, cerr)
+	}
+	if !ok {
+		return fmt.Errorf("hermes %s is older than the minimum version (%s) for `hermes desktop` — run `hermes update` yourself and retry",
+			version, hermesDesktopMinVersion)
+	}
 	fmt.Fprintf(os.Stderr, "%sHermes %s is older than the minimum version (%s) for `hermes desktop`; updating...%s\n", ansiGray, version, hermesDesktopMinVersion, ansiReset)
 	if err := hermesAttachedCommand(bin, "update").Run(); err != nil {
 		return fmt.Errorf("failed to update hermes to %s or newer: %w", hermesDesktopMinVersion, err)

@@ -30,6 +30,8 @@ package launch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -241,21 +243,23 @@ func RequireLicense(cmd *cobra.Command, args []string) error {
 }
 
 func requireLicenseLive(cmd *cobra.Command, args []string) error {
+	// OAICA_LICENSE_KEY is the documented alternative to `oaica activate` —
+	// README names it twice ("or `export OAICA_LICENSE_KEY=...`" and the
+	// env-var table's "License key for gated models") — and until 2026-09-26
+	// only `pull`/`serve` read it, so a deployment that injects the key from
+	// a secret manager instead of running an interactive activation was told
+	// to go buy a licence it already had (2026-09-26 audit).
+	//
+	// It is read FIRST, as pull/serve read it, and it wins over a stored
+	// activation: a stale ~/.oaica/license.json on the same machine used to
+	// shadow the injected key entirely, so the same variable meant two
+	// different things depending on which command you ran (2026-09-26 audit,
+	// second round).
+	if key := strings.TrimSpace(os.Getenv("OAICA_LICENSE_KEY")); key != "" {
+		return requireLicenseFromEnv(key)
+	}
 	f, err := loadLicenseFile()
 	if err != nil {
-		// No license.json on this machine. OAICA_LICENSE_KEY is the
-		// documented alternative to `oaica activate` — README names it twice
-		// ("or `export OAICA_LICENSE_KEY=...`" and the env-var table's
-		// "License key for gated models") — and until 2026-09-26 only
-		// `pull`/`serve` read it, so a deployment that injects the key from
-		// a secret manager instead of running an interactive activation was
-		// told to go buy a licence it already had (2026-09-26 audit).
-		//
-		// Nothing is written for this key: it stays the deployment's
-		// secret, not a file this process drops in the user's home.
-		if key := strings.TrimSpace(os.Getenv("OAICA_LICENSE_KEY")); key != "" {
-			return requireLicenseFromEnv(key)
-		}
 		return fmt.Errorf(
 			"oaica-code needs a one-time license — get one at %s, then run `oaica activate <key>`",
 			oaicaPurchaseURL,
@@ -298,27 +302,101 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 	)
 }
 
-// requireLicenseFromEnv is the OAICA_LICENSE_KEY path: an env-supplied key is
-// validated live on every launch (there is no stored activation to age out and
-// nothing is persisted for it), and an unreachable licence server is treated
-// the same way a stored key treats one — a warning, not a block, so injecting
-// the key does not turn a network blip into a failed launch.
+// requireLicenseFromEnv is the OAICA_LICENSE_KEY path. It has to match the
+// stored-key path on BOTH properties that path has: a cached validation
+// younger than the revalidation TTL costs no network call, and an unreachable
+// licence server is bounded by the offline grace window rather than being a
+// free pass forever.
+//
+// What it does NOT do is write the key. The anchor it persists holds a SHA-256
+// of the key and the time it was last validated, never the secret itself, so a
+// key injected from a secret manager stays in the secret manager.
 func requireLicenseFromEnv(key string) error {
 	if key == testLicenseKey {
 		return nil // dev/test key — never revalidates over the network
 	}
+
+	sum := sha256Hex(key)
+	anchor, _ := loadEnvLicenseAnchor()
+	if anchor != nil && anchor.KeySHA256 == sum && time.Since(anchor.ValidatedAt) < licenseRevalidateTTL {
+		return nil // validated recently — no network call, same as a stored key
+	}
+
 	valid, verr := validateLicenseLive(key, "")
-	if verr != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not reach the license server (%v) — running on the key from OAICA_LICENSE_KEY\n", verr)
+	if verr == nil {
+		if !valid {
+			return fmt.Errorf(
+				"license %s from OAICA_LICENSE_KEY is no longer valid (refunded or revoked) — get a new one at %s",
+				redactLicenseKey(key), oaicaPurchaseURL,
+			)
+		}
+		_ = saveEnvLicenseAnchor(envLicenseAnchor{KeySHA256: sum, ValidatedAt: time.Now()})
 		return nil
 	}
-	if !valid {
-		return fmt.Errorf(
-			"license %s from OAICA_LICENSE_KEY is no longer valid (refunded or revoked) — get a new one at %s",
-			redactLicenseKey(key), oaicaPurchaseURL,
-		)
+
+	// Unreachable server. The stored path allows this for
+	// licenseOfflineGrace only, anchored to its last successful validation —
+	// an env key with no such anchor would otherwise work forever without
+	// ever contacting the licence server, which is not "the same as a stored
+	// key", it is a different licence mode (2026-09-26 audit).
+	if anchor != nil && anchor.KeySHA256 == sum && time.Since(anchor.ValidatedAt) < licenseOfflineGrace {
+		fmt.Fprintf(os.Stderr, "warning: could not reach the license server (%v) — running on the OAICA_LICENSE_KEY activation cached %s ago, %s remaining before this must reconnect\n",
+			verr, time.Since(anchor.ValidatedAt).Round(time.Hour), (licenseOfflineGrace - time.Since(anchor.ValidatedAt)).Round(time.Hour))
+		return nil
 	}
-	return nil
+	return fmt.Errorf(
+		"the license key in OAICA_LICENSE_KEY could not be validated (%v) and no successful validation of it is on record — reconnect to the internet, or run `oaica activate <key>` once",
+		verr,
+	)
+}
+
+// envLicenseAnchor records that a key from OAICA_LICENSE_KEY was validated at
+// ValidatedAt. It stores a digest, not the key: the secret stays wherever the
+// deployment injected it from.
+type envLicenseAnchor struct {
+	KeySHA256   string    `json:"key_sha256"`
+	ValidatedAt time.Time `json:"validated_at"`
+}
+
+func envLicenseAnchorPath() (string, error) {
+	path, err := licenseFilePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(path), "license_env.json"), nil
+}
+
+func loadEnvLicenseAnchor() (*envLicenseAnchor, error) {
+	path, err := envLicenseAnchorPath()
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var a envLicenseAnchor
+	if err := json.Unmarshal(b, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func saveEnvLicenseAnchor(a envLicenseAnchor) error {
+	path, err := envLicenseAnchorPath()
+	if err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(a, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomic(path, b)
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 // redactLicenseKey shows enough of a key for the user to recognize it in

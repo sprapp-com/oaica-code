@@ -103,6 +103,25 @@ func TestDoctorReportDescribesTheOaicaDirectoryItself(t *testing.T) {
 	}
 }
 
+// The OAICA_LICENSE_KEY anchor is listed too: it decides whether an
+// env-supplied licence keeps working offline, and a deployment review that
+// cannot see it cannot answer that.
+func TestDoctorReportListsTheEnvLicenseAnchor(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+
+	anchor := filepath.Join(home, ".oaica", "license_env.json")
+	if line := reportLineContaining(buildDoctorReportString(t), anchor); line == "" {
+		t.Errorf("the report has no line for %s, so an operator cannot see whether an OAICA_LICENSE_KEY deployment has a validation on record:\n%s", anchor, buildDoctorReportString(t))
+	}
+}
+
+func buildDoctorReportString(t *testing.T) string {
+	t.Helper()
+	report, _ := buildDoctorReport()
+	return report
+}
+
 // reportLineContaining returns the first report line naming path, or "".
 func reportLineContaining(report, path string) string {
 	for _, l := range strings.Split(report, "\n") {

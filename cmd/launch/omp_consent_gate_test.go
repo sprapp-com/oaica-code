@@ -35,6 +35,15 @@ func ompStub(t *testing.T, dir string) string {
 	return logPath
 }
 
+// approveOMPTestConfirm answers the plugin gate with yes, for tests that are
+// about what happens AFTER the user agrees.
+func approveOMPTestConfirm(t *testing.T) {
+	t.Helper()
+	old := DefaultConfirmPrompt
+	DefaultConfirmPrompt = func(string, ConfirmOptions) (bool, error) { return true, nil }
+	t.Cleanup(func() { DefaultConfirmPrompt = old })
+}
+
 func TestOMPPluginInstallIsBehindAConsentGate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the omp stub is a POSIX shell script")

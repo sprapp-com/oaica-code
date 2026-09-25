@@ -242,6 +242,11 @@ func buildDoctorReport() (string, bool) {
 		describeFile(&b, filepath.Join(home, ".oaica", "api_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license.json"), true)
+		// The OAICA_LICENSE_KEY anchor: a hash and a timestamp, no key. Listed
+		// because it decides whether an env-supplied licence keeps working
+		// offline, which is a layout fact an operator reviewing a deployment
+		// wants to see (2026-09-26 audit, second round).
+		describeFile(&b, filepath.Join(home, ".oaica", "license_env.json"), true)
 		// sensitive=true: config.json is where OAICA_HOST lives, and that
 		// value may carry a key in its userinfo (see SplitUserinfoCredential)
 		// — the same shape the file's own mode decides whether other users

@@ -839,6 +839,12 @@ func TestHermesDesktopRun_UpdatesCliOlderThanMinVersion(t *testing.T) {
 	writeHermesVersionedTestBinary(t, tmpDir, "v0.15.1")
 
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {
+		// The min-version update is behind a consent gate (2026-09-26 audit);
+		// this test is about what happens once the user agrees, so it agrees.
+		// Anything else prompting here is still a bug.
+		if strings.Contains(prompt, "hermes desktop") {
+			return true, nil
+		}
 		t.Fatalf("did not expect messaging prompt during desktop launch: %s", prompt)
 		return false, nil
 	}
