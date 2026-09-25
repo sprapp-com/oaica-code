@@ -94,8 +94,13 @@ func appendRequestLog(entry requestLogEntry) {
 	if err != nil {
 		return
 	}
-	f.Write(b)
-	f.Write([]byte("\n"))
+	// ONE write for row + newline. Two Writes (f.Write(b) then f.Write("\n"))
+	// are not atomic with respect to other processes: concurrent sessions
+	// interleave their bytes and a reader sees a line that splices two rows
+	// ("…}{…"), which `oaica usage` cannot parse — it silently dropped those
+	// rows and still exited 0 (2026-09-26 audit, third round). O_APPEND makes
+	// the single Write land at the end atomically.
+	f.Write(append(b, '\n'))
 }
 
 // extractLastAndTotalMessageLen pulls the same two signals

@@ -94,19 +94,29 @@ var invalidPortFragment = regexp.MustCompile(`invalid port ":[^0-9][^"]*"`)
 // Anchored (^…$) and matched case-insensitively against the DECODED parameter
 // name, so `?api_key=`, `?API-KEY=`, `?token=` and `?access_token=` are covered
 // without a substring match turning "?monkey=" into a credential.
-var credentialQueryParam = regexp.MustCompile(`(?i)^(?:api[_-]?key|key|token|access[_-]?token|auth[_-]?token|apikey|secret|password)$`)
+//
+// "auth" is its own alternative, not just the "auth_token"/"auth-token" shapes:
+// a gateway that takes `?auth=<key>` is a real pattern, and the report printed
+// it in the clear under the old regex because the name was not on the list —
+// the leak scan could not see a value it was never told about (2026-09-26
+// audit, third round).
+var credentialQueryParam = regexp.MustCompile(`(?i)^(?:api[_-]?key|key|token|access[_-]?token|auth[_-]?token|apikey|secret|password|auth)$`)
 
 // queryCredentialValue finds one credential-looking query parameter anywhere in
 // text and captures its value, so both the redactor and the leak scan can agree
-// on what a URL carries. The "[?&;]" prefix is deliberate: a bare "?key=" inside
-// prose is matched only when something before it looks like a URL… which is not
-// something a regexp can decide, so callers pass single URLs. ";" is included
-// because RFC 3986 lets it separate query parameters: with only "[?&]" the
-// scanner matched the FIRST parameter, consumed the rest of the query as its
-// value, and never looked at "key=…" again — so a ";"-separated credential was
-// neither hidden nor known to the leak scan ("?seed=1;api_key=sk-…", 2026-09-26
-// audit). The value class excludes ";" for the same reason.
-var queryCredentialValue = regexp.MustCompile(`(?i)[?&;]([^=&#;\s]+)=(\s*[^&#;\s]*)`)
+// on what a URL carries. The "[?&;#]" prefix is deliberate: a bare "?key="
+// inside prose is matched only when something before it looks like a URL… which
+// is not something a regexp can decide, so callers pass single URLs. ";" is
+// included because RFC 3986 lets it separate query parameters: with only "[?&]"
+// the scanner matched the FIRST parameter, consumed the rest of the query as
+// its value, and never looked at "key=…" again — so a ";"-separated credential
+// was neither hidden nor known to the leak scan ("?seed=1;api_key=sk=…",
+// 2026-09-26 audit). "#" is included because a fragment is not part of the
+// request the transport sends, but it IS part of the URL string every error
+// message quotes and every report prints, so `…#api_key=sk-…` leaked into a
+// pasted ticket the same way (2026-09-26 audit, third round). The value class
+// excludes ";" and "#" for the same reason.
+var queryCredentialValue = regexp.MustCompile(`(?i)[?&;#]([^=&#;\s]+)=(\s*[^&#;\s]*)`)
 
 // queryCredentialValueAll is queryCredentialValue for a string that IS one URL
 // (a remote's base_url, never free prose): the value runs to the next "&", ";"
@@ -114,7 +124,7 @@ var queryCredentialValue = regexp.MustCompile(`(?i)[?&;]([^=&#;\s]+)=(\s*[^&#;\s
 // WHOLE rather than only up to the space. The whitespace-bounded rule above is
 // for error text, where running past a space would swallow the diagnostic that
 // follows the URL; this one is only used where the string is the URL.
-var queryCredentialValueAll = regexp.MustCompile(`(?i)[?&;]([^=&#;\s]+)=([^&#;]*)`)
+var queryCredentialValueAll = regexp.MustCompile(`(?i)[?&;#]([^=&#;\s]+)=([^&#;]*)`)
 
 // querySecrets returns every credential value text's query strings carry.
 // Ordered left to right for stable error text and stable test assertions.

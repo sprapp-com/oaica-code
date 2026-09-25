@@ -28,7 +28,14 @@ func Preview(ctx context.Context, dir string, port int) (string, error) {
 	fs := http.FileServer(http.Dir(dir))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/site/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/"+StateDir) {
+		// Resolved, not pattern-matched. The old check was
+		// strings.Contains(r.URL.Path, "/"+StateDir), which a SYMLINK walks
+		// straight past: `ln -s .oaica-site alias` then GET
+		// /site/alias/site.json served the brief and the whole plan, because
+		// that path contains no "/.oaica-site" (2026-09-26 audit, third
+		// round). The state directory must stay private however it is
+		// addressed.
+		if !servableUnder(dir, r.URL.Path) {
 			http.NotFound(w, r)
 			return
 		}
@@ -52,6 +59,41 @@ func Preview(ctx context.Context, dir string, port int) (string, error) {
 		_ = srv.Close()
 	}()
 	return base + "/", nil
+}
+
+// servableUnder reports whether the request path may be served out of root.
+// It answers by RESOLVING the path — filepath.Join cleans "..", EvalSymlinks
+// resolves every symlink in the deepest existing ancestor of the target — and
+// then requiring the resolved location to be inside root and outside root's
+// state directory.
+func servableUnder(root, urlPath string) bool {
+	rel := strings.TrimPrefix(urlPath, "/site/")
+	full := filepath.Join(root, filepath.FromSlash(rel))
+
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = root
+	}
+	// Walk up to the deepest ancestor that exists (the target itself may not,
+	// which is a 404 for the file server to answer, not a path to guess at).
+	probe := full
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			tail := strings.TrimPrefix(strings.TrimPrefix(full, probe), string(filepath.Separator))
+			target := filepath.Join(resolved, tail)
+			r, rerr := filepath.Rel(realRoot, target)
+			if rerr != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				return false
+			}
+			return r != StateDir && !strings.HasPrefix(r, StateDir+string(filepath.Separator))
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return false
+		}
+		probe = parent
+	}
 }
 
 func previewPage(name string) string {

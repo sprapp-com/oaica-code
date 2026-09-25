@@ -705,6 +705,15 @@ func (route proxyRoute) anthropicRemoteModelsTarget() (upstream, headerName, hea
 	if !ok {
 		return "", "", "", false
 	}
+	// A row that declares models_path serves its list there, not at the
+	// sibling of its messages path — the same rule the translated branch below
+	// follows, and the rule doctor and the context-window probe already
+	// resolve through (2026-09-26 audit, third round: this branch was missed
+	// when the translated one was fixed). No shipped row is affected today —
+	// the one models_path row is wire "openai" — so this is the latent half.
+	if route.ModelsURL != "" {
+		return route.ModelsURL, headerName, headerValue, true
+	}
 	return strings.TrimSuffix(upstream, "/messages") + "/models", headerName, headerValue, true
 }
 
@@ -1104,21 +1113,34 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// leg must not still get its credential-backed inventory (2026-09-26
 		// audit, second round). Empty reqModel: no single model is being asked
 		// for, only the catalogue.
-		if allowed, reason := checkEntitlement(r, table.Default.Label, ""); !allowed {
-			writeAnthropicError(w, http.StatusForbidden, reason)
-			return
-		}
+		//
+		// The gate sits on the branches that serve a LEG THIS GATE GOVERNS, and
+		// deliberately not on api.anthropic.com: entitlement.go's contract —
+		// restated in entitlement_passthrough_test.go — is that the native
+		// claude/* path is not gated, because it is the user's own credential
+		// against Anthropic's own API rather than a self-hosted or user-remote
+		// backend. A gate placed above this branch judged the native leg while
+		// POST /v1/messages on the same leg stayed open: denied catalogue, then
+		// served completions (2026-09-26 audit, third round).
 		if table.Default.NativePassthrough {
 			if upstream, headerName, headerValue, ok := table.Default.anthropicRemoteModelsTarget(); ok {
-				// Anthropic-wire remote: its own /v1/models, authenticated the
-				// way the vendor expects (x-api-key, or the native credential
-				// for api.anthropic.com itself). A 404 here is harmless —
-				// context_window_remote.go falls back to the catalog's
-				// declared window.
+				// Anthropic-wire REMOTE (a plan row): a user-remote leg, so it
+				// is gated exactly as its /v1/messages is. Its own /v1/models,
+				// authenticated the way the vendor expects (x-api-key). A 404
+				// here is harmless — context_window_remote.go falls back to the
+				// catalog's declared window.
+				if allowed, reason := checkEntitlement(r, table.Default.Label, ""); !allowed {
+					writeAnthropicError(w, http.StatusForbidden, reason)
+					return
+				}
 				anthropicModelsPassthrough(w, r, upstream, headerName, headerValue)
 				return
 			}
 			nativeAnthropicModelsPassthrough(w, r)
+			return
+		}
+		if allowed, reason := checkEntitlement(r, table.Default.Label, ""); !allowed {
+			writeAnthropicError(w, http.StatusForbidden, reason)
 			return
 		}
 		// ModelsURL when the row declares one: a per-surface-version remote
@@ -1208,11 +1230,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
 					return
 				}
-				feedPassthroughRouteHealth(table, route, table.SessionID,
+				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
 					anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID))
 				return
 			}
-			feedPassthroughRouteHealth(table, route, table.SessionID,
+			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
 				nativeAnthropicPassthrough(w, r, body, table.SessionID))
 			return
 		}
@@ -1383,11 +1405,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 								writeAnthropicError(w, http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
 								return
 							}
-							feedPassthroughRouteHealth(table, over, table.SessionID,
+							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 								anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID))
 							return
 						}
-						feedPassthroughRouteHealth(table, over, table.SessionID,
+						feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 							nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID))
 						return
 					}
@@ -2164,10 +2186,31 @@ func rewriteAnthropicRequestModel(body []byte, newModel string) ([]byte, error) 
 // Streaming responses are relayed as they arrive (Flush after every write)
 // rather than buffered — Claude Code's own SSE parsing depends on timely
 // chunk delivery, not just eventual byte-for-byte correctness.
-// nativeAnthropicBreakerKey is the breaker identity for a native claude/* leg,
-// whose BaseURL is deliberately empty so every other route's keying (on
-// BaseURL) would collide on "".
-const nativeAnthropicBreakerKey = "native-anthropic"
+// passthroughBreakerKey is the breaker identity a passthrough leg must be
+// filed under: the SAME string selectRoute and oversizeSwap read, or the feed
+// writes to a key nobody consults and the leg reads healthy forever.
+//
+// An ordinary leg's identity is route.BaseURL — including a native claude/*
+// leg, whose BaseURL is empty. The round-7 fix filed native legs under a
+// constant "native-anthropic" instead, which nothing read (consumers call
+// breakers.open(route.BaseURL)), so a native primary still served every
+// failing turn with a healthy fallback configured: the exact defect the fix
+// claimed to close, left open on the first leg it named (2026-09-26 audit,
+// third round).
+//
+// The native OVERSIZE leg is the one exception, and it is route_policy.go's
+// rule, not a new one: a native oversize leg has no BaseURL either, so filing
+// it under "" would make it share the primary's circuit — keyed on
+// nativeOversizeBreakerKey, which is what oversizeSwap checks.
+func passthroughBreakerKey(route proxyRoute, oversize bool) string {
+	if route.BaseURL != "" {
+		return route.BaseURL
+	}
+	if oversize {
+		return nativeOversizeBreakerKey
+	}
+	return "" // the native claude/* primary: consumers key on BaseURL, which is empty for it
+}
 
 // feedPassthroughRouteHealth feeds the circuit breaker and the `auto` policy's
 // per-session escalation from a passthrough leg's upstream status — the same
@@ -2178,22 +2221,23 @@ const nativeAnthropicBreakerKey = "native-anthropic"
 // … when the selected leg's breaker is OPEN → fail over") was false for every
 // native and Anthropic-wire leg (2026-09-26 audit).
 //
+// breakerKey comes from passthroughBreakerKey — the caller passes it because
+// only the caller knows whether the leg it served is the ordinary one or the
+// oversize crossover. Escalation is keyed on route.BaseURL, which is the leg
+// selectRoute noted the session on.
+//
 // status is the upstream status the leg relayed, 0 when it never answered.
 // The classification deliberately matches the translated path's: 5xx-class and
 // transport failures count against the leg, sub-300 proves recovery, and 4xx /
 // 429 are the leg WORKING (bad request, shedding) and must not open it.
-func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID string, status int) {
-	key := route.BaseURL
-	if key == "" {
-		key = nativeAnthropicBreakerKey // a native leg has no BaseURL to key on
-	}
+func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int) {
 	switch {
 	case status == 0 || status >= 500:
-		table.breakers.recordFail(key)
-		table.escalations.recordFail(sessionID, key)
+		table.breakers.recordFail(breakerKey)
+		table.escalations.recordFail(sessionID, route.BaseURL)
 	case status < 300:
-		table.breakers.recordOK(key)
-		table.escalations.recordOK(sessionID, key)
+		table.breakers.recordOK(breakerKey)
+		table.escalations.recordOK(sessionID, route.BaseURL)
 	}
 }
 

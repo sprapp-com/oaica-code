@@ -467,6 +467,24 @@ func Assemble(s *Site) string {
 
 // ---------- persistence ----------
 
+// fragmentFileName is the file a section fragment is stored under, refusing
+// any id that is not a bare slug.
+//
+// Section ids reach this package from two places it does not control: the
+// planner model's JSON, and site.json as it exists on disk (hand-edited,
+// restored from a backup, or written by an older version). Both were fed
+// straight into filepath.Join(st, sectionsDir, id+".html"), so an id of
+// "../../../.config/…" wrote — and Load read — outside the site directory
+// (2026-09-26 audit, third round). slugify is the normalizer the PLAN path
+// already ran ids through; this applies the same rule where the id is about to
+// become a path component.
+func fragmentFileName(id string) (string, error) {
+	if id != slugify(id) {
+		return "", fmt.Errorf("section id %q is not a plain slug (expected e.g. \"hero\" or \"how-it-works\")", id)
+	}
+	return id + ".html", nil
+}
+
 // Save writes state and the assembled index.html into dir.
 func (s *Site) Save(dir string) error {
 	st := filepath.Join(dir, StateDir)
@@ -481,7 +499,11 @@ func (s *Site) Save(dir string) error {
 		}
 	}
 	for id, frag := range s.Fragments {
-		if err := os.WriteFile(filepath.Join(st, sectionsDir, id+".html"), []byte(frag), 0o644); err != nil {
+		name, err := fragmentFileName(id)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(st, sectionsDir, name), []byte(frag), 0o644); err != nil {
 			return err
 		}
 	}
@@ -509,9 +531,20 @@ func Load(dir string) (*Site, error) {
 	if err := json.Unmarshal(meta, &s); err != nil {
 		return nil, fmt.Errorf("corrupt %s: %w", siteFile, err)
 	}
+	// site.json is on-disk state, not model output: the ids below are about to
+	// become path components, and a hand-edited or restored file is exactly
+	// where an id of "../.." would come from. normalizeSpec is the same rule
+	// the plan path applies (and is idempotent for ids it already wrote).
+	if err := normalizeSpec(&s.Spec); err != nil {
+		return nil, fmt.Errorf("corrupt %s: %w", siteFile, err)
+	}
 	s.Fragments = map[string]string{}
 	for _, sec := range s.Spec.Sections {
-		b, err := os.ReadFile(filepath.Join(st, sectionsDir, sec.ID+".html"))
+		name, err := fragmentFileName(sec.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", siteFile, err)
+		}
+		b, err := os.ReadFile(filepath.Join(st, sectionsDir, name))
 		if err == nil {
 			s.Fragments[sec.ID] = string(b)
 		}
@@ -521,6 +554,20 @@ func Load(dir string) (*Site, error) {
 
 // Export copies the publishable files (everything except StateDir) into dst.
 // Deploy uses this so the prompt/spec never leave the machine.
+//
+// What counts as publishable is a whitelist-shaped decision, not "everything
+// else": dst is uploaded to a public host. Three classes of file are skipped
+// (2026-09-26 audit, third round):
+//
+//   - the state directory itself (the brief, the plan, the model's raw output);
+//   - dotfiles and dot-directories, which is where credentials live in every
+//     convention that matters here (.env, .dev.vars, .wrangler/, .npmrc,
+//     .netrc, .git/). `.well-known` is the one exception — it is published
+//     content by definition;
+//   - anything whose name marks it as a key or secret, regardless of
+//     directory (a pem, an id_rsa, a secrets.json);
+//   - symlinks, because following one can copy a file from outside the site
+//     (a link to ~/.ssh/id_rsa was uploaded under a harmless-looking name).
 func Export(dir, dst string) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -531,10 +578,13 @@ func Export(dir, dst string) error {
 			return os.MkdirAll(dst, 0o755)
 		}
 		if d.IsDir() {
-			if d.Name() == StateDir || d.Name() == ".git" || d.Name() == "node_modules" {
+			if d.Name() == StateDir || d.Name() == ".git" || d.Name() == "node_modules" || isPrivateName(d.Name()) {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
+		}
+		if d.Type()&os.ModeSymlink != 0 || isPrivateName(d.Name()) {
+			return nil
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -542,6 +592,22 @@ func Export(dir, dst string) error {
 		}
 		return os.WriteFile(filepath.Join(dst, rel), b, 0o644)
 	})
+}
+
+// privateFileRe matches names that are a credential or a private key whatever
+// directory they sit in.
+var privateFileRe = regexp.MustCompile(`(?i)^(\.env.*|\.dev\.vars.*|\.?npmrc|\.?netrc|\.git-credentials|secrets?\.json|credentials(\.json)?|.*\.(pem|key|p12|pfx|jks)|id_(rsa|dsa|ecdsa|ed25519))$`)
+
+// isPrivateName reports whether a file or directory name must never be
+// uploaded to a public host.
+func isPrivateName(name string) bool {
+	if name == ".well-known" {
+		return false // published content by definition, despite the leading dot
+	}
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	return privateFileRe.MatchString(name)
 }
 
 // SortedIDs is a stable listing helper for the CLI.

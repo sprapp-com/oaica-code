@@ -41,18 +41,27 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 		return CloudLimitsSyncReport{URL: display}, err
 	}
 
-	var etag string
-	if b, rerr := os.ReadFile(cachePath + ".etag"); rerr == nil {
-		etag = strings.TrimSpace(string(b))
-	}
+	etag := loadCatalogETag(cachePath+".etag", display, defaultCloudLimitsSyncURL)
 
 	body, newEtag, fromCache, err := fetchCloudLimitsBody(url, etag, cachePath)
 	if err != nil {
 		return CloudLimitsSyncReport{URL: display}, err
 	}
 
+	// The body is parsed BEFORE it is written, and a body that does not parse
+	// is never written. The old code discarded this error and cached whatever
+	// it received, so one bad response replaced the last good copy with
+	// something cloudLimitsFromCatalog() cannot read — and that cache wins
+	// over the embedded default, so every alias's limits silently fell back to
+	// the built-in context size (`262144` → 1) until someone synced again
+	// (2026-09-26 audit, third round).
 	var f cloudLimitsCatalogFile
-	_ = json.Unmarshal(body, &f)
+	if err := json.Unmarshal(body, &f); err != nil {
+		if fromCache {
+			return CloudLimitsSyncReport{URL: display}, fmt.Errorf("the cached cloud-limits catalog at %s is not readable as one (%v) — remove that file and run this again while online", cachePath, err)
+		}
+		return CloudLimitsSyncReport{URL: display}, fmt.Errorf("%s returned a body that is not a cloud-limits catalog (%v) — the cached copy was left untouched", display, err)
+	}
 
 	if !fromCache {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
@@ -61,9 +70,7 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
 			return CloudLimitsSyncReport{URL: display}, err
 		}
-		if newEtag != "" {
-			_ = os.WriteFile(cachePath+".etag", []byte(newEtag), 0o600)
-		}
+		saveCatalogETag(cachePath+".etag", display, newEtag)
 	}
 
 	return CloudLimitsSyncReport{URL: display, Count: len(f.Limits), FromCache: fromCache}, nil

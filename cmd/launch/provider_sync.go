@@ -45,17 +45,25 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 		return ProviderSyncReport{URL: display}, err
 	}
 
-	var etag string
-	if b, rerr := os.ReadFile(cachePath + ".etag"); rerr == nil {
-		etag = strings.TrimSpace(string(b))
-	}
+	etag := loadCatalogETag(cachePath+".etag", display, defaultProviderSyncURL)
 
 	body, newEtag, fromCache, err := fetchProviderCatalogBody(url, etag)
 	if err != nil {
 		return ProviderSyncReport{URL: display}, err
 	}
 
-	f := parseProviderCatalogFile(body)
+	// Parsed before it is written, and a body that does not parse is never
+	// written: the synced cache overrides the embedded default, so caching one
+	// bad response (a captive-portal login page, a truncated transfer, a
+	// proxy's HTML error) emptied the provider catalogue for every later run
+	// with the count reported as 0 (2026-09-26 audit, third round).
+	f, ferr := parseProviderCatalogFileChecked(body)
+	if ferr != nil {
+		if fromCache {
+			return ProviderSyncReport{URL: display}, fmt.Errorf("the cached provider catalog at %s is not readable as one (%v) — remove that file and run this again while online", cachePath, ferr)
+		}
+		return ProviderSyncReport{URL: display}, fmt.Errorf("%s returned a body that is not a provider catalog (%v) — the cached copy was left untouched", display, ferr)
+	}
 	if !fromCache {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 			return ProviderSyncReport{URL: display}, err
@@ -63,9 +71,7 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
 			return ProviderSyncReport{URL: display}, err
 		}
-		if newEtag != "" {
-			_ = os.WriteFile(cachePath+".etag", []byte(newEtag), 0o600)
-		}
+		saveCatalogETag(cachePath+".etag", display, newEtag)
 	}
 
 	return ProviderSyncReport{URL: display, Count: len(f.Providers), FromCache: fromCache}, nil
@@ -126,7 +132,16 @@ func fetchProviderCatalogBody(url, etag string) (body []byte, newEtag string, fr
 }
 
 func parseProviderCatalogFile(b []byte) providerCatalogFile {
-	var f providerCatalogFile
-	_ = json.Unmarshal(b, &f)
+	f, _ := parseProviderCatalogFileChecked(b)
 	return f
+}
+
+// parseProviderCatalogFileChecked is parseProviderCatalogFile for the sync
+// path, which must not cache a body it could not read.
+func parseProviderCatalogFileChecked(b []byte) (providerCatalogFile, error) {
+	var f providerCatalogFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return providerCatalogFile{}, err
+	}
+	return f, nil
 }

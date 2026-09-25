@@ -2994,18 +2994,25 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				filter.Since = time.Now().Add(-d)
 			}
 
-			rows, err := launch.LoadUsageStats(filter)
+			rows, unreadable, err := launch.LoadUsageStatsCountingUnreadable(filter)
 			if err != nil {
 				return err
 			}
 			if asJSON {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
+				// LoadUsageStats never returns a nil slice, so an empty
+				// report encodes as [] rather than null — a consumer that
+				// iterates the documented row list broke on null
+				// (2026-09-26 audit, third round).
 				return enc.Encode(rows)
 			}
 			if len(rows) == 0 {
 				path, _ := launch.RequestLogPath()
 				fmt.Printf("No launch traffic logged yet (%s).\n", path)
+				if unreadable > 0 {
+					fmt.Printf("(%d unreadable line(s) were skipped — the log has corrupt or over-long entries.)\n", unreadable)
+				}
 				return nil
 			}
 			var totalReqs, totalErrs int
@@ -3018,6 +3025,12 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				totalChars += r.CharsSum
 			}
 			fmt.Printf("\ntotal requests: %d  errors: %d  chars: %d\n", totalReqs, totalErrs, totalChars)
+			// A dropped row must not be silent: this report is read as
+			// authoritative over an append-only log nothing rotates
+			// (2026-09-26 audit, third round).
+			if unreadable > 0 {
+				fmt.Printf("warning: %d log line(s) could not be read and are NOT counted above (over-long or corrupt entries).\n", unreadable)
+			}
 			fmt.Println("(request counts and message char-length only — no token counts locally; real token/$ cost lives on the gateway's usage ledger)")
 			return nil
 		},

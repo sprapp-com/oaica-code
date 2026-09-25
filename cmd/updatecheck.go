@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -51,13 +52,28 @@ func updateCheckURLForTest(url string) func() {
 // recent than this is skipped entirely (not even a network attempt).
 const updateCheckInterval = 20 * time.Hour
 
+// updateCheckRetryInterval is how long a FAILED attempt is remembered before
+// trying again. Shorter than updateCheckInterval because a failure says
+// nothing about the release — but not zero, because this runs before every
+// command and an offline machine would otherwise wait out updateCheckTimeout
+// on each one.
+const updateCheckRetryInterval = 30 * time.Minute
+
 // updateCheckTimeout bounds the network call itself. This runs before the
 // user's actual command; a slow or unreachable oaica.com must not add
 // perceptible delay to every invocation.
 const updateCheckTimeout = 1500 * time.Millisecond
 
 type updateCheckCache struct {
-	LastChecked   time.Time `json:"last_checked"`
+	// LastChecked is the last SUCCESSFUL check — the timestamp the freshness
+	// of LatestVersion rests on. A failed attempt does not move it, so one
+	// timeout (a hotel wifi, a 404, a captive portal) no longer silences the
+	// notice for the whole interval (2026-09-26 audit, third round).
+	LastChecked time.Time `json:"last_checked"`
+	// LastAttempt is the last attempt of any kind, success or failure. It
+	// backs off retries after a failure so a machine that is offline does not
+	// pay updateCheckTimeout on every single invocation.
+	LastAttempt   time.Time `json:"last_attempt,omitempty"`
 	LatestVersion string    `json:"latest_version"`
 	// Notified guards against printing the SAME available version on every
 	// single invocation for 20 hours straight -- once the user has seen it,
@@ -127,9 +143,16 @@ func fetchLatestVersion(ctx context.Context) string {
 	if resp.StatusCode != http.StatusOK {
 		return ""
 	}
-	var buf [256]byte
-	n, _ := resp.Body.Read(buf[:])
-	for _, line := range strings.Split(string(buf[:n]), "\n") {
+	// ReadAll, not one 256-byte Read. A single Read may return fewer bytes
+	// than the file holds — as few as one — so a body of
+	// "version=0.5.47\ncommit=…" could come back as "vers", parse to nothing,
+	// and be treated as a failed check. Bounded anyway: this is a version
+	// stamp, not a payload (2026-09-26 audit, third round).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(body), "\n") {
 		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "version="); ok {
 			return v
 		}
@@ -175,14 +198,24 @@ func checkForUpdate() {
 	cache := loadUpdateCheckCache()
 	latest := cache.LatestVersion
 	if time.Since(cache.LastChecked) >= updateCheckInterval {
-		ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
-		defer cancel()
-		if v := fetchLatestVersion(ctx); v != "" {
-			latest = v
+		// A previous ATTEMPT that failed backs off for a shorter interval
+		// rather than stamping LastChecked. The old code stamped it on every
+		// attempt, so one failed check silenced the notice for 20 hours — the
+		// exact failure the notice exists to prevent (2026-09-26 audit, third
+		// round).
+		recentFailure := cache.LastAttempt.After(cache.LastChecked) &&
+			time.Since(cache.LastAttempt) < updateCheckRetryInterval
+		if !recentFailure {
+			ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+			v := fetchLatestVersion(ctx)
+			cancel()
+			cache.LastAttempt = time.Now()
+			if v != "" {
+				cache.LatestVersion = v
+				cache.LastChecked = time.Now()
+			}
+			saveUpdateCheckCache(cache)
 		}
-		cache.LatestVersion = latest
-		cache.LastChecked = time.Now()
-		saveUpdateCheckCache(cache)
 	}
 	if latest == "" || !semverLess(version.Version, latest) {
 		return

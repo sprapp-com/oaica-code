@@ -98,6 +98,20 @@ func oaicaLicenseKeyPath() (string, error) {
 	return filepath.Join(dir, "license_key"), nil
 }
 
+// oaicaLicenseKey returns the weights-distribution licence key: OAICA_LICENSE_KEY
+// first, then the file this host saved. Same precedence as launch's
+// requireLicenseLive, so one machine cannot be running two different keys.
+//
+// This value is NOT validated here, deliberately, and that is not a gap the
+// audit's sibling finding (R7) should close: the entitlement decision for
+// these bytes belongs to the router, which both checks the key and hands back
+// the manifest's decrypt_key only after that check passes (see
+// oaicaFetchManifest). A client-side "is this key valid" test would either
+// duplicate the server's answer or, worse, be the thing that decides — a
+// licence check the client can be talked out of is not one. launch's stricter
+// env-anchor rule exists because that path must decide LOCALLY whether to
+// start a session; here the server decides and a bad key fails visibly with
+// license_required / license_invalid.
 func oaicaLicenseKey() string {
 	if k := strings.TrimSpace(os.Getenv("OAICA_LICENSE_KEY")); k != "" {
 		return k

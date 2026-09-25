@@ -106,7 +106,11 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(cache, []byte(`{"limits":[{"model":"x","context":1,"output":1}]}`), 0o600); err != nil {
+		// The real catalog shape: limits is a MAP keyed by alias, not a list.
+		// The old fixture was an array, which the sync used to cache anyway
+		// because it discarded the parse error (2026-09-26 audit, third round
+		// made the sync refuse an unreadable body, which is what exposed it).
+		if err := os.WriteFile(cache, []byte(`{"version":1,"limits":{"x":{"context":1,"output":1}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
