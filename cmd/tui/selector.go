@@ -208,13 +208,10 @@ func selectorModelWithCurrent(title string, items []SelectItem, current string) 
 		title:  title,
 		items:  items,
 		cursor: cursorForCurrent(items, current),
-		// Ranked filtering (exact > prefix > substring > description) is on
-		// for every selector, not just the chat modal. With OpenRouter's
-		// ~400 models in the launch picker, plain substring order is list
-		// order: typing "deepseek" surfaced "openrouter/deepseek/deepseek-
-		// chat-v2.5" above "deepseek/deepseek-chat" purely by position.
-		// Ranking puts the closest name first, which is what type-to-filter
-		// is for.
+		// Filtered views match on the name (or description) and display the
+		// matches ALPHABETICALLY — see sortSelectItemsForFilter for why the
+		// match-quality ranking this replaced was dropped (2026-09-25). On for
+		// every selector, not just the chat modal.
 		rankFiltered: true,
 	}
 	m.updateScroll(m.otherStart())
@@ -281,7 +278,7 @@ func (m selectorModel) filteredItems() []SelectItem {
 	var result []SelectItem
 	for _, item := range m.items {
 		if m.rankFiltered {
-			if selectItemMatchScore(item, filterLower).ok {
+			if selectItemMatches(item, filterLower) {
 				result = append(result, item)
 			}
 			continue
@@ -291,7 +288,7 @@ func (m selectorModel) filteredItems() []SelectItem {
 		}
 	}
 	if m.rankFiltered {
-		sortSelectItemsForFilter(result, filterLower)
+		sortSelectItemsForFilter(result)
 	}
 	return result
 }
@@ -865,97 +862,44 @@ func (m selectorModel) View() string {
 	return s
 }
 
-type selectItemScore struct {
-	ok          bool
-	rank        int
-	index       int
-	lengthDelta int
-	recommended int
-	name        string
-}
-
-func sortSelectItemsForFilter(items []SelectItem, filter string) {
-	filter = strings.ToLower(strings.TrimSpace(filter))
+// sortSelectItemsForFilter orders the filtered rows ALPHABETICALLY by name
+// (case-insensitive).
+//
+// It used to rank by match quality — exact, then prefix, then how early in the
+// name the query appeared, then by name length — so the closest name floated up
+// while everything else came out in whatever order the providers happened to be
+// listed. Typing "glm-5.3" put "zai/glm-5.3-flashx" ABOVE "ollama/glm-5.3"
+// (match at index 4 beat index 7), which reads as arbitrary: the user cannot
+// predict where a row will be, and a row's position changes when an unrelated
+// provider is added. Alphabetical makes the list scannable and the position
+// stable (2026-09-25).
+//
+// Match quality still decides what is IN the list (selectItemMatches), it just
+// no longer decides the order. The cost, accepted deliberately: an exact match
+// can now sit mid-list, and Enter takes the cursor row — the first row
+// alphabetically.
+func sortSelectItemsForFilter(items []SelectItem) {
 	sort.SliceStable(items, func(i, j int) bool {
-		return compareSelectItemsForFilter(items[i], items[j], filter) < 0
+		a := strings.ToLower(strings.TrimSpace(items[i].Name))
+		b := strings.ToLower(strings.TrimSpace(items[j].Name))
+		if a != b {
+			return a < b
+		}
+		// Equal names (the same id reached through two providers, or the
+		// router's own aliases): fall back to the description so the order is
+		// deterministic instead of insertion-dependent.
+		return items[i].Description < items[j].Description
 	})
 }
 
-func compareSelectItemsForFilter(a, b SelectItem, filter string) int {
-	aScore := selectItemMatchScore(a, filter)
-	bScore := selectItemMatchScore(b, filter)
-	for _, cmp := range []int{
-		compareSelectorInt(aScore.rank, bScore.rank),
-		compareSelectorInt(aScore.index, bScore.index),
-		compareSelectorInt(aScore.lengthDelta, bScore.lengthDelta),
-		compareSelectorInt(aScore.recommended, bScore.recommended),
-		strings.Compare(aScore.name, bScore.name),
-	} {
-		if cmp != 0 {
-			return cmp
-		}
+// selectItemMatches reports whether a row belongs in the filtered view: the
+// query is a substring of its name, or — as a fallback — of its description,
+// so a provider name typed into the box still surfaces the models under it.
+func selectItemMatches(item SelectItem, filterLower string) bool {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(item.Name)), filterLower) {
+		return true
 	}
-	return 0
-}
-
-func selectItemMatchScore(item SelectItem, filter string) selectItemScore {
-	filter = strings.ToLower(strings.TrimSpace(filter))
-	name := strings.ToLower(strings.TrimSpace(item.Name))
-	description := strings.ToLower(strings.TrimSpace(item.Description))
-	score := selectItemScore{
-		rank:        4,
-		index:       1 << 20,
-		lengthDelta: 1 << 20,
-		name:        name,
-	}
-	if item.Recommended {
-		score.recommended = -1
-	}
-	if filter == "" {
-		score.ok = true
-		return score
-	}
-	nameRunes := len([]rune(name))
-	filterRunes := len([]rune(filter))
-	if name == filter {
-		score.ok = true
-		score.rank = 0
-		score.index = 0
-		score.lengthDelta = 0
-		return score
-	}
-	if strings.HasPrefix(name, filter) {
-		score.ok = true
-		score.rank = 1
-		score.index = 0
-		score.lengthDelta = max(0, nameRunes-filterRunes)
-		return score
-	}
-	if index := strings.Index(name, filter); index >= 0 {
-		score.ok = true
-		score.rank = 2
-		score.index = len([]rune(name[:index]))
-		score.lengthDelta = max(0, nameRunes-filterRunes)
-		return score
-	}
-	if index := strings.Index(description, filter); index >= 0 {
-		score.ok = true
-		score.rank = 3
-		score.index = len([]rune(description[:index]))
-		score.lengthDelta = max(0, nameRunes-filterRunes)
-	}
-	return score
-}
-
-func compareSelectorInt(a, b int) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	default:
-		return 0
-	}
+	return strings.Contains(strings.ToLower(strings.TrimSpace(item.Description)), filterLower)
 }
 
 // cursorForCurrent returns the item index matching current, or 0 if not found.
@@ -1101,6 +1045,10 @@ func (m multiSelectorModel) filteredItems() []SelectItem {
 			result = append(result, item)
 		}
 	}
+	// Same alphabetical order as the single-select filter view — a multi-select
+	// picker over the same model list must not answer the same query with the
+	// same rows in a different order.
+	sortSelectItemsForFilter(result)
 	return result
 }
 

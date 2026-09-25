@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -485,6 +486,60 @@ func TestRenderContent_FilteredHeader(t *testing.T) {
 	}
 	if strings.Contains(content, "Recommended") {
 		t.Error("filtered view should not contain 'Recommended' header")
+	}
+}
+
+// The reported symptom this pins: searching "glm-5.3" listed
+// "zai/glm-5.3-flashx" first (its match sits at index 4, before
+// "ollama/glm-5.3" at index 7) and then several providers in catalog order.
+// Filtered results are alphabetical, so a row's position is predictable and
+// does not move when an unrelated provider is added.
+func TestFilteredItems_AlphabeticalOrder(t *testing.T) {
+	m := selectorModel{
+		title:  "Pick:",
+		filter: "glm-5.3",
+		// Every real constructor sets this; a zero-value literal is the
+		// unranked path, which keeps insertion order.
+		rankFiltered: true,
+		items: []SelectItem{
+			{Name: "zai/glm-5.3-flashx"},
+			{Name: "ollama/glm-5.3"},
+			{Name: "ollama/glm-5.3-flash"},
+			{Name: "ollama/glm-5.3-flash:cloud"},
+			{Name: "opencode-go/glm-5.3"},
+			{Name: "opencode-go/glm-5.3-flash"},
+			{Name: "ollama-cloud/glm-5.3"},
+			{Name: "ollama-cloud/glm-5.3-flash"},
+			{Name: "openrouter/z-ai/glm-5.3"},
+			{Name: "zai-coding-plan/glm-5.3", Description: "Coding Plan (Z.AI — subscription)"},
+			{Name: "unrelated/model"},
+		},
+	}
+
+	got := make([]string, 0)
+	for _, item := range m.filteredItems() {
+		got = append(got, item.Name)
+	}
+	want := []string{
+		"ollama-cloud/glm-5.3",
+		"ollama-cloud/glm-5.3-flash",
+		"ollama/glm-5.3",
+		"ollama/glm-5.3-flash",
+		"ollama/glm-5.3-flash:cloud",
+		"opencode-go/glm-5.3",
+		"opencode-go/glm-5.3-flash",
+		"openrouter/z-ai/glm-5.3",
+		"zai-coding-plan/glm-5.3",
+		"zai/glm-5.3-flashx",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("filtered order = %#v, want %#v", got, want)
+	}
+
+	// The rendered view uses the same order, and the cursor row is therefore
+	// the first name alphabetically — Enter takes what the user sees on top.
+	if content := m.renderContent(); !strings.Contains(content, "Top Results") {
+		t.Fatalf("filtered view lost its header: %q", content)
 	}
 }
 

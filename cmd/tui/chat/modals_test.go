@@ -234,7 +234,13 @@ func TestInitialModelPickerRendersBeforeChatShell(t *testing.T) {
 	}
 }
 
-func TestChatModelPickerRanksClosestFilteredModelFirst(t *testing.T) {
+// Filtered results are ordered alphabetically by name, whatever the match
+// quality: a row's position must be something the user can predict, and stable
+// when an unrelated provider is added (2026-09-25, replaced a
+// closest-match-first ranking). Match quality still decides membership —
+// llama3.2 is here on a DESCRIPTION match and a "recommended" flag does not
+// float a name up.
+func TestChatModelPickerOrdersFilteredModelsAlphabetically(t *testing.T) {
 	models := normalizeModelOptions([]ModelOption{
 		{Name: "gemma3:27b", Description: "recommended but longer", Recommended: true},
 		{Name: "llama3.2", Description: "mentions gemm in description"},
@@ -248,7 +254,7 @@ func TestChatModelPickerRanksClosestFilteredModelFirst(t *testing.T) {
 	for _, model := range filtered {
 		got = append(got, model.Name)
 	}
-	want := []string{"gemma4", "gemma3:27b", "gemma4:27b", "llama3.2"}
+	want := []string{"gemma3:27b", "gemma4", "gemma4:27b", "llama3.2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("filtered model order = %#v, want %#v", got, want)
 	}
