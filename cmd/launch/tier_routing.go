@@ -345,6 +345,17 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 	if isBareRouterSKU(sonnetModel) {
 		return resolveLaunchEndpoint("router/" + sonnetModel)
 	}
+	// A native Claude tier ("claude/sonnet", "anthropic/opus") is an explicit
+	// cross-provider choice in the same sense router/<id> is: it names the
+	// user's own Anthropic login, never a model on the primary's remote.
+	// Without this it fell through to sameRemote() below and oaica handed the
+	// remote the LITERAL id "claude/sonnet" as an upstream model — a tier the
+	// user asked for silently became a bogus model name on the primary's
+	// endpoint (found 2026-09-25 while fixing the bare-alias env bug; a native
+	// PRIMARY escaped it because its legs never reach this branch).
+	if _, ok := nativeClaudeModelTier(sonnetModel); ok {
+		return resolveLaunchEndpoint(sonnetModel)
+	}
 	explicit := strings.HasSuffix(sonnetModel, oaicaLocalTagSuffix) ||
 		strings.HasPrefix(sonnetModel, "router/") || strings.HasPrefix(sonnetModel, "oaica/") ||
 		strings.HasPrefix(sonnetModel, "ollama/") || strings.HasPrefix(sonnetModel, "daemon/")
@@ -434,6 +445,19 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 			plan.Routes.ByModel[haiku.UpstreamModel] = routeForDisguised(primary, haiku)
 		}
 	}
+	// Tier fidelity: Claude Code's opusplan mode resolves its opus and haiku
+	// slots from its OWN built-in catalog, ignoring ANTHROPIC_DEFAULT_OPUS_MODEL
+	// and ANTHROPIC_DEFAULT_HAIKU_MODEL entirely (probed 2026-09-25: both were
+	// set to sentinel ids and only the SONNET slot's value ever reached the
+	// wire). The request then arrives carrying a real Anthropic id
+	// ("claude-haiku-4-5-20251001") that means nothing to a local/remote leg.
+	// Registering the plan's native legs by FAMILY is what keeps a tier split
+	// honest in that mode: the haiku slot reaches the haiku leg the user
+	// configured instead of silently falling to the primary's model — on a
+	// claude/opus primary that was every background call (title generation,
+	// topic detection) billed at Opus rates.
+	plan.Routes.NativeTiers = nativeTierRoutes(plan)
+
 	// Route-policy fallback legs (route_policy.go): the OTHER legs of the
 	// plan, deduped by base URL. A plan with both legs on one remote has
 	// nothing to fall back onto — the URL is the failure domain — so a
@@ -457,25 +481,67 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 	return plan, nil
 }
 
-// claudeCodeModelAlias strips our own "claude/"/"anthropic/" picker prefix
-// before a value goes into an ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_*
-// env var: those are read by the REAL Claude Code binary, which only knows
-// its own bare aliases (opus/sonnet/fable/...), not our namespaced picker
-// syntax. Every non-native model id (the normal OAICA/remote/daemon case)
-// passes through completely unchanged -- this only ever touches the
-// claude/anthropic prefix.
+// nativeTierRoutes maps Claude model families ("opus", "sonnet", "haiku") to
+// the plan leg that owns them, for the legs that ARE native Anthropic tiers
+// (see proxyRouteTable.NativeTiers for the whole story: opusplan resolves its
+// opus/haiku slots internally, so the client sends real family ids we would
+// otherwise have to send to Default — i.e. to the PRIMARY's model, whatever
+// the user asked the tier for). A leg's own ByModel route is reused when one
+// exists so the family and the picker string can never disagree about the leg
+// they name; otherwise the leg is routed directly.
+func nativeTierRoutes(plan tierPlan) map[string]proxyRoute {
+	var routes map[string]proxyRoute
+	for _, leg := range []struct {
+		name string
+		ep   launchEndpoint
+	}{{plan.PrimaryName, plan.Primary}, {plan.SecondaryName, plan.Secondary}, {plan.HaikuName, plan.Haiku}} {
+		tier, ok := nativeClaudeModelTier(leg.name)
+		if !ok {
+			continue
+		}
+		r := routeFor(leg.ep)
+		if existing, ok := plan.Routes.ByModel[leg.name]; ok {
+			r = existing
+		}
+		if routes == nil {
+			routes = map[string]proxyRoute{}
+		}
+		routes[tier] = r
+	}
+	return routes
+}
+
+// claudeCodeModelAlias turns a plan leg name into the value for an
+// ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_* env var (or the --model flag),
+// which the REAL Claude Code binary reads. Every non-native model id (the
+// normal OAICA/remote/daemon case) passes through completely unchanged --
+// this only ever touches the claude/anthropic prefix.
 //
-// Why this matters even outside opusplan: a haiku-only split (sonnet ==
-// primary, so opusplan's own opus/sonnet slots have nothing distinctive to
-// resolve, but haiku differs) still sends the primary's raw picker string
-// as --model or ANTHROPIC_DEFAULT_OPUS_MODEL, and Claude Code rejected
-// "claude/fable" outright ("issue with the selected model", 2026-09-02) --
-// this is the actual fix; the opusplan-trigger widening above only gets
-// the SONNET slot right, not opus/haiku, which read this env var directly
-// regardless of mode.
+// A native tier resolves to the real catalog id (resolveNativeModelAlias),
+// not the bare tier name. Two independent reasons, both verified live
+// 2026-09-25 against Claude Code 2.1.282:
+//
+//   - The bare name is rejected outright. `claude` with nothing but
+//     ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet set (no oaica in the picture)
+//     exits with `[claude-code:unrecognized_model] {"model":"sonnet"}` /
+//     "There's an issue with the selected model (sonnet)". That is exactly
+//     what `oaica launch claude --model claude/opus --sonnet-model
+//     claude/sonnet` did: the SONNET slot is the one opusplan mode actually
+//     reads (its opus/haiku slots come from its own built-in catalog), and
+//     the launch died before the first request. A real id
+//     (claude-sonnet-4-5-20250929, claude-opus-4-5) is accepted; a
+//     made-up one (claude-bogus-9-9, oaica/native-sonnet) is rejected, so
+//     this must be a real resolution, not a rename.
+//   - The bare name means nothing on the wire. A native leg's request is
+//     forwarded to api.anthropic.com as-is (nativeAnthropicPassthrough), and
+//     Anthropic answers "model: fable not found" for the alias (2026-09-02).
+//
+// Resolution failing (no Anthropic credential, offline) falls back to the
+// bare tier: the same visible failure as before rather than a silent launch
+// on some other model.
 func claudeCodeModelAlias(model string) string {
 	if tier, ok := nativeClaudeModelTier(model); ok {
-		return tier
+		return resolveNativeModelAlias(tier)
 	}
 	return model
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func stubDaemon(t *testing.T, models ...string) {
@@ -31,6 +32,27 @@ func noRemotes(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 	writeRemotes(t, `{"remotes":[]}`)
 	stubBareIndex(t, map[string][]string{})
+}
+
+// stubNativeModelCatalog seeds resolveNativeModelAlias's cache with a
+// tier→wire-id mapping, so a test that reaches a native leg never makes a
+// live api.anthropic.com call — which it otherwise would, whenever the
+// machine running the tests has an Anthropic credential (an OAuth session in
+// ~/.claude/.credentials.json is enough), making the test's expected values
+// depend on Anthropic's current catalog.
+func stubNativeModelCatalog(t *testing.T, byTier map[string]string) {
+	t.Helper()
+	nativeModelAliasCache.Lock()
+	nativeModelAliasCache.m = map[string]nativeAliasCacheEntry{}
+	for tier, id := range byTier {
+		nativeModelAliasCache.m[tier] = nativeAliasCacheEntry{resolved: id, expiresAt: time.Now().Add(time.Hour)}
+	}
+	nativeModelAliasCache.Unlock()
+	t.Cleanup(func() {
+		nativeModelAliasCache.Lock()
+		nativeModelAliasCache.m = nil
+		nativeModelAliasCache.Unlock()
+	})
 }
 
 // A router model (what a fresh customer has) must go through the
@@ -478,12 +500,17 @@ func TestBuildTierPlan_NonNativePrimaryNeverSetsDisplayModel(t *testing.T) {
 // sent "claude/fable" straight into that env var and Claude Code rejected
 // it outright ("issue with the selected model").
 func TestClaudeCodeModelAlias(t *testing.T) {
+	stubNativeModelCatalog(t, map[string]string{
+		"fable":  "claude-fable-5-1",
+		"opus":   "claude-opus-4-5-20251101",
+		"sonnet": "claude-sonnet-4-5-20250929",
+	})
 	cases := map[string]string{
-		"claude/fable":         "fable",
-		"claude/opus":          "opus",
-		"claude/sonnet":        "sonnet",
-		"anthropic/fable":      "fable",
-		"anthropic/opus":       "opus",
+		"claude/fable":         "claude-fable-5-1",
+		"claude/opus":          "claude-opus-4-5-20251101",
+		"claude/sonnet":        "claude-sonnet-4-5-20250929",
+		"anthropic/fable":      "claude-fable-5-1",
+		"anthropic/opus":       "claude-opus-4-5-20251101",
 		"oaica-35b-a3b-vision": "oaica-35b-a3b-vision", // non-native: unchanged
 		"glm-5.3-flash:cloud":  "glm-5.3-flash:cloud",  // non-native: unchanged
 		"box/kat-awq":          "box/kat-awq",          // non-native: unchanged
@@ -495,17 +522,47 @@ func TestClaudeCodeModelAlias(t *testing.T) {
 	}
 }
 
-// TestBuildTierPlan_EnvVarsStripNativePrefix confirms envVars() actually
-// uses claudeCodeModelAlias on all four ANTHROPIC_DEFAULT_*/CLAUDE_CODE_*
-// slots that carry a model id, for a native primary with an OAICA
-// haiku-only split (sonnet == primary, only haiku differs) — the exact
-// combination that surfaced the bug.
-func TestBuildTierPlan_EnvVarsStripNativePrefix(t *testing.T) {
+// A tier the catalog lookup cannot resolve (no credential, offline, catalog
+// changed shape) falls back to the bare tier rather than inventing an id:
+// Claude Code then fails the same visible way it did before, instead of the
+// launch silently running a different model.
+func TestClaudeCodeModelAlias_UnresolvableFallsBackToTier(t *testing.T) {
+	nativeModelAliasCache.Lock()
+	nativeModelAliasCache.m = nil
+	nativeModelAliasCache.Unlock()
+	t.Cleanup(func() {
+		nativeModelAliasCache.Lock()
+		nativeModelAliasCache.m = nil
+		nativeModelAliasCache.Unlock()
+	})
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer down.Close()
+	orig := nativeAnthropicModelsUpstream
+	nativeAnthropicModelsUpstream = down.URL
+	t.Cleanup(func() { nativeAnthropicModelsUpstream = orig })
+
+	if got := claudeCodeModelAlias("claude/opus"); got != "opus" {
+		t.Errorf("claudeCodeModelAlias(claude/opus) = %q, want the bare tier %q when the catalog is unreachable", got, "opus")
+	}
+}
+
+// TestBuildTierPlan_EnvVarsCarryRealIds confirms envVars() puts a real
+// catalog id, not a bare tier, into every ANTHROPIC_DEFAULT_*/CLAUDE_CODE_*
+// slot carrying a native leg — for a native primary with an OAICA haiku-only
+// split (sonnet == primary, only haiku differs), the exact combination that
+// died with "[claude-code:unrecognized_model] {"model":"sonnet"}" on
+// 2026-09-25: the SONNET slot is the one opusplan mode reads, and Claude Code
+// rejects a bare alias there.
+func TestBuildTierPlan_EnvVarsCarryRealIds(t *testing.T) {
 	noRemotes(t)
 	t.Setenv("OAICA_HOST", "https://api.example.test")
 	t.Setenv("OAICA_API_KEY", "sk-cust")
 	stubCloudFetch(t, []oaicaModelEntry{{ID: "oaica-35b-a3b-vision"}}, nil)
 	stubDaemon(t)
+	stubNativeModelCatalog(t, map[string]string{"fable": "claude-fable-5-1"})
 
 	plan, err := buildTierPlan("claude/fable", "", "oaica-35b-a3b-vision", false)
 	if err != nil {
@@ -513,10 +570,10 @@ func TestBuildTierPlan_EnvVarsStripNativePrefix(t *testing.T) {
 	}
 	env := plan.envVars("http://127.0.0.1:0", "tok")
 	want := map[string]string{
-		"ANTHROPIC_DEFAULT_OPUS_MODEL":   "fable",
-		"ANTHROPIC_DEFAULT_SONNET_MODEL": "fable",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":   "claude-fable-5-1",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-fable-5-1",
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL":  "oaica-35b-a3b-vision",
-		"CLAUDE_CODE_AUTO_MODE_MODEL":    "fable",
+		"CLAUDE_CODE_AUTO_MODE_MODEL":    "claude-fable-5-1",
 	}
 	got := map[string]string{}
 	for _, kv := range env {
@@ -530,6 +587,64 @@ func TestBuildTierPlan_EnvVarsStripNativePrefix(t *testing.T) {
 		if got[k] != w {
 			t.Errorf("%s = %q, want %q (env: %v)", k, got[k], w, env)
 		}
+	}
+}
+
+// TestBuildTierPlan_NativeTierFamiliesRouteToTheirLeg: Claude Code's opusplan
+// mode resolves its opus and haiku slots from its own built-in catalog, so
+// requests arrive carrying real Anthropic family ids — never our env values.
+// Those ids must reach the leg that owns the family: with a native secondary
+// and a remote primary, a claude-sonnet-* request has to land on the native
+// leg, not be rewritten into the primary's model.
+func TestBuildTierPlan_NativeTierFamiliesRouteToTheirLeg(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	stubNativeModelCatalog(t, map[string]string{"sonnet": "claude-sonnet-4-5-20250929"})
+
+	plan, err := buildTierPlan("box/kat-awq", "claude/sonnet", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, _ := plan.Routes.resolve("claude-sonnet-4-5-20250929")
+	if !strings.HasPrefix(route.Label, string(sourceNativeAnthropic)+":") {
+		t.Fatalf("a claude-sonnet-* request resolved to %q, want the native secondary leg", route.Label)
+	}
+	if !route.NativePassthrough {
+		t.Error("the native sonnet leg must be a passthrough route")
+	}
+	// The family map must not hijack ids that are not Anthropic ones: a
+	// remote model typed by the user keeps its own upstream.
+	route, model := plan.Routes.resolve("kat-awq")
+	if route.BaseURL != "http://box:8080/v1" || model != "kat-awq" {
+		t.Fatalf("kat-awq resolved to %+v %q, want the box remote unchanged", route, model)
+	}
+	// With no distinct haiku leg the haiku family belongs to the primary —
+	// never a raw forward of an id no local/remote backend knows.
+	route, model = plan.Routes.resolve("claude-haiku-4-5-20251001")
+	if route.BaseURL != "http://box:8080/v1" || model != "kat-awq" {
+		t.Fatalf("haiku id resolved to %+v %q, want the primary leg with its own upstream model", route, model)
+	}
+	// The bare tiers Claude Code resolves internally ("haiku", "opus") are
+	// the same families, and must be treated the same way — a bare "haiku"
+	// reaching a remote verbatim is exactly the 404 this mapping prevents.
+	route, model = plan.Routes.resolve("haiku")
+	if route.BaseURL != "http://box:8080/v1" || model != "kat-awq" {
+		t.Fatalf(`bare "haiku" resolved to %+v %q, want the primary leg`, route, model)
+	}
+	// An explicit --haiku-model gets that family: this is what makes the tier
+	// work in opusplan mode at all, since Claude Code ignores
+	// ANTHROPIC_DEFAULT_HAIKU_MODEL there and sends its own haiku id.
+	haiku, err := resolveLaunchEndpoint("claude/haiku")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.HaikuName, plan.Haiku = "claude/haiku", haiku
+	plan.Routes.NativeTiers = nativeTierRoutes(plan)
+	if route, _ = plan.Routes.resolve("claude-haiku-4-5-20251001"); route.Label != routeFor(haiku).Label {
+		t.Fatalf("with --haiku-model claude/haiku the haiku id resolved to %q, want that leg (%q)", route.Label, routeFor(haiku).Label)
 	}
 }
 

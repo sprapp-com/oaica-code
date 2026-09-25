@@ -734,6 +734,19 @@ type proxyRouteTable struct {
 	// localities and the breaker like everything else. ContextWindow is
 	// probed at launch (withContextWindows) and must exceed the primary's.
 	Oversize proxyRoute
+	// NativeTiers maps a Claude model FAMILY ("opus", "sonnet", "haiku",
+	// "fable") to the plan leg that should serve it, for the native tiers of
+	// the plan. Built by buildTierPlan. See resolve() for why it exists:
+	// Claude Code's opusplan mode resolves its opus and haiku slots from its
+	// OWN built-in catalog, NOT from ANTHROPIC_DEFAULT_{OPUS,HAIKU}_MODEL, so
+	// the request arrives carrying a real Anthropic id ("claude-haiku-4-5-…")
+	// no matter what we put in the environment — probing 2026-09-25 set both
+	// vars to sentinel values and watched only the sonnet slot's value reach
+	// the wire. Without this map such an id can only fall to Default, which
+	// silently sends the subagent/haiku tier to the PRIMARY's model (the
+	// token-cost bug this fixed). Empty = every family id goes to Default
+	// (the pre-existing behaviour, byte-identical for a single-leg plan).
+	NativeTiers map[string]proxyRoute
 }
 
 // authorized reports whether r presents the table's client token.
@@ -915,12 +928,60 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 	// Claude Code's own background calls (topic detection, title gen) send
 	// those regardless of our ANTHROPIC_DEFAULT_HAIKU_MODEL, and no backend
 	// of ours knows them — forwarding raw made the upstream 404. Map them
-	// onto the default leg instead.
-	if strings.HasPrefix(requested, "claude-") || strings.HasPrefix(requested, "anthropic.") ||
-		requested == "claude" || requested == "haiku" || requested == "opus" || requested == "sonnet" {
+	// onto the leg that owns that family when the plan has one
+	// (NativeTiers), else onto the default leg as before.
+	if family, ok := claudeModelFamily(requested); ok {
+		if r, ok := t.NativeTiers[family]; ok {
+			return r, r.UpstreamModel
+		}
 		return t.Default, t.Default.UpstreamModel
 	}
 	return t.Default, requested
+}
+
+// claudeModelFamily reports which Claude family a model id names, for the
+// ids Claude Code sends on its own: the bare tiers it resolves internally
+// ("haiku", "opus", …), the "claude"/"anthropic." prefixes, and the real
+// catalog ids of a family (claude-haiku-4-5-20251001 → "haiku",
+// claude-fable-5-1 → "fable"). The family, not the exact id, is what the
+// routing table can act on: the point release changes under us, the tier
+// does not. Anything that is not an Anthropic id at all (glm-5.3,
+// oaica-35b-a3b-vision) reports false — it must reach its upstream unchanged.
+func claudeModelFamily(model string) (string, bool) {
+	if model == "" {
+		return "", false
+	}
+	switch {
+	case model == "claude" || model == "anthropic" ||
+		strings.HasPrefix(model, "anthropic.") || strings.HasPrefix(model, "anthropic-"):
+		return "claude", true
+	case isBareClaudeTier(model):
+		return model, true
+	}
+	bare, ok := strings.CutPrefix(model, "claude-")
+	if !ok {
+		return "", false
+	}
+	for _, tier := range []string{"opus", "sonnet", "haiku", "fable"} {
+		if bare == tier || strings.HasPrefix(bare, tier+"-") {
+			return tier, true
+		}
+	}
+	// An id we don't recognize the tier of, but shaped like an Anthropic one
+	// (claude-3-5-sonnet-20241022): same handling as the "claude" family —
+	// the default leg owns it, never a raw forward to an upstream that would
+	// 404 it.
+	return "claude", true
+}
+
+// isBareClaudeTier reports whether model is one of the tier names Claude Code
+// resolves on its own, with no version attached.
+func isBareClaudeTier(model string) bool {
+	switch model {
+	case "opus", "sonnet", "haiku", "fable":
+		return true
+	}
+	return false
 }
 
 // RunAnthropicOpenAIProxyRoutes is RunAnthropicOpenAIProxy with a routing
