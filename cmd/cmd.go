@@ -2910,20 +2910,21 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			path, _ := launch.UserConfigPath()
 			fmt.Printf("config:       %s\n", path)
 			fmt.Printf("sonnet_model: %s\n", orDashStr(c.SonnetModel, "(unset — flag/plan/wizard decide)"))
+			fmt.Printf("haiku_model:  %s\n", orDashStr(c.HaikuModel, "(same as the sonnet tier)"))
 			return nil
 		},
 	}
 	configSetCmd := &cobra.Command{
 		Use:   "set <key> <value>",
-		Short: "Set a preference (sonnet-model)",
+		Short: "Set a preference (sonnet-model, haiku-model)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			value := args[1]
+			if value == "-" || strings.EqualFold(value, "none") || strings.EqualFold(value, "unset") {
+				value = ""
+			}
 			switch args[0] {
 			case "sonnet-model", "sonnet_model":
-				value := args[1]
-				if value == "-" || strings.EqualFold(value, "none") || strings.EqualFold(value, "unset") {
-					value = ""
-				}
 				if err := launch.UserConfigSetSonnetModel(value); err != nil {
 					return err
 				}
@@ -2933,8 +2934,18 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 					fmt.Printf("sonnet_model = %s (every `oaica launch claude` without --sonnet-model/--plan now uses this)\n", value)
 				}
 				return nil
+			case "haiku-model", "haiku_model":
+				if err := launch.UserConfigSetHaikuModel(value); err != nil {
+					return err
+				}
+				if value == "" {
+					fmt.Println("haiku_model cleared")
+				} else {
+					fmt.Printf("haiku_model = %s (Claude Code's background work — titles, topic detection — now runs there instead of on the primary)\n", value)
+				}
+				return nil
 			default:
-				return fmt.Errorf("unknown key %q (known: sonnet-model)", args[0])
+				return fmt.Errorf("unknown key %q (known: sonnet-model, haiku-model)", args[0])
 			}
 		},
 	}

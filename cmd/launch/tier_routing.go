@@ -481,6 +481,21 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 	return plan, nil
 }
 
+// standingTierModels applies the user's saved preferences
+// (~/.oaica/config.json, user_config.go) to tiers neither a flag nor a plan
+// filled. Flag > plan > config > wizard/default — this is the config step of
+// that ladder, kept as its own function so the precedence is testable without
+// running a launch.
+func standingTierModels(sonnetModel, haikuModel string) (string, string) {
+	if sonnetModel == "" {
+		sonnetModel = UserConfigSonnetModel()
+	}
+	if haikuModel == "" {
+		haikuModel = UserConfigHaikuModel()
+	}
+	return sonnetModel, haikuModel
+}
+
 // nativeTierRoutes maps Claude model families ("opus", "sonnet", "haiku") to
 // the plan leg that owns them, for the legs that ARE native Anthropic tiers
 // (see proxyRouteTable.NativeTiers for the whole story: opusplan resolves its
@@ -725,11 +740,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		policyArg = w.RoutePolicy
 	}
 	// Standing user preference fills what neither a flag nor a plan set:
-	// ~/.oaica/config.json sonnet_model (user_config.go). Flag > plan >
-	// config > wizard default.
-	if sonnetModel == "" {
-		sonnetModel = UserConfigSonnetModel()
-	}
+	// ~/.oaica/config.json sonnet_model / haiku_model (user_config.go).
+	// Flag > plan > config > wizard default. A standing haiku_model is a real
+	// request for a distinct haiku tier, so it takes a native primary off the
+	// untouched runNative path (which has no env at all and would run its own
+	// built-in Haiku) — that is the intent, not a side effect.
+	sonnetModel, haikuModel = standingTierModels(sonnetModel, haikuModel)
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
 		// briefModeSystemPrompt's doc for why this exact wording and why

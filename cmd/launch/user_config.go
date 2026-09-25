@@ -1,9 +1,9 @@
 package launch
 
 // user_config.go — the user's standing launch preferences, ~/.oaica/config.json.
-// Deliberately tiny: one key so far (sonnet_model), read at launch as the
-// DEFAULT tier split so the user can define their own sonnet tier once and
-// have every subsequent `oaica launch claude` honor it without flags.
+// Deliberately tiny: two keys (sonnet_model, haiku_model), read at launch as
+// the DEFAULT tier split so the user can define their own tiers once and have
+// every subsequent `oaica launch claude` honor it without flags.
 //
 // Precedence for the sonnet tier (highest wins):
 //
@@ -11,6 +11,12 @@ package launch
 //	2. --plan <name>'s SonnetModel (explicit, saved plan)
 //	3. config.json's sonnet_model  (standing user preference)   <- here
 //	4. wizard / same-as-primary    (interactive default)
+//
+// The haiku tier follows the same ladder with --haiku-model / HaikuModel /
+// haiku_model. It is the tier worth setting: Claude Code sends its background
+// work there (conversation titles, topic detection, subagent spawning), so a
+// haiku tier left on the primary bills invisible traffic at primary prices —
+// see tier_routing.go's buildTierPlan and NativeTiers for the mechanics.
 //
 // Same atomic-write convention as plans.json / remotes.json.
 
@@ -29,6 +35,9 @@ type UserConfig struct {
 	// `oaica launch claude`. Empty = no standing preference (flag/plan/
 	// wizard decide, as before this file existed).
 	SonnetModel string `json:"sonnet_model,omitempty"`
+	// HaikuModel is the default haiku-tier model — the cheap leg for Claude
+	// Code's background traffic. Empty = no standing preference.
+	HaikuModel string `json:"haiku_model,omitempty"`
 }
 
 func userConfigPath() (string, error) {
@@ -66,11 +75,24 @@ func UserConfigPath() (string, error) { return userConfigPath() }
 // UserConfigSetSonnetModel persists the standing sonnet tier; empty string
 // clears it.
 func UserConfigSetSonnetModel(model string) error {
+	return userConfigSet(func(c *UserConfig) { c.SonnetModel = strings.TrimSpace(model) })
+}
+
+// UserConfigSetHaikuModel persists the standing haiku tier; empty string
+// clears it.
+func UserConfigSetHaikuModel(model string) error {
+	return userConfigSet(func(c *UserConfig) { c.HaikuModel = strings.TrimSpace(model) })
+}
+
+// userConfigSet applies one change and writes the file atomically, leaving
+// every other key untouched — the two setters above differ only in which
+// field they assign.
+func userConfigSet(mutate func(*UserConfig)) error {
 	c, err := UserConfigLoad()
 	if err != nil {
 		return err
 	}
-	c.SonnetModel = strings.TrimSpace(model)
+	mutate(&c)
 	path, err := userConfigPath()
 	if err != nil {
 		return err
@@ -102,4 +124,13 @@ func UserConfigSonnetModel() string {
 		return "" // unreadable config must not block a launch
 	}
 	return c.SonnetModel
+}
+
+// UserConfigHaikuModel returns the standing haiku tier ("" when unset).
+func UserConfigHaikuModel() string {
+	c, err := UserConfigLoad()
+	if err != nil {
+		return "" // unreadable config must not block a launch
+	}
+	return c.HaikuModel
 }
