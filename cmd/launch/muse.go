@@ -30,7 +30,7 @@ import (
 // global provider switch rather than an additive model list — writing it into
 // ~/.config/muse/settings.json would repoint the user's whole muse install. So
 // launch keeps its own config root and passes it to muse as XDG_CONFIG_HOME,
-// leaving a Meta-backed muse and `ollama launch muse` free to coexist.
+// leaving a Meta-backed muse and `oaica launch muse` free to coexist.
 type Muse struct{}
 
 const (

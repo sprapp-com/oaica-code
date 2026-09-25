@@ -58,7 +58,7 @@ func (p *Pi) Run(_ string, _ []LaunchModel, args []string) error {
 
 func ensureNpmInstalled() error {
 	if _, err := exec.LookPath("npm"); err != nil {
-		return fmt.Errorf("npm (Node.js) is required to launch pi\n\nInstall it first:\n  https://nodejs.org/\n\nThen re-run:\n  ollama launch pi")
+		return fmt.Errorf("npm (Node.js) is required to launch pi\n\nInstall it first:\n  https://nodejs.org/\n\nThen re-run:\n  oaica launch pi")
 	}
 	return nil
 }
@@ -85,7 +85,7 @@ func ensurePiInstalled() (string, error) {
 	}
 
 	if _, err := exec.LookPath("npm"); err != nil {
-		return "", fmt.Errorf("pi is not installed and required dependencies are missing\n\nInstall the following first:\n  npm (Node.js): https://nodejs.org/\n\nThen re-run:\n  ollama launch pi")
+		return "", fmt.Errorf("pi is not installed and required dependencies are missing\n\nInstall the following first:\n  npm (Node.js): https://nodejs.org/\n\nThen re-run:\n  oaica launch pi")
 	}
 
 	install, pkgErr := installedPiPackageInfo()
@@ -672,7 +672,7 @@ func (p *Pi) Models() []string {
 	return result
 }
 
-// isPiOllamaModel reports whether a model config entry is managed by ollama launch
+// isPiOllamaModel reports whether a model config entry is managed by oaica launch
 func isPiOllamaModel(cfg map[string]any) bool {
 	if v, ok := cfg["_launch"].(bool); ok && v {
 		return true

@@ -75,7 +75,9 @@ Upstream is **gatekeeper (:30098)**, not raw katlb, so external traffic gets
 the `openrouter` tier's concurrency cap (32) and cannot starve the three
 internal machines that share katlb.
 
-Build: `cd tools/gateway && go build -o oaica-gateway main.go`.
+Build: `cd tools/gateway && go build -o oaica-gateway .` (the whole package —
+`main.go` alone cannot compile: `pull.go`, `health.go` and
+`context_calibration.go` are part of it).
 
 ## Rotating the OpenRouter key (zero downtime)
 

@@ -382,7 +382,7 @@ func (h *Hermes) ensureInstalledFor(command string) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("Hermes is not installed and required dependencies are missing\n\nInstall the following first:\n  %s\n\nThen re-run:\n  ollama launch %s", strings.Join(missing, "\n  "), command)
+		return fmt.Errorf("Hermes is not installed and required dependencies are missing\n\nInstall the following first:\n  %s\n\nThen re-run:\n  oaica launch %s", strings.Join(missing, "\n  "), command)
 	}
 
 	ok, err := ConfirmPrompt("Hermes is not installed. Install now?")

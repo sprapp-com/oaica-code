@@ -114,7 +114,7 @@ func checkOpenCodeInstallerDependencies() error {
 	switch openCodeGOOS {
 	case "windows":
 		if _, err := exec.LookPath("npm"); err != nil {
-			return fmt.Errorf("opencode is not installed and required dependencies are missing\n\nInstall the following first:\n  npm (Node.js): https://nodejs.org/\n\nThen re-run:\n  ollama launch opencode")
+			return fmt.Errorf("opencode is not installed and required dependencies are missing\n\nInstall the following first:\n  npm (Node.js): https://nodejs.org/\n\nThen re-run:\n  oaica launch opencode")
 		}
 	default:
 		var missing []string
@@ -125,7 +125,7 @@ func checkOpenCodeInstallerDependencies() error {
 			missing = append(missing, "bash: https://www.gnu.org/software/bash/")
 		}
 		if len(missing) > 0 {
-			return fmt.Errorf("opencode is not installed and required dependencies are missing\n\nInstall the following first:\n  %s\n\nThen re-run:\n  ollama launch opencode", strings.Join(missing, "\n  "))
+			return fmt.Errorf("opencode is not installed and required dependencies are missing\n\nInstall the following first:\n  %s\n\nThen re-run:\n  oaica launch opencode", strings.Join(missing, "\n  "))
 		}
 	}
 	return nil

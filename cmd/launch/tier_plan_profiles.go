@@ -198,7 +198,12 @@ func PlanLastUsed() (string, error) {
 }
 
 // PlanRemove deletes a named plan, reporting whether it existed.
+//
+// The name is trimmed exactly as PlanSet trims it on write: a padded argument
+// (" p2 ") used to store a plan under "p2" and then fail to find it again, so
+// the same argument could create a plan it could never remove.
 func PlanRemove(name string) (bool, error) {
+	name = strings.TrimSpace(name)
 	p, err := loadTierPlanProfiles()
 	if err != nil {
 		return false, err
@@ -210,8 +215,11 @@ func PlanRemove(name string) (bool, error) {
 	return true, p.save()
 }
 
-// PlanGet resolves a named plan, or an error naming the plans file if not found.
+// PlanGet resolves a named plan, or an error naming the plans file if not
+// found. Trimmed like PlanSet, so the name a plan was stored under is the name
+// that resolves it.
 func PlanGet(name string) (TierPlanProfile, error) {
+	name = strings.TrimSpace(name)
 	p, err := loadTierPlanProfiles()
 	if err != nil {
 		return TierPlanProfile{}, err
@@ -254,7 +262,9 @@ func extractPlanFlag(args []string) (plan string, rest []string) {
 			rest = append(rest, a)
 		}
 	}
-	return plan, rest
+	// Trimmed exactly as PlanSet trims on write, so a padded `--plan " name "`
+	// resolves the plan that argument created.
+	return strings.TrimSpace(plan), rest
 }
 
 // resolvePlanModels turns a --plan name into (model, sonnetModel), applying

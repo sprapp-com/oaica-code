@@ -3,6 +3,10 @@ package launch
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -366,5 +370,137 @@ func TestResolveNativeModelAlias_SendsOAuthBetaHeader(t *testing.T) {
 	}
 	if gotBeta != "" {
 		t.Fatalf("anthropic-beta = %q on an x-api-key request, want it unset", gotBeta)
+	}
+}
+
+// withWizardEligibleLaunch arms the gate Claude.Run consults. Production sets
+// it in LaunchIntegration (launch.go), so a test that calls Run directly must
+// arm it itself — otherwise the wizard is skipped for a reason unrelated to
+// what is under test.
+func withWizardEligibleLaunch(t *testing.T) {
+	t.Helper()
+	old := tierWizardEligibleLaunch
+	tierWizardEligibleLaunch = true
+	t.Cleanup(func() { tierWizardEligibleLaunch = old })
+}
+
+// The wizard must never run for a launch that already names its tiers on the
+// command line: eligibility has to be decided BEFORE the extractors strip
+// --sonnet-model & co from args, because a bare `oaica launch claude
+// --sonnet-model x` has no --model flag and is interactive, so asking
+// afterwards always answered "eligible" — and the wizard's Enter-to-keep-it
+// answers then replaced the typed tier with "unset", running the launch
+// single-model at the primary's price with the flag silently gone.
+func TestRun_TypedTierFlagSuppressesTheWizard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, true)
+	withWizardEligibleLaunch(t)
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"http://zai:8080/v1","api_key":"k2","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+
+	binDir := t.TempDir()
+	envLog := filepath.Join(t.TempDir(), "env.txt")
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nenv > "+envLog+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the real PATH behind the fake bin dir: the stub script shells
+	// out to `env`.
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	old := tierWizardSelect
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		t.Fatalf("wizard ran for a launch that already named its tier (%s)", title)
+		return "", nil
+	}
+	t.Cleanup(func() { tierWizardSelect = old })
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, []string{"--sonnet-model", "zai/glm-4.5-air"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := string(data)
+	if !strings.Contains(env, "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air\n") {
+		t.Errorf("the typed sonnet tier did not reach the child: no matching ANTHROPIC_DEFAULT_SONNET_MODEL in its environment")
+	}
+	// The flag must also not have been forwarded to Claude Code verbatim —
+	// the launcher consumed it.
+	if strings.Contains(env, "--sonnet-model") {
+		t.Errorf("--sonnet-model leaked into the child environment")
+	}
+}
+
+// The saved config sits ABOVE the wizard in the documented ladder, so a wizard
+// answer must not replace a tier `oaica config set` already supplies. It used
+// to: the wizard assigned first and the config only filled what was still
+// empty, so answering the sonnet step silently discarded the saved model.
+func TestRun_SavedConfigTierBeatsTheWizard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	withInteractiveSession(t, true)
+	withWizardEligibleLaunch(t)
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"http://zai:8080/v1","api_key":"k2","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	if err := os.MkdirAll(filepath.Join(home, ".oaica"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".oaica", "config.json"),
+		[]byte(`{"sonnet_model":"zai/glm-4.5-air"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	envLog := filepath.Join(t.TempDir(), "env.txt")
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nenv > "+envLog+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		// The wizard still runs (it also covers oversize and the policy), but
+		// its answer must not be what the launch ends up using. A REAL pick,
+		// not the empty "same as primary": the empty answer would let the
+		// config rung fill the tier afterwards and the test would pass even
+		// with the wizard winning the rung.
+		switch {
+		case strings.Contains(title, "Sonnet"):
+			return "box/glm-4.6", nil
+		case strings.Contains(title, "Route policy"):
+			return "auto", nil
+		}
+		return "", nil // keep the step's default (haiku, oversize)
+	}
+	// Blank at the "Save as plan" prompt: don't write a plan, and don't block
+	// on stdin (the test's EOF was reaching it as an error).
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air\n") {
+		t.Error("the saved sonnet tier was replaced by the wizard's answer")
 	}
 }

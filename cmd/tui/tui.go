@@ -52,7 +52,7 @@ var runModelMenuItem = menuItem{
 
 // launcherMenuIntegrations is intentionally short: the root ollama command is
 // a quick path to the most common launch targets. Other registered
-// integrations remain available through `ollama launch <integration>`.
+// integrations remain available through `oaica launch <integration>`.
 var launcherMenuIntegrations = []string{"claude", "opencode", "hermes", "openclaw"}
 
 type model struct {

@@ -22,7 +22,7 @@ const (
 	codexAppProfileName          = "ollama-launch-codex-app"
 	codexAppBundleID             = "com.openai.codex"
 	codexAppModelCatalogFilename = "ollama-launch-models.json"
-	codexAppRestoreHint          = "To restore your usual ChatGPT profile, run: ollama launch chatgpt --restore"
+	codexAppRestoreHint          = "To restore your usual ChatGPT profile, run: oaica launch chatgpt --restore"
 	codexAppConfigurationSuccess = "ChatGPT profile changed to Ollama."
 	codexAppRestoreSuccess       = "ChatGPT restored to your usual profile."
 )
@@ -822,7 +822,7 @@ func defaultCodexAppOpenApp(args []string) error {
 		if appID := codexAppStartID(); appID != "" {
 			return codexAppOpenStart(appID)
 		}
-		return fmt.Errorf("ChatGPT was not found; install it from https://chatgpt.com/download, then re-run 'ollama launch chatgpt'")
+		return fmt.Errorf("ChatGPT was not found; install it from https://chatgpt.com/download, then re-run 'oaica launch chatgpt'")
 	case "darwin":
 		if path := codexAppAppPath(); path != "" {
 			cmd := exec.Command("open", path)

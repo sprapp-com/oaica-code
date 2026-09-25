@@ -251,7 +251,7 @@ func TestLaunchCmdClaudeDesktopLaunchReturnsUnsupported(t *testing.T) {
 			if !strings.Contains(err.Error(), "Claude Desktop is no longer supported") {
 				t.Fatalf("expected unsupported guidance, got %v", err)
 			}
-			if !strings.Contains(err.Error(), "ollama launch claude-desktop --restore") {
+			if !strings.Contains(err.Error(), "oaica launch claude-desktop --restore") {
 				t.Fatalf("expected restore guidance, got %v", err)
 			}
 		})

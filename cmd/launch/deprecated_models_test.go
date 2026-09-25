@@ -60,7 +60,7 @@ func TestDeprecatedLaunchModelErrorMentionsRecommendedModels(t *testing.T) {
 	if prompt == "" {
 		t.Fatal("expected deprecated model prompt")
 	}
-	for _, want := range []string{"qwen2.5-coder:32b does not work well with Codex", "recommended-cloud:cloud", "recommended-local", "ollama launch codex --model recommended-cloud:cloud", "Launch with qwen2.5-coder:32b anyway?"} {
+	for _, want := range []string{"qwen2.5-coder:32b does not work well with Codex", "recommended-cloud:cloud", "recommended-local", "oaica launch codex --model recommended-cloud:cloud", "Launch with qwen2.5-coder:32b anyway?"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt %q does not contain %q", prompt, want)
 		}

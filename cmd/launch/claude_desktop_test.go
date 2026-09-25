@@ -112,7 +112,7 @@ func TestClaudeDesktopIntegration(t *testing.T) {
 	t.Run("has success messages", func(t *testing.T) {
 		var _ ConfigurationSuccessIntegration = c
 		var _ RestoreSuccessIntegration = c
-		if got := c.ConfigurationSuccessMessage(); got != "Claude Desktop profile changed to Ollama Cloud.\nTo restore the usual Claude profile, run: ollama launch claude-desktop --restore" {
+		if got := c.ConfigurationSuccessMessage(); got != "Claude Desktop profile changed to Ollama Cloud.\nTo restore the usual Claude profile, run: oaica launch claude-desktop --restore" {
 			t.Fatalf("configuration success message = %q", got)
 		}
 		if got := c.RestoreSuccessMessage(); got != "Claude Desktop restored to the usual Claude profile." {
@@ -137,7 +137,7 @@ func TestLaunchIntegration_ClaudeDesktopLaunchReturnsUnsupported(t *testing.T) {
 			if !strings.Contains(err.Error(), "Claude Desktop is no longer supported") {
 				t.Fatalf("expected unsupported guidance, got %v", err)
 			}
-			if !strings.Contains(err.Error(), "ollama launch claude-desktop --restore") {
+			if !strings.Contains(err.Error(), "oaica launch claude-desktop --restore") {
 				t.Fatalf("expected restore guidance, got %v", err)
 			}
 		})
@@ -939,7 +939,7 @@ func TestClaudeDesktopRunReturnsUnsupported(t *testing.T) {
 		if !strings.Contains(err.Error(), "Claude Desktop is no longer supported") {
 			t.Fatalf("expected unsupported guidance, got %v", err)
 		}
-		if !strings.Contains(err.Error(), "ollama launch claude-desktop --restore") {
+		if !strings.Contains(err.Error(), "oaica launch claude-desktop --restore") {
 			t.Fatalf("expected restore guidance, got %v", err)
 		}
 	}

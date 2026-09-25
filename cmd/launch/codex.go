@@ -209,24 +209,24 @@ func codexValidateExtraArgs(args []string) error {
 	for i, arg := range args {
 		switch {
 		case arg == "-p", strings.HasPrefix(arg, "-p"):
-			return fmt.Errorf("conflicting extra argument %q: ollama launch codex manages --profile", arg)
+			return fmt.Errorf("conflicting extra argument %q: oaica launch codex manages --profile", arg)
 		case arg == "--profile", strings.HasPrefix(arg, "--profile="):
-			return fmt.Errorf("conflicting extra argument %q: ollama launch codex manages --profile", arg)
+			return fmt.Errorf("conflicting extra argument %q: oaica launch codex manages --profile", arg)
 		case arg == "-m", strings.HasPrefix(arg, "-m"):
-			return fmt.Errorf("conflicting extra argument %q: ollama launch codex manages --model", arg)
+			return fmt.Errorf("conflicting extra argument %q: oaica launch codex manages --model", arg)
 		case arg == "--model", strings.HasPrefix(arg, "--model="):
-			return fmt.Errorf("conflicting extra argument %q: ollama launch codex manages --model", arg)
+			return fmt.Errorf("conflicting extra argument %q: oaica launch codex manages --model", arg)
 		case arg == "-c", arg == "--config":
 			if i+1 < len(args) && codexConfigOverrideConflicts(args[i+1]) {
-				return fmt.Errorf("conflicting extra config %q: ollama launch codex manages provider and model catalog config", args[i+1])
+				return fmt.Errorf("conflicting extra config %q: oaica launch codex manages provider and model catalog config", args[i+1])
 			}
 		case strings.HasPrefix(arg, "-c") && len(arg) > len("-c"):
 			if codexConfigOverrideConflicts(strings.TrimPrefix(arg, "-c")) {
-				return fmt.Errorf("conflicting extra config %q: ollama launch codex manages provider and model catalog config", arg)
+				return fmt.Errorf("conflicting extra config %q: oaica launch codex manages provider and model catalog config", arg)
 			}
 		case strings.HasPrefix(arg, "--config="):
 			if codexConfigOverrideConflicts(strings.TrimPrefix(arg, "--config=")) {
-				return fmt.Errorf("conflicting extra config %q: ollama launch codex manages provider and model catalog config", arg)
+				return fmt.Errorf("conflicting extra config %q: oaica launch codex manages provider and model catalog config", arg)
 			}
 		}
 	}

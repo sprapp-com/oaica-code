@@ -71,7 +71,7 @@ func deepSeekHarnessLaunchArgs(patchPath string, args []string) []string {
 func validateDeepSeekHarnessArgs(args []string) error {
 	for _, arg := range args {
 		if arg == "--patch" || strings.HasPrefix(arg, "--patch=") {
-			return fmt.Errorf("conflicting extra argument %q: ollama launch dsh manages --patch", arg)
+			return fmt.Errorf("conflicting extra argument %q: oaica launch dsh manages --patch", arg)
 		}
 	}
 	return nil
@@ -99,7 +99,7 @@ func ensureDeepSeekHarnessInstalled() (string, error) {
 	}
 	npm, err := deepSeekHarnessLookPath("npm")
 	if err != nil {
-		return "", fmt.Errorf("dsh is not installed and npm (Node.js) is required\n\nInstall Node.js first:\n  https://nodejs.org/\n\nThen re-run:\n  ollama launch dsh")
+		return "", fmt.Errorf("dsh is not installed and npm (Node.js) is required\n\nInstall Node.js first:\n  https://nodejs.org/\n\nThen re-run:\n  oaica launch dsh")
 	}
 
 	ok, err := ConfirmPrompt("DeepSeek Harness is not installed. Install with npm?")

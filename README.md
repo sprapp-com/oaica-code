@@ -18,8 +18,9 @@ archive extracts to `bin/oaica`, so either extract into `~/.local`
 (`tar -C ~/.local -xzf oaica-*.tar.gz`) or move `bin/oaica` onto your `PATH`
 yourself (e.g. `/usr/local/bin`).
 
-**Current release:** 0.4.8 — see https://oaica.com/download/VERSION.txt for
-the live pointer.
+**Current release:** see https://oaica.com/download/VERSION.txt for the live
+pointer (it is written by the release build, so it cannot go stale the way a
+number typed here does).
 
 **API base URL:** `https://api.oaica.com` (`OAICA_HOST` defaults here;
 OpenAI-compatible).
@@ -95,7 +96,7 @@ oaica remote list
 ```
 
 Remotes are stored in `~/.oaica/remotes.json`. Built-in providers include
-`ollama-cloud` (`OLLAMA_API_KEY`), `z.ai`, `deepseek`, and `opencode-go`.
+`ollama-cloud` (`OLLAMA_API_KEY`), `zai`, `deepseek`, and `opencode-go`.
 
 ## Command overview
 

@@ -42,8 +42,9 @@ oaica pull oaica-nemotron-30b-a3b  # 25 GB, Q4_K_M GGUF, reasoning + tools
 ```
 
 The catalog is served from `GET https://api.oaica.com/v1/catalog` and may
-grow over time; `oaica pull --help` and the catalog endpoint are the source
-of truth for what's currently available. Weights are streamed into
+grow over time; the catalog endpoint is the source of truth for what's
+currently available (`oaica pull --help` only documents the command — it
+lists no models). Weights are streamed into
 `~/.oaica/models/<model>.gguf` (override the directory with
 `OAICA_MODELS_DIR`).
 
@@ -114,7 +115,7 @@ Override the models directory with `OAICA_MODELS_DIR`.
 | Symptom | Fix |
 |---|---|
 | `llama-server: command not found` (or `serve` can't find it) | Install llama.cpp and ensure `llama-server` is on `PATH`, or set `OAICA_LLAMA_SERVER=/full/path/to/llama-server` |
-| `pull` errors with an unknown/unrecognized model name | Check the current catalog — model names change over time; `GET https://api.oaica.com/v1/catalog` or `oaica pull --help` |
+| `pull` errors with an unknown/unrecognized model name | Check the current catalog — model names change over time; `GET https://api.oaica.com/v1/catalog` (the catalog endpoint is the list; `oaica pull --help` does not print one) |
 | A pull was interrupted partway through | Delete the partial download under `~/.oaica/models/` (look for a `.partial` file alongside the target `.gguf`) and re-run `oaica pull MODEL` |
 | `serve` fails with "port in use" / address already bound | Pick a free port explicitly with `oaica serve MODEL --port <N>`, or find and stop whatever is already bound to the default port |
 | `serve --host 0.0.0.0` refuses to start | Non-loopback hosts require `--api-key` (or pass `--insecure` if you understand the risk, on a trusted network only) |

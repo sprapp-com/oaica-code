@@ -51,7 +51,7 @@ func deprecatedLaunchModelPrompt(name, label, commandName, cloudRec, localRec st
 		return ""
 	}
 	if label = strings.TrimSpace(label); label == "" {
-		label = "ollama launch"
+		label = "oaica launch"
 	}
 
 	var b strings.Builder
@@ -81,7 +81,7 @@ func launchReplacementCommand(commandName, model string) string {
 	if commandName == "" || model == "" {
 		return ""
 	}
-	return fmt.Sprintf("ollama launch %s --model %s", commandName, model)
+	return fmt.Sprintf("oaica launch %s --model %s", commandName, model)
 }
 
 func firstNonEmpty(values ...string) string {

@@ -26,9 +26,9 @@ const (
 	claudeDesktopGatewayBaseURL  = "https://ollama.com"
 	claudeDesktopAPIKeyURL       = "https://ollama.com/settings/keys"
 	claudeDesktopModelLabel      = "Ollama Cloud"
-	claudeDesktopUnsupported     = "Claude Desktop is no longer supported. Existing installations can be restored with 'ollama launch claude-desktop --restore'."
+	claudeDesktopUnsupported     = "Claude Desktop is no longer supported. Existing installations can be restored with 'oaica launch claude-desktop --restore'."
 	claudeDesktopSuccessMessage  = "Claude Desktop profile changed to Ollama Cloud."
-	claudeDesktopRestoreMessage  = "To restore the usual Claude profile, run: ollama launch claude-desktop --restore"
+	claudeDesktopRestoreMessage  = "To restore the usual Claude profile, run: oaica launch claude-desktop --restore"
 	claudeDesktopRestoredMessage = "Claude Desktop restored to the usual Claude profile."
 )
 
@@ -837,7 +837,7 @@ func defaultClaudeDesktopOpenApp() error {
 		if path := claudeDesktopRunningAppPath(); path != "" {
 			return claudeDesktopOpenAppPath(path)
 		}
-		return fmt.Errorf("Claude Desktop executable was not found; open Claude Desktop manually once and re-run 'ollama launch claude-desktop --restore'")
+		return fmt.Errorf("Claude Desktop executable was not found; open Claude Desktop manually once and re-run 'oaica launch claude-desktop --restore'")
 	case "darwin":
 		return openClaudeDesktopDarwin()
 	default:

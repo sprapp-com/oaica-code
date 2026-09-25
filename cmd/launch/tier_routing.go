@@ -878,30 +878,33 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 			if l, ok := lookupCloudModelLimit(p.PrimaryName); ok && v < l.Context {
 				v = l.Context
 			}
-			// Find the current value in env and update it if our v is larger.
-			updated := false
+			// Raise the existing pair if our v is larger, and append one only
+			// if no pair exists yet. NEVER append a second pair: os/exec keeps
+			// the LAST duplicate of a variable, so appending a per-leg value
+			// (as this did) made the child read the smallest leg's window —
+			// the opposite of the max computed above.
+			idx, cur := -1, 0
 			for i, kv := range env {
-				if !strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") {
-					continue
+				if strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") {
+					idx = i
+					cur, _ = strconv.Atoi(strings.TrimPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="))
+					break
 				}
-				old, _ := strconv.Atoi(strings.TrimPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="))
-				if v > old {
-					s := strconv.Itoa(v)
-					env[i] = "CLAUDE_CODE_MAX_CONTEXT_TOKENS=" + s
-					// Update the paired AUTO_COMPACT_WINDOW at the same index +1.
-					if i+1 < len(env) && strings.HasPrefix(env[i+1], "CLAUDE_CODE_AUTO_COMPACT_WINDOW=") {
-						env[i+1] = "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" + s
-					}
-					updated = true
-				}
-				break
 			}
-			if !updated {
+			switch {
+			case idx < 0:
 				s := strconv.Itoa(v)
 				env = append(env,
 					"CLAUDE_CODE_MAX_CONTEXT_TOKENS="+s,
 					"CLAUDE_CODE_AUTO_COMPACT_WINDOW="+s,
 				)
+			case v > cur:
+				s := strconv.Itoa(v)
+				env[idx] = "CLAUDE_CODE_MAX_CONTEXT_TOKENS=" + s
+				// Update the paired AUTO_COMPACT_WINDOW at the same index +1.
+				if idx+1 < len(env) && strings.HasPrefix(env[idx+1], "CLAUDE_CODE_AUTO_COMPACT_WINDOW=") {
+					env[idx+1] = "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" + s
+				}
 			}
 		}
 	}
@@ -911,6 +914,15 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 // Run launches Claude Code against the plan: one local translation proxy,
 // routing per request model id.
 func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
+	// Decide wizard eligibility BEFORE the extractors below strip
+	// --sonnet-model/--haiku-model/--oversize/--route-policy/--plan/... from
+	// args: those flags are exactly what suppresses the wizard (tierWizardFlags),
+	// so asking afterwards always answered "eligible" and the wizard then
+	// OVERWROTE the caller's explicit tiers with its own answers — Enter on a
+	// step is "keep it" only relative to the wizard's own default, which is
+	// "unset", so a typed --sonnet-model was replaced by "" and the launch ran
+	// single-model at the primary's price.
+	wizardEligible := tierWizardEligible(args)
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
@@ -947,7 +959,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		if err != nil {
 			return fmt.Errorf("--plan: %w", err)
 		}
-	} else if wizardForced || tierWizardEligible(args) {
+	} else if wizardForced || wizardEligible {
 		// Sonnet/Haiku tier steps must offer the same "claude/*" and
 		// "anthropic/*" native-passthrough entries the primary picker step
 		// does (launch.go's selectSingleModelWithSelectorReady) — the
@@ -964,8 +976,21 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		if err != nil {
 			return fmt.Errorf("launch wizard: %w", err)
 		}
-		sonnetModel = w.SonnetModel
-		haikuModel = w.HaikuModel
+		// Ladder: the saved config sits ABOVE the wizard, so fill from it
+		// first and let the wizard's answer stand only for the tiers the
+		// preference left empty. (The wizard used to win outright — it assigned
+		// here and standingTierModels below only fills empty values — so
+		// `oaica config set sonnet-model X` was silently replaced by the
+		// wizard's "same as primary" and the split disappeared.) The saved
+		// flags are carried out so the stale-value retry still knows these came
+		// from the file.
+		sonnetModel, haikuModel, savedSonnet, savedHaiku = standingTierModels(sonnetModel, haikuModel)
+		if sonnetModel == "" {
+			sonnetModel = w.SonnetModel
+		}
+		if haikuModel == "" {
+			haikuModel = w.HaikuModel
+		}
 		oversizeModel = w.OversizeModel
 		policyArg = w.RoutePolicy
 	}
@@ -975,7 +1000,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// request for a distinct haiku tier, so it takes a native primary off the
 	// untouched runNative path (which has no env at all and would run its own
 	// built-in Haiku) — that is the intent, not a side effect.
-	sonnetModel, haikuModel, savedSonnet, savedHaiku = standingTierModels(sonnetModel, haikuModel)
+	sonnetModel, haikuModel, cfgSonnet, cfgHaiku := standingTierModels(sonnetModel, haikuModel)
+	// OR, not assignment: the wizard branch above may already have recorded
+	// that a tier came from the file, and this call sees a non-empty value (so
+	// it reports false) — overwriting would lose the attribution the stale-tier
+	// retry needs to forgive a saved value.
+	savedSonnet, savedHaiku = savedSonnet || cfgSonnet, savedHaiku || cfgHaiku
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
 		// briefModeSystemPrompt's doc for why this exact wording and why
