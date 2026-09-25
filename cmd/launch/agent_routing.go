@@ -344,7 +344,7 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 				go func() { _ = RunLocalLoggingProxy(ln, realHost) }()
 				baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 			}
-			token = oaicaLaunchAPIKeyForEnv()
+			token = oaicaTokenForModel(model)
 		}
 	} else {
 		realHost := oaicaResolveHostForModel(model)
@@ -353,7 +353,7 @@ func ResolveAgentModelWithOpts(ctx context.Context, model string, opts ResolveOp
 			go func() { _ = RunLocalLoggingProxy(ln, realHost) }()
 			baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 		}
-		token = oaicaLaunchAPIKeyForEnv()
+		token = oaicaTokenForModel(model)
 	}
 
 	meta = agentModelMeta(ctx, model)

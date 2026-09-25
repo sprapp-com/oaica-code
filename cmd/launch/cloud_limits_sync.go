@@ -32,10 +32,13 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 	if strings.TrimSpace(url) == "" {
 		url = defaultCloudLimitsSyncURL
 	}
+	// Same as ProviderSync: the request keeps the mirror credential, the report
+	// the caller prints does not (2026-09-26 audit).
+	display := redactBaseURL(url)
 
 	cachePath, err := cloudLimitsCatalogCachePath()
 	if err != nil {
-		return CloudLimitsSyncReport{URL: url}, err
+		return CloudLimitsSyncReport{URL: display}, err
 	}
 
 	var etag string
@@ -45,7 +48,7 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 
 	body, newEtag, fromCache, err := fetchCloudLimitsBody(url, etag, cachePath)
 	if err != nil {
-		return CloudLimitsSyncReport{URL: url}, err
+		return CloudLimitsSyncReport{URL: display}, err
 	}
 
 	var f cloudLimitsCatalogFile
@@ -53,17 +56,17 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 
 	if !fromCache {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-			return CloudLimitsSyncReport{URL: url}, err
+			return CloudLimitsSyncReport{URL: display}, err
 		}
 		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
-			return CloudLimitsSyncReport{URL: url}, err
+			return CloudLimitsSyncReport{URL: display}, err
 		}
 		if newEtag != "" {
 			_ = os.WriteFile(cachePath+".etag", []byte(newEtag), 0o600)
 		}
 	}
 
-	return CloudLimitsSyncReport{URL: url, Count: len(f.Limits), FromCache: fromCache}, nil
+	return CloudLimitsSyncReport{URL: display, Count: len(f.Limits), FromCache: fromCache}, nil
 }
 
 func fetchCloudLimitsBody(url, etag, cachePath string) (body []byte, newEtag string, fromCache bool, err error) {

@@ -1354,7 +1354,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.BaseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
+			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
 			return
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
@@ -1374,7 +1374,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// (route_policy.go): consecutive failures escalate the session to
 			// the stronger secondary leg.
 			table.escalations.recordFail(table.SessionID, route.BaseURL)
-			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
+			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 			return
 		}
 		defer resp.Body.Close()
@@ -1864,7 +1864,7 @@ func upstreamErrorMessage(s string) string {
 func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, nil)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "build request: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "build request: "+redactErr(err).Error())
 		return
 	}
 	if key != "" {
@@ -1872,7 +1872,7 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -1916,7 +1916,7 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream, headerName, headerValue string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream, nil)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
 		return
 	}
 	for k, vs := range r.Header {
@@ -1930,7 +1930,7 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 	req.Header.Set(headerName, headerValue)
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -2099,7 +2099,7 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
 		return
 	}
 	// Forward the client's own Anthropic-protocol headers (anthropic-
@@ -2125,7 +2125,7 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return
 	}
 	defer resp.Body.Close()

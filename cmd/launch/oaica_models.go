@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,9 +65,27 @@ func oaicaLocalServersRegistryPath() (string, error) {
 }
 
 // oaicaLocalServerEntries reads the registry `oaica serve` maintains and
-// returns only entries whose origin actually responds to /health right
-// now — a stale entry (server crashed without cleanup running, e.g.
-// kill -9) is filtered out here rather than offered as a live option.
+// returns only entries that are live RIGHT NOW: the recorded process must
+// still exist, and its origin must answer /health — a stale entry (server
+// crashed without cleanup running, e.g. kill -9) is filtered out here rather
+// than offered as a live option.
+//
+// Two things the /health check alone cannot do, both 2026-09-26 audit:
+//
+//   - It sent NO Authorization header, so a server started the way
+//     ServeHandler's own refusal message recommends for off-loopback use
+//     (`oaica serve <model> --host 0.0.0.0 --api-key K`) answered 401 and was
+//     dropped although it was up and reachable: RunNormalizingProxyOn gates
+//     /health on the bearer for every non-loopback bind (local_proxy.go). The
+//     registered --api-key is exactly what this probe must present, and the
+//     file it comes from is 0600.
+//   - A bare 200 says nothing about WHICH server answered. An entry whose
+//     recorded pid is gone is a crashed serve, and if its port was since
+//     taken over — by another `oaica serve` or by any local HTTP server that
+//     answers 200 on /health — the row for the dead model silently routed to
+//     the live one's weights. The pid was recorded for this and read by
+//     nothing; it is the one signal that tells "our serve" from "whatever
+//     answers on that port".
 func oaicaLocalServerEntries() []oaicaLocalServersRegistryEntry {
 	path, err := oaicaLocalServersRegistryPath()
 	if err != nil {
@@ -83,8 +102,18 @@ func oaicaLocalServerEntries() []oaicaLocalServersRegistryEntry {
 	live := make([]oaicaLocalServersRegistryEntry, 0, len(all))
 	client := &http.Client{Timeout: 800 * time.Millisecond}
 	for _, e := range all {
-		resp, err := client.Get(e.Origin + "/health")
-		if err != nil {
+		if !oaicaServeProcessAlive(e.PID) {
+			continue
+		}
+		req, rerr := http.NewRequest(http.MethodGet, e.Origin+"/health", nil)
+		if rerr != nil {
+			continue
+		}
+		if e.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+e.APIKey)
+		}
+		resp, derr := client.Do(req)
+		if derr != nil {
 			continue
 		}
 		resp.Body.Close()
@@ -93,6 +122,48 @@ func oaicaLocalServerEntries() []oaicaLocalServersRegistryEntry {
 		}
 	}
 	return live
+}
+
+// oaicaServeProcessAlive reports whether a registry entry's recorded pid can
+// still name a live process on this machine.
+//
+// The entry was written by the serve process itself (os.Getpid() at
+// registration), so a pid that is gone means that process is gone. Where the
+// question cannot be answered at all — no /proc (macOS, Windows), or a pid
+// outside the kernel's range while /proc/sys/kernel/pid_max is unreadable —
+// the entry is given the benefit of the doubt and the caller falls back to
+// the /health probe, which is the only test available there.
+//
+// Residual, and deliberately not guessed at: a pid may be RECYCLED, so a live
+// unrelated process holding a crashed serve's pid passes this check. Telling
+// that apart needs the responder to identify itself, which a bare
+// llama-server /health does not do.
+func oaicaServeProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if _, err := os.Stat("/proc/self"); err != nil {
+		return true // no /proc: liveness is not observable here
+	}
+	if max := oaicaKernelPIDMax(); max > 0 && pid > max {
+		return false // a pid the kernel cannot hand out: nothing wrote this but a test or a corrupt file
+	}
+	_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	return err == nil
+}
+
+// oaicaKernelPIDMax is the largest pid the kernel can hand out, 0 when it
+// cannot be read (no procfs).
+func oaicaKernelPIDMax() int {
+	b, err := os.ReadFile("/proc/sys/kernel/pid_max")
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // oaicaLocalTagSuffix marks a picker entry as explicitly local — Ollama's
@@ -135,6 +206,44 @@ func oaicaResolveHostForModel(model string) string {
 		// already caught a genuinely nonexistent model earlier.
 	}
 	return oaicaLaunchHost()
+}
+
+// oaicaLocalServeKeyForModel returns the --api-key the live `oaica serve`
+// registered for a "<model>:local" tag, or "" when there is no such server.
+// Explicit OAICA_HOST wins here exactly as it does in
+// oaicaResolveHostForModel: a pinned host means the tag is cloud-routed and
+// the registry is not consulted.
+func oaicaLocalServeKeyForModel(model string) string {
+	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" {
+		return ""
+	}
+	base, wasLocal := oaicaStripLocalTag(model)
+	if !wasLocal {
+		return ""
+	}
+	for _, e := range oaicaLocalServerEntries() {
+		if e.Model == base {
+			return e.APIKey
+		}
+	}
+	return ""
+}
+
+// oaicaTokenForModel is the bearer a launcher must send for a model it is
+// about to route: the key the local `oaica serve` registered when the model
+// is a "<model>:local" tag (its normalizing proxy rejects any other bearer
+// with 401 — local_proxy.go), the router credential otherwise.
+//
+// The launch path has always done this (tier_routing.go reads the registry's
+// APIKey); the agent path read oaicaLaunchAPIKeyForEnv() unconditionally, so
+// `oaica agent --model <m>:local` sent the ROUTER's key to a keyed local
+// serve and could never authenticate — and with no router key configured it
+// sent an empty bearer (2026-09-26 audit).
+func oaicaTokenForModel(model string) string {
+	if key := oaicaLocalServeKeyForModel(model); key != "" {
+		return key
+	}
+	return oaicaLaunchAPIKeyForEnv()
 }
 
 // openAIBaseURLAndKey returns the base URL, bearer key, and bare model id an

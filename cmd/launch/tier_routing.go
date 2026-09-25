@@ -373,6 +373,17 @@ func routeForDisguised(primary, leg launchEndpoint) proxyRoute {
 //
 // When the primary is not a user remote, the generic resolver applies.
 func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launchEndpoint, error) {
+	// A user alias wins in a tier slot exactly as it does in the primary slot
+	// (resolveLaunchEndpoint resolves it first, before every other source).
+	// Without this the alias NAME was treated as a literal upstream id and, at
+	// the bottom of this function, prefixed with the primary's remote — so
+	// `--sonnet-model fast` where fast aliases "zai/glm-air" ran the sonnet
+	// tier on the PRIMARY's host with the PRIMARY's credential and never
+	// reached the model the user aliased, while the same name in the primary
+	// slot went to zai (2026-09-26 audit).
+	if target, ok := resolveModelAlias(sonnetModel); ok {
+		sonnetModel = target
+	}
 	if primary.Source != sourceUserRemote {
 		// OAICA router SKUs resolve to the router even when a user remote
 		// mirrors the bare id in its own /models (opencode zen proxies our

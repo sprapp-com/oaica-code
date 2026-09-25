@@ -55,17 +55,23 @@ func AuthLogin(out io.Writer, provider, key string) error {
 		if err != nil {
 			return err
 		}
-		found := false
+		matched := ""
 		for _, r := range remotes {
 			if strings.EqualFold(r.Name, provider) {
-				found = true
+				matched = r.Name
 				break
 			}
 		}
-		if !found {
+		if matched == "" {
 			return fmt.Errorf("%q is not a provider oaica knows (neither in the provider catalog nor in ~/.oaica/remotes.json). Run `oaica auth list` to see the catalog, or `oaica remote add %s --base-url ...` first", provider, provider)
 		}
-		provider = strings.ToLower(provider)
+		// Store under the name the remote was ADDED with. The read path is a
+		// case-SENSITIVE map lookup on remote.Name (auth_store.go via
+		// storedAuthKey/user_remotes.go), so the lowercased copy this used to
+		// write was a credential nothing ever looked up: `oaica auth login
+		// MyBox` printed success, stored "mybox", and the very next launch
+		// still demanded a key — with no error anywhere (2026-09-26 audit).
+		provider = matched
 	} else {
 		provider = entry.Name
 	}

@@ -325,6 +325,22 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 		apiKey  string
 		models  []LaunchModel
 	}
+	// The daemon block's id is "ollama", which is also a legal USER REMOTE
+	// name (`oaica remote add ollama --base-url ...`). Two groups under one id
+	// are merged by byID, and whichever is added first owns the block: the
+	// other backend's models were then declared under its base URL and
+	// credential — local traffic exported to that remote, or the remote's
+	// model pointed at the daemon (2026-09-26 audit). The rename applies only
+	// when such a remote is actually present, so the ordinary config stays
+	// byte-identical.
+	localID := "ollama"
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok && ep.Name == localID {
+			localID = "ollama-local"
+			break
+		}
+	}
+
 	var groups []*providerGroup
 	byID := map[string]*providerGroup{}
 	add := func(m LaunchModel, id, name, baseURL, apiKey string) {
@@ -340,7 +356,7 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
 			add(m, ep.Name, ep.Name, ep.BaseURL, ep.Token)
 		} else {
-			add(m, "ollama", "Ollama", envconfig.Host().String()+"/v1", "")
+			add(m, localID, "Ollama", envconfig.Host().String()+"/v1", "")
 		}
 	}
 
@@ -360,7 +376,7 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 	}
 
 	// Top-level model: "<providerId>/<modelId>".
-	primaryProvider, primaryID := "ollama", opencodeModelID(primary)
+	primaryProvider, primaryID := localID, opencodeModelID(primary)
 	if ep, ok := resolveRemoteEndpoint(primary.Name); ok {
 		primaryProvider = ep.Name
 	}

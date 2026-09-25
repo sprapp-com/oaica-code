@@ -33,10 +33,16 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 	if strings.TrimSpace(url) == "" {
 		url = defaultProviderSyncURL
 	}
+	// display is the URL as the caller may print it. The request must keep any
+	// mirror credential in the userinfo (`--url https://KEY@mirror/…` is how a
+	// private mirror authenticates), but the report line `oaica provider sync`
+	// echoes — and every error string — must not, exactly as ModelSync's report
+	// already promises for the identical input (2026-09-26 audit).
+	display := redactBaseURL(url)
 
 	cachePath, err := providerCatalogCachePath()
 	if err != nil {
-		return ProviderSyncReport{URL: url}, err
+		return ProviderSyncReport{URL: display}, err
 	}
 
 	var etag string
@@ -46,23 +52,23 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 
 	body, newEtag, fromCache, err := fetchProviderCatalogBody(url, etag)
 	if err != nil {
-		return ProviderSyncReport{URL: url}, err
+		return ProviderSyncReport{URL: display}, err
 	}
 
 	f := parseProviderCatalogFile(body)
 	if !fromCache {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-			return ProviderSyncReport{URL: url}, err
+			return ProviderSyncReport{URL: display}, err
 		}
 		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
-			return ProviderSyncReport{URL: url}, err
+			return ProviderSyncReport{URL: display}, err
 		}
 		if newEtag != "" {
 			_ = os.WriteFile(cachePath+".etag", []byte(newEtag), 0o600)
 		}
 	}
 
-	return ProviderSyncReport{URL: url, Count: len(f.Providers), FromCache: fromCache}, nil
+	return ProviderSyncReport{URL: display, Count: len(f.Providers), FromCache: fromCache}, nil
 }
 
 func fetchProviderCatalogBody(url, etag string) (body []byte, newEtag string, fromCache bool, err error) {

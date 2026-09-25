@@ -200,17 +200,51 @@ func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	return fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
+// oaicaUnregisterLocalServerAt removes exactly the entry THIS process
+// registered: model, origin and pid all have to match. A teardown that knows
+// only the model name cannot tell its own entry from another live instance's
+// — `oaica serve bonsai` and `oaica serve bonsai --port 30002` both write a
+// "bonsai" entry (the second replaces the first), and the first one's exit
+// then deleted the entry the still-running second had written, so the only
+// source for a "bonsai:local" row lost the server that was up
+// (2026-09-26 audit).
+func oaicaUnregisterLocalServerAt(model, origin string) {
+	pid := os.Getpid()
+	oaicaDropLocalServers(func(e oaicaLocalServerEntry) bool {
+		return e.Model == model && e.Origin == origin && e.PID == pid
+	}, false)
+}
+
+// oaicaUnregisterLocalServer removes the OLDEST registry entry for model. It
+// is for a caller that knows nothing about the instance beyond the model name
+// (a future `serve --stop`, and the registry's own tests); a serve process
+// tearing itself down has an origin and a pid and must use
+// oaicaUnregisterLocalServerAt instead.
 func oaicaUnregisterLocalServer(model string) {
+	oaicaDropLocalServers(func(e oaicaLocalServerEntry) bool { return e.Model == model }, true)
+}
+
+// oaicaDropLocalServers rewrites local_servers.json without the entries match
+// selects — the first only, when first is true. Nothing is written when
+// nothing matched, so a teardown whose entry was already replaced (or never
+// registered) cannot disturb the live servers' entries.
+func oaicaDropLocalServers(match func(oaicaLocalServerEntry) bool, first bool) {
 	path, err := oaicaLocalServersPath()
 	if err != nil {
 		return
 	}
 	entries := oaicaReadLocalServers(path)
 	filtered := entries[:0]
+	dropped := false
 	for _, e := range entries {
-		if e.Model != model {
-			filtered = append(filtered, e)
+		if match(e) && (!first || !dropped) {
+			dropped = true
+			continue
 		}
+		filtered = append(filtered, e)
+	}
+	if !dropped {
+		return
 	}
 	b, err := json.MarshalIndent(filtered, "", "  ")
 	if err != nil {
@@ -297,6 +331,42 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 // with progress. Returns the local file path on success. Re-downloads are
 // NOT resumed (no Range support wired up yet) — deleting a partial file
 // and re-running is the current recovery path for an interrupted pull.
+// oaicaPullURL is the byte-stream URL for a manifest's pull_url, refused
+// unless it addresses the router itself.
+//
+// pull_url is DATA from the router's manifest, and oaicaHost()+pull_url is a
+// concatenation, not a URL join: a value that is not a path can carry its own
+// authority, and in the RFC-3986 userinfo form everything after the LAST "@"
+// is the authority — so "router@attacker/v1/pull/m" resolved to the attacker,
+// and the manifest chose both the host that received the distribution license
+// as a bearer and the bytes that were installed as the model file. The
+// sibling manifest field hf_url is refused unless it is https on
+// huggingface.co, for exactly this reason (hfHostAcceptsToken); this is the
+// same rule for the same kind of data, and it costs nothing: the router's own
+// pull_url is always a path ("/v1/pull/<model>", tools/gateway/pull.go).
+func oaicaPullURL(host, pullURL string) (string, error) {
+	pullURL = strings.TrimSpace(pullURL)
+	// "/v1/pull/x", not "//evil/x" (protocol-relative: another host), not
+	// "?k=v" (swallows the router's own path), not a bare host.
+	if !strings.HasPrefix(pullURL, "/") || strings.HasPrefix(pullURL, "//") {
+		return "", fmt.Errorf("router sent a pull_url that is not a path: %q", pullURL)
+	}
+	base, err := url.Parse(strings.TrimSpace(host))
+	if err != nil || base.Host == "" {
+		return "", fmt.Errorf("cannot resolve the router host: %w", err)
+	}
+	full, err := url.Parse(base.String() + pullURL)
+	if err != nil {
+		return "", fmt.Errorf("router sent an unusable pull_url: %w", err)
+	}
+	// The authority of the composed URL must be the router's, and the
+	// credential it rides in (if any) the router's own.
+	if full.Scheme != base.Scheme || full.Host != base.Host {
+		return "", fmt.Errorf("router sent a pull_url that points at %s, not at the router", full.Host)
+	}
+	return base.String() + pullURL, nil
+}
+
 func oaicaPullModel(model string) (string, error) {
 	manifest, err := oaicaFetchManifest(model)
 	if err != nil {
@@ -316,7 +386,10 @@ func oaicaPullModel(model string) (string, error) {
 		return oaicaPullFromHF(model, manifest, destPath)
 	}
 
-	pullURL := oaicaHost() + manifest.PullURL
+	pullURL, err := oaicaPullURL(oaicaHost(), manifest.PullURL)
+	if err != nil {
+		return "", err
+	}
 	req, err := http.NewRequest(http.MethodGet, pullURL, nil)
 	if err != nil {
 		return "", err
@@ -808,7 +881,9 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	if err := oaicaRegisterLocalServer(model, origin, apiKey); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to register local server (picker won't auto-discover it): %v\n", err)
 	}
-	cleanup := func() { oaicaUnregisterLocalServer(model) }
+	// Its OWN entry, matched by origin and pid — the model name alone is not
+	// enough to identify this instance (2026-09-26 audit).
+	cleanup := func() { oaicaUnregisterLocalServerAt(model, origin) }
 	defer cleanup()
 
 	// Calling Process.Kill()/Signal() after the process has already

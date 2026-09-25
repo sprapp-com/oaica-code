@@ -114,6 +114,8 @@ func ModelAliasSet(name, target string) error {
 
 // ModelAliasRemove deletes an alias, reporting whether it existed.
 func ModelAliasRemove(name string) (bool, error) {
+	// Trimmed like ModelAliasSet trims the name it stores (2026-09-26 audit).
+	name = strings.TrimSpace(name)
 	a, err := loadModelAliases()
 	if err != nil {
 		return false, err

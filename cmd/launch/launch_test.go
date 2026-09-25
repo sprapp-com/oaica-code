@@ -206,6 +206,15 @@ func setLaunchTestHome(t *testing.T, dir string) {
 	t.Setenv("Z_AI_API_KEY", "")
 	t.Setenv("OPENROUTER_API_KEY", "")
 	t.Setenv("OAICA_REMOTES_FILE", filepath.Join(dir, "no-remotes.json"))
+	// Same for the auth store. hermeticTestEnv points OAICA_AUTH_FILE at ONE
+	// shared path for the whole package run (it is a masked default, not a
+	// per-test fixture), so a test that logs in a remote wrote its key where
+	// every other test's reportSecrets could read it — which is how a later
+	// credential-free assertion failed on a key nobody in that test had set
+	// (2026-09-26 audit, found while porting the round-4 auth-login fix).
+	// Under this dir the store starts absent for every test, and a test that
+	// wants a login writes it there.
+	t.Setenv("OAICA_AUTH_FILE", filepath.Join(dir, "no-auth.json"))
 	prev := oaicaFetchCloudModelEntries
 	ollamaCloudEntriesFn = nil
 	oaicaFetchCloudModelEntries = func() ([]oaicaModelEntry, error) { return nil, nil }

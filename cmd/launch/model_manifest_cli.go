@@ -59,6 +59,13 @@ func ModelAdd(opts ModelAddOptions) (ModelManifestEntry, error) {
 
 // ModelRemove deletes a manifest entry by ID. Returns whether it existed.
 func ModelRemove(id string) (bool, error) {
+	// Trimmed exactly as ModelAdd trims what it stores: the argument a user
+	// passes to `oaica model rm` is the one they passed to `oaica model add`,
+	// and a padded copy of it named nothing, so the command failed with "no
+	// manifest entry" while `oaica model list` showed the row — and the row
+	// survived (2026-09-26 audit). ModelAdd/ModelShow/ModelAliasSet all trim;
+	// the removers were the odd ones out.
+	id = strings.TrimSpace(id)
 	m, err := loadModelManifest()
 	if err != nil {
 		return false, err
@@ -74,6 +81,7 @@ func ModelRemove(id string) (bool, error) {
 
 // ModelShow returns one entry, or an error naming the manifest path if not found.
 func ModelShow(id string) (ModelManifestEntry, error) {
+	id = strings.TrimSpace(id)
 	m, err := loadModelManifest()
 	if err != nil {
 		return ModelManifestEntry{}, err

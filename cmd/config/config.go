@@ -241,6 +241,14 @@ func LoadIntegration(appName string) (*integration, error) {
 	if !ok {
 		return nil, os.ErrNotExist
 	}
+	if integrationConfig == nil {
+		// A present-but-null entry — a hand-edited config.json, or any writer
+		// that emits null for an empty object. Returning (nil, nil) told every
+		// caller "found" and they dereference it, so `oaica launch vscode`
+		// panicked on a nil pointer instead of reporting a bad config file
+		// (2026-09-26 audit).
+		return nil, fmt.Errorf("integration %q has no settings in the config file (null entry)", appName)
+	}
 
 	return integrationConfig, nil
 }
