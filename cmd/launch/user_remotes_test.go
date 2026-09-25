@@ -2,6 +2,8 @@ package launch
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -177,7 +179,11 @@ func TestBuiltinRemotes_MergedIntoLoad(t *testing.T) {
 // serve no model list at all on their Anthropic-compatible endpoints, so
 // without the declared list a paid plan would be invisible in the picker.
 func TestRemoteLaunchModels_DeclaredCatalogModelsSurviveFailedSweep(t *testing.T) {
-	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1", Wire: "anthropic"}
+	// CatalogOrigin: the declared list is the VENDOR's, and remoteLaunchModels
+	// applies it only to the catalog's own row — a user remote of the same
+	// name keeps none of it (see CatalogOrigin).
+	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1",
+		Wire: "anthropic", CatalogOrigin: true}
 	models, err := remoteLaunchModels(r, nil, fmt.Errorf("HTTP 404"))
 	if err != nil {
 		t.Fatalf("remoteLaunchModels() error = %v, want the declared list to absorb a failed sweep", err)
@@ -216,7 +222,7 @@ func TestRemoteLaunchModels_UndeclaredRemoteStillReportsSweepFailure(t *testing.
 // declared id, so a provider that DOES answer /v1/models is unaffected by
 // having a declared list as well.
 func TestRemoteLaunchModels_SweptIDsWinAndKeepOrder(t *testing.T) {
-	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1"}
+	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1", CatalogOrigin: true}
 	models, err := remoteLaunchModels(r, []string{"Custom-Live", "MiniMax-M3"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -232,5 +238,70 @@ func TestRemoteLaunchModels_SweptIDsWinAndKeepOrder(t *testing.T) {
 	}
 	if m3Count != 1 {
 		t.Fatalf("MiniMax-M3 appears %d times, want once (swept id wins over the declared duplicate)", m3Count)
+	}
+}
+
+// TestRemoteEndpoint_TokenEnvNamesOneVariable: TokenEnv exists so a long-lived
+// proxy re-reads the credential from the environment on every request instead
+// of trusting the value resolved at launch (see its doc — the 2026-08-29
+// incident). A row naming two variables carried the raw comma-joined string,
+// which os.Getenv cannot resolve, so the live re-read was dead and every
+// request fell back to the launch-time key (2026-09-26 audit).
+func TestRemoteEndpoint_TokenEnvNamesOneVariable(t *testing.T) {
+	withTempHome(t)
+	useTempAuthStore(t)
+	clearAllCatalogKeys(t)
+	useOpencodeStore(t, `{}`)
+	t.Setenv("OPENCODE_API_KEY", "sk-live-opencode")
+
+	ep, ok := resolveRemoteEndpoint("opencode-go/glm-5")
+	if !ok {
+		t.Fatal("opencode-go must resolve with OPENCODE_API_KEY exported")
+	}
+	if ep.Token == "" {
+		t.Fatal("the endpoint resolved without a credential — the fixture is wrong")
+	}
+	if v := os.Getenv(ep.TokenEnv); v == "" {
+		t.Errorf("TokenEnv = %q names no environment variable, so a proxy built from this endpoint can never re-read "+
+			"the credential: resolveKey falls back to the launch-time key for the process's whole lifetime", ep.TokenEnv)
+	}
+}
+
+// TestRemoteLaunchModels_UserRowDoesNotInheritCatalogDeclaredModels: the
+// catalog's declared model list is looked up by NAME, and loadUserRemotes
+// deliberately lets a user's own row win over a catalog row of the same name
+// ("the catalog only ever supplies a default, never overrides a user's explicit
+// config"). Looking the declaration up by name then offered every model the
+// catalog declares for that name against the user's box — ids that box never
+// advertised, which a launch would POST to it (2026-09-26 audit).
+func TestRemoteLaunchModels_UserRowDoesNotInheritCatalogDeclaredModels(t *testing.T) {
+	withTempHome(t)
+	useTempAuthStore(t)
+	clearAllCatalogKeys(t)
+	writeRemotes(t, `{"remotes":[{"name":"minimax-coding-plan","base_url":"http://127.0.0.1:31999/anthropic","wire":"anthropic"}]}`)
+
+	r, _, ok := findUserRemoteForModel("minimax-coding-plan/my-local-model")
+	if !ok {
+		t.Fatal("the user's own row must resolve (user config wins over the catalog)")
+	}
+	if r.BaseURL != "http://127.0.0.1:31999/anthropic" {
+		t.Fatalf("resolved the wrong row: %+v", r)
+	}
+
+	// This box answers its own (tiny) model list, with no sweep error.
+	models, err := remoteLaunchModels(r, []string{"my-local-model"}, nil)
+	if err != nil {
+		t.Fatalf("remoteLaunchModels: %v", err)
+	}
+	var foreign []string
+	for _, m := range models {
+		if id, ok := strings.CutPrefix(m.Name, r.Name+"/"); ok && id != "my-local-model" {
+			foreign = append(foreign, id)
+		}
+	}
+	if len(foreign) > 0 {
+		t.Errorf("the picker offers %d model id(s) this remote never advertised (%v), because the catalog's "+
+			"declared list for the NAME %q is applied to the user's own row; a launch would POST %q to %s",
+			len(foreign), foreign, r.Name, foreign[0], r.BaseURL)
 	}
 }

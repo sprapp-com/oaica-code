@@ -149,8 +149,15 @@ func ModelScan(dirs []string) (localScanReport, error) {
 		case !existed:
 			m.Put(e)
 			report.Added = append(report.Added, f.id)
-		case prev.ModelPath == "" && prev.Source != "sync":
-			// known but pathless (hand-declared): fill in the path, keep config
+		case prev.ModelPath == "":
+			// known but pathless: fill in the path, keep config. The source is
+			// deliberately not consulted — a catalog-shipped entry (Source
+			// "sync") has no path and never will, so requiring Source != "sync"
+			// here made "where do this model's weights live" unrecordable for
+			// every model the catalog lists, while the scan's own header and
+			// `oaica model list --help` both promise it fills a pathless entry.
+			// Refusing to REPOINT an entry that already names a different path
+			// (the default case) is the discipline that matters.
 			prev.ModelPath = f.path
 			if prev.Quant == "" {
 				prev.Quant = e.Quant

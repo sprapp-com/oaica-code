@@ -49,8 +49,13 @@ type modelSyncCache struct {
 // the network hiccuped, a working sync turned into a hard error.
 func (c modelSyncCache) usable() bool {
 	// A cache file whose URL differs from the requested one is zeroed by the
-	// caller, so a non-zero SavedAt means "written by a successful fetch".
-	return !c.SavedAt.IsZero()
+	// caller, so a non-zero SavedAt means "written by a successful fetch" —
+	// and a successful fetch of a document that HAS models. The second half
+	// matters as much as the first: a cache holding an empty catalog is not a
+	// last-good copy, and serving it to an offline `--prune` deleted every
+	// synced entry. The router cache in oaica_models.go gates its fallbacks on
+	// exactly this pair.
+	return !c.SavedAt.IsZero() && len(c.Catalog.Models) > 0
 }
 
 func modelSyncCachePath() (string, error) {
@@ -115,31 +120,51 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 	if strings.TrimSpace(url) == "" {
 		url = defaultModelSyncURL
 	}
+	// display is the URL as it may be written down or printed. The request
+	// itself must keep the credential (that is how a mirror behind
+	// `--url https://KEY@mirror/models.json` authenticates), but the cache
+	// file, the manifest's source_url, the report line `oaica model sync`
+	// echoes, and every error string are all places the key must not reach —
+	// docs/ENTERPRISE.md names the catalog caches explicitly ("A credential
+	// must not reach a log, a cache, a support bundle, or a process argument
+	// list"), and this is the documented mirror setup.
+	display := redactBaseURL(url)
+	display = strings.TrimRight(display, "/")
 
-	catalog, fromCache, err := fetchModelCatalog(url)
+	catalog, fromCache, err := fetchModelCatalog(url, display)
 	if err != nil {
-		return ModelSyncReport{URL: url}, err
+		return ModelSyncReport{URL: display}, err
 	}
 
 	m, err := loadModelManifest()
 	if err != nil {
-		return ModelSyncReport{URL: url}, err
+		return ModelSyncReport{URL: display}, err
 	}
 
-	report := ModelSyncReport{URL: url, FromCache: fromCache}
-	for _, remote := range catalog.SortedIDs() {
-		e := catalog.Models[remote]
-		e.ID = remote
-		if err := validateModelManifestEntry(e); err != nil {
-			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: %v", remote, err))
+	report := ModelSyncReport{URL: display, FromCache: fromCache}
+	for _, listed := range catalog.SortedIDs() {
+		// The manifest keys on the exact id, and `model add` trims while this
+		// loop used to store the catalog key verbatim — so a stray space in a
+		// hand-authored catalog produced a second entry for one model, one of
+		// which no command could address (rm/show do not trim either).
+		id := strings.TrimSpace(listed)
+		if id == "" {
+			report.Skipped = append(report.Skipped, fmt.Sprintf("%q: empty model id", listed))
 			continue
 		}
-		prev, existed := m.Get(remote)
+		e := catalog.Models[listed]
+		e.ID = id
+		if err := validateModelManifestEntry(e); err != nil {
+			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		prev, existed := m.Get(id)
 		switch {
 		case !existed:
 			e.Source = "sync"
+			e.SourceURL = display
 			m.Put(e)
-			report.Added = append(report.Added, remote)
+			report.Added = append(report.Added, id)
 		case prev.Source != "sync":
 			// The entry is the user's: hand-added (no Source) or registered
 			// by the local scan. Automation must not rewrite it — the same
@@ -152,28 +177,57 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 			merged := prev
 			fillFromCatalog(&merged, e)
 			m.Put(merged)
-			report.Updated = append(report.Updated, remote)
+			report.Updated = append(report.Updated, id)
 		default:
 			e.Source = "sync"
+			e.SourceURL = display
 			// Local field notes win unless the catalog ships its own.
 			if e.Notes == "" {
 				e.Notes = prev.Notes
 			}
+			// ModelPath is the merge policy's standing exception (see
+			// fillFromCatalog): a path comes from the filesystem or the user,
+			// never from a remote document. The catalog never carries one, so
+			// replacing the entry wholesale silently cleared a path the user
+			// had recorded — and every later sync erased it again.
+			if e.ModelPath == "" {
+				e.ModelPath = prev.ModelPath
+			}
 			m.Put(e)
-			report.Updated = append(report.Updated, remote)
+			report.Updated = append(report.Updated, id)
 		}
 	}
 
 	if prune {
-		for _, id := range m.SortedIDs() {
-			if m.Models[id].Source != "sync" {
-				continue
+		switch {
+		case len(catalog.Models) == 0:
+			// A document that declares no models is not evidence that every
+			// model the user has was withdrawn. The dangerous shape is not
+			// hypothetical: any 200 whose body is JSON without a "models"
+			// member — a CDN or captive-portal error page, `{}`, or the
+			// literal null — parsed as "zero models", so `--prune` deleted
+			// every synced entry and reported it as a successful sync.
+			report.Skipped = append(report.Skipped, "prune: the fetched catalog declares no models — nothing pruned")
+		default:
+			for _, id := range m.SortedIDs() {
+				entry := m.Models[id]
+				if entry.Source != "sync" {
+					continue
+				}
+				// Only entries from THIS catalog are this catalog's to
+				// withdraw. An internal mirror synced with --url would
+				// otherwise have everything it supplied deleted by the next
+				// plain `model sync --prune`, which cannot know the mirror's
+				// entries at all.
+				if entry.SourceURL != "" && entry.SourceURL != display {
+					continue
+				}
+				if _, inCatalog := catalog.Models[id]; inCatalog {
+					continue
+				}
+				m.Remove(id)
+				report.Pruned = append(report.Pruned, id)
 			}
-			if _, inCatalog := catalog.Models[id]; inCatalog {
-				continue
-			}
-			m.Remove(id)
-			report.Pruned = append(report.Pruned, id)
 		}
 	}
 
@@ -185,7 +239,7 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 
 // fetchModelCatalog GETs the catalog body, honoring If-None-Match via
 // the sync cache. file:// URLs bypass HTTP entirely (no ETag).
-func fetchModelCatalog(url string) (modelManifest, bool, error) {
+func fetchModelCatalog(url, display string) (modelManifest, bool, error) {
 	if strings.HasPrefix(url, "file://") {
 		path := strings.TrimPrefix(url, "file://")
 		data, err := os.ReadFile(path)
@@ -198,13 +252,16 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 
 	cachePath, _ := modelSyncCachePath()
 	var cached modelSyncCache
-	if b, err := os.ReadFile(cachePath); err == nil && json.Unmarshal(b, &cached) == nil && cached.URL == url {
+	if b, err := os.ReadFile(cachePath); err == nil && json.Unmarshal(b, &cached) == nil && cached.URL == display {
 		// valid cache only if it came from the same URL
 	} else {
 		cached = modelSyncCache{}
 	}
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	// NewRedactedRequest, not http.NewRequest: its error text quotes the URL,
+	// and for a credential-carrying --url that is the key in a parse error
+	// before any request exists.
+	req, err := NewRedactedRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return modelManifest{}, false, err
 	}
@@ -217,7 +274,7 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 		if cached.usable() {
 			return cached.Catalog, true, nil
 		}
-		return modelManifest{}, false, fmt.Errorf("couldn't reach %s: %w", url, err)
+		return modelManifest{}, false, fmt.Errorf("couldn't reach %s: %w", display, redactErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -231,10 +288,10 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 			}
 			return cached.Catalog, true, nil
 		}
-		return modelManifest{}, false, fmt.Errorf("%s returned 304 but no cached copy from that URL is on disk", url)
+		return modelManifest{}, false, fmt.Errorf("%s returned 304 but no cached copy from that URL is on disk", display)
 	case resp.StatusCode != http.StatusOK:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return modelManifest{}, false, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+		return modelManifest{}, false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
@@ -246,7 +303,7 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 		return modelManifest{}, false, err
 	}
 	etag := resp.Header.Get("ETag")
-	if b, jerr := json.Marshal(modelSyncCache{SavedAt: time.Now(), URL: url, ETag: etag, Catalog: catalog}); jerr == nil {
+	if b, jerr := json.Marshal(modelSyncCache{SavedAt: time.Now(), URL: display, ETag: etag, Catalog: catalog}); jerr == nil {
 		_ = os.MkdirAll(filepath.Dir(cachePath), 0o700)
 		_ = os.WriteFile(cachePath, b, 0o600)
 	}
@@ -256,13 +313,26 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 // parseModelCatalog decodes a catalog body. The hosted file is the same
 // modelManifest shape as the local manifest; version 0 (absent) is
 // tolerated so hand-rolled catalogs don't need to remember "version": 1.
+//
+// A document with no "models" MEMBER is rejected rather than read as an empty
+// catalog. Without that, `{"message":"Not Found"}` from a proxy, `{}`, or the
+// literal `null` all decoded cleanly into "this catalog has zero models" — and
+// since the prune compares the manifest against exactly that map, one such
+// response over HTTP 200 deleted every synced entry in one go.
 func parseModelCatalog(data []byte) (modelManifest, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return modelManifest{}, fmt.Errorf("parse catalog: %w", err)
+	}
+	if _, ok := members["models"]; !ok {
+		return modelManifest{}, fmt.Errorf("parse catalog: the document has no \"models\" member, so it is not a catalog (refusing to read it as an empty one)")
+	}
 	var c modelManifest
 	if err := json.Unmarshal(data, &c); err != nil {
 		return modelManifest{}, fmt.Errorf("parse catalog: %w", err)
 	}
 	if c.Models == nil {
-		c.Models = map[string]ModelManifestEntry{}
+		return modelManifest{}, fmt.Errorf("parse catalog: \"models\" is null, not a model map")
 	}
 	return c, nil
 }

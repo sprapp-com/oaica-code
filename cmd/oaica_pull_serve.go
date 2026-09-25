@@ -50,9 +50,20 @@ import (
 // must not travel to whatever host that data happens to name; anything else
 // is fetched anonymously (the repos are public, so this costs speed, not
 // correctness).
+//
+// The SCHEME is checked too, and that is not belt-and-braces: "https" in a
+// URL is what makes the token unreadable on the wire. A manifest naming
+// http://huggingface.co/... passed the host allowlist and got the token
+// attached as a bearer over plaintext — anyone on the path (a coffee-shop
+// AP, a transparent proxy, the LAN) reads a private-repo credential. HF
+// serves everything over TLS, so refusing anything that is not https costs
+// nothing but the throttle.
 func hfHostAcceptsToken(rawURL string) bool {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
+		return false
+	}
+	if u.Scheme != "https" {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())

@@ -69,6 +69,14 @@ type userRemote struct {
 	BaseURL   string `json:"base_url"`
 	APIKey    string `json:"api_key"`
 	APIKeyEnv string `json:"api_key_env"`
+	// CatalogOrigin records that this row came from providerCatalog(), not from
+	// remotes.json — set only by providerCatalogAsUserRemotes. It gates the
+	// catalog's declared model list (providerCatalogDeclaredModels): that list
+	// describes the VENDOR's cloud models, so applying it to a user's own box
+	// because it happens to share a provider's name offered ids the box never
+	// heard of, and a launch POSTed them. json:"-" so the marker cannot be
+	// forged by the file, and a user row never carries it.
+	CatalogOrigin bool `json:"-"`
 	// Version is the OpenAI API version prefix appended to base_url when
 	// building endpoint URLs (e.g. "/v1/chat/completions"). Defaults to "v1".
 	// z.ai is the notable exception: it uses "v4"
@@ -159,8 +167,17 @@ type userRemotesFile struct {
 // that a user has already put in a shell profile — silently dropping a
 // variant is indistinguishable, from that user's seat, from the provider
 // disappearing.
-func (r userRemote) keyEnvNames() []string {
-	fields := strings.FieldsFunc(r.APIKeyEnv, func(c rune) bool {
+func (r userRemote) keyEnvNames() []string { return splitKeyEnvNames(r.APIKeyEnv) }
+
+// splitKeyEnvNames is the one parser for an api_key_env string, shared by
+// userRemote and providerCatalogEntry — two copies of it is how the two gates
+// drifted apart. The comma-joined form is a LIST of acceptable variable names,
+// and every consumer has to read it as one: `auth list` and the picker's
+// no-match hint compared the raw string against os.Getenv, so they judged a row
+// usable-with-the-OPENCODE_API_KEY-shaped name NOT usable, and told a user
+// whose provider was already working to go log in.
+func splitKeyEnvNames(apiKeyEnv string) []string {
+	fields := strings.FieldsFunc(apiKeyEnv, func(c rune) bool {
 		return c == ',' || c == ' ' || c == '\t'
 	})
 	out := make([]string, 0, len(fields))
@@ -172,15 +189,47 @@ func (r userRemote) keyEnvNames() []string {
 	return out
 }
 
-// remoteKeyEnvSet reports whether any variable this row names is set — the
-// picker's gate for showing a key-gated builtin.
-func remoteKeyEnvSet(r userRemote) bool {
-	for _, env := range r.keyEnvNames() {
-		if os.Getenv(env) != "" {
-			return true
+// keyEnvNameSet returns the first name in the list that is set in the
+// environment, or "" — the gate for every "is this row configured?" question.
+// First, not any: a row naming two variables should report the one the user
+// actually exported, and printing the raw comma-joined string as if it were a
+// variable name is what made the two gates disagree.
+func keyEnvNameSet(apiKeyEnv string) string {
+	for _, env := range splitKeyEnvNames(apiKeyEnv) {
+		if strings.TrimSpace(os.Getenv(env)) != "" {
+			return env
 		}
 	}
-	return false
+	return ""
+}
+
+// remoteKeyEnvSet reports whether any variable this row names is set — the
+// picker's gate for showing a key-gated builtin.
+func remoteKeyEnvSet(r userRemote) bool { return keyEnvNameSet(r.APIKeyEnv) != "" }
+
+// keyEnvNamesProse joins a row's acceptable variable names for a sentence:
+// "OPENCODE_API_KEY or OPENCODE_GO_API_KEY". Printing the raw comma-joined
+// field instead reads as a single variable name no user can export.
+func keyEnvNamesProse(apiKeyEnv string) string {
+	return strings.Join(splitKeyEnvNames(apiKeyEnv), " or ")
+}
+
+// keyEnvName returns the ONE variable name a consumer that re-reads the
+// credential per request should watch: the name actually set in the
+// environment, or the first acceptable name when none is. TokenEnv/KeyEnv
+// document themselves as an environment variable to os.Getenv on every
+// request, so handing them the raw comma-joined list — which names no variable
+// — made the live re-read dead: resolveKey's Getenv returned "" forever and the
+// proxy silently used the launch-time value for its whole lifetime, exactly the
+// stale-credential failure the field exists to prevent.
+func (r userRemote) keyEnvName() string {
+	if name := keyEnvNameSet(r.APIKeyEnv); name != "" {
+		return name
+	}
+	if names := r.keyEnvNames(); len(names) > 0 {
+		return names[0]
+	}
+	return ""
 }
 
 func (r userRemote) key() string {
@@ -407,17 +456,29 @@ type RemoteEndpoint struct {
 	Name    string // remote.Name — provider id in integration catalogs
 	BaseURL string // r.openAIBase() — includes the /v1 (or /v4) version prefix
 	Token   string // r.key(), resolved once at build time — see TokenEnv for why this is a fallback, not the source of truth
-	// TokenEnv is remote.APIKeyEnv, carried through so the proxy can re-read
-	// the credential from the environment on every request instead of
-	// caching whatever it resolved to when the launch proxy started. A
-	// process built before an env var was exported (or before it was
-	// rotated) otherwise keeps rejecting/using the stale value for its
-	// entire lifetime — hit in production 2026-08-29 (a client box's
-	// OAICA_GATEWAY_KEY was exported to ~/.bashrc after `oaica launch
-	// claude` had already started; every request 401'd until the process
-	// was killed and relaunched). Empty means Token came from a literal
-	// api_key in remotes.json, which has no live source to re-read.
-	TokenEnv        string
+	// TokenEnv is the ONE environment variable name the proxy re-reads on
+	// every request (remote.keyEnvName()) instead of caching whatever it
+	// resolved to when the launch proxy started. A process built before an env
+	// var was exported (or before it was rotated) otherwise keeps
+	// rejecting/using the stale value for its entire lifetime — hit in
+	// production 2026-08-29 (a client box's OAICA_GATEWAY_KEY was exported to
+	// ~/.bashrc after `oaica launch claude` had already started; every request
+	// 401'd until the process was killed and relaunched). Empty means Token
+	// came from a literal api_key in remotes.json — or that the row names no
+	// variable at all — so there is no live source to re-read.
+	//
+	// A single name, not the row's raw api_key_env string: see keyEnvName.
+	TokenEnv string
+	// ModelsURL is r.modelsURL() — where THIS remote's model list actually
+	// lives, resolved once. The version prefix is per-surface, not per-host
+	// (perplexity serves chat unversioned and lists models under /v1/models),
+	// so a probe that rebuilds "<base>/models" from BaseURL asks a URL the
+	// vendor does not serve: the picker sweep and doctor's probe both honor
+	// models_path and found the list, while the context-window probe 404'd —
+	// the launch then ran with no real window, so no
+	// CLAUDE_CODE_MAX_CONTEXT_TOKENS and no context-fit clamp ceiling in the
+	// proxy. Empty means BaseURL + "/models".
+	ModelsURL       string
 	UpstreamModel   string // bare id the remote expects (part after the first "/")
 	Wire            string
 	ToolFormat      string
@@ -444,7 +505,8 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		Name:            remote.Name,
 		BaseURL:         remote.openAIBase(),
 		Token:           remote.key(),
-		TokenEnv:        strings.TrimSpace(remote.APIKeyEnv),
+		TokenEnv:        remote.keyEnvName(),
+		ModelsURL:       remote.modelsURL(),
 		UpstreamModel:   bare,
 		Wire:            d.Wire,
 		ToolFormat:      d.ToolFormat,
@@ -753,7 +815,14 @@ func writeAtomic(path string, b []byte) error {
 // ordering and win any id collision; declared-only ids are appended in
 // sorted order, since a map has none.
 func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]LaunchModel, error) {
-	declared := providerCatalogDeclaredModels(r.Name)
+	// The declared list is the VENDOR's, so it applies only to the catalog's
+	// own row. `oaica remote add minimax-coding-plan <your own box>` used to
+	// inherit MiniMax's cloud model ids (the lookup is by NAME) and offer them
+	// against a box that serves none of them.
+	var declared map[string]providerCatalogModelLimit
+	if r.CatalogOrigin {
+		declared = providerCatalogDeclaredModels(r.Name)
+	}
 	if sweepErr != nil && len(declared) == 0 {
 		return nil, sweepErr
 	}

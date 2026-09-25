@@ -53,6 +53,14 @@ func reportSecrets() []reportSecret {
 	}
 
 	add("OAICA_API_KEY", os.Getenv("OAICA_API_KEY"))
+	// OAICA_HOST is a base URL configured exactly like a remote's, so it can
+	// carry a credential the same two ways (userinfo or a query parameter).
+	// The report itself prints only its presence, but the scan's job is to
+	// know every credential this client holds — a value that is missing from
+	// the list is a value a later print site could add without noticing.
+	for _, secret := range baseURLSecrets(os.Getenv("OAICA_HOST")) {
+		add("the key embedded in OAICA_HOST", secret)
+	}
 	for _, env := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN"} {
 		add(env, os.Getenv(env))
 	}
@@ -66,7 +74,18 @@ func reportSecrets() []reportSecret {
 			// space, a bad port) — those cannot be transmitted, but they can
 			// still be printed, and a report that prints a typed credential is
 			// the false negative this scan exists to prevent.
-			add("the key embedded in the base_url of "+r.Name, userinfoSecret(r.BaseURL))
+			// Both places a key can ride in a base URL: userinfo
+			// (https://user:password@host/v1 — including a password that
+			// contains "/", which url.Parse rejects outright) and the query
+			// string ("?api_key=…", "?token=…", a shape some gateways use
+			// instead of a header). The report prints the URL it failed on, so
+			// either form reaches a pasted ticket. Redaction alone is not
+			// enough: the scan is what makes "this report contains no
+			// credential values" a claim instead of a hope, and it can only
+			// check values it was told about.
+			for _, secret := range baseURLSecrets(r.BaseURL) {
+				add("the key embedded in the base_url of "+r.Name, secret)
+			}
 		}
 	}
 	if store, _, err := loadAuthStore(); err == nil {

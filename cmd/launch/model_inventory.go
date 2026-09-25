@@ -2,6 +2,7 @@ package launch
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -125,6 +126,15 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	if !force {
 		models, stale, ok := loadPickerCache()
 		if ok {
+			// The daemon's own list is the one source a cache cannot hold. It
+			// is runtime state with no file behind it, so `ollama pull` and
+			// `ollama rm` would be invisible for up to pickerCacheTTL — while
+			// `oaica model refresh`'s help promises a pull is discoverable on
+			// the next launch. It is also the one source that is cheap to
+			// re-read (a loopback /api/tags), so re-read it here and merge it
+			// in, leaving the expensive parts — the per-remote sweeps and the
+			// router — to the cache.
+			models = mergeLiveDaemonRows(ctx, i.client, models)
 			i.models = models
 			i.err = nil
 			i.loaded = true
@@ -145,22 +155,13 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	// so a dead origin (or a missing key) hid every locally pulled model too.
 	models := make([]LaunchModel, 0, 8)
 	seen := make(map[string]bool)
-	if i.client != nil {
-		if lst, lerr := i.client.List(ctx); lerr == nil && lst != nil {
-			for _, m := range lst.Models {
-				lm := launchModelFromListResponse(m)
-				if lm.Name == "" || seen[lm.Name] {
-					continue
-				}
-				// Already-namespaced ids (hf.co/..., "<remote>/<id>",
-				// ":local" tags, anything with a "/") keep their name; bare
-				// daemon models get the ollama/ picker prefix.
-				if !strings.Contains(lm.Name, "/") && !strings.HasSuffix(lm.Name, ":local") {
-					lm.Name = ollamaPickerPrefix + lm.Name
-				}
-				seen[lm.Name] = true
-				models = append(models, lm)
+	if rows, _ := daemonPickerRows(ctx, i.client); len(rows) > 0 {
+		for _, lm := range rows {
+			if seen[lm.Name] {
+				continue
 			}
+			seen[lm.Name] = true
+			models = append(models, lm)
 		}
 	}
 
@@ -215,6 +216,70 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	return cloneLaunchModels(i.models), i.err
 }
 
+// daemonPickerRows reads the local daemon's model list and names the rows the
+// way the picker shows them: bare daemon models get the ollama/ prefix,
+// already-namespaced ids (hf.co/..., "<remote>/<id>", ":local" tags, anything
+// with a "/") keep their name. ok=false means the daemon did not answer — not
+// an error, since a self-hosted user may have no daemon and a hosted user's
+// may be down; the caller decides what to do without it.
+func daemonPickerRows(ctx context.Context, client *api.Client) ([]LaunchModel, bool) {
+	if client == nil {
+		return nil, false
+	}
+	lst, err := client.List(ctx)
+	if err != nil || lst == nil {
+		return nil, false
+	}
+	out := make([]LaunchModel, 0, len(lst.Models))
+	for _, m := range lst.Models {
+		lm := launchModelFromListResponse(m)
+		if lm.Name == "" {
+			continue
+		}
+		if !strings.Contains(lm.Name, "/") && !strings.HasSuffix(lm.Name, oaicaLocalTagSuffix) {
+			lm.Name = ollamaPickerPrefix + lm.Name
+		}
+		out = append(out, lm)
+	}
+	return out, true
+}
+
+// isDaemonRow reports whether a picker row came from the local daemon (or the
+// router's ":local" merge of a live `oaica serve`), i.e. the rows
+// mergeLiveDaemonRows replaces with a live read.
+func isDaemonRow(name string) bool {
+	return strings.HasPrefix(name, ollamaPickerPrefix) || strings.HasSuffix(name, oaicaLocalTagSuffix)
+}
+
+// mergeLiveDaemonRows replaces the cached daemon rows with a live read of the
+// daemon's list, keeping every other cached row and its order. A daemon that
+// does not answer leaves the cached list untouched — the cache is still the
+// better answer for everything else, and an unreachable daemon is not a reason
+// to empty the menu.
+func mergeLiveDaemonRows(ctx context.Context, client *api.Client, cached []LaunchModel) []LaunchModel {
+	live, ok := daemonPickerRows(ctx, client)
+	if !ok {
+		return cached
+	}
+	out := make([]LaunchModel, 0, len(cached)+len(live))
+	seen := make(map[string]bool, len(cached)+len(live))
+	for _, m := range cached {
+		if isDaemonRow(m.Name) || seen[m.Name] {
+			continue
+		}
+		seen[m.Name] = true
+		out = append(out, m)
+	}
+	for _, m := range live {
+		if seen[m.Name] {
+			continue
+		}
+		seen[m.Name] = true
+		out = append(out, m)
+	}
+	return out
+}
+
 // pickerCacheTTL bounds how long the disk cache is trusted as fresh. One
 // launch cycle per hour pays the full probe cost; everything in between
 // opens the picker from the file. pickerCacheGrace is how long a STALE
@@ -243,42 +308,127 @@ type pickerCacheFile struct {
 
 // pickerCacheInputPaths are the files whose contents decide which rows the
 // inventory contains. Paths come from the same helpers the loaders use, so an
-// override (OAICA_REMOTES_FILE) is fingerprinted rather than bypassed.
+// override (OAICA_REMOTES_FILE, OPENCODE_AUTH_FILE, OAICA_MODELS_DIR) is
+// fingerprinted rather than bypassed.
+//
+// Each was added because a row appeared (or vanished) with no other file
+// changing, so the cache kept painting the old menu for up to pickerCacheTTL:
+//
+//   - authStorePath/userRemotesPath/licenseFilePath/providerCatalogCachePath:
+//     the original four (a login, a remote add, a licence, a catalog sync).
+//   - localServersPath: `oaica serve <model>` writes it, and each live entry
+//     becomes a "<model>:local" row.
+//   - ollamaCloudCachePath: its ids become the "ollama/<id>" rows; the scrape
+//     can learn about a new cloud model while the picker's own cache is still
+//     fresh, and the two windows used to stack.
+//   - the model manifest: `oaica model add`/`sync`/`scan` rows are inventory
+//     rows.
+//   - opencodeAuthPaths: the credential that GATES a whole provider's rows
+//     can be written by `opencode auth login`, a file read through a helper
+//     exactly like authStorePath() — which was fingerprinted.
 func pickerCacheInputPaths() []string {
-	out := make([]string, 0, 4)
-	if p := strings.TrimSpace(userRemotesPath()); p != "" {
-		out = append(out, p)
+	out := make([]string, 0, 8)
+	add := func(p string) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
 	}
-	if p := strings.TrimSpace(authStorePath()); p != "" {
-		out = append(out, p)
+	add(userRemotesPath())
+	add(authStorePath())
+	if p, err := licenseFilePath(); err == nil {
+		add(p)
 	}
-	if p, err := licenseFilePath(); err == nil && strings.TrimSpace(p) != "" {
-		out = append(out, p)
+	if p, err := providerCatalogCachePath(); err == nil {
+		add(p)
 	}
-	if p, err := providerCatalogCachePath(); err == nil && strings.TrimSpace(p) != "" {
-		out = append(out, p)
+	if p, err := oaicaLocalServersRegistryPath(); err == nil {
+		add(p)
+	}
+	if p, err := ollamaCloudCachePath(); err == nil {
+		add(p)
+	}
+	if p, err := modelManifestPath(); err == nil {
+		add(p)
+	}
+	for _, p := range opencodeAuthPaths() {
+		add(p)
 	}
 	return out
 }
 
-// pickerInputFingerprint records each input file's identity cheaply. A missing
-// file is recorded as absent rather than skipped: a config file APPEARING is
-// just as much a change as one being edited.
+// pickerEnvFingerprint records the state that decides rows but lives in the
+// environment rather than a file: which router OAICA_HOST points at, and which
+// providers currently have a credential.
+//
+// Env state cannot be fingerprinted by path, so it is fingerprinted by VALUE —
+// and only ever by a hash. OAICA_HOST can carry a key in its userinfo or query
+// string (docs/ENTERPRISE.md's rule: a credential must not reach a cache), so
+// the raw value never goes into the cache file; the digest answers the only
+// question the fingerprint asks ("same host as last time?").
+//
+// Both halves are load-bearing. Without OAICA_HOST, repointing at a different
+// router kept serving the old router's rows — the picker offered a model, and
+// a launch POSTed it, to a host that had never heard of it. Without credential
+// presence, `export Z_AI_API_KEY=…` in a new shell (or `opencode auth login
+// <provider>`, whose store IS fingerprinted but whose effect here is the same)
+// left the newly-credentialed provider's rows hidden for an hour — the exact
+// "I logged in and the picker still shows nothing" complaint this cache was
+// already fixed once for.
+func pickerEnvFingerprint() map[string]string {
+	out := map[string]string{}
+	host := strings.TrimSpace(os.Getenv("OAICA_HOST"))
+	if host != "" {
+		sum := sha256.Sum256([]byte(host))
+		out["env:OAICA_HOST"] = fmt.Sprintf("%x", sum[:8])
+	} else {
+		out["env:OAICA_HOST"] = "unset"
+	}
+	for _, e := range providerCatalog() {
+		if e.APIKeyEnv == "" {
+			continue
+		}
+		// The NAME of the variable that is set, not its value: a variable name
+		// is not a secret, and the name is all the fingerprint needs.
+		out["cred:"+e.Name] = keyEnvNameSet(e.APIKeyEnv)
+	}
+	return out
+}
+
+// pickerInputFingerprint records each input's identity by CONTENT, not by
+// mtime+size. Same-size edits with a preserved mtime are not exotic — `cp -p`,
+// `rsync -a`, a dotfiles manager, a backup restore, a tar extract, any
+// filesystem with one-second timestamp granularity — and each of them left the
+// picker painting the previous configuration's rows until the TTL lapsed.
+// These are a handful of small config files, read once per cache write.
+//
+// A missing file is recorded as absent rather than skipped: a config file
+// APPEARING is just as much a change as one being edited.
 func pickerInputFingerprint() map[string]string {
 	paths := pickerCacheInputPaths()
 	if len(paths) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(paths))
+	out := make(map[string]string, len(paths)+4)
 	for _, p := range paths {
-		st, err := os.Stat(p)
-		if err != nil {
-			out[p] = "absent"
-			continue
-		}
-		out[p] = fmt.Sprintf("%d:%d", st.ModTime().UnixNano(), st.Size())
+		out[p] = fileContentDigest(p)
+	}
+	for k, v := range pickerEnvFingerprint() {
+		out[k] = v
 	}
 	return out
+}
+
+// fileContentDigest is the content identity of one input file: "absent", or
+// "<size>:<sha256, truncated>". Truncated because the digest only has to
+// distinguish configurations, and 16 hex chars of SHA-256 does that with no
+// realistic collision risk while keeping the cache file readable.
+func fileContentDigest(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "absent"
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%d:%x", len(b), sum[:8])
 }
 
 // pickerInputsUnchanged reports whether the cache's fingerprint still matches
@@ -349,6 +499,17 @@ func loadPickerCache() ([]LaunchModel, bool, bool) {
 		ttl = pickerCacheTTL.Seconds()
 	}
 	age := time.Since(f.SavedAt)
+	if age < 0 {
+		// Dated in the future: the clock was ahead when the cache was written
+		// (a wrong RTC later corrected by NTP, a VM snapshot restored, a
+		// dual-boot box). Age is negative, which passes BOTH the grace check
+		// below and the freshness check after it, so the cache would be served
+		// as fresh for as long as the clock was wrong — days — with no
+		// background refresh ever kicked off (stale=false). The menu is frozen
+		// and only deleting the file unfreezes it. A cache cannot be newer than
+		// the process reading it, so treat it as not a cache at all.
+		return nil, false, false
+	}
 	if age > pickerCacheGrace {
 		return nil, false, false
 	}

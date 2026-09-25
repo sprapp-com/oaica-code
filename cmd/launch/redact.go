@@ -43,7 +43,99 @@ var credentialInURL = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)(?:[^\s/@
 // to a value already known to be one remote's base_url, never to free prose,
 // so the over-match cannot mangle an error message that merely contains a URL
 // and, later, an email address.
-var unparseableUserinfo = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/]*@`)
+var unparseableUserinfo = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.\-]*://).*@`)
+
+// quotedURLUserinfo is unparseableUserinfo for a URL quoted inside error text,
+// where the value cannot be anchored to the start of the string. net/http
+// quotes the request URL in both of its messages ("Get \"URL\": dial …",
+// "parse \"URL\": invalid port …"), so the closing quote bounds the match — no
+// spanning into surrounding prose, which is what keeps a bare
+// `[^\s]*@` from mangling an error that happens to mention a URL and later an
+// email address.
+//
+// It exists because a Basic password may CONTAIN a slash: url.Parse then
+// rejects the URL ("invalid port \":aBc9\" after host", the authority ending at
+// the first "/"), so url.Parse cannot tell us where the userinfo ends, and the
+// "://…@" rules that stop at "/" miss the credential entirely — the report
+// printed the password in the clear and its leak scan had never been told the
+// value (2026-09-26 audit).
+var quotedURLUserinfo = regexp.MustCompile(`"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^"\n]*@`)
+
+// invalidPortFragment matches the second half of the same parse failure: Go
+// cuts the authority at the "/" inside the credential and then reports that
+// span back verbatim as a bad port —
+//
+//	parse "https://user:aBc9/xY7z@host/v1": invalid port ":aBc9" after host
+//
+// so redacting the quoted URL still leaves the password's head sitting outside
+// the quotes in the same message (2026-09-26 audit: doctor --report printed
+// ":aBc9" for a password "aBc9/xY7z…").
+//
+// Only a fragment that does NOT begin with a digit is touched. A real bad port
+// (":99999", ":80x" is not a port either but is a typo a user needs to read) is
+// diagnostic; a fragment starting with anything else is credential text the
+// parser mistook for a port.
+var invalidPortFragment = regexp.MustCompile(`invalid port ":[^0-9][^"]*"`)
+
+// credentialQueryParam matches a query-parameter name that carries a credential
+// in the URL itself. It is the second place a key can ride in a base URL, and
+// it leaked the same way userinfo did: the transport echoes the request URL in
+// its errors, `ps` shows the argv, and `oaica doctor --report` prints the URL
+// it failed on — so the value reaches the same four places, and the pre-print
+// leak scan did not know to look for it.
+//
+// Anchored (^…$) and matched case-insensitively against the DECODED parameter
+// name, so `?api_key=`, `?API-KEY=`, `?token=` and `?access_token=` are covered
+// without a substring match turning "?monkey=" into a credential.
+var credentialQueryParam = regexp.MustCompile(`(?i)^(?:api[_-]?key|key|token|access[_-]?token|auth[_-]?token|apikey|secret|password)$`)
+
+// queryCredentialValue finds one credential-looking query parameter anywhere in
+// text and captures its value, so both the redactor and the leak scan can agree
+// on what a URL carries. The "[?&]" prefix is deliberate: a bare "?key=" inside
+// prose is matched only when something before it looks like a URL… which is not
+// something a regexp can decide, so callers pass single URLs.
+var queryCredentialValue = regexp.MustCompile(`(?i)[?&]([^=&#\s]+)=([^&#\s]*)`)
+
+// querySecrets returns every credential value text's query strings carry.
+// Ordered left to right for stable error text and stable test assertions.
+func querySecrets(text string) []string {
+	var out []string
+	for _, m := range queryCredentialValue.FindAllStringSubmatch(text, -1) {
+		name, err := url.QueryUnescape(m[1])
+		if err != nil {
+			name = m[1]
+		}
+		if !credentialQueryParam.MatchString(name) {
+			continue
+		}
+		value, err := url.QueryUnescape(m[2])
+		if err != nil {
+			value = m[2]
+		}
+		if value = strings.TrimSpace(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+// redactQueryCredentials replaces the value of every credential-looking query
+// parameter with REDACTED, keeping the parameter NAME so a support report still
+// says which shape failed ("/v1?api_key=REDACTED" reads as "the key rode in the
+// query", which is the diagnostic the line exists for).
+func redactQueryCredentials(text string) string {
+	return queryCredentialValue.ReplaceAllStringFunc(text, func(m string) string {
+		sub := queryCredentialValue.FindStringSubmatch(m)
+		name, err := url.QueryUnescape(sub[1])
+		if err != nil {
+			name = sub[1]
+		}
+		if !credentialQueryParam.MatchString(name) || strings.TrimSpace(sub[2]) == "" {
+			return m
+		}
+		return m[:len(m)-len(sub[2])] + "REDACTED"
+	})
+}
 
 // redactCredentials replaces the userinfo of every URL in text with REDACTED.
 // Text without such a URL is returned unchanged, so this is safe to apply
@@ -65,7 +157,7 @@ func redactBaseURL(baseURL string) string {
 	if strings.Contains(out, "@") && strings.Contains(out, "://") {
 		out = unparseableUserinfo.ReplaceAllString(out, "${1}REDACTED@")
 	}
-	return out
+	return redactQueryCredentials(out)
 }
 
 // SplitUserinfoCredential is splitRemoteUserinfo for the cmd package and for
@@ -100,6 +192,34 @@ func NewRedactedRequest(method, url string, body io.Reader) (*http.Request, erro
 		return nil, redactErr(err)
 	}
 	return req, nil
+}
+
+// baseURLSecrets returns every credential value a base URL could print, in the
+// forms it could appear in: the userinfo as a whole ("user:password"), the
+// password alone (a parse error quotes the URL, but a caller that prints only
+// the credential would show just this), and every credential-looking query
+// value. The leak scan is only as good as this list — a value missing from it
+// is one the report can print while still claiming it holds no credentials.
+func baseURLSecrets(baseURL string) []string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return nil
+	}
+	var out []string
+	if ui := userinfoSecret(baseURL); ui != "" {
+		out = append(out, ui)
+		if _, password, ok := strings.Cut(ui, ":"); ok && strings.TrimSpace(password) != "" {
+			out = append(out, password)
+			// url.Parse cuts the authority at the first "/" *inside* the
+			// password, so an error can repeat just that head as a "port"
+			// (see invalidPortFragment). A value the scan does not know is a
+			// value a print site can add without anything noticing.
+			if i := strings.Index(password, "/"); i > 0 {
+				out = append(out, password[:i])
+			}
+		}
+	}
+	return append(out, querySecrets(baseURL)...)
 }
 
 // userinfoSecret returns the credential a base URL carries, for a caller that
@@ -142,6 +262,20 @@ func redactErr(err error) error {
 		return nil
 	}
 	text := redactCredentials(err.Error())
+	// The quoted-URL rule catches a userinfo url.Parse cannot parse (a Basic
+	// password with a "/" in it), which the "://…@" rules cannot see past.
+	if strings.Contains(text, "@") {
+		text = quotedURLUserinfo.ReplaceAllString(text, `"${1}REDACTED@`)
+	}
+	// A base URL can also carry its key in the query string, and net/http echoes
+	// the whole request URL in a transport error ("Get \"https://host/v1?api_key=
+	// …\": dial tcp …"), so redacting userinfo is not enough — doctor --report
+	// printed this value on the line below one redactBaseURL had already cleaned
+	// (2026-09-26 audit).
+	text = redactQueryCredentials(text)
+	// The parse-error path re-states the credential fragment outside the URL's
+	// quotes, so it gets its own rule rather than relying on the quoted one.
+	text = invalidPortFragment.ReplaceAllString(text, `invalid port "REDACTED"`)
 	if text == err.Error() {
 		return err
 	}

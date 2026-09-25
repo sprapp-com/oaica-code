@@ -23,7 +23,6 @@ package launch
 // described identically everywhere it is surfaced.
 
 import (
-	"os"
 	"strings"
 )
 
@@ -96,7 +95,12 @@ func needsKeyInstruction(e providerCatalogEntry, hasExternal bool, cred external
 // hint must agree with the picker about what is missing, or it would advise a
 // user whose provider already works.
 func providerCatalogEntryUsable(e providerCatalogEntry) bool {
-	if e.APIKeyEnv != "" && strings.TrimSpace(os.Getenv(e.APIKeyEnv)) != "" {
+	// keyEnvNameSet, not os.Getenv(e.APIKeyEnv): api_key_env is a LIST of
+	// acceptable variable names, and comparing the raw comma-joined string
+	// against the environment judged a row usable-with-OPENCODE_API_KEY
+	// unusable — so this hint advised a user whose provider was already in the
+	// picker and already launching.
+	if keyEnvNameSet(e.APIKeyEnv) != "" {
 		return true
 	}
 	if hasStoredAuth(e.Name) {

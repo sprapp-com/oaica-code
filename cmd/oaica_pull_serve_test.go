@@ -156,3 +156,29 @@ func TestOaicaPullFromHF_PlaintextSizeMismatchCleansUp(t *testing.T) {
 		t.Fatal("partial file must be removed on a failed pull")
 	}
 }
+
+// TestHFHostAcceptsTokenRequiresHTTPS: `oaica pull` attaches the user's HF
+// token as a Bearer to the URL the router's manifest names. The guard checked
+// the host and nothing else, so a manifest naming http://huggingface.co/... was
+// accepted and the credential crossed the network in the clear — readable by an
+// on-path observer before the TLS hop, and Go's client does not upgrade http to
+// https on its own (2026-09-26 audit). The host check itself was sound:
+// lookalikes stay rejected.
+func TestHFHostAcceptsTokenRequiresHTTPS(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"https://huggingface.co/some/repo/resolve/main/model.gguf", true},
+		{"https://cdn-lfs.huggingface.co/some/repo/resolve/main/model.gguf", true},
+		{"http://huggingface.co/some/repo/resolve/main/model.gguf", false},
+		{"https://evil-huggingface.co/repo/model.gguf", false},
+		{"https://huggingface.co.evil.com/repo/model.gguf", false},
+		{"https://user:huggingface.co@evil.com/repo/model.gguf", false},
+	}
+	for _, c := range cases {
+		if got := hfHostAcceptsToken(c.url); got != c.want {
+			t.Errorf("hfHostAcceptsToken(%q) = %v, want %v", c.url, got, c.want)
+		}
+	}
+}

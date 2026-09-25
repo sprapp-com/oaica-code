@@ -44,7 +44,7 @@ var probeCache = struct {
 }{m: map[string]probeCacheEntry{}}
 
 func cachedRemoteContextWindow(route proxyRoute) int {
-	key := route.BaseURL + "|" + route.UpstreamModel
+	key := route.BaseURL + "|" + route.ModelsURL + "|" + route.UpstreamModel
 	probeCache.Lock()
 	e, ok := probeCache.m[key]
 	if ok && time.Now().Before(e.expiresAt) {
@@ -70,10 +70,17 @@ type remoteModelsResponse struct {
 	Data []remoteModelMeta `json:"data"`
 }
 
-// defaultRemoteContextWindow asks route.BaseURL (…/v1) for its model list
-// and returns the context window of the upstream model, 0 if unknown.
+// defaultRemoteContextWindow asks the route's model list for the upstream
+// model's context window, 0 if unknown.
 func defaultRemoteContextWindow(route proxyRoute) int {
-	url := strings.TrimRight(route.BaseURL, "/") + "/models"
+	url := route.ModelsURL
+	if url == "" {
+		// No models_path on the row: "<base>/models" is where an
+		// OpenAI-shaped host lists its models. (ModelsURL is set for every
+		// remote resolved through RemoteEndpoint, so this is the local/native
+		// path or a route built by hand.)
+		url = strings.TrimRight(route.BaseURL, "/") + "/models"
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

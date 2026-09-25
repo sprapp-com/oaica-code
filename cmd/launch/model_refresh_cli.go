@@ -5,13 +5,17 @@ package launch
 // router) and prints what's currently discoverable, right now, without
 // waiting for anyone else to fix or update anything.
 //
-// Every `oaica launch`/`oaica model` invocation already re-probes live —
-// modelInventory has no cross-process cache, so a plain `ollama pull` or a
-// remotes.json edit is visible on the very next launch with zero action
-// needed (see docs/MODELS_AND_PLANS.md's "Discovery, drift-safety, and
-// manual refresh" section). This command exists for the narrower case:
-// confirming RIGHT NOW that a model you just pulled/added is actually
-// discoverable, without launching Claude Code just to see the picker list.
+// Every `oaica launch`/`oaica model` invocation re-probes live. The picker
+// keeps a short-lived cache of the result (~/.oaica/picker_cache.json, one
+// hour) so the menu paints instantly, and that cache is keyed to the
+// configuration it was built from: an edited remotes.json, a provider login,
+// a catalog sync, a model add/scan, a local `oaica serve`, or a changed
+// OAICA_HOST voids it, so the next launch sees the new state. The local
+// daemon's model list — runtime state with no file behind it — is re-read live
+// even when the cache is used, so a `ollama pull` or `ollama rm` is visible on
+// the next launch too (see docs/MODELS_AND_PLANS.md's "Discovery, drift-safety,
+// and manual refresh" section). This command is the immediate answer for every
+// other source: it forces a live probe right now.
 
 import (
 	"context"

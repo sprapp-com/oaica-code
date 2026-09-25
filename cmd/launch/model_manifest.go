@@ -104,6 +104,15 @@ type ModelManifestEntry struct {
 	// hand-added entries are never touched by automation.
 	Source string `json:"source,omitempty"`
 
+	// SourceURL is the catalog this entry was synced FROM. `--url` exists
+	// for an internal mirror (docs/ENTERPRISE.md), and without recording
+	// which document an entry came from, a later `model sync --prune`
+	// against a different catalog read "not in MY catalog" as "withdrawn"
+	// and deleted every entry the mirror had supplied. Prune now only
+	// removes sync entries that came from the URL being synced (or from no
+	// recorded URL, which is how entries written before this field reads).
+	SourceURL string `json:"source_url,omitempty"`
+
 	// ModelPath is where the weights live locally (a directory for vLLM/
 	// HF-format, a single file for llama.cpp GGUF / prism-engine .pqm).
 	// Empty for daemon/user-remote entries, which resolve through their

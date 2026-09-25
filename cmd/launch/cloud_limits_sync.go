@@ -72,7 +72,14 @@ func fetchCloudLimitsBody(url, etag, cachePath string) (body []byte, newEtag str
 		return b, "", false, rerr
 	}
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	// The --url may carry the mirror's credential as userinfo
+	// (https://KEY@mirror/catalog.json). The request keeps it — that is how
+	// the mirror authenticates — but nothing written down or printed may:
+	// every message below, and the request builder's own parse error
+	// (NewRedactedRequest), use the redacted form. docs/ENTERPRISE.md names
+	// the catalog caches as a place a credential must never reach.
+	display := redactBaseURL(url)
+	req, err := NewRedactedRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -84,7 +91,7 @@ func fetchCloudLimitsBody(url, etag, cachePath string) (body []byte, newEtag str
 		if b, rerr := os.ReadFile(cachePath); rerr == nil {
 			return b, etag, true, nil
 		}
-		return nil, "", false, fmt.Errorf("couldn't reach %s: %w", url, err)
+		return nil, "", false, fmt.Errorf("couldn't reach %s: %w", display, redactErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -92,12 +99,12 @@ func fetchCloudLimitsBody(url, etag, cachePath string) (body []byte, newEtag str
 	case resp.StatusCode == http.StatusNotModified:
 		b, rerr := os.ReadFile(cachePath)
 		if rerr != nil {
-			return nil, "", false, fmt.Errorf("%s returned 304 but no cache exists", url)
+			return nil, "", false, fmt.Errorf("%s returned 304 but no cache exists", display)
 		}
 		return b, etag, true, nil
 	case resp.StatusCode != http.StatusOK:
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", false, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(errBody)))
+		return nil, "", false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))

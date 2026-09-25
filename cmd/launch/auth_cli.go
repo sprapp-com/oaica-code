@@ -104,7 +104,10 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	}
 	fmt.Fprintf(out, "Logged in to %s (%s). The key is stored in %s, mode 0600.\n", provider, maskKey(key), path)
 	if known && entry.APIKeyEnv != "" {
-		fmt.Fprintf(out, "An %s set in the environment still takes precedence over it.\n", entry.APIKeyEnv)
+		// keyEnvNamesProse, not the raw field: api_key_env may list two
+		// names, and "An A, B set in the environment" names nothing a user
+		// can export.
+		fmt.Fprintf(out, "An %s set in the environment still takes precedence over it.\n", keyEnvNamesProse(entry.APIKeyEnv))
 	}
 	return nil
 }
@@ -171,7 +174,7 @@ func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, k
 		fmt.Fprintf(out, "%s (from ~/.oaica/remotes.json)\n", provider)
 	}
 	if known && entry.APIKeyEnv != "" {
-		fmt.Fprintf(out, "Enter %s API key (input hidden; or set %s and skip this): ", provider, entry.APIKeyEnv)
+		fmt.Fprintf(out, "Enter %s API key (input hidden; or set %s and skip this): ", provider, keyEnvNamesProse(entry.APIKeyEnv))
 	} else {
 		fmt.Fprintf(out, "Enter %s API key (input hidden): ", provider)
 	}
@@ -215,7 +218,7 @@ func AuthLogout(out io.Writer, provider string) error {
 	}
 	fmt.Fprintf(out, "Removed the stored key for %s.\n", provider)
 	if entry, known := knownAuthProvider(provider); known && entry.APIKeyEnv != "" {
-		fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", entry.APIKeyEnv, provider)
+		fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", keyEnvNamesProse(entry.APIKeyEnv), provider)
 	}
 	return nil
 }
@@ -259,8 +262,13 @@ func AuthList(out io.Writer) error {
 		external, hasExternal := externalAuthFor(e.AuthVia, e.Name)
 		externalCmd := externalLoginArgvString(e.AuthVia, e.Name)
 		switch {
-		case e.APIKeyEnv != "" && strings.TrimSpace(os.Getenv(e.APIKeyEnv)) != "":
-			status, cred = "ready", "env:"+e.APIKeyEnv
+		case keyEnvNameSet(e.APIKeyEnv) != "":
+			// Name the variable that IS set: api_key_env can list two, and
+			// printing the raw comma-joined string as if it were a variable
+			// name told the user to export something that does not exist —
+			// while the gate above (raw os.Getenv) reported the row as missing
+			// a key that was in fact exported.
+			status, cred = "ready", "env:"+keyEnvNameSet(e.APIKeyEnv)
 		case stored[e.Name]:
 			status, cred = "ready", "stored"
 		case hasExternal && external.Key != "":

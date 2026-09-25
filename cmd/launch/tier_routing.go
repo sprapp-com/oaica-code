@@ -328,7 +328,7 @@ func routeFor(ep launchEndpoint) proxyRoute {
 	// endpoint and the vendor answers 404 ("502 upstream HTTP 404" in Claude
 	// Code) — the failure that shipped as zai-coding-plan, 2026-09-25.
 	return proxyRoute{
-		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel,
+		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, ModelsURL: ep.ModelsURL, UpstreamModel: ep.UpstreamModel,
 		Label:             string(ep.Source) + ":" + ep.Name,
 		Wire:              ep.Wire,
 		NativePassthrough: ep.Source == sourceNativeAnthropic || ep.Wire == "anthropic",

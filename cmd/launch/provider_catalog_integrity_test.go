@@ -317,3 +317,76 @@ func TestProviderCatalog_EveryNamedEnvVarIsAccepted(t *testing.T) {
 		})
 	}
 }
+
+// A version bump is the documented way to push a CORRECTION to hosts that
+// already ship the row, and the field most often corrected is a model's
+// context window (a vendor revises it down as often as up). The redefinition
+// branch called fillEmptyProviderFields(dst=synced, src=embedded), which for
+// the declared windows meant the EMBEDDED row's numbers won wherever it stated
+// one — so a bumped document's correction was silently overruled and every
+// host kept over-reporting the old window (CLAUDE_CODE_MAX_CONTEXT_TOKENS and
+// the proxy's context-fit clamp included).
+func TestProviderCatalog_RedefinitionUsesTheNewerDocumentsModelWindows(t *testing.T) {
+	shipped := embeddedRow(t, "zai")
+	old, ok := shipped.Models["glm-5.3"]
+	if !ok || old.Context == 0 {
+		t.Fatalf("the embedded zai row no longer declares glm-5.3 with a window (%+v) — pick another row", shipped.Models)
+	}
+	corrected := old.Context + 12345
+
+	writeSyncedProviderCache(t, 99, fmt.Sprintf(
+		`{"name":"zai","base_url":"https://api.z.ai/api/paas","version":"v4","api_key_env":"Z_AI_API_KEY",`+
+			`"models":{"glm-5.3":{"context":%d,"output":%d}}}`,
+		corrected, old.Output))
+
+	got := mergedCatalogRow(t, "zai")
+	if got.Models["glm-5.3"].Context != corrected {
+		t.Errorf("glm-5.3 context = %d, want the newer document's %d — a version bump cannot correct a window",
+			got.Models["glm-5.3"].Context, corrected)
+	}
+	if got.Models["glm-5.3"].Output != old.Output {
+		t.Errorf("glm-5.3 output = %d, want %d: a field the document does not state is filled from the shipped row, not blanked",
+			got.Models["glm-5.3"].Output, old.Output)
+	}
+}
+
+// The additive direction states the same rule from the other side: without a
+// version bump the synced copy fills gaps in the shipped row, and a window it
+// declares still wins — a measurement beats a shipped default.
+func TestProviderCatalog_AdditiveCopyStillUsesTheSyncedModelWindows(t *testing.T) {
+	shipped := embeddedRow(t, "zai")
+	old, ok := shipped.Models["glm-5.3"]
+	if !ok {
+		t.Fatalf("the embedded zai row no longer declares glm-5.3 (%+v)", shipped.Models)
+	}
+	const corrected = 424242
+
+	writeSyncedProviderCache(t, 2, fmt.Sprintf(
+		`{"name":"zai","base_url":"https://api.z.ai/api/paas","version":"v4","api_key_env":"Z_AI_API_KEY",`+
+			`"models":{"glm-5.3":{"context":%d,"output":%d}}}`,
+		corrected, old.Output))
+
+	if got := mergedCatalogRow(t, "zai").Models["glm-5.3"].Context; got != corrected {
+		t.Errorf("glm-5.3 context = %d, want %d", got, corrected)
+	}
+}
+
+// A redefining row with a whitespace base_url is a hand-edit that lost its
+// content, not an endpoint. add() drops such a row outright, but the
+// redefinition branch never went through add(), and fillEmptyProviderFields
+// only filled a LITERALLY empty BaseURL — so "   " survived as the row's
+// endpoint and every URL built from it became relative ("/v4/chat/completions",
+// a 404 with an error that names no host).
+func TestProviderCatalog_RedefinitionWithAWhitespaceEndpointKeepsTheShippedOne(t *testing.T) {
+	shipped := embeddedRow(t, "zai")
+	writeSyncedProviderCache(t, 99, `{"name":"zai","base_url":"   ","api_key_env":"Z_AI_API_KEY"}`)
+
+	got := mergedCatalogRow(t, "zai")
+	if got.EndpointBase() != shipped.EndpointBase() {
+		t.Errorf("a document that states no endpoint moved zai from %q to %q — every request is now relative",
+			shipped.EndpointBase(), got.EndpointBase())
+	}
+	if strings.TrimSpace(got.BaseURL) == "" {
+		t.Error("the merged row's base_url is blank")
+	}
+}

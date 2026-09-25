@@ -443,3 +443,35 @@ func providerCatalogPlanLabel(t *testing.T, name string) string {
 	t.Fatalf("provider catalog has no %q entry", name)
 	return ""
 }
+
+// TestAuthList_SecondEnvNameCountsAsReady: `oaica auth list`'s STATUS column
+// must agree with the picker. Comparing the credential column against the raw
+// "OPENCODE_API_KEY, OPENCODE_GO_API_KEY" as one variable name printed "needs
+// key" for a provider the picker happily launches (2026-09-26 audit).
+func TestAuthList_SecondEnvNameCountsAsReady(t *testing.T) {
+	withTempHome(t)
+	useTempAuthStore(t)
+	clearAllCatalogKeys(t)
+	useOpencodeStore(t, `{}`)
+	t.Setenv("OPENCODE_API_KEY", "sk-live-opencode")
+
+	var out bytes.Buffer
+	if err := AuthList(&out); err != nil {
+		t.Fatalf("AuthList: %v", err)
+	}
+	status := ""
+	for _, line := range strings.Split(out.String(), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "opencode-go" {
+			status = f[1]
+			break
+		}
+	}
+	if status == "" {
+		t.Fatalf("AuthList printed no opencode-go row:\n%s", out.String())
+	}
+	if status != "ready" {
+		t.Errorf("auth list says opencode-go is %q while OPENCODE_API_KEY is exported and the picker lists its models:\n%s",
+			status, out.String())
+	}
+}

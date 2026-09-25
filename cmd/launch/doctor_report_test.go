@@ -222,3 +222,93 @@ func TestDoctorCmd_ReportFlagWired(t *testing.T) {
 		t.Fatalf("the plain doctor run should not print the report section:\n%s", plain)
 	}
 }
+
+// TestDoctorReport_QueryCredentialInBaseURLIsRedactedAndScanned: a key can
+// ride in a base URL's query string ("?api_key=…"), a shape some gateways use
+// instead of a header, and the transport echoes the request URL in its errors.
+// Redacting userinfo alone left this value in cleartext while the report still
+// claimed to hold no credential values — and the scan could not have caught it
+// either, because reportSecrets only knew the userinfo form (2026-09-26 audit).
+func TestDoctorReport_QueryCredentialInBaseURLIsRedactedAndScanned(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	const token = "sk-live-query-credential-0123456789"
+	writeRemotes(t, `{"remotes":[{"name":"qbox","base_url":"http://127.0.0.1:1/v1?api_key=`+token+`","tool_format":"tool_calls"}]}`)
+
+	report, _ := buildDoctorReport()
+	if strings.Contains(report, token) {
+		t.Errorf("the report prints a credential carried in base_url's query string:\n%s", report)
+	}
+	// The parameter NAME stays: "/v1?api_key=REDACTED" is what tells a support
+	// reader which shape failed, which is the line's whole diagnostic value.
+	if !strings.Contains(report, "api_key=REDACTED") {
+		t.Errorf("the query parameter name should survive redaction:\n%s", report)
+	}
+
+	// The scan has to know the value, or a future print site could add it
+	// without anything refusing.
+	values := map[string]bool{}
+	for _, s := range reportSecrets() {
+		values[s.value] = true
+	}
+	if !values[token] {
+		t.Errorf("reportSecrets does not know about the query credential %q", token)
+	}
+
+	// End to end: the printed bundle must not carry it.
+	var out bytes.Buffer
+	_ = runDoctorReport(&out)
+	if strings.Contains(out.String(), token) {
+		t.Errorf("`oaica doctor --report` printed the query credential:\n%s", out.String())
+	}
+}
+
+// TestDoctorReport_UnparseableBasicPasswordIsRedactedAndScanned: a Basic
+// password containing "/" makes url.Parse reject the whole URL (the authority
+// ends at the first slash), so the parseable path cannot tell where the
+// userinfo ends and the report printed the password in the clear — while the
+// leak scan had never been told the value, so nothing refused (2026-09-26
+// audit). Both halves are pinned here: the redaction and the secret list.
+func TestDoctorReport_UnparseableBasicPasswordIsRedactedAndScanned(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	const secret = "aBc9/xY7z-do-not-print-me"
+	writeRemotes(t, `{"remotes":[{"name":"basicbox","base_url":"https://user:`+secret+`@127.0.0.1:1/v1"}]}`)
+
+	raw := "https://user:" + secret + "@127.0.0.1:1/v1"
+	if got := redactBaseURL(raw); strings.Contains(got, secret) {
+		t.Errorf("redactBaseURL(%q) = %q — an unparseable Basic password must still be redacted", raw, got)
+	}
+	if got := userinfoSecret(raw); got == "" {
+		t.Errorf("userinfoSecret(%q) = \"\" — the scan must know a password url.Parse cannot find", raw)
+	}
+
+	values := map[string]bool{}
+	for _, s := range reportSecrets() {
+		values[s.value] = true
+	}
+	if !values[secret] {
+		t.Errorf("reportSecrets does not know about the Basic password %q", secret)
+	}
+
+	report, _ := buildDoctorReport()
+	if strings.Contains(report, secret) {
+		t.Errorf("the report prints an unparseable Basic password in cleartext:\n%s", report)
+	}
+	// The parse error ALSO re-states the fragment Go mistook for a port
+	// ("invalid port \":aBc9\" after host") outside the URL's quotes, so the
+	// password's head leaks even when the quoted URL is redacted. Both halves
+	// of the value must be gone from the printed bundle.
+	if head, _, _ := strings.Cut(secret, "/"); strings.Contains(report, head) {
+		t.Errorf("the report prints %q, the password's head as Go's invalid-port fragment:\n%s", head, report)
+	}
+	if strings.Contains(report, "aBc9") {
+		t.Errorf("the report prints part of the Basic password:\n%s", report)
+	}
+
+	var out bytes.Buffer
+	if err := runDoctorReport(&out); err != nil && strings.Contains(err.Error(), secret) {
+		t.Errorf("the refusal/pass-through error text repeats the credential: %v", err)
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Errorf("`oaica doctor --report` printed a report containing the Basic password:\n%s", out.String())
+	}
+}

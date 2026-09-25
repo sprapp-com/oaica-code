@@ -153,3 +153,27 @@ func TestPickerNoMatchHint_FollowsTheCatalog(t *testing.T) {
 		t.Fatal("no unusable providers in the catalog — this test verified nothing")
 	}
 }
+
+// TestPickerNoMatchHint_SecondEnvNameCountsAsConfigured: a row can name two
+// variables ("OPENCODE_API_KEY, OPENCODE_GO_API_KEY") and the picker accepts
+// either, so the hint must too — it states the invariant itself ("the hint must
+// agree with the picker about what is missing, or it would advise a user whose
+// provider already works"). Judging the raw comma-joined string made a
+// configured provider look unconfigured (2026-09-26 audit).
+func TestPickerNoMatchHint_SecondEnvNameCountsAsConfigured(t *testing.T) {
+	withTempHome(t)
+	useTempAuthStore(t)
+	clearAllCatalogKeys(t)
+	useOpencodeStore(t, `{}`) // installed store, no entry for anything
+	t.Setenv("OPENCODE_API_KEY", "sk-live-opencode")
+
+	// The picker's own gate sees the row as configured…
+	if r := findBuiltinRemote(t, builtinRemotes(), "opencode-go"); r == nil {
+		t.Fatal("opencode-go is not usable with OPENCODE_API_KEY set — the two gates disagree differently than expected")
+	}
+	// …so "(no matches)" for its name is a typo, and the hint must be silent,
+	// exactly as it is for a provider with its single-named env key.
+	if got := PickerNoMatchHint("opencode-go"); got != "" {
+		t.Errorf("opencode-go has a live credential (OPENCODE_API_KEY) and is in the picker, but the no-match hint says:\n  %s", got)
+	}
+}

@@ -2400,12 +2400,19 @@ func NewCLI() *cobra.Command {
 	modelRefreshCmd := &cobra.Command{
 		Use:   "refresh",
 		Short: "Force a fresh, live probe of every model source (daemon, remotes, router) right now",
-		Long: `Every 'oaica launch'/'oaica model' invocation already re-probes model
-sources live -- there is no cross-process cache, so a plain 'ollama pull'
-or a remotes.json edit is visible on the very next launch with no action
-needed. This command exists for confirming RIGHT NOW that a model you just
-pulled or added is actually discoverable, without launching Claude Code
-just to see the picker list.`,
+		Long: `Every 'oaica launch'/'oaica model' invocation re-probes model sources
+live. The picker keeps a short-lived cache of that answer
+(~/.oaica/picker_cache.json, trusted for an hour) so the menu paints
+instantly, but the cache is keyed to the configuration it was built from:
+an edited remotes.json, a provider login, a catalog sync, a model add or
+scan, a local 'oaica serve', or a changed OAICA_HOST voids it, and the
+next launch reads the new state. The local daemon's list is re-read live
+even when the cache is used, so a 'ollama pull' or 'ollama rm' shows up
+on the next launch as well.
+
+This command is for confirming RIGHT NOW: it forces a live probe of every
+source and prints what is discoverable, without launching Claude Code just
+to see the picker list.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := launch.RefreshModelSources(15 * time.Second)

@@ -537,7 +537,7 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	}
 	return token, RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
 		ClientToken: token,
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
 			// An anthropic-wire remote is forwarded untranslated to its own
 			// /messages (see routeFor's doc for why); a single-leg launch of
 			// one takes exactly the same path as a tier-planned one.
@@ -557,7 +557,7 @@ func StartAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel
 	go func() {
 		_ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
 			ClientToken: token,
-			Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+			Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
 				// An anthropic-wire remote is forwarded untranslated to its own
 				// /messages (see routeFor's doc for why); a single-leg launch of
 				// one takes exactly the same path as a tier-planned one.
@@ -575,7 +575,11 @@ type proxyRoute struct {
 	// every request instead of trusting Key — see RemoteEndpoint.TokenEnv's
 	// doc for why a one-time-resolved credential is wrong for a long-lived
 	// proxy process.
-	KeyEnv        string
+	KeyEnv string
+	// ModelsURL is where this route's model list lives when it is not
+	// BaseURL+"/models" (the version prefix is per-surface — see
+	// RemoteEndpoint.ModelsURL). The context-window probe uses it.
+	ModelsURL     string
 	UpstreamModel string // model id the upstream expects
 	Label         string // for the request log / diagnostics
 	// ContextWindow is this route's real max context in tokens (probed via

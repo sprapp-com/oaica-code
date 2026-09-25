@@ -196,6 +196,10 @@ func providerCatalog() []providerCatalogEntry {
 					// Additive only: fill the embedded row's gaps.
 					merged := prev
 					fillEmptyProviderFields(&merged, e)
+					// The declared windows come from the synced document where
+					// it states them, in this direction too — a measurement,
+					// not a preference (see mergeDeclaredModelLimits).
+					merged.Models = mergeDeclaredModelLimits(prev.Models, e.Models)
 					byName[merged.Name] = merged
 					continue
 				}
@@ -206,6 +210,11 @@ func providerCatalog() []providerCatalogEntry {
 				merged := e
 				merged.Name = prev.Name
 				fillEmptyProviderFields(&merged, prev)
+				// …including the declarations: prev supplies the ids the
+				// synced row does not list at all, and nowhere else — the
+				// synced document's own numbers win, which is the whole point
+				// of bumping the version to correct a window.
+				merged.Models = mergeDeclaredModelLimits(prev.Models, e.Models)
 				byName[merged.Name] = merged
 			}
 		}
@@ -221,12 +230,19 @@ func providerCatalog() []providerCatalogEntry {
 // fillEmptyProviderFields copies only the fields dst is missing. Used in both
 // merge directions for the same reason: a field the incoming row does not
 // carry means "this document has nothing to say", not "unset what you know".
-// BaseURL is not fillable — a row that cannot state an endpoint is dropped by
-// add() rather than merged, since every field here is defined relative to it.
+//
+// "Missing" is judged on the TRIMMED value and the result is trimmed, because
+// a base_url of "   " is a hand-edit that lost its content, not an endpoint:
+// add() refuses such a row outright ("a row that cannot state an endpoint is
+// dropped"), but the redefinition branch never went through add(), so a
+// whitespace endpoint was accepted as a redefinition and every URL built from
+// the row became relative ("/v4/chat/completions") — the provider 404s for
+// every model, with an error that names no host.
 func fillEmptyProviderFields(dst *providerCatalogEntry, src providerCatalogEntry) {
-	if dst.BaseURL == "" {
+	if strings.TrimSpace(dst.BaseURL) == "" {
 		dst.BaseURL = src.BaseURL
 	}
+	dst.BaseURL = strings.TrimSpace(dst.BaseURL)
 	if dst.Version == "" {
 		dst.Version = src.Version
 	}
@@ -257,20 +273,49 @@ func fillEmptyProviderFields(dst *providerCatalogEntry, src providerCatalogEntry
 	if dst.Notes == "" {
 		dst.Notes = src.Notes
 	}
-	if len(src.Models) > 0 {
-		if dst.Models == nil {
-			dst.Models = make(map[string]providerCatalogModelLimit, len(src.Models))
-		}
-		for id, limit := range src.Models {
-			if _, exists := dst.Models[id]; !exists {
-				dst.Models[id] = limit
-			} else if limit.Context != 0 || limit.Output != 0 {
-				// A declared window is a measurement, not a preference: the
-				// newer document's numbers win when it states them.
-				dst.Models[id] = limit
-			}
-		}
+}
+
+// mergeDeclaredModelLimits merges a provider's declared model windows. kept is
+// the row being built, incoming the other document's declared windows: the
+// result holds every id either side lists, with the INCOMING numbers winning
+// wherever it states one.
+//
+// The direction is what this function exists to pin down. Callers pass the
+// SYNCED document as `incoming` in both merge directions, because a declared
+// window is a measurement, not a preference, and the fetched copy is the
+// newer one wherever it comes from. The redefinition branch used to call
+// fillEmptyProviderFields(dst, prev) — src = the EMBEDDED row — so the one
+// field a version bump is most often used to correct was exactly the field the
+// shipped row overruled: a vendor that revised a context window down (the
+// honest direction) kept being over-reported by every host, and
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS / the proxy's context-fit clamp never learned.
+//
+// A zero is treated as "states nothing", not as a value: Context and Output
+// are 0-means-unknown throughout, so a document that lists an id without a
+// window leaves the other side's number standing rather than blanking it.
+func mergeDeclaredModelLimits(kept, incoming map[string]providerCatalogModelLimit) map[string]providerCatalogModelLimit {
+	if len(kept) == 0 && len(incoming) == 0 {
+		return nil
 	}
+	out := make(map[string]providerCatalogModelLimit, len(kept)+len(incoming))
+	for id, limit := range kept {
+		out[id] = limit
+	}
+	for id, limit := range incoming {
+		prev, existed := out[id]
+		if !existed {
+			out[id] = limit
+			continue
+		}
+		if limit.Context == 0 {
+			limit.Context = prev.Context
+		}
+		if limit.Output == 0 {
+			limit.Output = prev.Output
+		}
+		out[id] = limit
+	}
+	return out
 }
 
 func parseProviderCatalogBytes(b []byte) []providerCatalogEntry {
@@ -305,6 +350,10 @@ func providerCatalogAsUserRemotes() []userRemote {
 			ToolFormat: e.ToolFormat,
 			APIKeyEnv:  e.APIKeyEnv,
 			AuthVia:    e.AuthVia,
+			// Marks the row as the catalog's, which is what lets
+			// remoteLaunchModels apply the vendor's declared model list to it
+			// and to nothing else (see CatalogOrigin).
+			CatalogOrigin: true,
 		})
 	}
 	return out
