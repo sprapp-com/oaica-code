@@ -223,7 +223,10 @@ func WriteRemoteList(w io.Writer) error {
 	fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", "NAME", "BASE_URL", "WIRE", "TOOL_FORMAT", "AUTH")
 	for _, r := range remotes {
 		d := r.Descriptor()
-		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", r.Name, r.BaseURL, d.Wire, d.ToolFormat, remoteAuthLabel(r))
+		// redactBaseURL: a remote configured as https://key@host/v1 carries
+		// the credential in the URL's userinfo, and list output lands in
+		// terminals, shell history and tickets. Same fix as doctor's.
+		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", r.Name, redactBaseURL(r.BaseURL), d.Wire, d.ToolFormat, remoteAuthLabel(r))
 	}
 	return nil
 }
@@ -244,7 +247,9 @@ func RemoteShow(name string) (userRemote, error) {
 }
 
 // WriteRemoteShow prints one remote's full detail to w. The api key is shown
-// as `<set>` / `env:<VAR>` / `none`, never its value.
+// as `<set>` / `env:<VAR>` / `none`, never its value — and a key embedded in
+// base_url's userinfo prints as REDACTED, so the field is never a second,
+// unredacted copy of the secret.
 func WriteRemoteShow(w io.Writer, name string) error {
 	r, err := RemoteShow(name)
 	if err != nil {
@@ -258,7 +263,7 @@ func WriteRemoteShow(w io.Writer, name string) error {
 		key = "<set>"
 	}
 	fmt.Fprintf(w, "name:          %s\n", r.Name)
-	fmt.Fprintf(w, "base_url:      %s\n", r.BaseURL)
+	fmt.Fprintf(w, "base_url:      %s\n", redactBaseURL(r.BaseURL))
 	fmt.Fprintf(w, "version:       %s\n", orDash(r.Version))
 	fmt.Fprintf(w, "wire:          %s\n", d.Wire)
 	fmt.Fprintf(w, "tool_format:   %s\n", d.ToolFormat)

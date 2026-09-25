@@ -147,7 +147,11 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 
 		req, err := http.NewRequest(r.Method, targetBaseURL+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			// redactErr: a target that carries the key as URL userinfo (an
+			// OAICA_HOST like https://sk-...@api.oaica.com, the same shape
+			// remotes.json leaked) appears in net/http's own error text —
+			// and this response goes back to the caller.
+			http.Error(w, redactErr(err).Error(), http.StatusBadGateway)
 			return
 		}
 		req.Header = r.Header.Clone()
@@ -155,7 +159,8 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			// A transport error quotes the request URL verbatim.
+			http.Error(w, redactErr(err).Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
@@ -177,7 +182,7 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 				Timestamp:        time.Now().UTC().Format(time.RFC3339),
 				Model:            modelField.Model,
 				Path:             r.URL.Path,
-				Backend:          targetBaseURL,
+				Backend:          redactCredentials(targetBaseURL),
 				LastMessageLen:   lastLen,
 				TotalMessagesLen: totalLen,
 				HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),

@@ -53,6 +53,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -146,7 +147,15 @@ func (r userRemote) key() string {
 	if v := externalAuthKey(r.AuthVia, r.Name); v != "" {
 		return v
 	}
-	return strings.TrimSpace(r.APIKey)
+	if v := strings.TrimSpace(r.APIKey); v != "" {
+		return v
+	}
+	// Last: a credential embedded in base_url's userinfo. openAIBase strips
+	// it from the URL (splitRemoteUserinfo), so this is the only place it is
+	// read back — without it, a remote configured as https://key@host would
+	// have lost its credential entirely once the URL stopped carrying it.
+	_, token := splitRemoteUserinfo(r.BaseURL)
+	return token
 }
 
 // RemoteDescriptor is the per-remote protocol metadata that decides routing
@@ -406,9 +415,42 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 // don't ("http://192.168.1.50:8080"). openAIBase appends "/<version>" exactly
 // once, so a trailing /v1 here would produce /v1/v1/<endpoint> (404).
 func remoteBaseURL(r userRemote) string {
-	b := strings.TrimRight(strings.TrimSpace(r.BaseURL), "/")
+	b, _ := splitRemoteUserinfo(r.BaseURL)
+	b = strings.TrimRight(strings.TrimSpace(b), "/")
 	b = strings.TrimSuffix(b, "/v1")
 	return b
+}
+
+// splitRemoteUserinfo separates a credential embedded in a base_url's
+// userinfo from the URL itself:
+//
+//	https://sk-abc@api.example.com/v1  ->  ("https://api.example.com/v1", "sk-abc")
+//
+// Remotes do get configured this way — it is the shape that leaked a key into
+// doctor output, `oaica remote list` and requests.log. It also broke auth:
+// net/http silently turns userinfo into Basic auth, while oaica's own code
+// reads the credential from key() and sends it as a bearer, so nothing oaica
+// printed or probed agreed with what actually authenticated the request.
+//
+// Only a bare userinfo is promoted. `user:password@host` is a genuine Basic
+// credential — rewriting it into a bearer would change how the request
+// authenticates, so it is left intact and only ever redacted at print sites
+// (redactCredentials).
+func splitRemoteUserinfo(baseURL string) (cleanURL, token string) {
+	raw := strings.TrimSpace(baseURL)
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return baseURL, ""
+	}
+	if _, hasPassword := u.User.Password(); hasPassword {
+		return baseURL, ""
+	}
+	token = u.User.Username() // no password: the username IS the credential
+	if token == "" {
+		return baseURL, ""
+	}
+	u.User = nil
+	return u.String(), token
 }
 
 // openAIBase returns the remote's full OpenAI base including its API version

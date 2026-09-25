@@ -87,6 +87,75 @@ func TestRemoteShowNeverPrintsAPIKey(t *testing.T) {
 	}
 }
 
+// A key embedded in base_url's userinfo (https://sk-...@host/v1) must print
+// redacted too — the literal-field check above never covered it, and list
+// output goes to terminals, shell logs and pasted tickets.
+func TestRemoteListAndShowRedactCredentialInURL(t *testing.T) {
+	withTempRemotesFile(t)
+	const key = "sk-url-embedded-0123456789"
+	if _, err := RemoteAdd(RemoteAddOptions{
+		Name: "urlbox", BaseURL: "https://" + key + "@api.example.com/v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var show, list bytes.Buffer
+	if err := WriteRemoteShow(&show, "urlbox"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRemoteList(&list); err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{show.String(), list.String()} {
+		if strings.Contains(out, key) {
+			t.Fatalf("credential in base_url leaked into output:\n%s", out)
+		}
+		if !strings.Contains(out, "https://REDACTED@api.example.com/v1") {
+			t.Fatalf("output should keep the host readable, redacted, got:\n%s", out)
+		}
+	}
+}
+
+// The credential oaica sends must be the same one the URL carried, and the
+// URL it sends to must no longer carry it — otherwise the fix for the leak
+// would silently de-authenticate every remote configured this way.
+func TestRemote_UserinfoCredentialBecomesBearerNotBasic(t *testing.T) {
+	withTempRemotesFile(t)
+	const key = "sk-url-embedded-0123456789"
+	if _, err := RemoteAdd(RemoteAddOptions{
+		Name: "urlbox", BaseURL: "https://" + key + "@api.example.com/v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ep, ok := resolveRemoteEndpoint("urlbox/m")
+	if !ok {
+		t.Fatal("remote not resolved")
+	}
+	if strings.Contains(ep.BaseURL, key) || strings.Contains(ep.BaseURL, "@") {
+		t.Fatalf("base URL still carries the credential: %s", ep.BaseURL)
+	}
+	if ep.BaseURL != "https://api.example.com/v1" {
+		t.Fatalf("base URL = %q", ep.BaseURL)
+	}
+	if ep.Token != key {
+		t.Fatalf("token = %q, want the URL's userinfo", ep.Token)
+	}
+
+	// user:password@ is a real Basic credential — left intact, not promoted.
+	if _, err := RemoteAdd(RemoteAddOptions{
+		Name: "basicbox", BaseURL: "https://u:p4ssw0rd@api.example.com/v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bep, _ := resolveRemoteEndpoint("basicbox/m")
+	if bep.Token != "" {
+		t.Fatalf("Basic userinfo must not become a bearer: %q", bep.Token)
+	}
+	if !strings.Contains(bep.BaseURL, "u:p4ssw0rd@") {
+		t.Fatalf("Basic userinfo must stay in the URL: %s", bep.BaseURL)
+	}
+}
+
 // Empty state must name the add command, the same way `oaica model list` does.
 func TestWriteRemoteListEmptyStateNamesAddCommand(t *testing.T) {
 	withTempRemotesFile(t)
