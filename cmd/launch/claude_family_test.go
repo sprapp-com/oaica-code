@@ -256,6 +256,7 @@ func TestNativeTierOnly_ExplicitFlagsKeepThePlanPath(t *testing.T) {
 		wantOK                         bool
 	}{
 		{"plain native launch", "claude/opus", "", "", "", "opus", true},
+		{"native with a sonnet split", "claude/opus", "zai/glm-4.5-air", "", "", "", false},
 		{"native with a haiku split", "claude/opus", "", "zai/glm-4.5-air", "", "", false},
 		{"native with --oversize", "claude/opus", "", "", "zai/glm-4.6", "", false},
 		{"empty tier is not native", "claude/", "", "", "", "", false},

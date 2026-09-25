@@ -293,12 +293,20 @@ at the first request instead. Check the launch's `tiers:` line, which prints
 what each tier actually resolved to. `oaica config show` prints both keys and
 the file path.
 
-One case is dropped without attribution: when the failure names no tier, or
-names both (it is then the primary's error, which no saved value can influence),
-BOTH saved keys are ignored for that launch, and the warning says so in those
-words rather than blaming a value the error never named. The launch then
-normally fails on the real error — the drop is only insurance that a stale key
-can never be the thing that breaks every launch in the fleet.
+One case is dropped without attribution: when the failure carries no tier
+prefix at all, which means it is the primary's own error — the only kind
+`buildTierPlan` does not wrap — and no saved value can influence it. BOTH saved
+keys are then ignored for that launch, and the warning says so in those words
+rather than blaming a value the error never named. The launch subsequently fails
+on the real error; the drop is only insurance that a stale key can never be the
+thing that breaks every launch in the fleet.
+
+The tier is identified by the flag **prefix** on the error, not by the flag text
+appearing anywhere in it: the leg's own message quotes the model name it could
+not resolve, so a botched value that merely reads like a flag
+(`--haiku-model ghost--sonnet-model:x`) must not make a haiku failure look like
+it named the sonnet tier as well — that would cost the healthy `sonnet_model`
+for that launch.
 
 Plan > remotes.json `route_policy` > local-first also still holds for the
 route policy. Old plans.json files missing `oversize_model`/`route_policy`

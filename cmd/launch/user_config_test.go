@@ -126,7 +126,12 @@ func TestSavedTiersToDrop(t *testing.T) {
 	sonnetErr := errors.New("--sonnet-model: no model named \"oaica/retired\" anywhere")
 	haikuErr := errors.New("--haiku-model: remote \"zai\" is not configured")
 	primaryErr := errors.New("no model named \"box/kat-awq\" anywhere")
-	bothErr := errors.New("--sonnet-model: x\n--haiku-model: y")
+	// The failing leg's own error interpolates the model name it could not
+	// resolve, so a value that merely contains flag-like text must not make
+	// the failure look like it named the other tier — that would cost the
+	// healthy saved key for the launch.
+	haikuErrEmbeddingSonnetFlag := errors.New(
+		`--haiku-model: no model named "ghost--sonnet-model:x" anywhere: not a user remote; not on https://api.oaica.com; not pulled on the local daemon`)
 	cases := []struct {
 		name                    string
 		err                     error
@@ -141,7 +146,10 @@ func TestSavedTiersToDrop(t *testing.T) {
 		// Unattributable: the warning must not claim the failing value came
 		// from config.json, but a stale key still may not break the launch.
 		{"primary fails, both saved", primaryErr, true, true, true, true, false},
-		{"error names both legs", bothErr, true, true, true, true, false},
+		// The leg prefix decides, not a substring elsewhere in the message:
+		// the healthy sonnet key survives a haiku value that reads like a
+		// sonnet flag.
+		{"haiku fails on a value containing --sonnet-model:", haikuErrEmbeddingSonnetFlag, true, true, false, true, true},
 		{"no error at all", nil, true, true, false, false, false},
 	}
 	for _, c := range cases {

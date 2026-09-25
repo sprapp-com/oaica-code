@@ -488,31 +488,37 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 }
 
 // savedTiersToDrop decides which ~/.oaica/config.json tier(s) a failed
-// buildTierPlan justifies dropping for one launch. buildTierPlan wraps each
+// buildTierPlan justifies dropping for one launch. buildTierPlan prefixes each
 // leg's failure with the flag name for that leg ("--sonnet-model: ..."), which
-// is how the failing tier is identified here; the error text is our own, so
-// the prefixes only change if buildTierPlan's wrapping changes.
+// is how the failing tier is identified here; the error text is our own, so the
+// prefixes only change if buildTierPlan's wrapping changes. The prefix — not a
+// substring anywhere in the message — is what identifies the leg: the leg's own
+// error interpolates the model name it could not resolve, and a value that
+// merely CONTAINS flag-like text ("ghost--sonnet-model:x", a botched config
+// value) would otherwise make a haiku failure look like it named both tiers and
+// cost the healthy sonnet tier for that launch.
 //
 // Dropping only the failing tier is the whole point: both keys are set across
 // the fleet, and a stale sonnet_model must not cost the (healthy) haiku tier —
 // losing it silently re-bills Claude Code's background work at the primary's
 // price, the exact cost `haiku_model` exists to remove.
 //
-// An error naming neither leg or both cannot be attributed to one tier (and is
-// usually the primary's, which no saved tier can influence), so every saved
-// value is dropped — a stale key must never break every launch — and reported
-// as unattributed so the warning does not claim a value the error never named
-// came from the config file. A value the user typed on this command line is
-// never forgiven: savedSonnet/savedHaiku say which tiers came from the file.
+// An error with no leg prefix is the primary's (buildTierPlan wraps only the
+// two secondary legs), which no saved tier can influence; every saved value is
+// dropped anyway — a stale key must never break every launch — but reported as
+// unattributed so the warning does not claim a value the error never named came
+// from the config file. A value the user typed on this command line is never
+// forgiven: savedSonnet/savedHaiku say which tiers came from the file.
 func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (dropSonnet, dropHaiku, attributed bool) {
 	if err == nil || (!savedSonnet && !savedHaiku) {
 		return false, false, false
 	}
 	msg := err.Error()
-	namesSonnet := strings.Contains(msg, "--sonnet-model:")
-	namesHaiku := strings.Contains(msg, "--haiku-model:")
-	if namesSonnet != namesHaiku {
-		return savedSonnet && namesSonnet, savedHaiku && namesHaiku, true
+	switch {
+	case strings.HasPrefix(msg, "--sonnet-model:"):
+		return savedSonnet, false, true
+	case strings.HasPrefix(msg, "--haiku-model:"):
+		return false, savedHaiku, true
 	}
 	return savedSonnet, savedHaiku, false
 }

@@ -212,3 +212,17 @@ func TestResolveAgentModel_RouterSKUBareWhenCatalogUnreachable(t *testing.T) {
 		t.Errorf("baseURL = %q, want router host", baseURL)
 	}
 }
+
+// A launch notice must reach whatever os.Stderr IS at the moment it is
+// printed, not a value snapshotted at package init: captureStderr (and any
+// future caller that redirects stderr) only sees the former. Regression test
+// for the price banner, which is printed outside buildTierPlanBuffered's
+// window (the --oversize leg) as well as inside it.
+func TestPrintPriceBanner_GoesToLiveStderr(t *testing.T) {
+	got := captureStderr(t, func() {
+		printPriceBanner(RemoteEndpoint{Name: "priced", PriceInputPerM: 1.5, PriceOutputPerM: 3})
+	})
+	if !strings.Contains(got, "priced: $1.50/M in, $3.00/M out") {
+		t.Fatalf("price banner = %q, want it on the redirected stderr", got)
+	}
+}
