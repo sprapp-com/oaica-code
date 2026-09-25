@@ -229,10 +229,7 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 
 	found, reachable := daemonHasModel(base)
 	if found {
-		return launchEndpoint{Source: sourceDaemon, RemoteEndpoint: RemoteEndpoint{
-			Name: "ollama", BaseURL: strings.TrimRight(envconfig.Host().String(), "/") + "/v1", Token: "ollama",
-			UpstreamModel: base, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
-		}}, nil
+		return daemonEndpoint(base), nil
 	}
 	if reachable {
 		tried = append(tried, fmt.Sprintf("not pulled on the local daemon at %s", redactBaseURL(envconfig.Host().String())))
@@ -243,6 +240,16 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		return launchEndpoint{}, fmt.Errorf("model %q: %s", model, strings.Join(tried, "; "))
 	}
 	return launchEndpoint{}, fmt.Errorf("model %q not found: not a user remote (~/.oaica/remotes.json); %s", model, strings.Join(tried, "; "))
+}
+
+// daemonEndpoint is the local Ollama daemon's OpenAI-compatible endpoint for
+// one of its own model ids. One definition, so the primary slot and a tier
+// slot cannot disagree about which host or which credential the daemon means.
+func daemonEndpoint(model string) launchEndpoint {
+	return launchEndpoint{Source: sourceDaemon, RemoteEndpoint: RemoteEndpoint{
+		Name: "ollama", BaseURL: strings.TrimRight(envconfig.Host().String(), "/") + "/v1", Token: "ollama",
+		UpstreamModel: model, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
+	}}
 }
 
 // tierPlan is everything a launch needs, computed without starting anything
@@ -373,6 +380,26 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 	}
 	if explicit {
 		return resolveLaunchEndpoint(sonnetModel)
+	}
+	// A local model id can contain "/" and never carries the "daemon/" prefix:
+	// `oaica pull` records the publisher's id verbatim ("hf.co/Qwen/Qwen3-8B"),
+	// and the registry serves "library/…". The primary resolves such a string
+	// through resolveLaunchEndpoint's daemon fallback, so a tier slot must
+	// resolve it the same way — otherwise one spelling names a local model in
+	// the primary slot and an id on the primary's remote in the
+	// --sonnet-model slot, with that remote's credential, and subagent traffic
+	// leaves the machine the weights were pulled onto (2026-09-26 audit).
+	//
+	// An exact local match beats the guess below, which forwards the id to a
+	// remote that does not enumerate it. The remote reading is not lost: it
+	// stays reachable by naming it, "<primary>/<id>". Bare ids are not probed
+	// here — the un-namespaced contract above is deliberate and a bare id is
+	// never a daemon-only spelling (TestSecondary_BareIDNeverSilentlyLeaves
+	// PrimaryRemote pins that).
+	if strings.Contains(sonnetModel, "/") {
+		if found, _ := daemonHasModel(sonnetModel); found {
+			return daemonEndpoint(sonnetModel), nil
+		}
 	}
 	// Prefix with the primary's remote name in case the id is enumerated
 	// there under the namespaced form; otherwise pass it through unchanged.
@@ -876,9 +903,16 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 	// backend actually generating tokens under auto-compact's window
 	// guess.
 	if isNativeClaudeModel(p.PrimaryName) && p.PrimaryContext == 0 {
+		// Net of the output budget, exactly as contextEnvVars and the merge
+		// loop below do: the loop only RAISES an existing pair, so a raw
+		// window written here is never corrected downwards, and auto-compact
+		// then fires 32k too late — into the upstream's "prompt is too long"
+		// 400 the reserve exists to prevent (2026-09-26 audit).
 		if v := p.SecondaryContext; v > 0 {
+			v = usableContextWindow(p.SecondaryName, v)
 			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(v), "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(v))
 		} else if v := p.HaikuContext; v > 0 {
+			v = usableContextWindow(p.HaikuName, v)
 			env = append(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS="+strconv.Itoa(v), "CLAUDE_CODE_AUTO_COMPACT_WINDOW="+strconv.Itoa(v))
 		}
 	}

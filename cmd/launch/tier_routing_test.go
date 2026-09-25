@@ -205,6 +205,47 @@ func TestBuildTierPlan_CrossSourceTiers(t *testing.T) {
 	}
 }
 
+// Regression (audit, high): an un-namespaced secondary that the LOCAL DAEMON
+// serves under an id containing "/" was forwarded to the primary's remote
+// instead. `oaica pull hf.co/Qwen/Qwen3-8B` records the publisher's id
+// verbatim, and the primary slot resolves that exact string through
+// resolveLaunchEndpoint's daemon fallback; the --sonnet-model slot instead
+// guessed "<primary>/<id>" and sent it upstream to a remote that does not
+// enumerate it, with that remote's credential — so subagent traffic left the
+// machine the user had just pulled the weights onto (2026-09-26 audit).
+func TestBuildTierPlan_SlashedDaemonIDStaysLocal(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	const local = "hf.co/Qwen/Qwen3-8B"
+	stubDaemon(t, local)
+	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+	plan, err := buildTierPlan("box/kat-awq", local, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Secondary.Source != sourceDaemon || plan.Secondary.Token != "ollama" || plan.Secondary.BaseURL != "http://127.0.0.1:11434/v1" {
+		t.Fatalf("secondary = %s %q %s, want the local daemon", plan.Secondary.Source, plan.Secondary.Token, plan.Secondary.BaseURL)
+	}
+	if r, m := plan.Routes.resolve(local); r.Key != "ollama" || m != local {
+		t.Fatalf("subagent route = %+v %q, want the daemon under its own id", r, m)
+	}
+
+	// The remote reading is still reachable, by naming it: "<remote>/<id>".
+	plan, err = buildTierPlan("box/kat-awq", "box/"+local, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Secondary.Source != sourceUserRemote || plan.Secondary.Token != "k" {
+		t.Fatalf("namespaced secondary = %s %q, want the primary's remote", plan.Secondary.Source, plan.Secondary.Token)
+	}
+	if r, m := plan.Routes.resolve("box/" + local); r.Key != "k" || m != local {
+		t.Fatalf("explicit remote route = %+v %q", r, m)
+	}
+}
+
 func TestBuildTierPlan_SingleModelPinsEveryTier(t *testing.T) {
 	noRemotes(t)
 	t.Setenv("OAICA_HOST", "https://api.example.test")
@@ -923,6 +964,32 @@ func TestEnvVars_TakesTheLargestLegWindowNotThePrimarys(t *testing.T) {
 	}
 	if !slices.Contains(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=230144") {
 		t.Fatalf("AUTO_COMPACT_WINDOW was not raised with it: %v", env)
+	}
+}
+
+// envVars' native-primary fallback (a bare "claude/opus" primary has no probed
+// window of its own) advertised the OAICA leg's RAW window, skipping the
+// output-budget reserve that every other path applies through
+// usableContextWindow. The merge loop below it cannot correct that: it only
+// RAISES the pair, and the usable 230144 (= 262144 − 32000) is never greater
+// than the 262144 already written, so the reserve stayed handed back and
+// auto-compact fired 32k too late — into the upstream's "prompt is too long"
+// 400 that reserving the output budget exists to prevent (2026-09-26 audit).
+func TestEnvVars_NativePrimaryHoldsTheOutputReserve(t *testing.T) {
+	plan := tierPlan{
+		PrimaryName:      "claude/opus",
+		SecondaryName:    "box/mid",
+		HaikuName:        "box/mid",
+		SecondaryContext: 262144,
+		Routes: proxyRouteTable{
+			Default: proxyRoute{UpstreamModel: "opus"},
+			ByModel: map[string]proxyRoute{},
+		},
+	}
+	env := plan.envVars("http://127.0.0.1:1", "")
+	if !slices.Contains(env, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=230144") ||
+		!slices.Contains(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=230144") {
+		t.Fatalf("env = %v, want the sonnet leg's usable 230144 (262144 net of the 32000 output budget)", env)
 	}
 }
 
