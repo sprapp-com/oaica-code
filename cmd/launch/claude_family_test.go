@@ -809,3 +809,96 @@ func TestRun_AbandonedWizardLeavesTypedFlagsAlone(t *testing.T) {
 		t.Errorf("an abandoned wizard wiped the typed --route-policy:\n%s", stderr)
 	}
 }
+
+// The other half of the answered/abandoned distinction: when the user DOES
+// answer the Sonnet step with a model, that choice is this launch's tier even
+// though a --sonnet-model supplied the step's default row. The flag is the
+// default, not a ceiling -- otherwise the wizard would be a dialog that cannot
+// change the thing it asks about.
+func TestRun_WizardAnsweredSonnetBeatsTheTypedFlag(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	_, envLog := setupWizardConfigTierRun(t, `{}`)
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "Sonnet") {
+			// Take a row that is NOT the typed default.
+			for _, it := range items {
+				if it.Name == "zai/glm-4.6" {
+					return it.Name, nil
+				}
+			}
+			t.Errorf("the wizard's Sonnet step must offer zai/glm-4.6: %+v", items)
+			return "", nil
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	models := []LaunchModel{{Name: "box/kat-awq", Remote: true}, {Name: "zai/glm-4.6", Remote: true}}
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--wizard", "--sonnet-model", "zai/glm-4.5-air"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	data, _ := os.ReadFile(envLog)
+	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.6") {
+		t.Errorf("the wizard's answer did not become the tier (env):\n%s", data)
+	}
+	if !strings.Contains(stderr, "zai/glm-4.6") {
+		t.Errorf("want the wizard summary to name the picked tier:\n%s", stderr)
+	}
+}
+
+// Esc at the first (Sonnet) step must re-ask the plan step when plans exist,
+// not end the wizard with the tiers silently discarded. The step order makes
+// this easy to get wrong: the plan prompt is offered BEFORE the tier steps, so
+// "back" from the first tier step has somewhere to go.
+func TestRun_WizardEscAtSonnetReasksThePlanStep(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setupWizardConfigTierRun(t, `{}`)
+	if err := PlanSet("saved-here", TierPlanProfile{Model: "box/kat-awq", SonnetModel: "box/kat-awq", RoutePolicy: string(RouteLocalOnly)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var planStepAsks int
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "plan") {
+			planStepAsks++
+			return tierWizardScratch, nil // scratch: walk the tiers
+		}
+		if planStepAsks == 0 {
+			// The very first prompt was not the plan step: the wizard then has
+			// no step to back into, which is what this pins.
+			t.Errorf("first prompt was %q, want the saved-plan step", title)
+			return tierWizardBack, nil
+		}
+		if planStepAsks == 1 {
+			return tierWizardBack, nil // esc on Sonnet -> back to the plan step
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if planStepAsks < 2 {
+		t.Errorf("esc at the Sonnet step did not re-ask the plan step (asked %d times):\n%s", planStepAsks, stderr)
+	}
+}
