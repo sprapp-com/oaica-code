@@ -100,3 +100,23 @@ func TestUpdateCheckCachePath_UnderOaicaDir(t *testing.T) {
 		t.Errorf("expected update_check.json, got %q", filepath.Base(path))
 	}
 }
+
+// This check runs early enough to be the first thing that creates ~/.oaica on
+// a fresh machine, and it used to create it 0o755 — a world-listable home for
+// the API key, remotes.json and auth.json that README.md tells operators is
+// "created owner-only, mode 0700".
+func TestUpdateCheckCache_CreatesHomeDirOwnerOnly(t *testing.T) {
+	setUpdateCheckHome(t)
+	saveUpdateCheckCache(updateCheckCache{LastChecked: time.Now(), LatestVersion: "0.4.9"})
+	path, err := updateCheckCachePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("~/.oaica created mode %o, want 0700", perm)
+	}
+}

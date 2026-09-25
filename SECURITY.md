@@ -34,12 +34,24 @@ Relevant when assessing an issue, and when deciding what to report:
 - **Credentials.** Your API key (`OAICA_API_KEY`) is read from the environment
   or from a config file written by `oaica provider login`. It is sent as a
   bearer token to the endpoint you are talking to, and is not written to logs,
-  usage records, or caches. `oaica doctor --report` prints an explicitly
-  redacted support bundle — see `.claude`-adjacent docs under `docs/`.
+  usage records, or caches: that was audited across `requests.log`, the picker
+  and catalog caches, and every command that prints a remote. A credential
+  configured inside a URL prints as `https://REDACTED@host/v1`, and a bare
+  `https://<token>@host/v1` remote is promoted to an ordinary bearer so the
+  secret stops travelling in URLs and process arguments. `oaica doctor
+  --report` prints an explicitly redacted support bundle, and refuses to print
+  at all if a secret value would appear in it. See
+  [docs/ENTERPRISE.md](docs/ENTERPRISE.md) for the full data-handling picture.
 - **What leaves the machine.** Prompts, attachments and tool output go to the
   endpoint you selected (`api.oaica.com` by default, or a remote you
-  configured). Nothing else: there is no telemetry, no crash reporting, and no
-  analytics in this client.
+  configured). There is no telemetry, no crash reporting, and no analytics.
+  The one unprompted request the client makes is an update check: a plain GET
+  of `oaica.com/download/VERSION.txt`, at most once per 20 hours, with no body
+  and no identifiers — it tells that host your IP and that oaica is installed,
+  and `OAICA_NO_UPDATE_CHECK=1` turns it off. `oaica launch <agent>` will also
+  offer to run an agent's own vendor installer when that agent is missing; it
+  asks first, and the full list of destinations is in
+  [docs/ENTERPRISE.md](docs/ENTERPRISE.md#network-connections).
 - **Files written.** Configuration and state live under `~/.oaica/` (config,
   plans, remotes, caches, usage counters). Installers write the binary into a
   directory on `PATH` and nothing else; the macOS/Linux installer cleans up

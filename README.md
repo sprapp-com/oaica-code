@@ -205,6 +205,9 @@ directory while model weights you still want are in it.
 
 ## Docs
 
+- [docs/ENTERPRISE.md](docs/ENTERPRISE.md) — data handling, what it writes to
+  disk, install/pinning/air-gapped, and what has not been tested (for a
+  security review)
 - [docs/LOCAL_USE.md](docs/LOCAL_USE.md) — self-hosting in detail
 - [docs/RELEASE.md](docs/RELEASE.md) — cutting a release
 - [docs/SITE_BUILDER.md](docs/SITE_BUILDER.md) — the static site builder

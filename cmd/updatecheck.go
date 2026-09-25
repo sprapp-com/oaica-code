@@ -89,7 +89,13 @@ func saveUpdateCheckCache(c updateCheckCache) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// 0o700, matching every other ~/.oaica creator. This check runs early on
+	// many commands, so on a fresh machine it can be the FIRST thing to create
+	// the directory — at 0o755 it left every later secret sitting in a
+	// world-listable directory, which is not what README.md tells an operator
+	// to expect. An already-existing directory is not touched (not ours to
+	// silently rewrite); new ones are owner-only.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return
 	}
 	b, err := json.Marshal(c)
