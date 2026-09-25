@@ -141,7 +141,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("gatekeeper: bad upstream_addr %q: %v", g.cfg.UpstreamAddr, err)
 	}
-	proxy := httputil.NewSingleHostReverseProxy(upstreamURL)
+	// Resolve the upstream for every request so a SIGHUP config reload changes
+	// the live routing target as documented. NewSingleHostReverseProxy captures
+	// its target at construction time, which previously made a reloaded
+	// upstream_addr appear to succeed while traffic continued to use the old
+	// backend.
+	proxy := &httputil.ReverseProxy{Director: func(req *http.Request) {
+		g.mu.RLock()
+		upstreamAddr := g.cfg.UpstreamAddr
+		g.mu.RUnlock()
+		target, err := url.Parse(upstreamAddr)
+		if err != nil {
+			// loadConfig validated the initial value and configuration is
+			// operator-owned; preserve the existing request on an invalid
+			// reload rather than panicking a serving handler.
+			return
+		}
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+	}}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
