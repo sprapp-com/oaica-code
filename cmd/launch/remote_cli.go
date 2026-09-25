@@ -34,6 +34,14 @@ type RemoteAddOptions struct {
 	Wire       string
 	ToolFormat string
 	Version    string
+	// VersionSet reports that the caller actually passed --api-version, which
+	// is what separates "set the version to this" from "I did not mention it".
+	// Without it, replacing an existing entry cleared Version, and clearing
+	// Version MOVES THE ENDPOINT: a v4 remote re-added to rotate its key
+	// silently began resolving to ".../v1/chat/completions" (404), with a
+	// confirmation line that did not say so. Every other flag here describes
+	// the entry's value; this one also describes the absence of an intent.
+	VersionSet bool
 }
 
 // loadUserRemotesFileRaw reads remotes.json WITHOUT merging builtinRemotes():
@@ -149,7 +157,16 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 			// split entirely, a lost route_policy reverts remote-only to
 			// local-first, a lost auth_via re-prompts for a credential
 			// another tool already owns.
+			//
+			// Version HAS a flag and is still preserved when that flag was not
+			// passed (VersionSet). The usual "absent means cleared" rule exists
+			// so a field can be reset to its default by omitting it — but for
+			// Version the default is not neutral, it is a different endpoint,
+			// so the reset has to be typed (`--api-version v1`).
 			existing := f.Remotes[i]
+			if !opts.VersionSet {
+				r.Version = existing.Version
+			}
 			r.ToolReliable = existing.ToolReliable
 			r.ForceTools = existing.ForceTools
 			r.PriceInputPerM = existing.PriceInputPerM

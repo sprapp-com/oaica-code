@@ -230,6 +230,71 @@ type pickerCacheFile struct {
 	SavedAt   time.Time     `json:"saved_at"`
 	TTLSecond float64       `json:"ttl_seconds"`
 	Models    []LaunchModel `json:"models"`
+	// Inputs fingerprints the config files this list was derived from. A cache
+	// is only a cache of a question already answered, and the question is
+	// "what does THIS configuration offer" — so the answer is void the moment
+	// the configuration changes. Without this, `oaica remote add` (or a
+	// provider login, or a catalog sync) was invisible to the next launch for
+	// up to pickerCacheTTL, and for up to pickerCacheGrace before anything
+	// noticed: the user edits remotes.json, launches, and their brand-new
+	// remote is simply not on the menu.
+	Inputs map[string]string `json:"inputs,omitempty"`
+}
+
+// pickerCacheInputPaths are the files whose contents decide which rows the
+// inventory contains. Paths come from the same helpers the loaders use, so an
+// override (OAICA_REMOTES_FILE) is fingerprinted rather than bypassed.
+func pickerCacheInputPaths() []string {
+	out := make([]string, 0, 4)
+	if p := strings.TrimSpace(userRemotesPath()); p != "" {
+		out = append(out, p)
+	}
+	if p := strings.TrimSpace(authStorePath()); p != "" {
+		out = append(out, p)
+	}
+	if p, err := licenseFilePath(); err == nil && strings.TrimSpace(p) != "" {
+		out = append(out, p)
+	}
+	if p, err := providerCatalogCachePath(); err == nil && strings.TrimSpace(p) != "" {
+		out = append(out, p)
+	}
+	return out
+}
+
+// pickerInputFingerprint records each input file's identity cheaply. A missing
+// file is recorded as absent rather than skipped: a config file APPEARING is
+// just as much a change as one being edited.
+func pickerInputFingerprint() map[string]string {
+	paths := pickerCacheInputPaths()
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(paths))
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			out[p] = "absent"
+			continue
+		}
+		out[p] = fmt.Sprintf("%d:%d", st.ModTime().UnixNano(), st.Size())
+	}
+	return out
+}
+
+// pickerInputsUnchanged reports whether the cache's fingerprint still matches
+// the files on disk. A cache with no fingerprint at all (written by an older
+// build) is not trusted: it cannot say what it was built from.
+func pickerInputsUnchanged(f pickerCacheFile) bool {
+	now := pickerInputFingerprint()
+	if len(f.Inputs) == 0 || len(now) != len(f.Inputs) {
+		return false
+	}
+	for k, v := range f.Inputs {
+		if now[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // pickerCachePath lives under ~/.oaica next to plans.json/remotes.json.
@@ -246,7 +311,7 @@ func savePickerCache(models []LaunchModel) {
 	if err != nil || len(models) == 0 {
 		return
 	}
-	b, err := json.Marshal(pickerCacheFile{SavedAt: time.Now(), TTLSecond: pickerCacheTTL.Seconds(), Models: models})
+	b, err := json.Marshal(pickerCacheFile{SavedAt: time.Now(), TTLSecond: pickerCacheTTL.Seconds(), Models: models, Inputs: pickerInputFingerprint()})
 	if err != nil {
 		return
 	}
@@ -270,6 +335,13 @@ func loadPickerCache() ([]LaunchModel, bool, bool) {
 	}
 	var f pickerCacheFile
 	if json.Unmarshal(b, &f) != nil || len(f.Models) == 0 {
+		return nil, false, false
+	}
+	if !pickerInputsUnchanged(f) {
+		// The configuration moved under the cache. Not merely stale: WRONG for
+		// the question being asked, so it must not paint the menu at all —
+		// falling through to the full load is what makes a just-added remote
+		// visible on the very next launch.
 		return nil, false, false
 	}
 	ttl := f.TTLSecond

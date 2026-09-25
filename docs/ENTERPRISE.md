@@ -34,8 +34,8 @@ row 9.)
 | 4 | `raw.githubusercontent.com` | Only when you run `oaica remote sync`, `oaica model sync` or `oaica model cloud-limits sync` **without** `--url` | A GET for that catalog's JSON in this repository | Pass `--url` (a `file://` path works) and the default is never contacted; or don't run the sync commands |
 | 5 | Agent installers at the vendor's own host — `claude.ai`, `code.kimi.com`, `dev.meta.ai`, `hermes-agent.nousresearch.com`, `opencode.ai`, `qwen-code-assets.oss-cn-hangzhou.aliyuncs.com` | Only when you run `oaica launch <agent>` for an agent that is not installed and you confirm the install | A GET for the vendor's own installer script, which it then runs | Don't launch that agent; install it yourself first, or from your own mirror |
 | 6 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
-| 7 | `api.lemonsqueezy.com` (`/v1/licenses`) | `oaica activate <key>` once, then a revalidation on `oaica launch` when the stored activation is older than 7 days | The licence key and this machine's activation id; the response says whether the licence is still valid | No switch while the licence gate is in force. A cached activation younger than 7 days makes no call, and an unreachable licence server keeps working for 30 days |
-| 8 | `huggingface.co`, or the router's own storage | Only when you run `oaica pull <model>` | `GET /v1/manifest/<model>` on your endpoint, then the weight bytes from the URL that manifest names — the router's storage, or HuggingFace when the manifest says `source=hf` | `oaica pull` is optional: point `OAICA_HOST` at a model already on disk and pull nothing |
+| 7 | `api.lemonsqueezy.com` (`/v1/licenses`) | `oaica activate <key>` once, then a revalidation on `oaica launch` when the stored activation is older than 7 days | The licence key and this machine's activation id; the response says whether the licence is still valid | No switch for a purchased key while the licence gate is in force; a cached activation younger than 7 days makes no call, and an unreachable licence server keeps working for 30 days. **One published key bypasses the gate and this call entirely:** the string `OAICA-TEST-DEV-FREE` is compiled into the binary (`cmd/launch/license.go`), activates locally, and never revalidates. It is in the public source, it is not a secret, and any build-from-source can remove the gate anyway — the licence is a convenience paywall on the prebuilt binary, not a control that resists a determined user. Do not treat it as one when threat-modelling |
+| 8 | `huggingface.co`, or the router's own storage | Only when you run `oaica pull <model>` | `GET /v1/manifest/<model>` on your endpoint, then the weight bytes from the URL that manifest names — the router's storage, or HuggingFace when the manifest says `source=hf`. On a HuggingFace URL, and only there, the request carries your HuggingFace token as a bearer header if one is present (`HF_TOKEN`, else `~/.huggingface/token`) — a speed-up for a public repo, not a requirement; a URL naming any other host is fetched anonymously, so a manifest cannot direct that token somewhere else | `oaica pull` is optional: point `OAICA_HOST` at a model already on disk and pull nothing. Unset `HF_TOKEN` and move `~/.huggingface/token` aside and the download still works, unauthenticated |
 | 9 | `api.cloudflare.com` (and `*.pages.dev`), **via the `wrangler` CLI** | Only when you run `oaica site deploy DIR` and `wrangler` is installed and authenticated | Your site's build output, uploaded by `wrangler pages deploy` under your own Cloudflare account. The socket is opened by `wrangler`, not by this binary — oaica shells out rather than reimplementing the Pages API | Don't run `oaica site deploy`; the site builder is optional and `oaica site new|edit|preview` stay entirely local |
 
 The endpoint in row 1 defaults to `https://api.oaica.com` (an
@@ -87,7 +87,7 @@ the modes it actually finds so you can verify that on a given host.
 | `~/.oaica/config.json`, `plans.json`, `models.json`, `aliases.json` | Tiers, named plans, model manifest, aliases | No |
 | `~/.oaica/model_picks.json`, `picker_cache.json` | Picker frequency and cached inventory | No (no URLs or keys — the cached row is name/metadata only) |
 | `~/.oaica/local_servers.json` | Which `oaica serve` instances are running, their ports, and the `--api-key` each was started with | **Possibly** |
-| `~/.oaica/requests.log` | One line per launch request: model name, which backend served it (a label, or the endpoint URL with any credential redacted), message *sizes*, timing, status | No — sizes, not content |
+| `~/.oaica/requests.log` | One line per launch request **that this client routed and metered**: model name, which backend served it (a label, or the endpoint URL with any credential redacted), message *sizes*, timing, status | No — sizes, not content |
 | `~/.oaica/cache/` | Cached catalog and probe answers | No |
 | `~/.oaica/update_check.json` | Last update check: when, and which version was newest | No |
 | `~/.oaica/models/` | Downloaded GGUF weights | No |
@@ -98,6 +98,16 @@ security team will ask about: it records the byte length of the last message
 and of the whole conversation, plus a boolean "would the router have called this
 hard", and never message text, headers, or credentials. `oaica usage` summarises
 it. Delete the file at any time; nothing else depends on it.
+
+It is also not a complete accounting of your traffic, and should not be read as
+one: a leg oaica does not route or meter writes no row. A remote that speaks
+the Anthropic wire natively (the `zai-coding-plan`, `minimax-coding-plan` and
+`minimax-cn-coding-plan` rows, a raw `api.anthropic.com` entry, or
+`oaica launch claude-login`) is passed through end to end, so its requests
+appear in neither `requests.log` nor `oaica usage`. Absence of a row is not
+evidence that no request was made. What such a leg *does* print — the request
+and response themselves — is the same traffic you asked for; it simply never
+touches oaica's own ledger.
 
 Integrations write outside `~/.oaica/` too, in their own config locations —
 for example a Codex profile, or the launching agent's settings file — when you
@@ -119,10 +129,11 @@ argument list. Concretely, the client:
   configured, which is often what you need in a ticket;
 - refuses to print `oaica doctor --report` at all if any secret value would
   appear in it, rather than printing a partially-redacted bundle. The scan
-  covers every place a key can sit — the environment, `remotes.json`,
-  `auth.json`, the `api_key`, `license_key` and `license.json` files, and the
-  `--api-key` values in `local_servers.json` — so a value the report does not
-  currently print is still checked against it;
+  covers every place a key can sit — the environment (`OAICA_API_KEY`,
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HF_TOKEN`), `remotes.json`,
+  `auth.json`, the `api_key`, `license_key` and `license.json` files, the
+  `--api-key` values in `local_servers.json`, and `~/.huggingface/token` — so
+  a value the report does not currently print is still checked against it;
 - promotes a bare `https://<token>@host/v1` remote into a normal bearer token
   and strips it from the URL, so the secret stops travelling in URLs, in
   command lines visible to `ps`, and in `net/http` error text.

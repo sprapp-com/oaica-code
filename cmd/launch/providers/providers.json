@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "providers": [
     {"name": "anthropic", "base_url": "https://api.anthropic.com", "wire": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
     {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "key_url": "https://platform.openai.com/api-keys", "notes": "Per-token platform API. The codex ids are declared because the platform's /v1/models list does not advertise them. A ChatGPT Plus/Pro/Max subscription is a DIFFERENT credential with no API key at all — that is ~/.codex/auth.json (auth_mode \"chatgpt\"), reachable in oaica as the native 'codex/native' picker entry, not as a row here.",
@@ -36,7 +36,7 @@
     {"name": "together", "base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
     {"name": "fireworks", "base_url": "https://api.fireworks.ai/inference/v1", "api_key_env": "FIREWORKS_API_KEY"},
     {"name": "cerebras", "auth_via": "opencode", "base_url": "https://api.cerebras.ai/v1", "api_key_env": "CEREBRAS_API_KEY"},
-    {"name": "perplexity", "auth_via": "opencode", "base_url": "https://api.perplexity.ai", "api_key_env": "PERPLEXITY_API_KEY"},
+    {"name": "perplexity", "auth_via": "opencode", "base_url": "https://api.perplexity.ai", "version": "none", "models_path": "/v1/models", "api_key_env": "PERPLEXITY_API_KEY"},
     {"name": "alibaba", "auth_via": "opencode", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY"},
     {"name": "moonshot", "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY", "plan_label": "API Plan (Moonshot/Kimi — per-token key)"},
     {"name": "zhipu", "base_url": "https://open.bigmodel.cn/api/paas",
@@ -106,7 +106,7 @@
       "kimi-for-coding-highspeed": {"context": 262144, "output": 32768}
     }
     },
-    {"name": "opencode-go", "auth_via": "opencode", "base_url": "https://opencode.ai/zen/go/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_GO_API_KEY", "plan_label": "Coding Plan (OpenCode Go — subscription)",
+    {"name": "opencode-go", "auth_via": "opencode", "base_url": "https://opencode.ai/zen/go/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_API_KEY, OPENCODE_GO_API_KEY", "plan_label": "Coding Plan (OpenCode Go — subscription)",
      "models": {
       "deepseek-v4-flash": {"context": 1000000, "output": 384000},
       "deepseek-v4-flash-vision-exp": {"context": 1000000, "output": 384000},
@@ -247,7 +247,7 @@
       "wan2.7-image-pro": {"context": 8192, "output": 0}
     }
     },
-    {"name": "github-copilot", "base_url": "https://api.githubcopilot.com", "tool_format": "tool_calls", "api_key_env": "GITHUB_TOKEN", "plan_label": "Included subscription (GitHub Copilot — OAuth token)", "key_url": "https://github.com/settings/tokens",
+    {"name": "github-copilot", "base_url": "https://api.githubcopilot.com", "version": "none", "tool_format": "tool_calls", "api_key_env": "GITHUB_TOKEN", "plan_label": "Included subscription (GitHub Copilot — OAuth token)", "key_url": "https://github.com/settings/tokens",
      "models": {
       "claude-fable-5": {"context": 1000000, "output": 128000},
       "claude-fable-5.1": {"context": 1000000, "output": 128000},

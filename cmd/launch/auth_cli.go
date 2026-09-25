@@ -157,7 +157,10 @@ func AuthLoginVia(out io.Writer, provider, via string) error {
 
 func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, known bool) (string, error) {
 	if known {
-		fmt.Fprintf(out, "%s — %s\n", provider, entry.BaseURL)
+		// The endpoint oaica will actually call, not the catalog's base_url
+		// prefix — a v4 row's BaseURL stops a segment short, so the URL shown
+		// beside "paste your key for this provider" 404s.
+		fmt.Fprintf(out, "%s — %s\n", provider, entry.EndpointBase())
 		if entry.PlanLabel != "" {
 			fmt.Fprintf(out, "Plan: %s\n", entry.PlanLabel)
 		}

@@ -7,12 +7,13 @@ package launch
 //
 // Design mirrors oaica_models.go's router cache: GET with If-None-Match,
 // 304 falls back to the cached body, offline falls back to the last good
-// copy. Merge policy is deliberately one-directional: remote config wins,
-// but local Notes (the user's own field notes) survive unless the remote
-// actually ships one. `--prune` removes only entries this sync brought
-// in (Source=="sync") that have since disappeared from the catalog;
-// hand-added (`oaica model add`) and scanned (`model scan`) entries are
-// never touched.
+// copy. Merge policy turns on who owns the entry: an entry this sync brought
+// in (Source=="sync") is replaced by the catalog, while an entry the user
+// owns — hand-added (`oaica model add`) or registered by the local scan — is
+// only ever filled in where it is missing, never rewritten (fillFromCatalog).
+// `--prune` removes only entries this sync brought in that have since
+// disappeared from the catalog; hand-added and scanned entries are never
+// touched by automation.
 
 import (
 	"encoding/json"
@@ -37,6 +38,21 @@ type modelSyncCache struct {
 	Catalog modelManifest `json:"catalog"`
 }
 
+// usable reports whether this is a copy this sync actually fetched. It is the
+// gate for both fallbacks (a 304 body, and a host that cannot be reached).
+//
+// It deliberately does NOT test Catalog.Version: that field is the catalog
+// document's own schema version, and parseModelCatalog documents version 0 as
+// tolerated ("hand-rolled catalogs don't need to remember version: 1"). So a
+// perfectly good fetched copy of a versionless catalog used to fail both
+// fallbacks with "no cache exists" while that copy sat on disk — and, once
+// the network hiccuped, a working sync turned into a hard error.
+func (c modelSyncCache) usable() bool {
+	// A cache file whose URL differs from the requested one is zeroed by the
+	// caller, so a non-zero SavedAt means "written by a successful fetch".
+	return !c.SavedAt.IsZero()
+}
+
 func modelSyncCachePath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -53,6 +69,43 @@ type ModelSyncReport struct {
 	Pruned    []string
 	Skipped   []string // entries that failed validation (id: reason)
 	FromCache bool     // served from the 304/last-good cache, not a fresh 200
+}
+
+// fillFromCatalog copies only the fields a user-owned manifest entry is
+// missing, never overwriting one it already carries. `oaica model sync` runs
+// against a file the user also edits by hand and that `oaica model scan`
+// writes to; a field the entry already has is by definition someone's
+// decision. ModelPath is the deliberate exception in the other direction: it
+// stays untouched, because a path comes from the filesystem (the scan) or
+// from the user, never from a remote document.
+func fillFromCatalog(dst *ModelManifestEntry, src ModelManifestEntry) {
+	if dst.Engine == "" {
+		dst.Engine = src.Engine
+	}
+	if dst.Arch == "" {
+		dst.Arch = src.Arch
+	}
+	if dst.Quant == "" {
+		dst.Quant = src.Quant
+	}
+	if dst.ContextWindow == 0 {
+		dst.ContextWindow = src.ContextWindow
+	}
+	if dst.DefaultMaxOutputTokens == 0 {
+		dst.DefaultMaxOutputTokens = src.DefaultMaxOutputTokens
+	}
+	if dst.GPUMemGB == 0 {
+		dst.GPUMemGB = src.GPUMemGB
+	}
+	if dst.RAMGB == 0 {
+		dst.RAMGB = src.RAMGB
+	}
+	if len(dst.LaunchFlags) == 0 {
+		dst.LaunchFlags = src.LaunchFlags
+	}
+	if dst.Notes == "" {
+		dst.Notes = src.Notes
+	}
 }
 
 // ModelSync fetches the catalog at url (empty = defaultModelSyncURL) and
@@ -81,18 +134,34 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: %v", remote, err))
 			continue
 		}
-		e.Source = "sync"
 		prev, existed := m.Get(remote)
-		if existed {
+		switch {
+		case !existed:
+			e.Source = "sync"
+			m.Put(e)
+			report.Added = append(report.Added, remote)
+		case prev.Source != "sync":
+			// The entry is the user's: hand-added (no Source) or registered
+			// by the local scan. Automation must not rewrite it — the same
+			// discipline the scan keeps when two files claim one id. Before
+			// this, sync replaced the entry wholesale (`e.Source = "sync"`),
+			// which both destroyed the user's model_path/launch_flags and
+			// re-labelled the entry as sync-sourced, so the NEXT `--prune`
+			// deleted a model the help promises is "never touched by
+			// automation". Only fields the entry is missing are filled in.
+			merged := prev
+			fillFromCatalog(&merged, e)
+			m.Put(merged)
+			report.Updated = append(report.Updated, remote)
+		default:
+			e.Source = "sync"
 			// Local field notes win unless the catalog ships its own.
 			if e.Notes == "" {
 				e.Notes = prev.Notes
 			}
+			m.Put(e)
 			report.Updated = append(report.Updated, remote)
-		} else {
-			report.Added = append(report.Added, remote)
 		}
-		m.Put(e)
 	}
 
 	if prune {
@@ -145,7 +214,7 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		// Offline but we have a last-good copy: use it rather than failing.
-		if cached.SavedAt != (time.Time{}) && cached.Catalog.Version > 0 {
+		if cached.usable() {
 			return cached.Catalog, true, nil
 		}
 		return modelManifest{}, false, fmt.Errorf("couldn't reach %s: %w", url, err)
@@ -154,7 +223,7 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 
 	switch {
 	case resp.StatusCode == http.StatusNotModified:
-		if cached.Catalog.Version > 0 {
+		if cached.usable() {
 			cached.SavedAt = time.Now()
 			if b, jerr := json.Marshal(cached); jerr == nil {
 				_ = os.MkdirAll(filepath.Dir(cachePath), 0o700)
@@ -162,7 +231,7 @@ func fetchModelCatalog(url string) (modelManifest, bool, error) {
 			}
 			return cached.Catalog, true, nil
 		}
-		return modelManifest{}, false, fmt.Errorf("%s returned 304 but no cache exists", url)
+		return modelManifest{}, false, fmt.Errorf("%s returned 304 but no cached copy from that URL is on disk", url)
 	case resp.StatusCode != http.StatusOK:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return modelManifest{}, false, fmt.Errorf("%s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))

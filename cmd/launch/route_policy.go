@@ -75,6 +75,22 @@ type routePolicy string
 // Empty means the default (local-first). Invalid values fail loudly — a
 // typo'd policy silently degrading to the default would be worse than a
 // failed launch.
+// RoutePolicyNames is every policy parseRoutePolicy accepts, in the order
+// user-facing text lists them — the single source for both flag help lines and
+// the refusal below. It exists because the three had already drifted:
+// `oaica plan set --help` denied "weighted" while the command accepted it and
+// two documents shipped it, so the one line a user reads when setting a plan
+// was the one line that was wrong (2026-09-26).
+func RoutePolicyNames() []string {
+	return []string{
+		string(RouteLocalFirst), string(RouteRemoteFirst), string(RouteAuto),
+		string(RouteLocalOnly), string(RouteRemoteOnly), string(RouteWeighted),
+	}
+}
+
+// RoutePolicyList renders RoutePolicyNames for a help string or an error.
+func RoutePolicyList() string { return strings.Join(RoutePolicyNames(), ", ") }
+
 func parseRoutePolicy(s string) (routePolicy, error) {
 	switch s {
 	case "":

@@ -53,7 +53,7 @@ func reportSecrets() []reportSecret {
 	}
 
 	add("OAICA_API_KEY", os.Getenv("OAICA_API_KEY"))
-	for _, env := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"} {
+	for _, env := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HF_TOKEN"} {
 		add(env, os.Getenv(env))
 	}
 	if remotes, err := loadUserRemotes(); err == nil {
@@ -88,6 +88,13 @@ func reportSecrets() []reportSecret {
 	if home := reportHome(); home != "" {
 		add("the key saved by `oaica signin` (~/.oaica/api_key)",
 			readSecretFile(filepath.Join(home, ".oaica", "api_key")))
+		// `oaica pull` attaches the HuggingFace token (HF_TOKEN, or the file
+		// the official `hf` tooling writes) to a weight download, so it is a
+		// credential this machine transmits and can therefore also be printed
+		// by a report (2026-09-26 audit: it was in neither the secret list nor
+		// the egress documentation).
+		add("the HuggingFace token in ~/.huggingface/token",
+			readSecretFile(filepath.Join(home, ".huggingface", "token")))
 		add("the licence key in ~/.oaica/license_key",
 			readSecretFile(filepath.Join(home, ".oaica", "license_key")))
 		// `oaica serve --api-key K` records K in local_servers.json, so that

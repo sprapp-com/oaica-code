@@ -74,13 +74,20 @@ type userRemote struct {
 	// z.ai is the notable exception: it uses "v4"
 	// (https://api.z.ai/api/paas/v4/chat/completions). Leave empty for the
 	// common OpenAI "v1" layout. Set it to remoteVersionNone ("none") for an
-	// endpoint whose base_url already ends at the OpenAI root and must not have
-	// a segment appended (Google: ".../v1beta/openai").
+	// endpoint whose base_url is already the complete base and must not have a
+	// segment appended (Google: ".../v1beta/openai"). "none" uses base_url
+	// verbatim apart from a trailing slash, so a base that ends in "/v1" keeps
+	// it.
 	//
 	// The version belongs in base_url OR in Version, never both: whatever
 	// base_url ends with is preserved and Version is appended to it, so a
 	// version in each place resolves to "/v4/v1" and 404s every request.
 	Version string `json:"version"`
+	// ModelsPath overrides where this remote's model list lives, relative to
+	// base_url (or an absolute URL). Empty means openAIBase()+"/models". Set it
+	// for a vendor whose model list is versioned differently from its chat
+	// endpoint — see modelsURL.
+	ModelsPath string `json:"models_path,omitempty"`
 	// Wire is the request/response protocol the box speaks: "openai"
 	// (/v1/chat/completions, the default) or "anthropic" (/v1/messages). Empty
 	// defaults to "openai". Drives routing: matching wire → direct; mismatch →
@@ -143,8 +150,41 @@ type userRemotesFile struct {
 // Every credential path ends here, so a provider logged in interactively — by
 // oaica or by opencode — works everywhere an env var does. A key the user
 // explicitly handed oaica outranks one another tool left on disk.
+// keyEnvNames splits a row's api_key_env into the environment variables it
+// names. Usually one. A second name is for a vendor that documents a
+// different spelling than the one an earlier catalog shipped: opencode's own
+// docs and models.dev both say OPENCODE_API_KEY for the Go subscription, but
+// this catalog shipped OPENCODE_GO_API_KEY, so a host that exported the old
+// name must keep working. Listing both is the honest way to rename a variable
+// that a user has already put in a shell profile — silently dropping a
+// variant is indistinguishable, from that user's seat, from the provider
+// disappearing.
+func (r userRemote) keyEnvNames() []string {
+	fields := strings.FieldsFunc(r.APIKeyEnv, func(c rune) bool {
+		return c == ',' || c == ' ' || c == '\t'
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// remoteKeyEnvSet reports whether any variable this row names is set — the
+// picker's gate for showing a key-gated builtin.
+func remoteKeyEnvSet(r userRemote) bool {
+	for _, env := range r.keyEnvNames() {
+		if os.Getenv(env) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (r userRemote) key() string {
-	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
+	for _, env := range r.keyEnvNames() {
 		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
 			return v
 		}
@@ -225,7 +265,7 @@ func userRemotesPath() string {
 func builtinRemotes() []userRemote {
 	var out []userRemote
 	for _, p := range providerCatalogAsUserRemotes() {
-		if p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "" {
+		if remoteKeyEnvSet(p) {
 			out = append(out, p)
 			continue
 		}
@@ -479,14 +519,53 @@ const remoteVersionNone = "none"
 // remoteVersionNone to append nothing.
 func (r userRemote) openAIBase() string {
 	v := strings.Trim(strings.TrimSpace(r.Version), "/")
-	switch {
-	case strings.EqualFold(v, remoteVersionNone):
-		return remoteBaseURL(r)
-	case v == "":
+	if strings.EqualFold(v, remoteVersionNone) {
+		// Nothing to append, so nothing may be stripped either: the caller
+		// said base_url is already the whole base. Going through
+		// remoteBaseURL here would TrimSuffix("/v1") and quietly delete a
+		// version the user configured -- and "/v1" is the most common way an
+		// OpenAI-compatible base ends, so `--api-version none` on such a
+		// remote sent every request to <host>/chat/completions (404).
+		b, _ := splitRemoteUserinfo(r.BaseURL)
+		return strings.TrimRight(strings.TrimSpace(b), "/")
+	}
+	if v == "" {
 		v = "v1"
 	}
 	return remoteBaseURL(r) + "/" + v
 }
+
+// modelsURL is where this remote's model list lives: openAIBase()+"/models"
+// unless the row says otherwise.
+//
+// The override exists because a vendor's version prefix is per-SURFACE, not
+// per-host. Perplexity serves chat unversioned ("/chat/completions" — the
+// versioned path 404s) while listing models under "/v1/models"; one `version`
+// field cannot express both, so such a row sets version "none" (correct for
+// every request oaica sends) plus models_path "/v1/models". Without it, the
+// picker's sweep and doctor's reachability probe both ask a URL the host does
+// not serve, and a working provider reads as broken.
+func (r userRemote) modelsURL() string {
+	p := strings.TrimSpace(r.ModelsPath)
+	switch {
+	case p == "":
+		return r.openAIBase() + "/models"
+	case strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://"):
+		return p
+	default:
+		base, _ := splitRemoteUserinfo(r.BaseURL)
+		return strings.TrimRight(strings.TrimSpace(base), "/") + "/" + strings.TrimLeft(p, "/")
+	}
+}
+
+// EndpointBase is openAIBase for callers outside this package — the base URL
+// oaica appends its endpoint paths to. Print sites should use THIS, not
+// BaseURL: the configured base is a prefix (a v4 row's BaseURL stops at
+// "/api/paas"), so a user who curls what a message showed them gets a 404 while
+// the row itself works. Credentials are already stripped (splitRemoteUserinfo),
+// but callers must still redact before printing (RedactBaseURL) since a token
+// can ride in a query parameter.
+func (r userRemote) EndpointBase() string { return r.openAIBase() }
 
 // remoteModelsFetchTimeout bounds one remote's contribution to the picker.
 // All remotes are queried concurrently, but the picker should still appear
@@ -496,7 +575,7 @@ const remoteModelsFetchTimeout = 2 * time.Second
 // fetchRemoteModels lists one remote's models endpoint (e.g. /v1/models).
 // Short timeout: a sleeping box must not stall the picker.
 func fetchRemoteModels(r userRemote) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, r.openAIBase()+"/models", nil)
+	req, err := http.NewRequest(http.MethodGet, r.modelsURL(), nil)
 	if err != nil {
 		// redactErr: the picker's warning would otherwise print the remote's
 		// URL, key included, when the URL carries the key as userinfo.

@@ -37,7 +37,7 @@ const doctorProbeTimeout = 2 * time.Second
 func probeRemote(r userRemote) string {
 	ctx, cancel := context.WithTimeout(context.Background(), doctorProbeTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.openAIBase()+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.modelsURL(), nil)
 	if err != nil {
 		// redactErr: net/http echoes the request URL — which can carry the
 		// key as userinfo — in these messages.
@@ -101,9 +101,15 @@ func doctorChecks(w io.Writer) bool {
 		if r.RoutePolicy != "" {
 			suffix = "  (route_policy: " + r.RoutePolicy + ")"
 		}
+		// The RESOLVED endpoint, not the configured prefix: the probe above
+		// fetched openAIBase()+"/models", so printing BaseURL showed a URL one
+		// version segment short of the one that was actually tried (a v4 row
+		// printed ".../api/paas" beside an "ok" earned at ".../api/paas/v4"),
+		// and the printed link 404s when followed by hand — which is the one
+		// thing this line is for.
 		// Credential-embedded URLs (https://key@host/...) print
 		// redacted — doctor output lands in terminals and CI logs.
-		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", r.Name, redactBaseURL(r.BaseURL), r.Wire, status, suffix)
+		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", r.Name, redactBaseURL(r.openAIBase()), r.Wire, status, suffix)
 	}
 	if len(remotes) == 0 {
 		fmt.Fprintln(w, "  (none configured)")

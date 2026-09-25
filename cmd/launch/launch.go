@@ -304,6 +304,44 @@ type SelectionItem struct {
 
 // LaunchCmd returns the cobra command for launching integrations.
 // The runTUI callback is called when the root launcher UI should be shown.
+// launchLongHelp is `oaica launch --help`. The integrations section is built
+// from the registry rather than hand-listed: a hardcoded list had drifted in
+// both directions — it advertised two integrations the registry hides (kimi,
+// vscode) and omitted a registered launcher (dsh) — so the one place a user
+// reads the list was the one place it was wrong. ListVisibleIntegrationSpecs
+// applies the registry's own rules (hidden, unsupported on this platform, the
+// Windows pool exclusion) in the launcher display order.
+func launchLongHelp() string {
+	var b strings.Builder
+	b.WriteString(`Launch the Ollama interactive menu, or directly launch a specific integration.
+
+Without arguments, this is equivalent to running 'ollama' directly.
+Flags and extra arguments require an integration name.
+
+Supported integrations:
+`)
+	for _, spec := range ListVisibleIntegrationSpecs() {
+		fmt.Fprintf(&b, "  %-15s %s", spec.Name, spec.Runner.String())
+		if len(spec.Aliases) > 0 {
+			fmt.Fprintf(&b, " (aliases: %s)", strings.Join(spec.Aliases, ", "))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(`
+Examples:
+  oaica launch
+  oaica launch claude
+  oaica launch claude --model <model>
+  oaica launch chatgpt
+  oaica launch chatgpt --restore
+  oaica launch hermes
+  oaica launch hermes-desktop
+  oaica launch droid --config (does not auto-launch)
+  oaica launch codex --restore
+  oaica launch codex -- --sandbox workspace-write`)
+	return b.String()
+}
+
 func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) error, runTUI func(cmd *cobra.Command)) *cobra.Command {
 	var modelFlag string
 	var configFlag bool
@@ -316,41 +354,8 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 	cmd := &cobra.Command{
 		Use:   "launch [INTEGRATION] [-- [EXTRA_ARGS...]]",
 		Short: "Launch the oaica menu or an integration",
-		Long: `Launch the Ollama interactive menu, or directly launch a specific integration.
-
-Without arguments, this is equivalent to running 'ollama' directly.
-Flags and extra arguments require an integration name.
-
-Supported integrations:
-  claude          Claude Code
-  chatgpt         ChatGPT (aliases: codex-app, codex-desktop, codex-gui)
-  hermes          Hermes Agent
-  openclaw        OpenClaw (aliases: clawdbot, moltbot)
-  opencode        OpenCode
-  codex           Codex
-  hermes-desktop  Hermes Desktop
-  copilot         Copilot CLI (aliases: copilot-cli)
-  omp             OMP
-  droid           Droid
-  kimi            Kimi Code CLI
-  pi              Pi
-  pool            Pool
-  cline           Cline
-  qwen            Qwen Code
-  vscode          VS Code (aliases: code)
-
-Examples:
-  oaica launch
-  oaica launch claude
-  oaica launch claude --model <model>
-  oaica launch chatgpt
-  oaica launch chatgpt --restore
-  oaica launch hermes
-  oaica launch hermes-desktop
-  oaica launch droid --config (does not auto-launch)
-  oaica launch codex --restore
-  oaica launch codex -- --sandbox workspace-write`,
-		Args: cobra.ArbitraryArgs,
+		Long:  launchLongHelp(),
+		Args:  cobra.ArbitraryArgs,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if restoreFlag || launchCommandCanSkipHeartbeat(args) {
 				return nil
@@ -498,7 +503,7 @@ Examples:
 	cmd.Flags().StringVar(&sonnetFlag, "sonnet-model", "", "Secondary (sonnet/subagent) tier model")
 	cmd.Flags().StringVar(&haikuFlag, "haiku-model", "", "Haiku/background tier model")
 	cmd.Flags().StringVar(&oversizeFlag, "oversize", "", "Compaction/oversize-tier model for requests past the primary's window")
-	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: local-first, remote-first, auto, local-only, remote-only, weighted")
+	cmd.Flags().StringVar(&policyFlag, "route-policy", "", "Route policy: "+RoutePolicyList())
 	cmd.Flags().BoolVar(&wizardFlag, "wizard", false, "Force the interactive launch-tier wizard")
 	cmd.Flags().StringArrayVar(&shardFlags, "shard", nil, "model:weight — repeatable, sets a route's traffic weight for --route-policy weighted")
 	return cmd

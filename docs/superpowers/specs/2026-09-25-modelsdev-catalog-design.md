@@ -175,14 +175,20 @@ Absent optional fields degrade rather than reject: `cost` defaults every compone
 `limit` is required by opencode's schema and is present on all 8177 entries upstream, and
 a missing `release_date` sorts last.
 
-Two upstream quirks the overlay corrects, both found while writing this spec:
+Two upstream quirks this spec set out to correct. **Both are stale as written** — kept
+here with the correction rather than deleted, because each was fixed a different way and
+the record of which is which matters when reading the rest of this document:
 
 - `opencode-go` upstream is `https://opencode.ai/zen/go/v1` with `OPENCODE_API_KEY`.
-  oaica's hand-written row says `https://opencode.ai/zen/go` — the version path is missing
-  — and is marked "reference only — no api_key_env", so it stays unselectable for no
-  reason. Porting fixes both.
-- `zai-coding-plan` upstream reuses `ZHIPU_API_KEY`; oaica's key is
-  `Z_AI_CODING_PLAN_API_KEY`. Overlay overrides the env name.
+  oaica's row now carries the version path (`https://opencode.ai/zen/go/v1`) and accepts
+  **both** spellings of the variable (`"api_key_env": "OPENCODE_API_KEY,
+  OPENCODE_GO_API_KEY"`, split by `userRemote.keyEnvNames`) — the vendor's documented name
+  first, the one this catalog shipped earlier second, so a host that exported the old name
+  keeps its row. It is a normal selectable row, not a reference-only placeholder.
+- `zai-coding-plan` upstream reuses `ZHIPU_API_KEY`; this row deliberately does not.
+  It keys off `Z_AI_API_KEY`, because that is the credential this fleet's Coding Plan is
+  actually billed against and the row must be usable with the key the user holds. The
+  divergence is intentional, not an unported quirk.
 
 ## Model id translation
 

@@ -2551,15 +2551,18 @@ instead (see cmd/launch/model_manifest.go).`,
 			r, err := launch.RemoteAdd(launch.RemoteAddOptions{
 				Name: args[0], BaseURL: baseURL, APIKey: apiKey,
 				APIKeyEnv: apiKeyEnv, Wire: wire, ToolFormat: toolFormat,
-				Version: apiVersion,
+				Version: apiVersion, VersionSet: cmd.Flags().Changed("api-version"),
 			})
 			if err != nil {
 				return err
 			}
 			d := r.Descriptor()
-			// Redacted: --base-url can itself carry the key as userinfo, and
-			// this line lands in the terminal, the CI log and scrollback.
-			fmt.Printf("added %s (%s, wire=%s, tool_format=%s)\n", r.Name, launch.RedactBaseURL(r.BaseURL), d.Wire, d.ToolFormat)
+			// The RESOLVED endpoint (EndpointBase: base-url plus the version
+			// segment), not the configured prefix — this line is what a user
+			// copies into curl when a launch misbehaves, and the prefix alone
+			// 404s. Redacted: --base-url can itself carry the key as userinfo,
+			// and this line lands in the terminal, the CI log and scrollback.
+			fmt.Printf("added %s (%s, wire=%s, tool_format=%s)\n", r.Name, launch.RedactBaseURL(r.EndpointBase()), d.Wire, d.ToolFormat)
 			return nil
 		},
 	}
@@ -2826,7 +2829,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 	planSetCmd.Flags().String("sonnet-model", "", "Model for Sonnet/subagent-tier requests (default: same as --model)")
 	planSetCmd.Flags().String("haiku-model", "", "Model for Haiku/background-tier requests (default: same as --model)")
 	planSetCmd.Flags().String("oversize", "", "Larger-context model for requests the current leg cannot hold")
-	planSetCmd.Flags().String("route-policy", "", "local-first|remote-first|auto|local-only|remote-only (default: local-first)")
+	planSetCmd.Flags().String("route-policy", "", launch.RoutePolicyList()+" (default: local-first)")
 	planSetCmd.Flags().String("description", "", "Free-text description shown in `oaica plan list`")
 
 	planListCmd := &cobra.Command{

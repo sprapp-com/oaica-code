@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -43,6 +44,21 @@ import (
 // — that one authorizes cloud chat calls, this one authorizes downloading
 // raw weights). Distinguishing them matters: a leaked chat API key should
 // never double as a weights-download credential.
+// hfHostAcceptsToken reports whether a manifest's HuggingFace URL is a
+// huggingface.co host, the only host this machine's HF token may be sent to.
+// HFURL is data from the router's manifest, so the token is a credential that
+// must not travel to whatever host that data happens to name; anything else
+// is fetched anonymously (the repos are public, so this costs speed, not
+// correctness).
+func hfHostAcceptsToken(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "huggingface.co" || strings.HasSuffix(host, ".huggingface.co")
+}
+
 // oaicaHFToken opportunistically finds a HuggingFace token for faster HF
 // pull downloads (public repo, so this is a speed optimization only, never
 // required for correctness) — checks HF_TOKEN first, then the standard
@@ -361,12 +377,17 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	if err != nil {
 		return "", err
 	}
-	if hfToken := oaicaHFToken(); hfToken != "" {
+	if hfToken := oaicaHFToken(); hfToken != "" && hfHostAcceptsToken(*manifest.HFURL) {
 		// The repo is public — a token isn't required for correctness,
 		// only speed. HF explicitly warns unauthenticated requests get
 		// throttled ("Please set a HF_TOKEN to enable higher rate limits
 		// and faster downloads"); opportunistically use one if the user
 		// already has the HF CLI configured locally, but don't require it.
+		//
+		// hfHostAcceptsToken is the guard that makes this safe: HFURL comes
+		// from the endpoint's manifest, so without it a router (or anything
+		// that can answer as one) could name any host it liked and receive
+		// this machine's HuggingFace token as a bearer on the next pull.
 		req.Header.Set("Authorization", "Bearer "+hfToken)
 	}
 	client := &http.Client{Timeout: 0}
