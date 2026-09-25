@@ -297,10 +297,138 @@ own models and the provider corrections, local models still come from the daemon
 explicit `remotes.json` entries still work. External providers simply do not appear, with
 a single line saying so and naming the sync command. Nothing errors.
 
+## Format-drift detection and repair
+
+models.dev is a live third-party database. A silent upstream reformat would corrupt the
+picker with no warning, so the sync path is built to notice, preserve evidence, refuse
+anything it cannot read, and hand a repair path to an agent.
+
+### Raw archive
+
+Every distinct payload is kept verbatim, content-addressed, at
+`~/.oaica/cache/catalog/archive/modelsdev-<sha256-12>.json`, indexed by
+`archive/index.json` (sha, fetched_at, source URL, ETag, provider and model counts).
+Identical re-syncs do not duplicate. Retention: the first-ever baseline plus the last four
+distinct payloads, ~25 MB worst case, local only and never committed. This guarantees the
+exact bytes any build ran against remain recoverable for a diff.
+
+### Shape signature
+
+`shape.json` stores the sorted set of provider-level and model-level keys with each key's
+JSON type, hashed, plus the counts. It catches added, removed, and retyped fields cheaply,
+without a per-field diff of 8177 entries.
+
+### Contract check
+
+A validator for every field oaica actually reads, mirroring opencode's own schema so that
+we fail where opencode would: `env` an array of strings, `models` an object,
+`limit.context` and `limit.output` finite numbers, `cost.*` numbers or absent, `tool_call`
+a bool or absent, `id` and `name` non-empty strings. The contract is the set of fields
+listed in the mapping tables above; anything not read is not constrained.
+
+### Sync verdict
+
+| Condition | Action |
+|---|---|
+| Bytes unchanged | no-op |
+| Contract passes, shape unchanged | adopt silently |
+| Contract passes, shape changed | adopt, print drift report, save new shape |
+| Contract fails | **refuse**, keep last-good, write drift artifact, non-zero exit |
+
+`--force` adopts a failing payload for inspection. `--accept-drift` records the current
+shape as accepted, and is the only way to clear a refusal.
+
+### Drift artifact
+
+A refusal writes `~/.oaica/cache/catalog/drift/<ts>-<sha>.json` — the delta only, small
+enough to read whole, never a pointer to two 5 MB blobs:
+
+```json
+{
+  "source": "https://models.dev/api.json",
+  "sha256": "9c11…", "prev_sha256": "4f2a…", "fetched_at": "2026-09-25T12:04:11Z",
+  "verdict": "refused",
+  "contract_failures": [
+    {"path": "providers.groq.models.llama-x.limit.context",
+     "expected": "number", "actual": "string", "sample": "163840"}
+  ],
+  "shape_changes": [
+    {"path": "model.cost.tiers", "kind": "added"},
+    {"path": "model.status", "kind": "retyped", "before": "string", "after": "null"}
+  ],
+  "counts": {"providers": {"before": 223, "after": 231},
+             "models": {"before": 8177, "after": 8402}},
+  "affected": {"providers": ["groq"], "models": 3},
+  "opencode_schema": {"pinned_sha": "b71c…", "live_sha": "b71c…", "changed": false},
+  "next_steps": ["oaica model catalog diff 4f2a…",
+                 "oaica model catalog sync --accept-drift",
+                 "docs/CATALOG_DRIFT.md"]
+}
+```
+
+`affected` names which providers genuinely break rather than only that a field moved
+somewhere. This artifact is the interface an agent acts on.
+
+### Whose problem it is
+
+The artifact records the sha256 of opencode's own `packages/core/src/models-dev.ts` and
+refetches it on drift. If that schema changed too, upstream refactored and we follow it.
+If it did not, models.dev shipped something opencode has not absorbed, which is likely an
+upstream defect to report rather than chase. This distinguishes "our turn" from "theirs"
+before any code is touched.
+
+The refetch is best-effort. Offline, or if the file moves, the artifact reports
+`"changed": null` rather than guessing, and the drift is still fully actionable from
+`contract_failures` alone.
+
+### Three remediation paths
+
+The refusal is never a dead end; the artifact names the field, shows a sample, and the
+agent picks one of three, each with an explicit command:
+
+1. **Benign or additive** → `oaica model catalog sync --accept-drift`.
+2. **Mapping needs a Go change** → edit the mapping, add the case to the frozen fixture
+   and its test, then `--accept-drift` once tests pass.
+3. **Upstream is wrong for us** → add an overlay entry in `oaica.json`, no Go change.
+
+The loop is documented in `docs/CATALOG_DRIFT.md` and referenced from `AGENTS.md`, so an
+agent working in this repo finds it without being told.
+
+### Developer notification
+
+- **Exit code and stderr summary** on every refusal.
+- **A `DRIFT` marker** in the catalog cache directory, so any later `oaica` invocation —
+  including a plain `oaica launch` — prints one line pointing at the artifact. Advisory,
+  never blocking.
+- **A generated, ready-to-run `gh issue create -F …` line** in that output.
+- **A daily scheduled workflow on the fork** runs `oaica model catalog check` against
+  upstream from our CI and opens or updates the issue itself. Drift therefore reaches the
+  developer with no user involvement.
+
+No user data is uploaded from user machines; the CI check is what provides fleet-wide
+notice. This is a deliberate choice over shipping catalog state to the ledger.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `oaica model catalog sync` | fetch, validate, adopt or refuse |
+| `oaica model catalog check` | fetch and validate, adopt nothing; `--json` for machines |
+| `oaica model catalog diff <sha\|baseline>` | compare stored archives |
+| `oaica model catalog drift --latest` | print the newest artifact and its next steps |
+| `oaica model catalog sync --accept-drift` | clear a refusal, recording the new shape |
+| `oaica model catalog status` | provenance: source, fetched_at, sha, counts, pinned opencode version and commit |
+
 ## Code impact
 
 - New: catalog fetch/parse/merge, the overlay parser, usage tracking, the picker sections,
   id translation, and first-party endpoint resolution.
+- New (drift): the archive writer and index, the shape signature, the contract validator,
+  the drift artifact, `check` / `diff` / `drift` / `status` commands, the `DRIFT` marker,
+  and `docs/CATALOG_DRIFT.md` with its `AGENTS.md` pointer.
+- New (CI): a daily workflow on the fork running `oaica model catalog check --json` and
+  opening or updating a drift issue. No change to the existing release workflow, since the
+  notification path chosen is CI-side rather than a release gate.
 - Replaced: `providerCatalog()` reads the overlay instead of `providers.json`;
   `cloudModelLimits` merges from the catalog rather than `cloud_limits.json`;
   `builtinRemotes()` sources its env-var gating from the catalog's `env[]` arrays.
@@ -314,7 +442,9 @@ a single line saying so and naming the sync command. Nothing errors.
 
 ## Error handling
 
-- Unparseable or absent catalog → overlay only, one notice, no error.
+- Unparseable or absent catalog → overlay only, one notice, no error. This is distinct
+  from a contract failure: JSON that does not parse is not adopted and not archived, while
+  JSON that parses but breaks the contract is archived for diffing and refused.
 - Unparseable overlay → embedded overlay, since the embedded copy is always present.
 - A provider entry missing both `base_url` and a resolvable upstream `api` → skipped
   silently rather than listed as broken.
@@ -349,6 +479,14 @@ Hermetic, following the existing seams:
   `local_servers.json` entry is skipped; nothing resolves → marked unavailable.
 - Regression: `zai-coding-plan` env override and `opencode-go` corrected URL asserted
   directly, since both are live bugs the port fixes.
+- Drift, each driven by a synthetic payload rather than a network call: unchanged bytes →
+  no-op; additive shape change → adopted with a report; retyped `limit.context` → refused
+  and last-good retained; a second provider breaking the same field → both named in
+  `affected`; `--force` adopts a failing payload; `--accept-drift` clears the refusal and
+  the next identical sync is a no-op. The frozen fixture's shape hash is asserted, so a
+  mapping change that silently stops reading a field fails CI.
+- Drift artifact: parses as JSON, contains only the delta, and `next_steps` commands all
+  exist in the command surface.
 
 ## Rollout
 
@@ -358,5 +496,11 @@ endpoints, an external provider listed with upstream context and pricing, the fr
 used section populated after two launches, and `--url file://` working for the air-gapped
 path.
 
+The drift path is exercised against the live archive: sync twice (second is a no-op),
+then run `oaica model catalog check` and confirm it reports no drift, and finally validate
+a deliberately corrupted copy via a `file://` URL to confirm the refusal, the artifact,
+and the `DRIFT` marker all fire without touching the adopted catalog.
+
 Rollback is `git revert` — the embedded overlay means a reverted binary is immediately
-self-consistent, with no cache or user-file migration to undo.
+self-consistent, with no cache or user-file migration to undo. The archive and drift
+directories are pure cache and can be deleted at any time without loss.
