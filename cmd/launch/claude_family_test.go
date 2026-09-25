@@ -237,6 +237,36 @@ func TestTierFamilyRoutes_SlotRuleKeepsTheConfiguredLegReachable(t *testing.T) {
 	}
 }
 
+// The untouched native path is for launches with nothing for the proxy to do.
+// A --oversize/--route-policy/--shard given on the command line is consumed by
+// the launcher and re-applied on the PLAN path, so runNative (execs Claude Code
+// with the passthrough args only) would drop it silently — a flag that cannot
+// work must not evaporate (round-4 audit).
+func TestNativeTierOnly_ExplicitFlagsKeepThePlanPath(t *testing.T) {
+	shards := map[string]int{"box/kat-awq": 3}
+	cases := []struct {
+		name                                   string
+		model, sonnet, haiku, oversize, policy string
+		shards                                 map[string]int
+		wantTier                               string
+		wantOK                                 bool
+	}{
+		{"plain native launch", "claude/opus", "", "", "", "", nil, "opus", true},
+		{"native with a haiku split", "claude/opus", "", "zai/glm-4.5-air", "", "", nil, "", false},
+		{"native with --oversize", "claude/opus", "", "", "zai/glm-4.6", "", nil, "", false},
+		{"native with --route-policy", "claude/opus", "", "", "", "auto", nil, "", false},
+		{"native with --shard", "claude/opus", "", "", "", "", shards, "", false},
+		{"empty tier is not native", "claude/", "", "", "", "", nil, "", false},
+		{"non-native primary", "box/kat-awq", "", "", "", "", nil, "", false},
+	}
+	for _, c := range cases {
+		tier, ok := nativeTierOnly(c.model, c.sonnet, c.haiku, c.oversize, c.policy, c.shards)
+		if ok != c.wantOK || tier != c.wantTier {
+			t.Errorf("%s: nativeTierOnly = %q/%v, want %q/%v", c.name, tier, ok, c.wantTier, c.wantOK)
+		}
+	}
+}
+
 // An empty tier is a truncated picker string, not a family: it must not claim
 // the "" key, and it must not resolve to the first Anthropic catalog entry.
 func TestTierFamilyRoutes_EmptyTierClaimsNothing(t *testing.T) {

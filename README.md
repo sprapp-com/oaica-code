@@ -55,7 +55,8 @@ Hosted models: `oaica-35b-a3b-vision` (262k context, vision, MTP) and
 Multi-model launches (v0.5.0+): a plain interactive
 `oaica launch claude` walks a wizard — primary, then Sonnet/execution
 tier, then the Haiku tier (Claude Code's background work: titles, topic
-detection — leaving it unset bills those calls at the primary's price),
+detection — unset, a split launch bills those calls at the primary's price,
+while a plain native launch keeps Claude Code's own Haiku),
 then a compaction/oversize model (only models with a probed LARGER
 context window are offered), then a route
 policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)

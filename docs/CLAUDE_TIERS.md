@@ -288,6 +288,13 @@ at the first request instead. Check the launch's `tiers:` line, which prints
 what each tier actually resolved to. `oaica config show` prints both keys and
 the file path.
 
+One case is dropped without attribution: when the failure names no tier at all
+(it is the primary's, which no saved value can influence), BOTH saved keys are
+ignored for that launch, and the warning says so in those words rather than
+blaming a value the error never named. The launch then normally fails on the
+real error — the drop is only insurance that a stale key can never be the thing
+that breaks every launch in the fleet.
+
 Plan > remotes.json `route_policy` > local-first also still holds for the
 route policy. Old plans.json files missing `oversize_model`/`route_policy`
 load unchanged (missing = empty = today's defaults).

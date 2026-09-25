@@ -601,6 +601,21 @@ func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, b
 	return sonnetModel, haikuModel, sonnetSaved, haikuSaved
 }
 
+// nativeTierOnly reports whether this launch has nothing for the local proxy
+// to do: a native primary, no tier split, and no --oversize/--route-policy/
+// --shard. Those three flags are consumed by the launcher (extractOversizeModel
+// / extractRoutePolicy / extractShardFlags) and re-applied on the PLAN path, so
+// runNative — which execs Claude Code with the passthrough args only — would
+// drop them silently. An explicit flag that cannot work must not evaporate.
+func nativeTierOnly(model, sonnetModel, haikuModel, oversizeModel, policyArg string, shardWeights map[string]int) (string, bool) {
+	tier, ok := nativeClaudeModelTier(model)
+	if !ok || tier == "" || sonnetModel != "" || haikuModel != "" ||
+		oversizeModel != "" || policyArg != "" || len(shardWeights) != 0 {
+		return "", false
+	}
+	return tier, true
+}
+
 // isSlotFamily reports whether a family is one the positional pass can place:
 // Claude Code's own tier slots (opus, sonnet, haiku). No slot owns any other
 // family ("fable", "claude"), so nothing competes for one — a leg named for it
@@ -891,7 +906,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
 	// Set below by standingTierModels: which tiers came from the saved config
-	// rather than a flag/plan. See the buildTierPlan retry for the one use.
+	// rather than a flag/plan. See resolveTierPlan for the one use.
 	savedSonnet, savedHaiku := false, false
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
@@ -971,7 +986,16 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// a native leg forwards straight to api.anthropic.com with the user's
 	// own credential and incurs no OAICA billing either way — see
 	// proxyRoute.NativePassthrough's doc for what that skips (2026-09-02).
-	if tier, ok := nativeClaudeModelTier(model); ok && sonnetModel == "" && haikuModel == "" {
+	//
+	// --oversize/--route-policy/--shard must keep the launch on the plan path
+	// even with no tier split: runNative execs Claude Code with the passthrough
+	// args only, so those flags would be dropped silently — and
+	// `--oversize <bigger-remote>` alongside a native primary is a supported
+	// setup (see the oversize block below), not a request to ignore it.
+	nativeOnly := func(sonnet, haiku string) (string, bool) {
+		return nativeTierOnly(model, sonnet, haiku, oversizeModel, policyArg, shardWeights)
+	}
+	if tier, ok := nativeOnly(sonnetModel, haikuModel); ok {
 		return c.runNative(tier, args)
 	}
 
@@ -990,7 +1014,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// not choose (it saw the un-forgiven config values). Only reachable when
 	// a saved value was actually dropped: the earlier check returns runNative
 	// for every other empty-tier native launch.
-	if tier, ok := nativeClaudeModelTier(model); ok && effSonnet == "" && effHaiku == "" {
+	if tier, ok := nativeOnly(effSonnet, effHaiku); ok {
 		return c.runNative(tier, args)
 	}
 	// Policy precedence: --route-policy flag > primary remote's
