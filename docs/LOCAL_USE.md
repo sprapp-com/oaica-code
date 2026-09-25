@@ -123,10 +123,17 @@ Override the models directory with `OAICA_MODELS_DIR`.
 
 ```shell
 sudo rm /usr/local/bin/oaica   # or: rm ~/.local/bin/oaica
-rm -rf ~/.oaica
 ```
 
-This removes the binary, saved keys, the model manifest, and all
-downloaded weights. If you installed `llama-server` separately via a
-package manager, remove it with that package manager if you no longer
-need it.
+Removing the binary is the whole uninstall. Your data stays in `~/.oaica`
+(saved API key, `config.json`, `plans.json`, `remotes.json`, `models.json`,
+and every pulled GGUF under `models/`). Delete only what you mean to lose:
+
+```shell
+rm -f ~/.oaica/config.json     # standing tiers only
+rm -f ~/.oaica/plans.json      # named plans only
+rm -rf ~/.oaica                # EVERYTHING — keys, plans, remotes, model weights
+```
+
+If you installed `llama-server` separately via a package manager, remove it
+with that package manager if you no longer need it.
