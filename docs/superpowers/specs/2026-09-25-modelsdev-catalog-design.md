@@ -6,8 +6,9 @@
 ## Problem
 
 oaica-code's provider directory is hand-maintained. `cmd/launch/providers/providers.json`
-holds 19 rows with hand-guessed base URLs, `cmd/launch/cloud_limits/cloud_limits.json`
-holds 21 more hand-written context/output limits, and both must be edited by hand
+holds 44 rows with hand-guessed base URLs (29 of them also declaring a `models` map with
+per-model context/output windows), `cmd/launch/cloud_limits/cloud_limits.json` holds 21
+more hand-written context/output limits, and both must be edited by hand
 whenever a provider ships a new model, reprices, or changes an endpoint. Every such
 change needs a human to notice it, edit JSON, and push.
 
@@ -246,7 +247,11 @@ Per provider:
 2. If the remote is unreachable, show the full models.dev list, each entry marked
    `unverified`.
 3. A remote with no credential mechanism at all is treated as genuinely unauthenticated
-   and is not swept (existing `remote_key_prompt.go` behaviour).
+   and is not swept. **This gate does not exist yet and is part of the work**: today
+   `fetchRemoteModels` (`user_remotes.go`) sweeps every remote in the list and only
+   omits the auth header when the key is empty, so a keyless provider is still probed
+   and still pays the sweep timeout. `remote_key_prompt.go` skips only the *prompt*, not
+   the sweep — do not read it as evidence that the gate is implemented.
 
 Inverting the current order means the common path no longer pays the per-remote sweep
 timeout, and an offline machine still shows a full catalog.
@@ -254,16 +259,31 @@ timeout, and an offline machine still shows a full catalog.
 ## First-party endpoint resolution
 
 oaica's own models have no fixed endpoint — the gateway lives on a different port on each
-machine (8081 here, others on .46/.128). Resolution order, first hit wins:
+machine (8081 here, others on .46/.128).
 
-1. `OAICA_GATEWAY_URL` environment variable.
-2. A `local_servers.json` entry matching the model id. `oaica serve` already writes this
-   file and entries are already `/health`-probed, so a stale entry is skipped rather than
-   offered.
-3. A `remotes.json` entry or alias, i.e. today's path.
-4. Otherwise the model is listed but marked unavailable, with the reason.
+**Correction (2026-09-26, found while mapping the tree for the plan):** this section was
+written from intent, not from the code. `OAICA_GATEWAY_URL` **does not exist anywhere in
+the tree today** — the only hit is this document. The chain actually implemented in
+`resolveLaunchEndpoint` (`tier_routing.go:137-243`) is, first hit wins:
 
-No ports or hosts are hardcoded anywhere in the shipped overlay.
+1. `~/.oaica/aliases.json` (alias mechanism).
+2. Native Anthropic `claude/*` / `anthropic/*` prefix — deliberately ahead of user
+   remotes, so a remote named `claude` cannot shadow it.
+3. A `remotes.json` entry or a bare id exactly one remote serves.
+4. `local_servers.json` — reachable **only** via an explicit `:local` tag, not for a bare
+   id. `oaica serve` already writes this file and entries are already `/health`-probed,
+   so a stale entry is skipped rather than offered.
+5. Explicit `router/` | `oaica/` | `ollama/` | `daemon/` prefixes, then the router
+   (`oaicaFetchCloudModelEntries`), then the local daemon.
+6. Error naming every place tried.
+
+The overlay work therefore does **not** reorder any of the above — reordering step 4 ahead
+of step 3 would change behaviour for every existing user for no gain, and the `:local` tag
+is an explicit opt-in that already covers the "started on this box" case. What is new is
+only `OAICA_GATEWAY_URL` as an override at the top of the chain, plus the requirement that
+first-party catalogue rows resolve through this chain (or are listed as unavailable with
+the reason) instead of assuming an endpoint. No ports or hosts are hardcoded anywhere in
+the shipped overlay.
 
 ## Frequently used
 
@@ -446,9 +466,22 @@ notice. This is a deliberate choice over shipping catalog state to the ledger.
   serve, their content folded into `oaica.json`.
 - Unchanged: `userRemote`, `RemoteDescriptor`, `resolveLaunchEndpoint`, the alias
   mechanism, and the daemon/local model path.
-- The refactor landed on 2026-09-17 (uncommitted) — data-driven providers, cloud limits,
-  and `remote_key_prompt.go` — is the foundation this builds on, and its tests
-  (`clearCatalogKeys`, `stubUserRemoteModels`, `stubBareIndex`) continue to apply.
+- The data-driven provider + cloud-limit refactor is the foundation this builds on, and
+  its tests (`clearCatalogKeys`, `stubUserRemoteModels`, `stubBareIndex`) continue to
+  apply. **Correction (2026-09-26):** it is neither dated 2026-09-17 nor uncommitted. It
+  landed as `2fe50bbe` "launch: data-driven provider + cloud-limit catalogs" on
+  2026-09-25 (17 files: `provider_catalog.go`, `provider_sync.go`,
+  `cloud_limits_catalog.go`, `cloud_limits_sync.go`, `remote_key_prompt.go`, both JSON
+  files, `cmd/cmd.go`, `models.go`, `user_remotes.go`, `model_detect.go`, `model_sync.go`
+  and 5 test files), with follow-ups `196130d8`, `b8436137`, `5426c932`, `fcacdada`,
+  `74ac00b5`, `1b37dadc`, `6cc0ebf9` the same day.
+- **The current cache layer overrides by name WHOLESALE, not per field** — a synced
+  `~/.oaica/cache/providers/providers.json` row replaces the embedded row entirely, so a
+  field added to a newer binary's embedded copy is invisible on any host holding an older
+  cache, with no error and no merge. `provider_catalog.go`'s own header documents this
+  (and records the 2026-09-25 "the feature is inert on the real box" incident it caused).
+  Read-time overlay is the fix, and this is the concrete reason it must be read-time
+  rather than a second synced copy.
 
 ## Error handling
 
