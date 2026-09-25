@@ -232,6 +232,11 @@ func buildDoctorReport() (string, bool) {
 	fmt.Fprintf(&b, "\nconfiguration files (contents are never included):\n")
 	home := reportHome()
 	if home != "" {
+		// The directory itself first: a 0755 ~/.oaica makes every file
+		// below reachable whatever its own mode says, so the 0700/0600
+		// layout check this list exists to answer is decided HERE and the
+		// report was silent on it (2026-09-26 audit).
+		describeFile(&b, filepath.Join(home, ".oaica"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "auth.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "remotes.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "api_key"), true)

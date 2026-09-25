@@ -182,6 +182,23 @@ func ensureOMPWebSearchPlugin(bin string) {
 		doneVerb = "Updated"
 	}
 
+	// The same consent gate every other agent's installer passes through:
+	// docs/ENTERPRISE.md's egress table tells a reviewer "none of these
+	// installers run unprompted", and this one did — `oaica launch omp`
+	// reached `omp plugin install` (which fetches a package from npm) with no
+	// prompt at all, including for a plugin the user never asked for
+	// (2026-09-26 audit).
+	ok, cerr := ConfirmPrompt(fmt.Sprintf("%s %s?", verb, ompWebSearchPlugin))
+	if cerr != nil {
+		fmt.Fprintf(os.Stderr, "%s  Warning: could not ask about %s: %v%s\n", ansiYellow, ompWebSearchPlugin, cerr, ansiReset)
+		return
+	}
+	if !ok {
+		fmt.Fprintf(os.Stderr, "%s  Skipping %s — install it yourself with `%s plugin install %s`%s\n",
+			ansiYellow, ompWebSearchPlugin, bin, ompWebSearchPlugin, ansiReset)
+		return
+	}
+
 	fmt.Fprintf(os.Stderr, "%s%s %s...%s\n", ansiGray, verb, ompWebSearchPlugin, ansiReset)
 	cmd := exec.Command(bin, "plugin", "install", ompWebSearchPlugin)
 	cmd.Stdout = os.Stdout

@@ -64,6 +64,45 @@ func TestDoctorReportPrintsConfigPathPermissions(t *testing.T) {
 	}
 }
 
+// TestDoctorReportDescribesTheOaicaDirectoryItself is the other half of the
+// same question, missed by the round-5 fix: the list described eight paths
+// UNDER ~/.oaica and never ~/.oaica itself — the one directory whose own mode
+// decides whether a 0600 credential file inside it is reachable at all, which
+// is the fact the 0700/0600 checklist item sends a reviewer to this bundle to
+// establish (2026-09-26 audit).
+func TestDoctorReportDescribesTheOaicaDirectoryItself(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+
+	dir := filepath.Join(home, ".oaica")
+	// 0755 on purpose: the layout the report has to make visible.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	report, _ := buildDoctorReport()
+
+	var dirLine string
+	for _, l := range strings.Split(report, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(l), dir) {
+			dirLine = l
+			break
+		}
+	}
+	if dirLine == "" {
+		t.Fatalf("the report has no line for %s itself, so the 0700/0600 layout question cannot be answered for the directory that decides it:\n%s", dir, report)
+	}
+	if !strings.Contains(dirLine, "directory") {
+		t.Errorf("the ~/.oaica line does not present it as a directory:\n  %s", dirLine)
+	}
+	if !strings.Contains(dirLine, "mode 0755") {
+		t.Errorf("~/.oaica is mode 0755 on disk and the report prints it as:\n  %s\n— a 0755 ~/.oaica makes every credential file inside it reachable whatever that file's own mode says", dirLine)
+	}
+	if !strings.Contains(dirLine, "readable by other users") {
+		t.Errorf("a 0755 ~/.oaica should be flagged as group/world-readable; got:\n  %s", dirLine)
+	}
+}
+
 // reportLineContaining returns the first report line naming path, or "".
 func reportLineContaining(report, path string) string {
 	for _, l := range strings.Split(report, "\n") {

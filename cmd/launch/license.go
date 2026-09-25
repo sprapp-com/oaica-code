@@ -243,7 +243,19 @@ func RequireLicense(cmd *cobra.Command, args []string) error {
 func requireLicenseLive(cmd *cobra.Command, args []string) error {
 	f, err := loadLicenseFile()
 	if err != nil {
-		// No license.json at all — never activated on this machine.
+		// No license.json on this machine. OAICA_LICENSE_KEY is the
+		// documented alternative to `oaica activate` — README names it twice
+		// ("or `export OAICA_LICENSE_KEY=...`" and the env-var table's
+		// "License key for gated models") — and until 2026-09-26 only
+		// `pull`/`serve` read it, so a deployment that injects the key from
+		// a secret manager instead of running an interactive activation was
+		// told to go buy a licence it already had (2026-09-26 audit).
+		//
+		// Nothing is written for this key: it stays the deployment's
+		// secret, not a file this process drops in the user's home.
+		if key := strings.TrimSpace(os.Getenv("OAICA_LICENSE_KEY")); key != "" {
+			return requireLicenseFromEnv(key)
+		}
 		return fmt.Errorf(
 			"oaica-code needs a one-time license — get one at %s, then run `oaica activate <key>`",
 			oaicaPurchaseURL,
@@ -284,6 +296,29 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 		"license could not be re-validated (%v) and the %s offline grace period has expired — reconnect to the internet to continue",
 		verr, licenseOfflineGrace,
 	)
+}
+
+// requireLicenseFromEnv is the OAICA_LICENSE_KEY path: an env-supplied key is
+// validated live on every launch (there is no stored activation to age out and
+// nothing is persisted for it), and an unreachable licence server is treated
+// the same way a stored key treats one — a warning, not a block, so injecting
+// the key does not turn a network blip into a failed launch.
+func requireLicenseFromEnv(key string) error {
+	if key == testLicenseKey {
+		return nil // dev/test key — never revalidates over the network
+	}
+	valid, verr := validateLicenseLive(key, "")
+	if verr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not reach the license server (%v) — running on the key from OAICA_LICENSE_KEY\n", verr)
+		return nil
+	}
+	if !valid {
+		return fmt.Errorf(
+			"license %s from OAICA_LICENSE_KEY is no longer valid (refunded or revoked) — get a new one at %s",
+			redactLicenseKey(key), oaicaPurchaseURL,
+		)
+	}
+	return nil
 }
 
 // redactLicenseKey shows enough of a key for the user to recognize it in

@@ -1345,6 +1345,17 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 							return
 						}
 						w.Header().Set("X-Oaica-Route", over.Label)
+						// The gate above ran against the leg the request
+						// STARTED on; this crossover serves it on a
+						// DIFFERENT leg, so the leg that actually spends
+						// upstream time has to be the one evaluated
+						// (2026-09-26 audit — a gate denying the oversize
+						// label let the request through because the
+						// pre-swap label had been allowed).
+						if allowed, reason := checkEntitlement(r, over.Label, over.UpstreamModel); !allowed {
+							writeAnthropicError(w, http.StatusForbidden, reason)
+							return
+						}
 						if over.Wire == "anthropic" {
 							upstream, headerName, headerValue, ok := over.anthropicPassthroughTarget()
 							if !ok {
@@ -1360,6 +1371,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					route = over
 					oaiReq.Model = route.UpstreamModel
 					w.Header().Set("X-Oaica-Route", route.Label)
+					// Same reason as the passthrough crossover above: the
+					// request is answered on `over`, so `over` is the leg
+					// the gate has to judge (2026-09-26 audit).
+					if allowed, reason := checkEntitlement(r, route.Label, route.UpstreamModel); !allowed {
+						writeAnthropicError(w, http.StatusForbidden, reason)
+						return
+					}
 					fitBudget = route.ContextWindow - estTokens - margin
 				}
 			}

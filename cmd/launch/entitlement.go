@@ -13,15 +13,21 @@ package launch
 // after routing is resolved (route, reqModel) but before the upstream call is
 // made — so a denial never spends upstream GPU time, and the check sees
 // exactly what a real entitlement decision would need: which model, which
-// route/backend label. "Every" means the two call sites in that handler: the
-// OpenAI-translated path and the Anthropic-wire remote inside the
-// NativePassthrough branch. The native claude/* leg is deliberately NOT
-// gated — it is api.anthropic.com under the user's own credential, so it is
-// neither self-hosted nor user-remote, and the rule above is about the
-// requests that spend an OAICA-side or self-hosted leg. When the gate was
-// called from the translated path alone, an Anthropic-wire remote — exactly
-// the self-hosted class named here — bypassed it entirely (2026-09-26 audit:
-// a deny-all gate armed let a zai-coding-plan request reach its upstream).
+// route/backend label. "Every" means every leg a request can LEAVE for a
+// remote on, and each is judged by the label that SERVES it: the
+// OpenAI-translated path, the Anthropic-wire remote in the NativePassthrough
+// branch, and both oversize-crossover legs (route_policy.go's oversizeSwap,
+// which re-points the request at a different backend late in the handler).
+// The native claude/* leg is deliberately NOT gated — it is
+// api.anthropic.com under the user's own credential, so it is neither
+// self-hosted nor user-remote, and the rule above is about the requests that
+// spend an OAICA-side or self-hosted leg. Each of those three omissions was
+// found by audit, in turn: the translated path alone left an Anthropic-wire
+// remote — exactly the self-hosted class named here — ungated (2026-09-26
+// audit: a deny-all gate armed let a zai-coding-plan request reach its
+// upstream), and the crossover then served a leg the gate had judged under
+// the PRE-swap label (same audit: a gate denying the oversize label still
+// spent its upstream).
 //
 // Enable/disable: entitlementCheckEnabled defaults to false. Turning it on
 // without also setting entitlementCheckFn to something real would deny
