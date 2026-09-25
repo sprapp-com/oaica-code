@@ -226,3 +226,41 @@ func TestPrintPriceBanner_GoesToLiveStderr(t *testing.T) {
 		t.Fatalf("price banner = %q, want it on the redirected stderr", got)
 	}
 }
+
+// Every tier flag is trimmed at the extractor, because the extracted value is
+// compared to model ids byte-for-byte and echoed into ANTHROPIC_DEFAULT_*_MODEL:
+// `--sonnet-model "box/glm-4.6 "` (a trailing space is easy to paste from a
+// shell one-liner) used to resolve to nothing and misroute the whole split,
+// with an error naming a model id the user never typed.
+func TestTierFlagExtractors_TrimTheirValues(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"--sonnet-model", mustSonnet([]string{"--sonnet-model", " box/glm-4.6\t"}), "box/glm-4.6"},
+		{"--haiku-model", mustHaiku([]string{"--haiku-model= box/glm-4.5-air "}), "box/glm-4.5-air"},
+		{"--oversize", mustOversize([]string{"--oversize", "\tbig-box/glm-9 "}), "big-box/glm-9"},
+		{"--route-policy", mustPolicy([]string{"--route-policy", " remote-first "}), "remote-first"},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s extracted %q, want %q", c.name, c.got, c.want)
+		}
+	}
+
+	shards, rest := extractShardFlags([]string{"--shard", " box/glm-4.6 : 3 ", "--shard", "zai/glm-4.5-air:2"})
+	if shards["box/glm-4.6"] != 3 {
+		t.Errorf("--shard trimmed weights = %v, want box/glm-4.6 -> 3 (the model half of <model>:<weight> is trimmed too)", shards)
+	}
+	if shards["zai/glm-4.5-air"] != 2 {
+		t.Errorf("--shard untrimmed value lost: %v", shards)
+	}
+	if len(rest) != 0 {
+		t.Errorf("flags were left in the pass-through args: %v", rest)
+	}
+}
+
+func mustSonnet(args []string) string   { v, _ := extractSonnetModel(args); return v }
+func mustHaiku(args []string) string    { v, _ := extractHaikuModel(args); return v }
+func mustOversize(args []string) string { v, _ := extractOversizeModel(args); return v }
+func mustPolicy(args []string) string   { v, _ := extractRoutePolicy(args); return v }

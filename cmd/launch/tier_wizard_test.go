@@ -136,7 +136,7 @@ func TestRunTierWizard_SavesPlan(t *testing.T) {
 	var selectLog []string
 	withStubbedWizardUI(t, &selectLog, []string{"kat-awq-7b", "kat-awq-1.5b", tierWizardScanOversize, "big-box/glm-9", "remote-first"}, "daily-driver")
 
-	plan, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq")
+	plan, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestRunTierWizard_DefaultsLeaveEverythingUnset(t *testing.T) {
 	tierWizardSelect = func(title string, items []SelectionItem) (string, error) { return items[0].Name, nil }
 	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
 
-	c, err := runTierWizard(nil, "solo-model")
+	c, err := runTierWizard(nil, "solo-model", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -359,7 +359,7 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
 		return tierWizardBack, nil
 	}
-	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq")
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -386,7 +386,7 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 		calls++
 		return ans, nil
 	}
-	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq")
+	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestRunTierWizard_BackFromPolicyReturnsThroughOversizePrompt(t *testing.T) 
 		calls++
 		return ans, nil
 	}
-	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b"), "kat-awq")
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b"), "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
 		}
 		return items[0].Name, nil // "(same as primary)" / local-first
 	}
-	c, err := runTierWizard(models, "kat-awq")
+	c, err := runTierWizard(models, "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
 		}
 		return items[0].Name, nil
 	}
-	c, err = runTierWizard(models2, "kat-awq")
+	c, err = runTierWizard(models2, "kat-awq", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -541,7 +541,7 @@ func TestRunTierWizard_NativeClaudeSelectableForHaikuTier(t *testing.T) {
 		return items[0].Name, nil
 	}
 
-	c, err := runTierWizard(models, "solo-model")
+	c, err := runTierWizard(models, "solo-model", "", "", "", "")
 	if err != nil {
 		t.Fatalf("runTierWizard: %v", err)
 	}
@@ -550,5 +550,169 @@ func TestRunTierWizard_NativeClaudeSelectableForHaikuTier(t *testing.T) {
 	}
 	if c.SonnetModel != "anthropic/sonnet" {
 		t.Fatalf("SonnetModel = %q, want anthropic/sonnet", c.SonnetModel)
+	}
+}
+
+// The wizard's first step: reuse a saved plan instead of walking the tiers
+// again. Enter must default to the plan used last FROM THIS DIRECTORY — that is
+// the entire point of the option, and re-answering every step is what it
+// exists to avoid.
+func TestTierWizardReusedPlan_EnterReusesTheLastPlanHere(t *testing.T) {
+	withTempOaicaHome(t)
+	if err := PlanSet("dev", TierPlanProfile{Model: "kat-awq", SonnetModel: "kat-awq-7b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PlanSet("prod", TierPlanProfile{Model: "big-box/glm-9"}); err != nil {
+		t.Fatal(err)
+	}
+
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	var titles []string
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		titles = append(titles, title)
+		return items[0].Name, nil // the Enter key
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq", "", "", "", "")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.PlanName != "prod" {
+		t.Fatalf("PlanName = %q, want the last plan saved here (prod)", c.PlanName)
+	}
+	if len(titles) != 1 {
+		t.Fatalf("reusing a plan ran %d steps (%v) — the tier steps must be skipped", len(titles), titles)
+	}
+	if titles[0] != "Start from a saved plan?" {
+		t.Fatalf("first step = %q, want the plan-reuse step", titles[0])
+	}
+}
+
+// ...and the other two answers: pick a different saved plan, or walk the tiers.
+func TestTierWizardReusedPlan_AnotherPlanAndStartFromScratch(t *testing.T) {
+	withTempOaicaHome(t)
+	if err := PlanSet("dev", TierPlanProfile{Model: "kat-awq"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PlanSet("prod", TierPlanProfile{Model: "big-box/glm-9"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PlanSet("dev", TierPlanProfile{Model: "kat-awq"}); err != nil { // make "dev" the last-used
+		t.Fatal(err)
+	}
+
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	// (a) "another saved plan" -> the second selector lists every plan.
+	answers := []string{tierWizardOtherPlan, "prod"}
+	i := 0
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if i >= len(answers) {
+			return items[0].Name, nil
+		}
+		a := answers[i]
+		i++
+		if a == tierWizardOtherPlan {
+			for _, it := range items {
+				if it.Name == tierWizardOtherPlan || it.Name == tierWizardScratch || it.Name == "dev" {
+					continue
+				}
+				t.Errorf("unexpected row %q in the plan step", it.Name)
+			}
+		}
+		return a, nil
+	}
+	c, err := runTierWizard(nil, "kat-awq", "", "", "", "")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.PlanName != "prod" {
+		t.Fatalf("PlanName = %q, want prod", c.PlanName)
+	}
+
+	// (b) "start from scratch" -> the tier steps run as before. Naming a plan
+	// is then the save prompt's job alone, and it must say that its Enter-key
+	// default overwrites an existing plan (reaching it means the user just
+	// declined to reuse that very plan).
+	i = 0
+	answers = []string{tierWizardScratch}
+	var titles []string
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		titles = append(titles, title)
+		if i < len(answers) {
+			a := answers[i]
+			i++
+			return a, nil
+		}
+		return items[0].Name, nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) {
+		if !strings.Contains(prompt, "overwrite") {
+			t.Errorf("the save prompt must say the default overwrites a plan: %q", prompt)
+		}
+		return "scratch-launch", nil
+	}
+	c, err = runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq", "", "", "", "")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if len(titles) < 2 || titles[0] != "Start from a saved plan?" {
+		t.Fatalf("steps = %v, want the plan step then the tier steps", titles)
+	}
+	if c.PlanName != "scratch-launch" {
+		t.Fatalf("PlanName = %q, want the name typed at the save prompt — a scratch launch must not reuse "+
+			"a saved plan's tiers", c.PlanName)
+	}
+}
+
+// A standing config tier must lead its step as a selectable row (Enter = keep),
+// and "(same as primary)" must still be able to take the split back OFF — with
+// the saved tier pre-selected there was otherwise no row that could.
+func TestTierWizardTierItems_KeepRowLeadsAndSameAsPrimaryClears(t *testing.T) {
+	items, _ := tierWizardTierItems(testLaunchModels("kat-awq", "kat-awq-7b"), []string{"kat-awq", "kat-awq-7b"}, "kat-awq", true, "zai/glm-4.5-air")
+	if len(items) < 3 || items[0].Name != "zai/glm-4.5-air" {
+		t.Fatalf("the saved tier must lead the step: %+v", items)
+	}
+	found := false
+	for _, it := range items {
+		if it.Name == "(same as primary)" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no row can clear the saved tier")
+	}
+
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	step := 0
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		defer func() { step++ }()
+		switch {
+		case strings.Contains(title, "Sonnet") && step == 0:
+			return items[0].Name, nil // Enter: keep the saved tier
+		case strings.Contains(title, "Haiku"):
+			return "(same as primary)", nil
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq", "zai/glm-4.5-air", "zai/glm-4.5-air", "", "")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.SonnetModel != "zai/glm-4.5-air" {
+		t.Fatalf("Enter did not keep the saved sonnet tier: %+v", c)
+	}
+	if c.HaikuModel != "" {
+		t.Fatalf("(same as primary) did not clear the saved haiku tier: %+v", c)
 	}
 }

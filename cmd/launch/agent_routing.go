@@ -239,7 +239,14 @@ func extractSonnetModel(args []string) (sonnetModel string, rest []string) {
 			rest = append(rest, a)
 		}
 	}
-	return sonnetModel, rest
+	// Trim: the value is matched BYTE-FOR-BYTE by resolveRemoteEndpoint's
+	// "<remote>/<id>" split, so a padded value (" zai/glm-4.5-air ") matches
+	// no remote and falls through to "prefix it with the primary's remote" —
+	// the named remote is silently ignored, the tier is routed to the
+	// primary's backend, and no error is reported because the env var and the
+	// routing key are both the same padded string (2026-09-26). Same
+	// byte-for-byte class that plan names were fixed for.
+	return strings.TrimSpace(sonnetModel), rest
 }
 
 // extractHaikuModel pulls a launcher-level "--haiku-model <id>" (or
@@ -261,7 +268,8 @@ func extractHaikuModel(args []string) (haikuModel string, rest []string) {
 			rest = append(rest, a)
 		}
 	}
-	return haikuModel, rest
+	// Trimmed for the same reason as extractSonnetModel above.
+	return strings.TrimSpace(haikuModel), rest
 }
 
 // ResolveAgentModel resolves a picker model name to the Anthropic-native

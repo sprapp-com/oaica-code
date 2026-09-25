@@ -504,11 +504,14 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 // price, the exact cost `haiku_model` exists to remove.
 //
 // An error with no leg prefix is the primary's (buildTierPlan wraps only the
-// two secondary legs), which no saved tier can influence; every saved value is
-// dropped anyway — a stale key must never break every launch — but reported as
-// unattributed so the warning does not claim a value the error never named came
-// from the config file. A value the user typed on this command line is never
-// forgiven: savedSonnet/savedHaiku say which tiers came from the file.
+// two secondary legs), which no saved tier can influence — so dropping them
+// would cost both tiers for nothing, and (observed 2026-09-26) a primary that
+// blipped once and then answered turned into a silent single-model launch at
+// the primary's price, the exact harm the tier split exists to prevent. Such
+// an error is retried UNCHANGED (the resolution reaches the network, so a
+// transient failure is possible); if the retry fails too, the error stands and
+// the launch fails, as documented. A value the user typed on this command line
+// is never forgiven: savedSonnet/savedHaiku say which tiers came from the file.
 func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (dropSonnet, dropHaiku, attributed bool) {
 	if err == nil || (!savedSonnet && !savedHaiku) {
 		return false, false, false
@@ -520,7 +523,12 @@ func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (dropSonnet, drop
 	case strings.HasPrefix(msg, "--haiku-model:"):
 		return false, savedHaiku, true
 	}
-	return savedSonnet, savedHaiku, false
+	// Unattributed: no leg named, so nothing justifies dropping a saved key.
+	// (This used to report both keys as droppable, which meant a mistyped
+	// PRIMARY — an input no `oaica config set` can invalidate — stripped the
+	// user's standing sonnet and haiku tiers and told them those were to
+	// blame; 2026-09-26 audit.)
+	return false, false, false
 }
 
 // resolveTierPlan builds the launch's tier plan, forgiving a stale saved tier.
@@ -549,6 +557,22 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 	for attempt := 0; attempt < 2; attempt++ {
 		dropSonnet, dropHaiku, attributed := savedTiersToDrop(err, savedSonnet, savedHaiku)
 		if !dropSonnet && !dropHaiku {
+			if attempt == 0 && (savedSonnet || savedHaiku) {
+				// Unattributed and there ARE saved tiers: the error cannot be
+				// theirs, so rebuild the identical plan once instead of
+				// stripping the split for an error it did not cause. If the
+				// retry fails the same way, that is the answer — a second
+				// unattributed failure must NOT fall through to the drop
+				// branch below, which is what blamed the saved tiers for a
+				// mistyped primary (2026-09-26 audit).
+				var retryBuf strings.Builder
+				plan, err = buildTierPlanBuffered(model, sonnetModel, haikuModel, forceTools, &retryBuf)
+				if err == nil {
+					_, _ = io.WriteString(os.Stderr, retryBuf.String())
+					return plan, sonnetModel, haikuModel, nil
+				}
+				return tierPlan{}, "", "", err
+			}
 			return tierPlan{}, "", "", err
 		}
 		var dropped []string
@@ -865,14 +889,15 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 	// Claude Code still warns about an "unknown model" and clamps to 200k
 	// even though the router (oaica-35b-a3b-vision) exposes 262144.
 	// Take the max of the cloud-primary limit and any probed non-native
-	// leg windows so every session gets the correct ceiling.
+	// leg windows so every session gets the correct ceiling. This is the only
+	// place the LEG windows are folded in, so no case may skip it: an earlier
+	// `continue` here claimed the native-primary fallback above had already
+	// set the pair, but that fallback requires PrimaryContext == 0 while this
+	// loop runs on PrimaryContext > 0 — the pair in hand therefore holds the
+	// PRIMARY's window only, and a larger probed sonnet leg (65536 primary vs
+	// 262144 sonnet) was silently dropped, leaving Claude Code to auto-compact
+	// a subagent session at a quarter of the leg's real window (2026-09-26).
 	for _, v := range []int{p.SecondaryContext, p.HaikuContext} {
-		if v > 0 && !isCloudModelName(p.PrimaryName) && p.PrimaryContext > 0 {
-			// native-primary + probed-router case: env already set by the
-			// native-primary fallback above, and the max equals or exceeds
-			// it — skip to avoid redundant noise.
-			continue
-		}
 		if v > 0 {
 			v = max(v, p.PrimaryContext)
 			if l, ok := lookupCloudModelLimit(p.PrimaryName); ok && v < l.Context {
@@ -947,19 +972,11 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	if picked, ok := strings.CutPrefix(model, planPickerPrefix); ok && planName == "" {
 		planName, model = picked, ""
 	}
-	if planName != "" {
-		resolvedModel, resolvedSonnet, resolvedHaiku, err := resolvePlanModels(planName, model, sonnetModel, haikuModel)
-		if err != nil {
-			return fmt.Errorf("--plan: %w", err)
-		}
-		model, sonnetModel, haikuModel = resolvedModel, resolvedSonnet, resolvedHaiku
-		// Flags > plan > remotes.json route_policy: the plan only fills what
-		// the flags left empty (tier_plan_profiles.go).
-		policyArg, oversizeModel, err = resolvePlanTier(planName, policyArg, oversizeModel)
-		if err != nil {
-			return fmt.Errorf("--plan: %w", err)
-		}
-	} else if wizardForced || wizardEligible {
+	// The wizard runs BEFORE the plan block (not after it) because its first
+	// step can hand back a plan name: "reuse the plan I used here last time"
+	// is only reachable from inside the wizard, and the answer has to take the
+	// same resolution path a typed --plan does (resolvePlanModels below).
+	if planName == "" && (wizardForced || wizardEligible) {
 		// Sonnet/Haiku tier steps must offer the same "claude/*" and
 		// "anthropic/*" native-passthrough entries the primary picker step
 		// does (launch.go's selectSingleModelWithSelectorReady) — the
@@ -972,31 +989,64 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		for _, m := range nativeClaudePickerModels {
 			wizardModels = append(wizardModels, LaunchModel{Name: m.Name, Remote: true})
 		}
-		w, err := runTierWizard(wizardModels, model)
+		// The standing config feeds the wizard's DEFAULTS, not a ceiling on
+		// its answers: read it here so each tier step can lead with a "keep
+		// <saved model>" row (tierWizardTierItems). Enter then means "keep my
+		// saved tier" — which is what a standing tier is FOR — while picking
+		// any other row is a deliberate per-launch choice, exactly like a
+		// flag, and must survive. Inverting that (config over the wizard's
+		// answer) made a step the user answered look like it did nothing, and
+		// made the preview and the saved plan name a tier the launch then
+		// discarded (2026-09-26 audit).
+		cfgSonnet, cfgHaiku, fromFileSonnet, fromFileHaiku := standingTierModels(sonnetModel, haikuModel)
+		// The typed --oversize/--route-policy lead their steps as "keep" rows:
+		// the flag wins either way (below), so a step defaulting anywhere else
+		// would make the wizard's closing preview name a leg this launch is
+		// not going to use.
+		w, err := runTierWizard(wizardModels, model, cfgSonnet, cfgHaiku, oversizeModel, policyArg)
 		if err != nil {
 			return fmt.Errorf("launch wizard: %w", err)
 		}
-		// Ladder: the saved config sits ABOVE the wizard, so fill from it
-		// first and let the wizard's answer stand only for the tiers the
-		// preference left empty. (The wizard used to win outright — it assigned
-		// here and standingTierModels below only fills empty values — so
-		// `oaica config set sonnet-model X` was silently replaced by the
-		// wizard's "same as primary" and the split disappeared.) The saved
-		// flags are carried out so the stale-value retry still knows these came
-		// from the file.
-		sonnetModel, haikuModel, savedSonnet, savedHaiku = standingTierModels(sonnetModel, haikuModel)
-		if sonnetModel == "" {
-			sonnetModel = w.SonnetModel
+		if w.PlanName != "" {
+			// Reused a saved plan: it supplies every tier, so the steps were
+			// skipped and there is nothing else to apply here.
+			planName = w.PlanName
+		} else {
+			sonnetModel, haikuModel = w.SonnetModel, w.HaikuModel
+			// A tier the user left at its saved value is still a saved value
+			// for the stale-tier retry below (forgiven on failure); one they
+			// picked is a choice made on this command line and never is.
+			savedSonnet = fromFileSonnet && w.SonnetModel == cfgSonnet
+			savedHaiku = fromFileHaiku && w.HaikuModel == cfgHaiku
 		}
-		if haikuModel == "" {
-			haikuModel = w.HaikuModel
+		// Flags still win: the wizard only fills what the caller left empty
+		// (--oversize/--route-policy were both overwritten unconditionally
+		// until 2026-09-26, so a typed --wizard + --route-policy launch
+		// silently ran the wizard's "auto" instead — and --shard, which only
+		// means anything under `weighted`, went inert with it).
+		if oversizeModel == "" {
+			oversizeModel = w.OversizeModel
 		}
-		oversizeModel = w.OversizeModel
-		policyArg = w.RoutePolicy
+		if policyArg == "" {
+			policyArg = w.RoutePolicy
+		}
+	}
+	if planName != "" {
+		resolvedModel, resolvedSonnet, resolvedHaiku, err := resolvePlanModels(planName, model, sonnetModel, haikuModel)
+		if err != nil {
+			return fmt.Errorf("--plan: %w", err)
+		}
+		model, sonnetModel, haikuModel = resolvedModel, resolvedSonnet, resolvedHaiku
+		// Flags > plan > remotes.json route_policy: the plan only fills what
+		// the flags left empty (tier_plan_profiles.go).
+		policyArg, oversizeModel, err = resolvePlanTier(planName, policyArg, oversizeModel)
+		if err != nil {
+			return fmt.Errorf("--plan: %w", err)
+		}
 	}
 	// Standing user preference fills what neither a flag nor a plan set:
 	// ~/.oaica/config.json sonnet_model / haiku_model (user_config.go).
-	// Flag > plan > config > wizard default. A standing haiku_model is a real
+	// Flag > plan > wizard > config > same-as-primary. A standing haiku_model is a real
 	// request for a distinct haiku tier, so it takes a native primary off the
 	// untouched runNative path (which has no env at all and would run its own
 	// built-in Haiku) — that is the intent, not a side effect.
@@ -1190,7 +1240,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	if len(plan.Routes.Fallbacks) > 1 {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
 	}
-	if plan.Routes.Oversize.BaseURL != "" {
+	if plan.Routes.Oversize.BaseURL != "" || plan.Routes.Oversize.NativePassthrough {
 		// The crossover compares the oversize leg with the window of the leg
 		// that would otherwise serve, and each tier route carries its own
 		// (applyContextWindowsToRoutes) — so the primary's window is NOT "the"
@@ -1201,11 +1251,21 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		// always is). Name the leg, then say so when the PRIMARY's own requests
 		// are outside its reach — rather than printing ">0k-token requests" or
 		// a number that is only right when the primary is the leg overflowing.
+		//
+		// A NATIVE oversize leg carries no BaseURL by construction
+		// (proxyRoute.NativePassthrough), so gating on BaseURL alone made
+		// `--oversize claude/<tier>` print NOTHING at all — not even the
+		// `tiers:`/`route policy:` lines, which have their own gates — leaving
+		// the user unable to tell whether the flag had any effect (2026-09-26).
 		over := plan.Routes.Oversize
-		if over.ContextWindow > 0 {
+		switch {
+		case over.NativePassthrough:
+			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> claude/%s (your own Anthropic login; Anthropic enforces its real window upstream and we never probe it, so this leg needs no size comparison)\n",
+				over.UpstreamModel)
+		case over.ContextWindow > 0:
 			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> %s (%s, %dk window)\n",
 				over.Label, over.UpstreamModel, over.ContextWindow/1024)
-		} else {
+		default:
 			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> %s (%s; its own window is unprobed, and the crossover needs it)\n",
 				over.Label, over.UpstreamModel)
 		}

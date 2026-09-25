@@ -705,10 +705,13 @@ func extractRoutePolicy(args []string) (string, []string) {
 		a := args[i]
 		switch {
 		case a == "--route-policy" && i+1 < len(args):
-			p := args[i+1]
+			// Trimmed: the policy is matched exactly, so a padded value
+			// (" local-only") failed with a message quoting surrounding
+			// whitespace the user cannot see they typed.
+			p := strings.TrimSpace(args[i+1])
 			return p, append(args[:i:i], args[i+2:]...)
 		case strings.HasPrefix(a, "--route-policy="):
-			return strings.TrimPrefix(a, "--route-policy="), append(args[:i:i], args[i+1:]...)
+			return strings.TrimSpace(strings.TrimPrefix(a, "--route-policy=")), append(args[:i:i], args[i+1:]...)
 		}
 	}
 	return "", args
@@ -724,10 +727,12 @@ func extractOversizeModel(args []string) (string, []string) {
 		a := args[i]
 		switch {
 		case a == "--oversize" && i+1 < len(args):
-			m := args[i+1]
+			// Trimmed for the same reason as --sonnet-model: a padded value
+			// silently routes the leg to the primary's remote.
+			m := strings.TrimSpace(args[i+1])
 			return m, append(args[:i:i], args[i+2:]...)
 		case strings.HasPrefix(a, "--oversize="):
-			return strings.TrimPrefix(a, "--oversize="), append(args[:i:i], args[i+1:]...)
+			return strings.TrimSpace(strings.TrimPrefix(a, "--oversize=")), append(args[:i:i], args[i+1:]...)
 		}
 	}
 	return "", args
@@ -766,7 +771,11 @@ func extractShardFlags(args []string) (map[string]int, []string) {
 		if !ok {
 			continue
 		}
-		weight, err := strconv.Atoi(weightStr)
+		// Both halves trimmed: a padded model id matches no existing route
+		// and this flag's documented behaviour for a non-matching id is a
+		// SILENT no-op, so padding would look like the weight was ignored.
+		model = strings.TrimSpace(model)
+		weight, err := strconv.Atoi(strings.TrimSpace(weightStr))
 		if err != nil || weight <= 0 {
 			continue
 		}

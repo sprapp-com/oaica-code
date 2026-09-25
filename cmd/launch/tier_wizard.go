@@ -3,13 +3,19 @@ package launch
 // tier_wizard.go — the interactive launch tier wizard (2026-08-31 design,
 // option A; haiku tier added 2026-09-02). Step 1 is the model picker a
 // plain `oaica launch claude` already runs; this file adds the remaining
-// four steps on the same list of picker models:
+// steps on the same list of picker models:
 //
-//	Step 2  Sonnet/subagent tier (secondary) — same list, "(same as
-//	        primary)" first and the default.
-//	Step 3  Haiku/background tier — same list, "(same as primary)" first
-//	        and the default. No "auto": unlike Sonnet, there is no "best
-//	        recommended model" concept for cheap/background requests.
+//	Step 0  Saved plans (2026-09-26) — only when one exists: reuse the plan
+//	        launched last from this directory (Enter), pick another, or start
+//	        from scratch. A reused plan supplies every tier, so steps 2-4 are
+//	        skipped and the plan resolves exactly as a typed --plan.
+//	Step 2  Sonnet/subagent tier (secondary) — same list, leading with
+//	        "keep <model>" when ~/.oaica/config.json has a sonnet_model
+//	        (Enter keeps it), then "auto"/"(same as primary)" and the rest.
+//	Step 3  Haiku/background tier — same list, same "keep" row for
+//	        haiku_model, then "(same as primary)" and the rest. No "auto":
+//	        unlike Sonnet, there is no "best recommended model" concept for
+//	        cheap/background requests.
 //	Step 4  Compaction/oversize model — candidates filtered to models whose
 //	        PROBED context window (remoteContextWindowFn, the same 2s /models
 //	        probe the proxy uses) is at least the primary's (">=" is
@@ -80,7 +86,15 @@ func extractWizardFlag(args []string) (bool, []string) {
 
 // tierWizardFlags are the launcher-level flags that suppress the wizard: a
 // caller who passed any of them already made (part of) these decisions.
-var tierWizardFlags = []string{"--sonnet-model", "--haiku-model", "--oversize", "--route-policy", "--plan", "--force-tools", "--brief-mode", "--shard"}
+//
+// --force-tools and --brief-mode are deliberately NOT in this list. They are
+// not tier decisions (a tool-gate override and an output style), so passing
+// them says nothing about which models to run: suppressing the wizard for them
+// silently removed the tier steps from `oaica launch claude --brief-mode` with
+// no message at all (2026-09-26 audit — the check runs on the raw argv, before
+// the extractors strip them, so their membership only ever showed up after the
+// gate moved earlier).
+var tierWizardFlags = []string{"--sonnet-model", "--haiku-model", "--oversize", "--route-policy", "--plan", "--shard"}
 
 // tierWizardEligible reports whether this launch should run steps 2-4.
 func tierWizardEligible(args []string) bool {
@@ -271,15 +285,37 @@ const tierWizardScanOversize = "(find a compatible oversize model)"
 const tierWizardBack = "\x00back"
 
 // tierWizardTierItems builds the item list for one tier-selection step
-// (Sonnet or Haiku) over the same picker model list: "(same as primary)"
-// leads (plus "auto" when withAuto — only the Sonnet step wants it), OAICA
-// router recommendations lead the rest and are marked "OAICA Models"
-// (picker parity), everything else falls into the alphabetized "Remote
-// Models" tail. autoTarget is the first recommended non-primary model in
-// its provider-prefixed form — the "auto" step's Sonnet answer, or "" when
-// withAuto is false or there is no recommendation to resolve to.
-func tierWizardTierItems(models []LaunchModel, names []string, primary string, withAuto bool) (items []SelectionItem, autoTarget string) {
-	if len(names) == 0 {
+// (Sonnet or Haiku) over the same picker model list: a "keep the saved tier"
+// row leads when the standing config has one (keep != ""), then "auto" when
+// withAuto (only the Sonnet step wants it), then "(same as primary)", then
+// OAICA router recommendations marked "OAICA Models" (picker parity), then
+// everything else in the alphabetized "Remote Models" tail. autoTarget is the
+// first recommended non-primary model in its provider-prefixed form — the
+// "auto" step's Sonnet answer, or "" when withAuto is false or there is no
+// recommendation to resolve to.
+//
+// leadRow puts name at the front of items, described as keepDesc, adding it
+// when the list does not offer it (a typed route policy is not restricted to
+// the wizard's own menu). The selector's Enter key answers items[0], so a value
+// already in effect has to lead its step for Enter to mean "keep it" — and it
+// must be SELECTABLE (the row's name IS the value) rather than an implicit
+// default, or the preview at the end shows a choice the launch will discard.
+func leadRow(items []SelectionItem, name, keepDesc string) []SelectionItem {
+	out := []SelectionItem{{Name: name, Description: keepDesc}}
+	for _, it := range items {
+		if it.Name != name {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// keep must lead, because the selector's default is items[0]: Enter has to
+// mean "keep my saved tier" for a standing config to be worth anything, and it
+// must be SELECTABLE (the row's name IS the model) rather than an implicit
+// default, or the preview at the end could show a tier the launch discards.
+func tierWizardTierItems(models []LaunchModel, names []string, primary string, withAuto bool, keep string) (items []SelectionItem, autoTarget string) {
+	if len(names) == 0 && keep == "" {
 		return nil, ""
 	}
 	recommended := map[string]bool{}
@@ -300,10 +336,17 @@ func tierWizardTierItems(models []LaunchModel, names []string, primary string, w
 			routerRec[m.Name] = true
 		}
 	}
-	items = []SelectionItem{{Name: "(same as primary)", Description: "route this tier to " + primary, Recommended: true}}
-	if withAuto {
-		items = append([]SelectionItem{{Name: "auto", Description: "let OAICA pick this tier (best recommended model) — recommended", Recommended: true}}, items...)
+	var lead []SelectionItem
+	if keep != "" {
+		lead = append(lead, SelectionItem{Name: keep, Description: "the tier saved in ~/.oaica/config.json — enter keeps it", Recommended: true})
 	}
+	autoIdx := -1
+	if withAuto {
+		autoIdx = len(lead)
+		lead = append(lead, SelectionItem{Name: "auto", Description: "let OAICA pick this tier (best recommended model) — recommended", Recommended: true})
+	}
+	lead = append(lead, SelectionItem{Name: "(same as primary)", Description: "route this tier to " + primary, Recommended: true})
+	items = lead
 	// tierItemName namespaces every row by its provider so the stored plan
 	// is unambiguous at launch (resolveSecondaryEndpoint's explicit forms):
 	// "oaica-*" stays bare (the router's own id), anything already carrying
@@ -341,44 +384,138 @@ func tierWizardTierItems(models []LaunchModel, names []string, primary string, w
 			items = append(items, SelectionItem{Name: tierItemName(n), Remote: true})
 		}
 	}
-	// Alphabetize the non-recommended tail (recommended rows already
-	// lead); keep the leading auto/same-as-primary rows untouched.
-	lead := 1
-	if withAuto {
-		lead = 2 // auto + (same as primary)
-	}
-	sort.SliceStable(items[lead:], func(a, b int) bool {
-		return items[lead+a].Name < items[lead+b].Name
+	// Alphabetize the non-recommended tail (recommended rows already lead);
+	// keep the leading synthetic rows untouched.
+	sort.SliceStable(items[len(lead):], func(a, b int) bool {
+		return items[len(lead)+a].Name < items[len(lead)+b].Name
 	})
-	// No recommendation available: "auto" would be a promise it can't
-	// keep — drop it so "(same as primary)" leads instead.
-	if withAuto && autoTarget == "" {
-		items = items[1:]
+	// No recommendation available: "auto" would be a promise it can't keep —
+	// drop it (by index, since "keep" may sit ahead of it).
+	if withAuto && autoTarget == "" && autoIdx >= 0 {
+		items = append(append([]SelectionItem{}, items[:autoIdx]...), items[autoIdx+1:]...)
 	}
-	if len(items) <= 1 {
-		return nil, autoTarget // single-model inventory: nothing to choose
+	// Nothing but "(same as primary)": a single-model inventory with no saved
+	// tier has nothing to choose. A saved tier IS a choice, so keep the step.
+	if len(items) <= 1 && keep == "" {
+		return nil, autoTarget
 	}
 	return items, autoTarget
 }
 
-// runTierWizard runs steps 2-5 on the picker model list. models is the same
-// inventory the picker showed; primary is the already-picked model.
-// Navigation: enter advances, esc/arrow-left steps back (re-asking the
-// previous prompt); esc on the very first step abandons the wizard and the
-// launch continues with the defaults.
-func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, error) {
+// tierWizardOtherPlan / tierWizardScratch are the two non-plan rows of the
+// wizard's first step (see tierWizardReusedPlan).
+const (
+	tierWizardOtherPlan = "(another saved plan…)"
+	tierWizardScratch   = "(start from scratch — walk the tiers)"
+)
+
+// tierWizardReusedPlan runs the wizard's first step: start from a saved plan,
+// or walk the tiers. Returns (name, true) when the user chose a plan — the
+// caller then resolves it exactly as a typed --plan does, so every tier comes
+// from the plan and the remaining steps are skipped — and ("", false) for
+// "start from scratch".
+//
+// Only offered when at least one plan exists: with none, the step would be a
+// menu of one real option. An unreadable plans.json degrades to "no plans"
+// rather than failing the launch — the same forgiveness PlanLastUsed applies,
+// and the alternative is that a corrupt preference file blocks every launch.
+func tierWizardReusedPlan() (string, bool, error) {
+	names, err := PlanSortedNames()
+	if err != nil || len(names) == 0 {
+		return "", false, nil
+	}
+	last, err := PlanLastUsed()
+	if err != nil {
+		last = ""
+	}
+	items := []SelectionItem{}
+	if last != "" {
+		items = append(items, SelectionItem{Name: last, Description: "the last plan launched from this directory — enter reuses it"})
+	}
+	items = append(items, SelectionItem{Name: tierWizardOtherPlan, Description: "pick from your saved plans"})
+	items = append(items, SelectionItem{Name: tierWizardScratch, Description: "choose the tiers for this launch (and optionally save them as a new plan)"})
+	if last == "" {
+		// Nothing to reuse as the default, so do not make the picker's
+		// Enter-key default a second menu.
+		items[0], items[1] = items[1], items[0]
+	}
+	sel, err := tierWizardSelect("Start from a saved plan?", items)
+	if err != nil {
+		return "", false, err
+	}
+	switch sel {
+	case last, "":
+		if last == "" {
+			return "", false, nil
+		}
+		return last, true, nil
+	case tierWizardOtherPlan:
+		picked, err := tierWizardSelect("Saved plans", planNameItems(names))
+		if err != nil {
+			return "", false, err
+		}
+		if picked == "" || picked == tierWizardBack || picked == tierWizardScratch {
+			return "", false, nil
+		}
+		return picked, true, nil
+	case tierWizardScratch, tierWizardBack:
+		return "", false, nil
+	}
+	// A selector that answered with a plan name directly (production pickers
+	// return items[0].Name on empty input, and tests may stub a name).
+	for _, n := range names {
+		if n == sel {
+			return n, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// planNameItems is one SelectionItem per plan name, for the "another saved
+// plan" sub-step.
+func planNameItems(names []string) []SelectionItem {
+	items := make([]SelectionItem, 0, len(names))
+	for _, n := range names {
+		items = append(items, SelectionItem{Name: n, Description: "saved plan"})
+	}
+	return items
+}
+
+// runTierWizard runs the wizard's steps on the picker model list. models is
+// the same inventory the picker showed; primary is the already-picked model;
+// keepSonnet/keepHaiku are the standing config tiers (~/.oaica/config.json) and
+// keepOversize/keepPolicy the --oversize/--route-policy values typed on this
+// command line — each leads its step as a selectable "keep" row so Enter means
+// what it looks like it means, and each is "" when nothing is set. Navigation:
+// enter advances, esc/arrow-left steps back (re-asking the previous prompt);
+// esc on the very first step abandons the wizard and the launch continues with
+// the defaults.
+//
+// A first step is offered when at least one plan exists: reuse the plan used
+// last from this directory (Enter), pick another saved plan, or start from
+// scratch and walk the tiers. A reused plan supplies every tier, so the tier
+// steps are skipped and the choice comes back in PlanName — the caller
+// resolves it exactly like a typed --plan.
+func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOversize, keepPolicy string) (tierWizardChoice, error) {
 	c := tierWizardChoice{RoutePolicy: string(RouteAuto)}
 	names := launchModelNames(models)
 
+	if plan, reused, err := tierWizardReusedPlan(); err != nil {
+		return c, err
+	} else if reused {
+		c.PlanName = plan
+		return c, nil
+	}
+
 	// Step 2 — Sonnet/subagent tier, and step 3 — Haiku/background tier.
-	// Same picker vocabulary for both; "(same as primary)" first so Enter
-	// keeps the single-model launch, OAICA router recommendations lead the
-	// rest and are marked (the picker's "OAICA Models" section order,
-	// carried over). tierItier builds one step's item list; only the Sonnet
-	// step offers "auto" (a background/haiku tier has no "best recommended
-	// model" concept the product otherwise uses).
-	sonnetItems, autoSecondary := tierWizardTierItems(models, names, primary, true)
-	haikuItems, _ := tierWizardTierItems(models, names, primary, false)
+	// Same picker vocabulary for both; a saved tier leads as "keep", else
+	// "(same as primary)" leads so Enter keeps the single-model launch; OAICA
+	// router recommendations lead the rest and are marked (the picker's "OAICA
+	// Models" section order, carried over). tierWizardTierItems builds one
+	// step's item list; only the Sonnet step offers "auto" (a background/haiku
+	// tier has no "best recommended model" concept the product otherwise uses).
+	sonnetItems, autoSecondary := tierWizardTierItems(models, names, primary, true, keepSonnet)
+	haikuItems, _ := tierWizardTierItems(models, names, primary, false, keepHaiku)
 
 	// Step 4 — route policy. `auto` first and pre-selected: it is the wizard's
 	// default (a plain launch has no explicit policy to honor), and today it
@@ -392,11 +529,32 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		{Name: string(RouteLocalOnly), Description: "never leave local legs — fail visibly rather than cross over"},
 		{Name: string(RouteRemoteOnly), Description: "never leave remote legs — same"},
 	}
+	// A policy or oversize leg typed on the command line leads its step, the
+	// same way a saved config tier leads its own: the flag wins regardless
+	// (see the caller), so a step whose Enter key landed anywhere else would
+	// print a preview line naming a leg the launch is not going to use.
+	if keepPolicy != "" {
+		policyItems = leadRow(policyItems, keepPolicy, "typed on the command line — enter keeps it")
+	}
 
 	type wizardStep struct {
 		title    string
 		items    []SelectionItem
 		optional bool // nil items = skipped entirely, but still a back-stop
+	}
+	// oversizeItems is the oversize step's menu. A leg typed with --oversize
+	// leads it for the same reason a typed policy leads its own step: the flag
+	// is what the launch will use, and Enter must not make the preview claim
+	// otherwise.
+	oversizeItems := func() []SelectionItem {
+		items := []SelectionItem{
+			{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"},
+			{Name: tierWizardScanOversize, Description: "probe the catalog for a larger-context fallback (may take a while)"},
+		}
+		if keepOversize != "" {
+			items = leadRow(items, keepOversize, "typed on the command line — enter keeps it")
+		}
+		return items
 	}
 	steps := []wizardStep{
 		{title: "Sonnet/subagent tier (secondary model)", items: sonnetItems, optional: true},
@@ -405,10 +563,7 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 		// catalog can have hundreds of remote models, and a context probe can
 		// take seconds each. The default stays the existing honest failure
 		// behavior; discovery is an explicit, opt-in action below.
-		{title: "Compaction/oversize model", items: []SelectionItem{
-			{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"},
-			{Name: tierWizardScanOversize, Description: "probe the catalog for a larger-context fallback (may take a while)"},
-		}, optional: true},
+		{title: "Compaction/oversize model", items: oversizeItems(), optional: true},
 		{title: "Route policy (what the launch proxy does when a backend fails)", items: policyItems},
 	}
 	// clearStep resets the field the step at index i writes, on stepping
@@ -457,11 +612,18 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				// model name, and "auto" has no meaning after launch.
 				sel = autoSecondary
 			}
-			if sel != "" && sel != "(same as primary)" {
+			// "(same as primary)" is an explicit CLEAR, not "leave what is
+			// there": the step may lead with a saved tier, and without this
+			// there was no row that could take a split back off.
+			if sel == "(same as primary)" {
+				c.SonnetModel = ""
+			} else if sel != "" {
 				c.SonnetModel = sel
 			}
 		case 1:
-			if sel != "(same as primary)" {
+			if sel == "(same as primary)" {
+				c.HaikuModel = ""
+			} else if sel != "" {
 				c.HaikuModel = sel
 			}
 		case 2:
@@ -479,6 +641,9 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 							desc = fmt.Sprintf("probed window %dk", w/1024)
 						}
 						items = append(items, SelectionItem{Name: n, Description: desc, Remote: true})
+					}
+					if keepOversize != "" {
+						items = leadRow(items, keepOversize, "typed on the command line — enter keeps it")
 					}
 					steps[i].items = items
 					steps[i].title = fmt.Sprintf("Compaction/oversize model (at least %s's probed %dk window)", primary, primaryWindow/1024)
@@ -499,13 +664,17 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	fmt.Fprintf(os.Stderr, "%s\n", tierWizardPreview(primary, c))
 
 	// Plan save: Enter reuses the last saved plan name when there is one
-	// (plans.json last_used), blank only when none exists.
+	// (plans.json last_used), blank only when none exists. Reaching this
+	// prompt means the user walked the tiers — i.e. they did NOT take the
+	// reuse step at the top — so the default is only ever accepted by someone
+	// who read it, and the wording says plainly that it REPLACES that plan's
+	// tiers rather than adding one ("enter = dev" read like a save-as).
 	last, _ := PlanLastUsed()
 	prompt := "Save as plan (name, blank = skip)"
 	defaultName := ""
 	if last != "" {
 		defaultName = last
-		prompt += ", enter = " + last
+		prompt += ", enter = overwrite " + last
 	}
 	name, err := tierWizardReadLine(prompt + ": ")
 	if err != nil && name == "" {

@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -771,5 +773,151 @@ func TestApplyContextWindowsToRoutes_SetsHaikuClamp(t *testing.T) {
 	fam := plan.Routes.FamilyLegs["haiku"]
 	if fam.ContextWindow != 262144 {
 		t.Fatalf("FamilyLegs[haiku] ContextWindow = %d, want the probed 262144", fam.ContextWindow)
+	}
+}
+
+// Fallback and oversize routes are copies taken before the windows are probed,
+// so they sat at ContextWindow 0 forever. Two consequences, both pinned here:
+// the proxy's context-fit clamp (gated on ContextWindow > 0) had nothing to
+// enforce on a failover leg, and `auto` escalation — which picks the LARGEST
+// healthy alternate — could never choose the --oversize leg, since every
+// fallback compared as 0 and won by order instead.
+func TestApplyContextWindowsToRoutes_StampsFallbacksAndOversize(t *testing.T) {
+	orig := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = orig })
+	windows := map[string]int{
+		"http://small.test/v1": 32768,
+		"http://mid.test/v1":   131072,
+		"http://big.test/v1":   262144,
+	}
+	remoteContextWindowFn = func(r proxyRoute) int { return windows[r.BaseURL] }
+
+	plan := &tierPlan{
+		PrimaryName:   "kat-awq",
+		SecondaryName: "box/mid",
+		HaikuName:     "box/mid",
+		Primary:       launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://small.test/v1", UpstreamModel: "kat-awq"}},
+		Secondary:     launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://mid.test/v1", UpstreamModel: "mid"}},
+		Haiku:         launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://mid.test/v1", UpstreamModel: "mid"}},
+		Routes: proxyRouteTable{
+			Default: proxyRoute{BaseURL: "http://small.test/v1", UpstreamModel: "kat-awq"},
+			ByModel: map[string]proxyRoute{
+				"kat-awq": {BaseURL: "http://small.test/v1", UpstreamModel: "kat-awq"},
+				"box/mid": {BaseURL: "http://mid.test/v1", UpstreamModel: "mid"},
+			},
+			// Pre-probe copies: windows unknown, exactly as buildTierPlan leaves them.
+			Fallbacks: []proxyRoute{{BaseURL: "http://mid.test/v1", UpstreamModel: "mid"}},
+			Oversize:  proxyRoute{BaseURL: "http://big.test/v1", UpstreamModel: "big"},
+			breakers:  &routeBreakers{},
+		},
+	}
+	plan.withContextWindows()
+	plan.applyContextWindowsToRoutes()
+
+	if got := plan.Routes.Fallbacks[0].ContextWindow; got != 131072 {
+		t.Fatalf("fallback ContextWindow = %d, want the leg's probed 131072 — the failover leg gets no clamp without it", got)
+	}
+	if got := plan.Routes.Oversize.ContextWindow; got != 262144 {
+		t.Fatalf("oversize ContextWindow = %d, want the probed 262144", got)
+	}
+	// The point of all that: escalation now goes to the BIGGEST healthy leg.
+	// With the fallback stamped 131072 and oversize 262144, oversize wins; with
+	// the pre-fix zeros the fallback won by being added first.
+	target, ok := plan.Routes.escalationTarget(plan.Routes.Default)
+	if !ok || target.BaseURL != "http://big.test/v1" {
+		t.Fatalf("escalationTarget = %q (ok=%v), want the oversize leg http://big.test/v1", target.BaseURL, ok)
+	}
+	// A leg that already knows its window is not overwritten by the fill-in.
+	plan.Routes.Fallbacks[0].ContextWindow = 4096
+	plan.applyContextWindowsToRoutes()
+	if got := plan.Routes.Fallbacks[0].ContextWindow; got != 4096 {
+		t.Fatalf("fallback ContextWindow = %d, want the existing 4096 kept", got)
+	}
+}
+
+// A failure the error does not ATTRIBUTE to a saved tier must not cost the
+// saved tiers. savedTiersToDrop only recognizes errors that name their leg
+// ("--sonnet-model: ..."), and an unattributed one — here the PRIMARY failing
+// to resolve, which has nothing to do with either saved key — used to fall
+// through to the drop-both branch: one launch of a mistyped primary stripped
+// the user's standing sonnet AND haiku tiers with a message blaming them for an
+// error they had no part in. The retry is identical instead, and when it fails
+// too the error stands as-is.
+func TestRun_UnattributedFailureDoesNotBlameTheSavedTiers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	if err := os.MkdirAll(filepath.Join(home, ".oaica"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"sonnet_model":"box/glm-4.6","haiku_model":"box/glm-4.6"}`
+	if err := os.WriteFile(filepath.Join(home, ".oaica", "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = (&Claude{}).Run("ghost-model", nil, nil)
+	})
+	if runErr == nil {
+		t.Fatal("Run succeeded on a primary nothing serves")
+	}
+	if strings.Contains(stderr, "retries without them") || strings.Contains(stderr, "ignoring") {
+		t.Errorf("the launch blamed the saved tiers for a primary failure:\n%s", stderr)
+	}
+	// The error is the caller's to print (cobra does), so it comes back intact
+	// and names the model actually at fault.
+	if !strings.Contains(runErr.Error(), "ghost-model") {
+		t.Errorf("Run's error does not name the failing primary: %v", runErr)
+	}
+}
+
+// envVars folds every known leg window into ONE CLAUDE_CODE_MAX_CONTEXT_TOKENS
+// pair, taking the maximum. A larger probed SONNET leg than the primary used to
+// be skipped on the way in: an earlier `continue` in that loop claimed the
+// native-primary fallback had already set the pair, but the fallback needs
+// PrimaryContext == 0 while the loop runs on PrimaryContext > 0 — so the pair
+// in hand held only the PRIMARY's window and a subagent session auto-compacted
+// at a quarter of its leg's real window.
+func TestEnvVars_TakesTheLargestLegWindowNotThePrimarys(t *testing.T) {
+	plan := tierPlan{
+		PrimaryName:      "kat-awq",
+		SecondaryName:    "box/mid",
+		HaikuName:        "box/mid",
+		PrimaryContext:   65536,
+		SecondaryContext: 262144,
+		Routes: proxyRouteTable{
+			Default: proxyRoute{BaseURL: "http://box:8080/v1", UpstreamModel: "kat-awq"},
+			ByModel: map[string]proxyRoute{},
+		},
+	}
+	env := plan.envVars("http://127.0.0.1:1", "")
+
+	var pairs []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CLAUDE_CODE_MAX_CONTEXT_TOKENS=") {
+			pairs = append(pairs, kv)
+		}
+	}
+	if len(pairs) != 1 {
+		t.Fatalf("CLAUDE_CODE_MAX_CONTEXT_TOKENS appears %d times (%v), want exactly one — os/exec keeps the LAST duplicate, so a second pair makes the child read the smaller leg's window", len(pairs), pairs)
+	}
+	if pairs[0] != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
+		t.Fatalf("window = %q, want the larger probed sonnet leg's 262144 (primary is 65536)", pairs[0])
+	}
+	if !slices.Contains(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144") {
+		t.Fatalf("AUTO_COMPACT_WINDOW was not raised with it: %v", env)
 	}
 }

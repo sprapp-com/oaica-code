@@ -143,9 +143,10 @@ func TestSavedTiersToDrop(t *testing.T) {
 		{"haiku leg fails, both saved", haikuErr, true, true, false, true, true},
 		{"sonnet leg fails, only haiku saved", sonnetErr, false, true, false, false, true},
 		{"nothing saved", sonnetErr, false, false, false, false, false},
-		// Unattributable: the warning must not claim the failing value came
-		// from config.json, but a stale key still may not break the launch.
-		{"primary fails, both saved", primaryErr, true, true, true, true, false},
+		// Unattributable: no leg is named, so no saved key may be blamed or
+		// dropped — a mistyped PRIMARY is not something `oaica config set`
+		// can have invalidated. The retry is identical instead.
+		{"primary fails, both saved", primaryErr, true, true, false, false, false},
 		// The leg prefix decides, not a substring elsewhere in the message:
 		// the healthy sonnet key survives a haiku value that reads like a
 		// sonnet flag.

@@ -224,6 +224,38 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 			p.Routes.ByModel[p.Haiku.UpstreamModel] = r
 		}
 	}
+	// Fallback and oversize routes are copies of these same legs, taken in
+	// buildTierPlan before the windows were known, and they were left at
+	// ContextWindow 0 forever. Two real consequences (2026-09-26 audit):
+	//
+	//   - the proxy's context-fit clamp is gated on `route.ContextWindow > 0`,
+	//     so a request served by a fallback AFTER its primary's breaker opened
+	//     had no ceiling at all — the exact request that a failover is most
+	//     likely to carry, since it failed somewhere else first;
+	//   - `auto` escalation picks the LARGEST-window healthy leg
+	//     (escalationTarget), and every fallback comparing as 0 meant the
+	//     --oversize leg was never the winner: escalation went to whichever
+	//     alternate came first, typically the smaller one.
+	//
+	// Keyed by BaseURL, which is how the route table itself keys fallbacks; a
+	// native leg has none and carries no window either way. Only a 0 is
+	// filled, so a leg that already knows its window is never overwritten.
+	for _, w := range []struct {
+		ep launchEndpoint
+		n  int
+	}{{p.Primary, p.PrimaryContext}, {p.Secondary, p.SecondaryContext}, {p.Haiku, p.HaikuContext}} {
+		if w.n <= 0 || w.ep.BaseURL == "" {
+			continue
+		}
+		for i := range p.Routes.Fallbacks {
+			if p.Routes.Fallbacks[i].BaseURL == w.ep.BaseURL && p.Routes.Fallbacks[i].ContextWindow == 0 {
+				p.Routes.Fallbacks[i].ContextWindow = w.n
+			}
+		}
+		if p.Routes.Oversize.BaseURL == w.ep.BaseURL && p.Routes.Oversize.ContextWindow == 0 {
+			p.Routes.Oversize.ContextWindow = w.n
+		}
+	}
 	// Family routes are copies taken in buildTierPlan, i.e. BEFORE these
 	// windows were known. Refresh them from ByModel, which was just updated, so
 	// a request that arrives on a Claude family id (Claude Code's own

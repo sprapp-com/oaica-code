@@ -440,15 +440,81 @@ func TestRun_TypedTierFlagSuppressesTheWizard(t *testing.T) {
 	}
 }
 
-// The saved config sits ABOVE the wizard in the documented ladder, so a wizard
-// answer must not replace a tier `oaica config set` already supplies. It used
-// to: the wizard assigned first and the config only filled what was still
-// empty, so answering the sonnet step silently discarded the saved model.
-func TestRun_SavedConfigTierBeatsTheWizard(t *testing.T) {
+// A saved config tier (oaica config set sonnet-model X) must LEAD its wizard
+// step, so that Enter — the way a user keeps a standing preference — keeps X.
+// It did not: the step led with "(same as primary)", Enter therefore meant "no
+// split", and answering the step discarded the saved model.
+func TestRun_WizardStepLeadsWithTheSavedConfigTier(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake claude binary is a /bin/sh script")
 	}
-	home := t.TempDir()
+	home, envLog := setupWizardConfigTierRun(t, `{"sonnet_model":"zai/glm-4.5-air"}`)
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	var sonnetLead string
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "Sonnet") {
+			sonnetLead = items[0].Name
+			return items[0].Name, nil // the Enter key
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sonnetLead != "zai/glm-4.5-air" {
+		t.Errorf("the saved sonnet tier does not lead its step (got %q) — Enter would drop the standing split", sonnetLead)
+	}
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air\n") {
+		t.Error("Enter on the saved tier's own row did not keep it")
+	}
+	_ = home
+}
+
+// ...and an explicit pick is a choice made on THIS command line, exactly like
+// a flag, so it beats the standing config for that launch. The saved value is
+// the step's default, not a ceiling on its answers.
+func TestRun_WizardPickBeatsTheSavedConfigTier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	_, envLog := setupWizardConfigTierRun(t, `{"sonnet_model":"zai/glm-4.5-air"}`)
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "Sonnet") {
+			return "box/glm-4.6", nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=box/glm-4.6\n") {
+		t.Error("the wizard's explicit pick did not beat the standing config tier")
+	}
+}
+
+// setupWizardConfigTierRun arms an interactive, wizard-eligible launch whose
+// only tier is a standing config sonnet_model, with a fake `claude` that dumps
+// its environment. Returns the temp home and the env dump's path.
+func setupWizardConfigTierRun(t *testing.T, configJSON string) (home, envLog string) {
+	t.Helper()
+	home = t.TempDir()
 	setLaunchTestHome(t, home)
 	withInteractiveSession(t, true)
 	withWizardEligibleLaunch(t)
@@ -461,46 +527,123 @@ func TestRun_SavedConfigTierBeatsTheWizard(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".oaica"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".oaica", "config.json"),
-		[]byte(`{"sonnet_model":"zai/glm-4.5-air"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".oaica", "config.json"), []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	binDir := t.TempDir()
-	envLog := filepath.Join(t.TempDir(), "env.txt")
+	envLog = filepath.Join(t.TempDir(), "env.txt")
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nenv > "+envLog+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return home, envLog
+}
+
+// A policy or oversize leg TYPED on the command line must survive `--wizard`,
+// exactly like every other flag: the wizard fills what the caller left empty.
+// It overwrote both unconditionally until 2026-09-26, so `--wizard
+// --route-policy remote-first` silently ran the wizard's `auto` (and `--shard`,
+// which only means anything under `weighted`, went inert with it).
+func TestRun_TypedPolicyAndOversizeSurviveTheWizard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	_, _ = setupWizardConfigTierRun(t, `{}`)
+
+	origProbe := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = origProbe })
+	remoteContextWindowFn = func(r proxyRoute) int {
+		switch strings.TrimRight(r.BaseURL, "/") {
+		case "http://box:8080/v1":
+			return 32768
+		case "http://zai:8080/v1":
+			return 262144
+		}
+		return 0
+	}
 
 	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
-	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
-		// The wizard still runs (it also covers oversize and the policy), but
-		// its answer must not be what the launch ends up using. A REAL pick,
-		// not the empty "same as primary": the empty answer would let the
-		// config rung fill the tier afterwards and the test would pass even
-		// with the wizard winning the rung.
-		switch {
-		case strings.Contains(title, "Sonnet"):
-			return "box/glm-4.6", nil
-		case strings.Contains(title, "Route policy"):
-			return "auto", nil
-		}
-		return "", nil // keep the step's default (haiku, oversize)
-	}
-	// Blank at the "Save as plan" prompt: don't write a plan, and don't block
-	// on stdin (the test's EOF was reaching it as an error).
-	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
 	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
-
-	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
-		t.Fatalf("Run: %v", err)
+	// Only the Enter key in this test: the typed policy and oversize leg must
+	// LEAD their steps (else the wizard's closing preview names a leg the
+	// launch will not use) and Enter must therefore return them back.
+	var oversizeLead, policyLead string
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "oversize") || strings.Contains(title, "Compaction") {
+			oversizeLead = items[0].Name
+		}
+		if strings.Contains(title, "policy") {
+			policyLead = items[0].Name
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil // the Enter key
+		}
+		return "", nil
 	}
-	data, err := os.ReadFile(envLog)
-	if err != nil {
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	models := []LaunchModel{
+		{Name: "box/kat-awq", Remote: true},
+		{Name: "zai/glm-4.6", Remote: true},
+		{Name: "box/glm-4.6", Remote: true},
+	}
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--wizard", "--route-policy", "remote-first", "--oversize", "zai/glm-4.6"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "route policy: remote-first") {
+		t.Errorf("the typed --route-policy did not survive the wizard (stderr: %s)", stderr)
+	}
+	if policyLead != "remote-first" {
+		t.Errorf("the typed policy does not lead its step (got %q) — Enter would leave the preview claiming another", policyLead)
+	}
+	if oversizeLead != "zai/glm-4.6" {
+		t.Errorf("the typed oversize leg does not lead its step (got %q)", oversizeLead)
+	}
+	if !strings.Contains(stderr, "oversize: requests past the serving leg's window -> remote:zai (glm-4.6, 256k window)") {
+		t.Errorf("the typed --oversize leg is not the one in effect (stderr: %s)", stderr)
+	}
+	if strings.Contains(stderr, "box/glm-4.6") {
+		t.Errorf("the wizard's own oversize answer replaced the typed --oversize leg (stderr: %s)", stderr)
+	}
+}
+
+// A native primary with a native --oversize leg is the documented setup (swap
+// to your own Anthropic login's real window when the primary's overflow needs
+// it). Its banner must say that, and must NOT talk about a size comparison it
+// never made: the primary's window is never probed (native bypasses probing),
+// so the crossover cannot be described in the same terms as a remote leg's.
+func TestRun_NativeOversizeBannerSaysNoComparisonWasMade(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	stubNativeModelCatalog(t, map[string]string{"fable": "claude-fable-5-1", "opus": "claude-opus-4-5-20251101"})
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air\n") {
-		t.Error("the saved sonnet tier was replaced by the wizard's answer")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("claude/fable", nil, []string{"--oversize", "claude/opus"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "oversize: requests past the serving leg's window -> claude/") {
+		t.Errorf("no native-oversize banner naming the leg:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "your own Anthropic login") {
+		t.Errorf("the banner does not say whose credential serves it:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "not larger than the primary's") {
+		t.Errorf("the banner claims a size comparison against a window native never probes:\n%s", stderr)
 	}
 }
