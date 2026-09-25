@@ -54,9 +54,16 @@ func TestDoctorReport_WithholdsEveryCredential(t *testing.T) {
 			t.Errorf("report is missing %q — it would not be usable for support", want)
 		}
 	}
-	// The credential-embedded remote URL must still be listed, redacted.
-	if !strings.Contains(report, "REDACTED@example.test") {
-		t.Errorf("report should list the remote's base URL with the userinfo redacted")
+	// The credential-embedded remote URL must still be listed: support needs to
+	// know which host was configured. The userinfo is gone rather than shown as
+	// "REDACTED@" — the value the client prints is the resolved endpoint
+	// (openAIBase), and that strips a userinfo credential outright
+	// (splitRemoteUserinfo), so no placeholder is left to print.
+	if !strings.Contains(report, "example.test") {
+		t.Errorf("report should list the remote's endpoint; got no example.test line")
+	}
+	if strings.Contains(report, "@example.test") {
+		t.Errorf("report printed a userinfo-carrying URL — the credential's position is showing")
 	}
 }
 

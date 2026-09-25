@@ -4217,3 +4217,62 @@ func compareStringSlices(got, want [][]string) string {
 	}
 	return ""
 }
+
+// The integrations list a user reads in `oaica launch --help` is generated from
+// the registry, and it has to stay that way: the hand-written list it replaced
+// had drifted in both directions — advertising two integrations the registry
+// hides and omitting a registered launcher. So the check is equality, not
+// containment: every visible spec appears, and no hidden one does.
+func TestLaunchHelpListsExactlyTheVisibleIntegrations(t *testing.T) {
+	help := launchLongHelp()
+
+	_, section, ok := strings.Cut(help, "Supported integrations:\n")
+	if !ok {
+		t.Fatalf("the help has no integrations section:\n%s", help)
+	}
+	section, _, _ = strings.Cut(section, "\nExamples:")
+
+	listed := map[string]bool{}
+	for _, line := range strings.Split(section, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 {
+			listed[f[0]] = true
+		}
+	}
+
+	for _, spec := range ListVisibleIntegrationSpecs() {
+		if !listed[spec.Name] {
+			t.Errorf("visible integration %q is missing from `launch --help`", spec.Name)
+		}
+		// The runner column is what the user actually gets, so a wrong one is
+		// as bad as a missing row.
+		if want := spec.Runner.String(); !strings.Contains(section, want) {
+			t.Errorf("the help does not name %q's runner (%s)", spec.Name, want)
+		}
+	}
+	for _, spec := range integrationSpecs {
+		if !spec.Hidden {
+			continue
+		}
+		if listed[spec.Name] {
+			t.Errorf("hidden integration %q is advertised in `launch --help`", spec.Name)
+		}
+	}
+}
+
+// Every route policy the help, the error messages and the plan-set flag
+// advertise must be one the parser accepts: a name in that list that
+// parseRoutePolicy rejects turns advice into a hard failure.
+func TestRoutePolicyNamesAreAllAccepted(t *testing.T) {
+	names := RoutePolicyNames()
+	if len(names) == 0 {
+		t.Fatal("RoutePolicyNames is empty — every help string and refusal message is built from it")
+	}
+	for _, n := range names {
+		if _, err := parseRoutePolicy(n); err != nil {
+			t.Errorf("advertised policy %q is rejected by the parser: %v", n, err)
+		}
+		if !strings.Contains(RoutePolicyList(), n) {
+			t.Errorf("%q is in RoutePolicyNames but not in RoutePolicyList", n)
+		}
+	}
+}

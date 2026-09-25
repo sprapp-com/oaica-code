@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -61,8 +62,17 @@ func TestLaunchCmd(t *testing.T) {
 		if !strings.Contains(cmd.Long, "hermes") {
 			t.Error("Long description should mention hermes")
 		}
-		if !strings.Contains(cmd.Long, "kimi") {
-			t.Error("Long description should mention kimi")
+		// ...and it must mention kimi only if the registry would SHOW kimi. The
+		// hand-written list this replaced advertised kimi and vscode (both
+		// hidden) and omitted dsh, so "is kimi mentioned?" was pinning the
+		// drift rather than the contract. TestLaunchHelpListsExactly… in
+		// launch_test.go owns the full equality check; this is the one-line
+		// version so a failure here names the obvious cause.
+		hidden := slices.ContainsFunc(integrationSpecs, func(s *IntegrationSpec) bool {
+			return s.Name == "kimi" && s.Hidden
+		})
+		if mentions := strings.Contains(cmd.Long, "kimi"); mentions == hidden {
+			t.Errorf("Long description mentions kimi=%v but the registry hides kimi=%v", mentions, hidden)
 		}
 	})
 

@@ -43,14 +43,24 @@ func hermeticTestEnv() {
 	// dozen of them would otherwise leak catalog remotes into every picker
 	// test. Data-driven (provider_catalog.go), so this loop covers new
 	// providers/plans automatically — nothing to add here when one ships.
+	//
+	// Each NAME is masked, not the row's api_key_env string: a row may name
+	// more than one variable ("OPENCODE_API_KEY, OPENCODE_GO_API_KEY" — see
+	// keyEnvNames), and setting the comma-joined string as a single variable
+	// left both real ones untouched. A box that exports one of them then
+	// leaked a live credential into any test that walks the credential list
+	// (reportSecrets), which is how the leak was found.
 	for _, p := range providerCatalog() {
-		if p.APIKeyEnv == "" {
-			continue
+		for _, env := range (userRemote{APIKeyEnv: p.APIKeyEnv}).keyEnvNames() {
+			os.Setenv(env, "")
 		}
-		os.Setenv(p.APIKeyEnv, "")
 	}
 	os.Setenv("OAICA_HOST", "http://127.0.0.1:1")
 	os.Setenv("OAICA_API_KEY", "")
 	os.Setenv("OAICA_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-auth.json"))
 	os.Setenv("OPENCODE_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-opencode-auth.json"))
+	// The HuggingFace token is a credential this client transmits (`oaica pull`
+	// attaches it) and one the support report therefore scans for — so it is
+	// part of the ambient state a test must not inherit either.
+	os.Setenv("HF_TOKEN", "")
 }

@@ -6,6 +6,7 @@ package launch
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +54,51 @@ func TestDoctor_FailingProbeFailsTheCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "weighted") {
 		t.Errorf("the policies line must name every accepted value:\n%s", out)
+	}
+}
+
+// The URL doctor prints beside "ok" is the URL a user curls while debugging,
+// so it has to be the endpoint doctor actually probed. It used to print the
+// configured base_url, which on a row with a version segment is a truncated
+// PREFIX of the real endpoint — a v4 row showed ".../api/paas" next to an "ok"
+// earned at ".../api/paas/v4/models", and following the printed link by hand
+// answers 404.
+func TestDoctor_PrintsTheEndpointItProbes(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+
+	var probedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
+
+	// A v4 row: the version belongs to the endpoint, not to the configured
+	// base, so the two differ by exactly the segment under test.
+	writeRemotes(t, fmt.Sprintf(
+		`{"remotes":[{"name":"vfour","base_url":%q,"version":"v4","api_key":"sk-1"}]}`, srv.URL+"/api/paas"))
+
+	var err error
+	out := captureDoctorStdout(t, func() { err = DoctorCmd().RunE(DoctorCmd(), nil) })
+	if err != nil {
+		t.Fatalf("a remote the test server answers must pass: %v\n%s", err, out)
+	}
+	if probedPath != "/api/paas/v4/models" {
+		t.Fatalf("the probe hit %q, want the resolved /api/paas/v4/models", probedPath)
+	}
+
+	printed := ""
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "vfour" {
+			printed = f[1]
+		}
+	}
+	if printed == "" {
+		t.Fatalf("doctor printed no line for vfour:\n%s", out)
+	}
+	if want := srv.URL + "/api/paas/v4"; printed != want {
+		t.Errorf("doctor prints %q, want the endpoint it probed (%s/models)", printed, want)
 	}
 }
 

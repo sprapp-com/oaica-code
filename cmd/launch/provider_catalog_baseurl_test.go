@@ -38,6 +38,11 @@ func TestProviderCatalog_BaseURLsResolveToTheDocumentedEndpoint(t *testing.T) {
 		"volcengine-coding-plan": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
 		// Version before the root, not after it: append nothing.
 		"google": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+		// Same class, found by probing both paths live (2026-09-26): the
+		// versioned path answers 404 and the bare one answers the vendor's own
+		// auth error, so the version must not be appended.
+		"perplexity":     "https://api.perplexity.ai/chat/completions",
+		"github-copilot": "https://api.githubcopilot.com/chat/completions",
 		// Controls — these were already right and must stay so.
 		"zai":     "https://api.z.ai/api/paas/v4/chat/completions",
 		"mistral": "https://api.mistral.ai/v1/chat/completions",
@@ -59,19 +64,37 @@ func TestProviderCatalog_BaseURLsResolveToTheDocumentedEndpoint(t *testing.T) {
 
 // The sentinel itself, pinned apart from the catalog so the mechanism is
 // tested even if the catalog stops using it.
+//
+// "Append nothing" means append nothing — and REMOVE nothing either. The
+// sentinel's own documented use is a base_url that already IS the OpenAI root,
+// and the most common such root on earth ends in "/v1"; routing the sentinel
+// through remoteBaseURL (which strips a trailing /v1 for the append case)
+// would delete the version the user configured and send every request to
+// "<host>/chat/completions", which is a 404 on any standard endpoint.
 func TestOpenAIBase_VersionNoneAppendsNothing(t *testing.T) {
-	cases := []struct{ version, want string }{
-		{"", "https://api.example.com/v1"},
-		{"v1", "https://api.example.com/v1"},
-		{"/v1/", "https://api.example.com/v1"},
-		{"v4", "https://api.example.com/v4"},
-		{"none", "https://api.example.com"},
-		{"NONE", "https://api.example.com"},
+	cases := []struct{ base, version, want string }{
+		{"https://api.example.com", "", "https://api.example.com/v1"},
+		{"https://api.example.com", "v1", "https://api.example.com/v1"},
+		{"https://api.example.com", "/v1/", "https://api.example.com/v1"},
+		{"https://api.example.com", "v4", "https://api.example.com/v4"},
+		{"https://api.example.com", "none", "https://api.example.com"},
+		{"https://api.example.com", "NONE", "https://api.example.com"},
+		// The sentinel's own case: the base is already the whole root.
+		{"https://generativelanguage.googleapis.com/v1beta/openai", "none",
+			"https://generativelanguage.googleapis.com/v1beta/openai"},
+		// A root that ends in /v1 keeps it — this is the case the sentinel
+		// must not "normalise".
+		{"https://api.example.com/v1", "none", "https://api.example.com/v1"},
+		{"https://gw.corp.example/openai/v1/", "none", "https://gw.corp.example/openai/v1"},
+		// Any version, with any trailing slash, without doubling.
+		{"https://api.z.ai/api/paas", "v4", "https://api.z.ai/api/paas/v4"},
+		{"https://api.deepseek.com/v1", "v1", "https://api.deepseek.com/v1"},
 	}
 	for _, c := range cases {
-		r := userRemote{Name: "x", BaseURL: "https://api.example.com", Version: c.version}
+		r := userRemote{Name: "x", BaseURL: c.base, Version: c.version}
 		if got := r.openAIBase(); got != c.want {
-			t.Errorf("version %q -> %s, want %s", c.version, got, c.want)
+			t.Errorf("BaseURL=%q version=%q -> %s, want %s (the request would go to %s/chat/completions)",
+				c.base, c.version, got, c.want, got)
 		}
 	}
 }

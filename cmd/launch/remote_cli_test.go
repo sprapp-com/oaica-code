@@ -225,3 +225,80 @@ func TestRemoteAddPreservesUnexposedFields(t *testing.T) {
 		t.Fatalf("hand-tuned fields were reset: %+v", f.Remotes[0])
 	}
 }
+
+// Version is a flag-driven field, but omitting it must not clear it: clearing
+// it MOVES THE ENDPOINT. `remote add box --api-version v4` then `remote add box
+// --api-key K2` (rotate the key, say nothing about the version) used to
+// re-resolve the row from ".../v4/chat/completions" to ".../v1/chat/completions"
+// — a 404 on every request — while the confirmation line, identical to the
+// correct one, said nothing. The reset has to be typed.
+func TestRemoteAddPreservesVersionWhenTheFlagIsAbsent(t *testing.T) {
+	withTempRemotesFile(t)
+
+	for _, c := range []struct{ name, base, version string }{
+		// A row whose base is already the whole root (google's shape).
+		{"gtest", "https://generativelanguage.googleapis.com/v1beta/openai", remoteVersionNone},
+		// A row whose version is a path segment of its own (z.ai's shape).
+		{"ztest", "https://api.z.ai/api/paas", "v4"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := RemoteAdd(RemoteAddOptions{
+				Name: c.name, BaseURL: c.base, APIKey: "sk-1", Version: c.version, VersionSet: true,
+			}); err != nil {
+				t.Fatalf("RemoteAdd: %v", err)
+			}
+			f, _, err := loadUserRemotesFileRaw()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want string
+			for _, r := range f.Remotes {
+				if r.Name == c.name {
+					want = r.openAIBase()
+				}
+			}
+
+			// The natural edit: same row, new key, no --api-version.
+			if _, err := RemoteAdd(RemoteAddOptions{Name: c.name, BaseURL: c.base, APIKey: "sk-2"}); err != nil {
+				t.Fatalf("re-add: %v", err)
+			}
+			f, _, err = loadUserRemotesFileRaw()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := userRemote{}
+			found := 0
+			for _, r := range f.Remotes {
+				if r.Name == c.name {
+					got, found = r, found+1
+				}
+			}
+			if found != 1 {
+				t.Fatalf("re-add should replace, not append: found %d %s rows in %+v", found, c.name, f.Remotes)
+			}
+			if got.Version != c.version {
+				t.Errorf("version %q -> %q on a re-add that did not mention it", c.version, got.Version)
+			}
+			if got.openAIBase() != want {
+				t.Errorf("re-adding to rotate the key moved the endpoint from %s to %s (requests now go to %s/chat/completions)",
+					want, got.openAIBase(), got.openAIBase())
+			}
+
+			// Naming the flag is what resets it.
+			if _, err := RemoteAdd(RemoteAddOptions{
+				Name: c.name, BaseURL: c.base, APIKey: "sk-2", Version: "v1", VersionSet: true,
+			}); err != nil {
+				t.Fatalf("re-add with --api-version: %v", err)
+			}
+			f, _, err = loadUserRemotesFileRaw()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range f.Remotes {
+				if r.Name == c.name && r.Version != "v1" {
+					t.Errorf("an explicit --api-version v1 did not take: version=%q", r.Version)
+				}
+			}
+		})
+	}
+}
