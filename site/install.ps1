@@ -71,6 +71,13 @@ $DebugInstall = [bool]$env:OAICA_DEBUG
 # OAICA_RELEASE_REPO overrides the repository. OAICA_DOWNLOAD_URL is accepted
 # as an alias of OAICA_DOWNLOAD_BASE for existing dev/test setups.
 $Repo = if ($env:OAICA_RELEASE_REPO) { $env:OAICA_RELEASE_REPO } else { "sprapp-com/oaica-code" }
+
+# Scratch space. [System.IO.Path]::GetTempPath() honours TEMP/TMP and has a
+# fallback, where reading $env:TEMP directly yields $null in contexts that
+# unset it — and a null path there would make checksum verification fail into
+# its own "skipping" branch, i.e. install unverified bytes while looking fine.
+$TempDir = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force | Out-Null }
 if ($env:OAICA_DOWNLOAD_BASE) {
     $DownloadBaseURL = $env:OAICA_DOWNLOAD_BASE.TrimEnd('/')
 } elseif ($env:OAICA_DOWNLOAD_URL) {
@@ -196,7 +203,7 @@ function Test-ArchiveChecksum {
         [string]$Path
     )
 
-    $sumsFile = Join-Path $env:TEMP "oaica-SHA256SUMS"
+    $sumsFile = Join-Path $TempDir "oaica-SHA256SUMS"
     try {
         Invoke-Download -Url "$UrlBase/SHA256SUMS" -OutFile $sumsFile
     } catch {
@@ -280,7 +287,7 @@ function Invoke-Install {
         Write-Host ">>> Downloading OAICA for Windows..."
     }
 
-    $tempZip = Join-Path $env:TEMP "oaica-windows-amd64.zip"
+    $tempZip = Join-Path $TempDir "oaica-windows-amd64.zip"
     Invoke-Download -Url $zipUrl -OutFile $tempZip
     Test-ArchiveChecksum -UrlBase $DownloadBaseURL -Name $zipName -Path $tempZip
 
@@ -291,7 +298,7 @@ function Invoke-Install {
         Write-Host ">>> Installing OAICA..."
     }
 
-    $tempExtract = Join-Path $env:TEMP "oaica-extract"
+    $tempExtract = Join-Path $TempDir "oaica-extract"
     if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force }
     Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
 

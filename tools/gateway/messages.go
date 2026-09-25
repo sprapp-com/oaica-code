@@ -43,11 +43,11 @@ package main
 //	  status code, so an upstream 4xx/5xx reads native to the client.
 
 import (
-	"log"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -504,9 +504,9 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 					Content   *string `json:"content"`
 					Reasoning *string `json:"reasoning"`
 					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Name     string `json:"name"`
+						Index     int    `json:"index"`
+						ID        string `json:"id"`
+						Name      string `json:"name"`
 						Arguments string `json:"arguments"`
 					} `json:"tool_calls"`
 				} `json:"delta"`

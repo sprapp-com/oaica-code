@@ -1,0 +1,107 @@
+name: oaica-ci
+
+# Upstream's test.yaml only runs on pull_request, so nothing gated commits
+# landing directly on main — a broken build could sit on main until the next
+# release tag tried to build it. This workflow is the fork's gate: it runs on
+# every push to main and on pull requests that touch the code we own.
+#
+# It deliberately does NOT build the upstream inference engine (llama.cpp via
+# CMake, CUDA/ROCm images): this fork ships a client, and those jobs take tens
+# of minutes per run. `go build ./...` covers every Go package, including the
+# engine's Go side, without the C++ build.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'anthropic/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/oaica-ci.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit SHA, not a tag: a tag can be moved to different code
+      # after review, a SHA cannot. (Same for every action in this repo's own
+      # workflows; see SECURITY.md.)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          # Only the trees this fork maintains: upstream files come and go
+          # with merges, and a formatting gate on them would make merges fail
+          # for reasons unrelated to us.
+          out=$(gofmt -l cmd anthropic tools)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"
+            gofmt -d cmd anthropic tools
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./cmd/... ./anthropic/...
+
+      - name: go build (all packages)
+        run: go build ./...
+
+      - name: go test
+        run: go test ./cmd/... ./anthropic/... ./tools/...
+
+  modules:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each of these is its own module (its own go.mod), so the root
+        # `go build ./...` never sees them.
+        module:
+          - tools/gatekeeper
+          - tools/oaicalb
+          - tools/meterhub
+          - tools/gateway
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build + test ${{ matrix.module }}
+        working-directory: ${{ matrix.module }}
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"
+            exit 1
+          fi
+          go build ./...
+          go test ./...
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - name: Installer helpers (checksum, retry, URL base, copy drift)
+        run: bash scripts/tests/install_checksum_test.sh

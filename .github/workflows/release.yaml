@@ -9,26 +9,52 @@ name: release
 # Tag scheme: oaica-v<semver>. Plain v* tags are upstream Ollama's and
 # already exist in this repo (v0.3.0, v0.32.5, ...), so they cannot name
 # fork releases.
+#
+# The installers read their archives from this release (see
+# docs/RELEASE.md), so what CI builds here is what a user installs.
 on:
   push:
     tags:
       - 'oaica-v*'
+  # Rehearse the whole pipeline without publishing: builds, verifies, attests
+  # and uploads the SBOM as a run artifact, but creates no release. Use this
+  # before tagging a release that changes the build.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the oaica-v prefix (e.g. 0.5.47)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and verify only — do not create or update the release'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
+  contents: write # create the release and upload its assets
+  id-token: write # sign the build provenance attestation
+  attestations: write # publish that attestation
+
+env:
+  # "oaica-v0.5.47" on a tag push, "0.5.47" on a dispatch.
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Pinned to a commit SHA, not a tag: a tag can be moved to different code
+      # after review, a SHA cannot. Same for every action in this repo's own
+      # workflows; see SECURITY.md.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
       - name: Build all platform archives
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq zstd zip
           export VERSION="${VERSION#oaica-v}"
@@ -40,11 +66,43 @@ jobs:
           for f in oaica-linux-amd64.tar.zst oaica-linux-amd64.tgz \
                    oaica-linux-arm64.tar.zst oaica-linux-arm64.tgz \
                    oaica-darwin-amd64.zip oaica-darwin-arm64.zip \
-                   oaica-windows-amd64.zip SHA256SUMS install.sh install.ps1; do
+                   oaica-windows-amd64.zip SHA256SUMS VERSION.txt \
+                   install.sh install.ps1; do
             [ -s "dist/$f" ] || { echo "missing dist/$f"; exit 1; }
           done
+          # The archive the installers actually fetch must be the versioned
+          # one, and its checksum must match what SHA256SUMS claims.
+          grep -qx "version=${VERSION#oaica-v}" dist/VERSION.txt \
+            || { echo "dist/VERSION.txt does not name ${VERSION#oaica-v}:"; cat dist/VERSION.txt; exit 1; }
+          (cd dist && sha256sum -c SHA256SUMS)
           ls -l dist/
+      - name: Generate SBOM (CycloneDX)
+        # Software bill of materials for the release: every Go module and
+        # version that went into these binaries, so a user can check what they
+        # are shipping without running a scanner themselves.
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: dist
+          format: cyclonedx-json
+          output-file: dist/oaica-${{ env.VERSION }}.sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest build provenance
+        # Signed (Sigstore, keyless) statement that these exact bytes were
+        # built by this workflow from this commit. Verify with:
+        #   gh attestation verify oaica-linux-amd64.tar.zst -R sprapp-com/oaica-code
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Upload build artifacts (dry run only)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oaica-${{ env.VERSION }}-dist
+          path: dist/
+          retention-days: 14
       - name: Create or update GitHub release
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

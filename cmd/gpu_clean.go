@@ -44,10 +44,10 @@ var orphanWorkerPatterns = []string{
 }
 
 type gpuHolder struct {
-	PID     int
-	PPID    int
-	Cmd     string
-	Orphan  bool
+	PID    int
+	PPID   int
+	Cmd    string
+	Orphan bool
 	// MemMiB is best-effort from nvidia-smi --query-compute-apps; 0 when
 	// nvidia-smi didn't report this PID (fuser found it, nvidia-smi's
 	// cached list didn't — itself a symptom of the same staleness this

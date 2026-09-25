@@ -438,7 +438,9 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 
 // decryptChunkedAESGCMStream reads the chunked AES-256-GCM frame format
 // (matches the encryption tool used to prepare HF-hosted models):
-//   repeated: [4-byte big-endian ciphertext_len][12-byte nonce][ciphertext+16-byte GCM tag]
+//
+//	repeated: [4-byte big-endian ciphertext_len][12-byte nonce][ciphertext+16-byte GCM tag]
+//
 // Decrypts one chunk at a time (8MB plaintext each) so memory use stays
 // flat regardless of file size — never buffers the whole (multi-GB) file.
 func decryptChunkedAESGCMStream(r io.Reader, w io.Writer, key []byte) (int64, error) {

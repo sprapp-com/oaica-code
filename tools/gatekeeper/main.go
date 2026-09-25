@@ -38,7 +38,7 @@ import (
 
 type gkConfig struct {
 	Tiers        map[string]int    `json:"tiers"`
-	Keys         map[string]string `json:"keys"`         // key -> tier name
+	Keys         map[string]string `json:"keys"`          // key -> tier name
 	UpstreamAddr string            `json:"upstream_addr"` // default "http://127.0.0.1:30099"
 	ListenAddr   string            `json:"listen_addr"`   // default ":30098"
 }
@@ -137,8 +137,10 @@ func main() {
 		}
 	}()
 
-	upstreamURL, err := url.Parse(g.cfg.UpstreamAddr)
-	if err != nil {
+	// Fail fast on a bad initial upstream_addr. The parsed value itself is not
+	// kept: the Director below re-parses the address on every request so that
+	// a SIGHUP reload takes effect, so this is a startup check only.
+	if _, err := url.Parse(g.cfg.UpstreamAddr); err != nil {
 		log.Fatalf("gatekeeper: bad upstream_addr %q: %v", g.cfg.UpstreamAddr, err)
 	}
 	// Resolve the upstream for every request so a SIGHUP config reload changes

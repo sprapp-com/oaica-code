@@ -58,8 +58,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -1320,11 +1320,11 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 	g.ledgerMu.Lock()
 	if g.ledger != nil {
 		if _, err := g.ledger.Write(append(b, '\n')); err != nil {
-		// Audit L14: a silent failure here silently loses billing rows
-		// (disk full, fd closed). One log line per failure is cheap; the
-		// request still serves.
-		log.Printf("ledger write failed: %v", err)
-	}
+			// Audit L14: a silent failure here silently loses billing rows
+			// (disk full, fd closed). One log line per failure is cheap; the
+			// request still serves.
+			log.Printf("ledger write failed: %v", err)
+		}
 	}
 	g.ledgerMu.Unlock()
 
@@ -1496,8 +1496,6 @@ func newRequestID() string {
 
 // processStart is the fallback "created" timestamp for /models entries.
 var processStart = time.Now().Unix()
-
-
 
 // completionHandler is the metered proxy path for /v1/chat/completions and
 // /v1/completions. It reads the (capped) body once to: validate the model id

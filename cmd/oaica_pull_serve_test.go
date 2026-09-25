@@ -73,7 +73,7 @@ func TestAutoPopulateModelManifest_NeverPanicsOnManifestError(t *testing.T) {
 	// fail. autoPopulateModelManifest must degrade to a warning, not panic
 	// or return an error that could fail the pull itself.
 	t.Setenv("HOME", "")
-	t.Setenv("USERPROFILE", "") // Windows equivalent, belt and suspenders
+	t.Setenv("USERPROFILE", "")                              // Windows equivalent, belt and suspenders
 	autoPopulateModelManifest("my-model", "/some/path.gguf") // must not panic
 }
 
