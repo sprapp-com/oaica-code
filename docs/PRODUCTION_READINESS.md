@@ -17,7 +17,8 @@ reality disagree.
 ## 2. Tier profiles ("our own /opusplan")
 
 **Done.** `cmd/launch/tier_plan_profiles.go` + `oaica plan set/list/show/rm`.
-A plan is a named (Model, SonnetModel) pair stored in `~/.oaica/plans.json`;
+A plan is a named Model/SonnetModel/HaikuModel/OversizeModel/RoutePolicy
+record stored in `~/.oaica/plans.json`;
 `oaica launch claude --plan NAME` resolves it upstream of `buildTierPlan`,
 so it reuses `tierPlan`/`proxyRouteTable` unchanged — no new routing path.
 Model and sonnet-model may be on entirely different remotes (confirmed: one

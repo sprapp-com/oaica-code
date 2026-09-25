@@ -46,25 +46,36 @@ use it, pick one (or mix them):
 
 ```shell
 oaica signin                                       # or: export OAICA_API_KEY=...  (key from https://oaica.com)
-oaica run oaica-35b-a3b-vision "hello"
-oaica launch claude --model oaica-35b-a3b-vision    # run Claude Code against it (installs claude with --yes)
+oaica run kat-awq "hello"
+oaica launch claude --model kat-awq                 # run Claude Code against it (prompts to install claude)
 ```
 
-Hosted models: `oaica-35b-a3b-vision` (262k context, vision, MTP) and
-`oaica-nemotron-30b-a3b` (262k context, reasoning + tools).
+`--yes` is the launcher's own confirm flag, and the command above does not pass
+it: a non-interactive launch without it errors `Claude Code is not installed;
+re-run with --yes to install it` when Claude Code is missing.
+
+Hosted models: `kat-awq` and `oaica-nemotron-30b-a3b`, both 262,144 context
+(`tools/a100b/gateway.json` — the served config, and so the authority on what
+actually runs). The repo catalog `models/models.json` advertises a larger
+window (1048576) for `oaica-35b-a3b-vision`, which is why `oaica launch`
+budgets against what the live probe returns rather than any number written
+down here.
 
 Multi-model launches (v0.5.0+): a plain interactive
-`oaica launch claude` walks a wizard — primary, then Sonnet/execution
-tier, then the Haiku tier (Claude Code's background work: titles, topic
-detection — unset, a split launch bills those calls at the primary's price,
-while a plain native launch keeps Claude Code's own Haiku),
+`oaica launch claude` walks a wizard — when `~/.oaica/plans.json` has entries
+its first prompt offers to reuse the plan last launched from this directory
+(Enter), pick another saved plan, or start from scratch — then primary, then
+the Sonnet/execution tier, then the Haiku tier (Claude Code's background work:
+titles, topic detection — unset, a split launch bills those calls at the
+primary's price, while a plain native launch keeps Claude Code's own Haiku),
 then a compaction/oversize model (only models whose probed
 context window is at least the primary's are offered — an equal
 window can still take over when the primary fails, though the size
 crossover itself needs strictly larger), then a route
 policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)
 with cross-leg failover via a health circuit breaker — and can save the
-whole setup as a named plan. Same knobs exist as flags
+whole setup as a named plan (Enter at the save prompt overwrites the last-used
+plan name, blank skips). Same knobs exist as flags
 (`--sonnet-model`, `--haiku-model`, `--oversize`, `--route-policy`). Set the
 tiers once with
 `oaica config set sonnet-model <model>` / `oaica config set haiku-model
@@ -113,6 +124,13 @@ Remotes are stored in `~/.oaica/remotes.json`. Built-in providers include
 | `oaica signin` / `oaica signout` | Save or remove your OAICA API key |
 | `oaica site new\|edit\|preview\|deploy` | Optional static site builder |
 | `oaica gpu ps\|clean` | Inspect / clean up local GPU-memory-holding processes |
+| `oaica agent [PROMPT]` | Run a streaming coding agent |
+| `oaica doctor` | Read-only check of launch routing: remote reachability, route policies, daemon leg (exit 1 on a failed remote probe) |
+| `oaica usage` | Summarize this machine's launch traffic (`~/.oaica/requests.log`): requests, errors, routing per model/backend |
+| `oaica auth login\|list\|logout` | Store model-provider credentials in `~/.oaica/auth.json` |
+| `oaica provider login\|list\|logout` | Same `~/.oaica/auth.json` store as `oaica auth` (hidden alias) |
+| `oaica router login\|list\|logout` | Manage provider backends on the api.oaica.com router (requires `OAICA_ADMIN_KEY`) |
+| `oaica claude-login` | Sign in to the real Claude Code on your own Anthropic account, bypassing OAICA entirely |
 
 `oaica list`, `ps`, `rm`, `show`, `cp`, `create`, and `push` are upstream
 Ollama daemon commands, kept for compatibility — they only work if you
@@ -122,16 +140,24 @@ reference on any command.
 
 ## Configuration & files
 
-Everything lives under `~/.oaica/`:
+Everything lives under `~/.oaica/` (created owner-only, mode 0700):
 
 | Path | Contents |
 |---|---|
 | `~/.oaica/api_key` | Saved OAICA API key (`oaica signin`) |
+| `~/.oaica/auth.json` | Stored model-provider credentials (`oaica auth`) |
+| `~/.oaica/aliases.json` | User-defined model-name shortcuts (`oaica model alias`) |
 | `~/.oaica/config.json` | Standing launch tiers — `sonnet_model`, `haiku_model` (`oaica config`) |
 | `~/.oaica/license_key` | Saved license key |
+| `~/.oaica/license.json` | Activation state for a purchased license (`oaica activate`); distinct from `license_key` |
+| `~/.oaica/local_servers.json` | Runtime state of running `oaica serve` instances (rewritten on every start/stop) |
 | `~/.oaica/models.json` | Local model manifest (`oaica model`) |
 | `~/.oaica/plans.json` | Named tier plans (`oaica plan`) |
 | `~/.oaica/remotes.json` | User-defined remotes (`oaica remote`) |
+| `~/.oaica/model_picks.json` | Picker frequency/recency state (which models you actually pick) |
+| `~/.oaica/picker_cache.json` | Cached picker inventory, so a launch doesn't re-probe everything |
+| `~/.oaica/requests.log` | Local launch traffic log — model, backend label, sizes, status, never content (`oaica usage`) |
+| `~/.oaica/cache/` | Cached probe answers: `providers/`, `models/`, `cloud_limits/` |
 | `~/.oaica/models/` | Downloaded GGUF weights (`oaica pull`) |
 | `~/.oaica/update_check.json` | Update-check state |
 
@@ -140,6 +166,7 @@ Environment variables:
 | Variable | Purpose |
 |---|---|
 | `OAICA_API_KEY` | Hosted API key (overrides the saved one) |
+| `OAICA_ADMIN_KEY` | Operator admin key — `oaica router`'s provider-registry commands require it, and `OAICA_API_KEY` will not do ("auth commands need the operator admin key"); `oaica auth` writes the local store and needs no admin key |
 | `OAICA_LICENSE_KEY` | License key for gated models |
 | `OAICA_HOST` | Override the hosted API base URL |
 | `OAICA_NO_UPDATE_CHECK` | Set to disable the update-check notice |

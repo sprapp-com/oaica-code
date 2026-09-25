@@ -64,10 +64,14 @@ laptop only -- it must never appear in this repo.
   chunk. Every completion is appended to the JSONL ledger (request id, key
   label, model, prompt/completion tokens, status, latency, `usage_seen`).
 - Non-streaming requests are clamped to **4096** output tokens (down from
-  8192) and get an HTTP 504 if they haven't finished within 90s — use
-  `stream:true` for longer replies.
-- Everything else is 404 before touching the proxy (vLLM's /metrics,
-  /tokenize, dev endpoints are unreachable from the public key).
+  8192) and get an HTTP 504 if the upstream hasn't answered within the 600 s
+  response-header timeout (900 s per-request wall clock) — use `stream:true`
+  for longer replies.
+- The mux also serves `/v1/messages` (Anthropic wire), `/v1/manifest/`,
+  `/v1/pull/` and `/v1/catalog` (the `oaica pull` routes); only the catch-all
+  `/` returns 404. Everything else — vLLM's /metrics, /tokenize, dev
+  endpoints — is 404 before touching the proxy and unreachable from the
+  public key.
 - SIGHUP reloads config and rebuilds the upstream proxy; a bad file is
   rejected and the previous config kept -- reload never kills the gateway.
 

@@ -102,9 +102,13 @@ every place that was tried (and the fix when the router rejected the key).
   primary (one proxy = one base URL + key).
 - Router and daemon models bypassed the translation proxy: Claude Code was
   pointed straight at the host and expected it to speak `/v1/messages`. The
-  public gateway only speaks `/v1/chat/completions`, so a fresh install's
+  public gateway spoke only `/v1/chat/completions` then (it has since added
+  `/v1/messages` on the Anthropic wire plus the `/v1/manifest/`, `/v1/pull/`
+  and `/v1/catalog` pull routes, and `kat-awq` still does not serve the
+  Anthropic wire on its own), so a fresh install's
   `launch claude --model kat-awq` died with `unrecognized_model`. Now every
-  source goes through the proxy.
+  source goes through the proxy, except a native `claude/*` / `anthropic/*`
+  leg, which bypasses it entirely by design.
 
 ## Security notes
 
@@ -132,7 +136,11 @@ every place that was tried (and the fix when the router rejected the key).
   turn-to-turn instead of scattering across replicas under plain leastconn.
   A backend with no such LB just ignores the header.
 - Tool calling is gated per endpoint (`--force-tools` downgrades refusal to
-  a warning).
+  a warning). It is a launcher-level flag but is NOT registered as a
+  top-level one, so it must come after `--`:
+  `oaica launch claude --model X -- --force-tools` (a bare `--force-tools`
+  errors with `unknown flag`). `--brief-mode` is the same, and is otherwise
+  undocumented.
 - Upstream streaming is bounded only by connection setup and by Claude Code
   disconnecting — a slow local model may stream as long as it needs.
 - Ollama cloud models (`…:cloud`) need `ollama signin` on the daemon.
@@ -244,45 +252,62 @@ using it, plus `"weight": N` (see `weighted`, above) to opt that remote
 into consistent-hash traffic distribution; the `--route-policy` flag wins
 over the remote's own default, and `--shard` overrides `weight` for a
 single launch without editing the file. `oaica doctor` prints every
-remote's reachability + wire + route_policy and the daemon leg — exit 1 on any
-failing probe, so cron/scripts can grep.
+remote's reachability + wire + route_policy and the daemon leg — exit 1 when
+a configured remote's `/models` probe fails or its `route_policy` is invalid,
+so cron/scripts can grep. An unreachable local daemon does NOT fail: it
+prints "unreachable (fine ...)".
 
 ## Interactive launch wizard (2026-08-31)
 
-A plain interactive `oaica launch claude` (no explicit `--model`, no
-tier/policy/oversize/plan flags) now walks the remaining tiers after the
-picker:
+A plain interactive `oaica launch claude` (no tier/policy/oversize/plan/shard
+flag passed) now walks the remaining tiers after the picker:
 
-1. **Primary model** — the existing picker (unchanged).
-2. **Sonnet/subagent tier** — same picker list, `(same as primary)` first and
-   the default (Enter keeps the single-model launch).
-3. **Haiku tier** — the cheap leg for Claude Code's background work; same
-   picker list, `(same as primary)` default. Setting this is the one step
-   that removes real spend (see the tier table above), so it is worth a
-   deliberate choice.
-4. **Compaction/oversize model** — only models whose PROBED context window
+1. **Saved plans** — offered whenever `~/.oaica/plans.json` has entries:
+   reuse the plan last launched from this directory (Enter), pick another
+   saved plan, or start from scratch. A reused plan supplies every tier, so
+   the tier steps below are skipped.
+2. **Primary model** — the existing picker (unchanged).
+3. **Sonnet/subagent tier** — same picker list. It leads with a "keep your
+   tier for this launch" row when a standing `~/.oaica/config.json`
+   `sonnet_model` or a typed `--sonnet-model` exists (Enter keeps it), then
+   `auto`, then `(same as primary)`, then the rest; with nothing standing to
+   keep, `(same as primary)` leads and Enter keeps the single-model launch.
+4. **Haiku tier** — the cheap leg for Claude Code's background work; same
+   picker list, same "keep" row for a standing `haiku_model` or a typed
+   `--haiku-model`, then `(same as primary)` default (no `auto`: there is no
+   "best recommended model" concept for cheap/background requests). Setting
+   this is the one step that removes real spend (see the tier table above),
+   so it is worth a deliberate choice.
+5. **Compaction/oversize model** — only models whose PROBED context window
    (the same 2s `/models` probe the proxy uses) is at least the primary's
    qualify (`>=` is deliberate: an equal-window independent backend can still
    take over when the primary fails near the ceiling, even though the size
-   crossover itself only fires for a strictly larger one — see below);
-   `(none — fail honestly at the ceiling)` is the default. With no probe
-   answer and no qualifying model, the step offers nothing.
-5. **Route policy** — five of the six `--route-policy` values
+   crossover itself only fires for a strictly larger one — see below).
+   The step opens with `(none — fail honestly at the ceiling)` (Enter) and a
+   "probe the catalog for a larger-context fallback" row: the catalog is not
+   scanned on the launch path (hundreds of remotes, seconds each), so
+   discovery is that explicit opt-in. After a scan the candidates replace the
+   menu; with no probe answer and no qualifying model it says so.
+6. **Route policy** — five of the six `--route-policy` values
    (`auto` first and the default, then `local-first`, `remote-first`,
    `local-only`, `remote-only`). `weighted` is not offered: the wizard has no
    step for setting per-leg weights, so use `--shard` /
    `remotes.json` `"weight"` to pick it.
 
 A one-line preview prints (e.g. `fallback: a <-> b · oversize: c (256k) ·
-policy: remote-first`) and the choice can be saved as a named plan (blank
-skips): `oaica plan list` / `oaica plan show NAME` show the oversize +
-policy columns, `oaica plan set NAME --model a --sonnet-model b --oversize c
---route-policy remote-first` builds one by hand.
+policy: remote-first`) and the choice can be saved as a named plan: Enter at
+the save prompt overwrites the last-used plan name, blank skips, and a write
+failure warns and continues rather than losing the launch. `oaica plan list` /
+`oaica plan show NAME` show the oversize + policy columns, `oaica plan set
+NAME --model a --sonnet-model b --oversize c --route-policy remote-first`
+builds one by hand.
 
 Precedence for both non-primary tiers is the same ladder: **flag >
-`--plan`'s stored field > `~/.oaica/config.json`
+`--plan`'s stored field > wizard > `~/.oaica/config.json`
 (`sonnet_model`/`haiku_model`, set with `oaica config set`; a key is cleared
-with `oaica config set <key> -`) > wizard > same-as-primary**.
+with `oaica config set <key> -`) > same-as-primary**. An ANSWERED wizard step
+is a per-launch choice and outranks the standing config; a step left at Enter
+(its leading "keep" row, or `(same as primary)`) keeps the standing tier.
 
 A saved value that fails to RESOLVE is reported and ignored for that launch
 rather than failing it — a stale key must not break every launch in the fleet
@@ -298,13 +323,15 @@ at the first request instead. Check the launch's `tiers:` line, which prints
 what each tier actually resolved to. `oaica config show` prints both keys and
 the file path.
 
-One case is dropped without attribution: when the failure carries no tier
-prefix at all, which means it is the primary's own error — the only kind
-`buildTierPlan` does not wrap — and no saved value can influence it. BOTH saved
-keys are then ignored for that launch, and the warning says so in those words
-rather than blaming a value the error never named. The launch subsequently fails
-on the real error; the drop is only insurance that a stale key can never be the
-thing that breaks every launch in the fleet.
+An unattributed failure — one carrying no tier prefix at all, which means it is
+the primary's own error, the only kind `buildTierPlan` does not wrap and the one
+no saved value can influence — does NOT drop either saved key. It retries the
+identical plan once (resolution reaches the network, so a transient failure is
+possible) and, if the retry fails the same way, fails the launch on the real
+error. Only a failure whose message carries the `--sonnet-model:` or
+`--haiku-model:` prefix drops that one key: stripping a standing tier for an
+error it did not cause would silently turn the launch single-model at the
+primary's price, the exact cost `haiku_model` exists to remove.
 
 The tier is identified by the flag **prefix** on the error, not by the flag text
 appearing anywhere in it: the leg's own message quotes the model name it could
@@ -317,5 +344,9 @@ Plan > remotes.json `route_policy` > local-first also still holds for the
 route policy. Old plans.json files missing `oversize_model`/`route_policy`
 load unchanged (missing = empty = today's defaults).
 
-Flag-only and non-interactive launches (`--model`, `--yes`, scripts, cron)
-never see the wizard — their behavior is byte-identical.
+Any interactive, non-restore launch walks the wizard — a plain interactive
+`--model` included, whose Enter-key defaults keep what was typed — and it is
+skipped only when a tier/policy/oversize/plan/shard flag was passed. It never
+runs non-interactively: scripts and cron see no wizard at all, so their behavior
+is byte-identical. `--wizard` forces the steps past that gate and errors with
+`launch wizard: --wizard requires an interactive session` when non-interactive.

@@ -29,7 +29,7 @@ oaica model add oaica-35b-a3b-vision \
   --context-window 262144 \
   --max-output-tokens 32000 \
   --gpu-mem-gb 73 \
-  --notes "GPU0+GPU2 on a100b behind oaicalb; Mamba align mode needs max-num-batched-tokens>=2096"
+  --notes "GPU0+GPU1 on a100b behind oaicalb; Mamba align mode needs max-num-batched-tokens>=2096"
 ```
 
 `--engine` is one of `vllm`, `llama.cpp`, `prism-engine`, `ollama-daemon`,
@@ -100,10 +100,11 @@ field, so a `--plan` launch that wants weighting still needs `--shard` (or
 `remotes.json` weights) passed alongside `--plan` on the command line.
 
 The same setup can be built interactively: a plain `oaica launch claude`
-(no flags) walks a wizard — primary, Sonnet tier, Haiku tier (Claude Code's
-background work), compaction model (offering only models whose probed
-window is at least the primary's), route policy — and offers to save the
-result as a plan. The two secondary tiers can also be set once for every launch with
+(no flags) walks a wizard — when saved plans exist its first prompt offers to
+reuse the plan last launched from this directory — then primary, Sonnet tier,
+Haiku tier (Claude Code's background work), compaction model (offering only
+models whose probed window is at least the primary's), route policy — and
+offers to save the result as a plan. The two secondary tiers can also be set once for every launch with
 `oaica config set sonnet-model <model>` / `oaica config set haiku-model
 <model>` (a flag or a plan still wins).
 
@@ -113,11 +114,11 @@ oaica plan show oaica-full
 oaica plan rm oaica-full
 ```
 
-A plan is resolved before anything else in `oaica launch claude`: it just
-fills in `--model`/`--sonnet-model` if you didn't pass them explicitly. An
-explicit `--model` (or `--sonnet-model`) on the command line always wins
-over the plan's value for that field — a plan is a default, not an
-override.
+A plan is resolved before anything else in `oaica launch claude`: it fills in
+`--model`, `--sonnet-model`, `--haiku-model`, `--oversize` and the route
+policy, and only for the fields the flags left empty. An explicit flag on the
+command line always wins over the plan's value for that field — a plan is a
+default, not an override.
 
 ## GPU housekeeping (self-hosting on your own box)
 
@@ -138,12 +139,16 @@ a process that still has a live parent, even one it doesn't recognize.
 
 ## Discovery, drift-safety, and manual refresh
 
-The picker's "Local Models" / "Remote Models" / "Recommended" / "More"
-sections are never cached across launches — every `oaica launch`/`oaica
-model` invocation is a fresh process with no persistent state, so a plain
-`ollama pull <model>` or a `~/.oaica/remotes.json` edit is visible on the
-very next launch automatically. There is nothing to "refresh" in the
-common case; it already is.
+The picker's "Local Models" / "Remote Models" / "OAICA Models" / "More"
+sections are rendered from a disk cache at `~/.oaica/picker_cache.json`:
+trusted fresh for one hour (`pickerCacheTTL`), and for up to six hours more
+it paints instantly while a background refresh rewrites it
+(`pickerCacheGrace`). So a plain `ollama pull <model>` or a
+`~/.oaica/remotes.json` edit is normally visible on the next launch, but
+within the hour it may not be — `oaica model refresh` forces a live probe
+when it is not, and `oaica launch --refresh` (or the picker's own refresh
+row) does the same for one launch. Past the grace window the cache is
+ignored entirely and the full load runs.
 
 **If Ollama (or a remote) changes its response format**, the picker
 degrades safely instead of corrupting: local models are parsed into typed

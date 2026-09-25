@@ -249,7 +249,8 @@ completions, `internal-91` key, 2026-08-29):
 **Recommendation, already the current architecture**: keep the
 **subscription** layer flat-monthly (Starter/Pro/Team), gated by
 **token-based** rolling-window caps (5h/weekly — see `checkWindowCap` in
-`tools/meterhub`), not request-count caps. Bill the **metered/API** tier
+`tools/gateway/main.go`; `tools/meterhub` holds the caps data it enforces),
+not request-count caps. Bill the **metered/API** tier
 strictly per-token (`gwPricing`, `computeCostUSD`, cache-hit pricing,
 overage billing — all live). Request count is fine as a secondary
 abuse/rate-limit signal, never as the primary billing unit for this
@@ -307,7 +308,8 @@ becomes the binding constraint.
 
 **Bottom line**: ~60 subscribers on this Starter/Pro mix covers the
 1x-A100 GPU cost with healthy margin, and the rolling-window token caps
-(already built and enforced — see `tools/meterhub`'s `checkWindowCap`)
+(already built and enforced — `checkWindowCap` lives in
+`tools/gateway/main.go` and reads its caps data from `tools/meterhub`)
 are what make this safe: they bound worst-case cost per subscriber
 regardless of how heavy any individual user's real usage gets.
 
@@ -425,10 +427,11 @@ before launch: meter and price unattended/scripted usage differently
 from interactive sessions, not lump them into the same cap.
 
 **Status:** proposal only. Before deploying: (1) add automation-tier
-metering (see risk above), (2) verify `tools/meterhub` can enforce
-request-count caps, not just token-count caps — it currently only
-implements `checkWindowCap` for tokens (see the single-GPU section
-above), so this needs new plumbing, not just a rate-card change.
+metering (see risk above), (2) verify the gateway can enforce
+request-count caps, not just token-count caps — `checkWindowCap` (in
+`tools/gateway/main.go`, reading its caps data from `tools/meterhub`)
+only handles tokens (see the single-GPU section above), so this needs
+new plumbing, not just a rate-card change.
 
 ## "Unlimited" tier, rate-limited by concurrency, not tokens/requests —
 ## alternative proposal (2026-09-07)
@@ -442,7 +445,10 @@ headline number, but the real enforcement is "3-4 / 4-5 / 6-7 concurrent
 agents" per tier — the token estimate is marketing dressing).
 
 **Why this fits our infra specifically:** both production replicas run
-`--max-num-seqs 18` (verified live, 2026-09-07, ports 30110 and 30111) —
+`--max-num-seqs 18` (verified live, 2026-09-07; the production backends are the
+LB's pair — ports 30106 and 30108 in `tools/a100b/oaicalb.json`. The
+30110/30112 entries in the stale `vllm_awq_replicas.conf` and the watchdog's
+REPLICAS default are not live production replicas) —
 a hard admission-control cap on simultaneous in-flight sequences per
 GPU, already enforced at the vLLM level regardless of what we sell on
 top of it. Capping concurrency *per subscriber* on top of this existing
@@ -631,17 +637,18 @@ influence it. The gateway reads the **real** `prompt_tokens` the engine
 returned (not client-declared, not estimated), bills cached prefix
 tokens at the flat $0.008 cache rate regardless of size, then bills the
 uncached remainder at the bracket rate selected by the whole-request
-prompt size (`tokens ≤ 32,768 → $0.05`, `≤ 131,072 → $0.06`,
+prompt size (`tokens <= 32,000 → $0.05`, `<= 128,000 → $0.06`,
 otherwise `$0.10`). One over-128k request pays $0.10/M on *all* its
 uncached input; a cache-heavy retry of the same prompt pays $0.008 on
 the hit and $0.10/M only on the fresh tail. Output bills at $0.28/M
 independent of bracket. `price_tier` in the meterhub ledger records the
 bracket per request — past-hour split under ~3× load: 49 / 690 / 261.
 
-The fleet is homogeneous: all four replicas (GPU0/1/2/7) are the same
-checkpoint, launch tier (256k) and capacity (262k ctx, 18 seqs), behind
-leastconn + session-hash LB. Brackets are per-request pricing, never
-per-GPU — no GPU, queue or routing difference exists between prompt
+The LB fronts two replicas (GPU0+GPU1), the same checkpoint, launch tier (256k)
+and capacity (262k ctx, 18 seqs), behind leastconn + session-hash LB — GPU2 was
+released back to other tenants 2026-08-29 and GPU7 runs nemotron, so any
+capacity maths must not assume four replicas. Brackets are per-request pricing,
+never per-GPU — no GPU, queue or routing difference exists between prompt
 sizes. Possible follow-up if cost data warrants: a >200k bracket
 (p95 latency rises steeply past ~130k prompts) and a >1000-records/hr
 meterhub aggregate query (the `/usage` list endpoint caps at 1000 rows,
