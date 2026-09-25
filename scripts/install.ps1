@@ -51,6 +51,15 @@ $ProgressPreference = "SilentlyContinue"
 # --------------------------------------------------------------------------
 
 $Version      = if ($env:OAICA_VERSION) { $env:OAICA_VERSION } else { "" }
+
+# Either spelling pins: a bare semver (0.5.46) or the full tag the releases
+# page shows (oaica-v0.5.46). Only "v" used to be stripped — and TrimStart('v')
+# strips every leading "v" — so a tag produced the prefix twice
+# ("oaica-voaica-v0.5.46", a 404), which is exactly what a user copying the
+# tag from the releases page typed (2026-09-26 audit). Normalise once, here.
+$VersionPin = $Version
+if ($VersionPin.StartsWith("oaica-v")) { $VersionPin = $VersionPin.Substring(7) }
+elseif ($VersionPin.StartsWith("v")) { $VersionPin = $VersionPin.Substring(1) }
 $InstallDir   = if ($env:OAICA_INSTALL_DIR) { $env:OAICA_INSTALL_DIR } else { "" }
 $Uninstall    = $env:OAICA_UNINSTALL -eq "1"
 $DebugInstall = [bool]$env:OAICA_DEBUG
@@ -83,7 +92,7 @@ if ($env:OAICA_DOWNLOAD_BASE) {
 } elseif ($env:OAICA_DOWNLOAD_URL) {
     $DownloadBaseURL = $env:OAICA_DOWNLOAD_URL.TrimEnd('/')
 } elseif ($Version) {
-    $DownloadBaseURL = "https://github.com/$Repo/releases/download/oaica-v$($Version.TrimStart('v'))"
+    $DownloadBaseURL = "https://github.com/$Repo/releases/download/oaica-v$VersionPin"
 } else {
     $DownloadBaseURL = "https://github.com/$Repo/releases/latest/download"
 }
@@ -273,17 +282,20 @@ function Invoke-Uninstall {
 # --------------------------------------------------------------------------
 
 function Invoke-Install {
-    # OAICA is a thin CLI (talks to api.sprapp.com — OAICA_FORK_PLAN.md
+    # OAICA is a thin CLI (talks to api.oaica.com — OAICA_FORK_PLAN.md
     # option 2), not a GUI desktop app, so unlike upstream Ollama this
-    # ships a plain oaica.exe in a zip, not an Inno Setup installer — no
-    # Authenticode signature to verify either (no code-signing cert yet;
-    # see the TODO in Test-Signature above for when one exists).
+    # ships a plain oaica.exe in a zip, not an Inno Setup installer. Nothing
+    # here verifies an Authenticode signature: no code-signing certificate
+    # exists yet, so there is no signature to check. (An earlier version of
+    # this comment pointed at a Test-Signature function that was never
+    # written; the integrity guarantee on this path is the SHA256SUMS check
+    # in the download step, not a publisher signature.)
     if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
         throw "No Windows ARM64 build yet — only amd64."
     }
 
     if ($Version) {
-        Write-Host ">>> Installing OAICA $($Version.TrimStart('v'))"
+        Write-Host ">>> Installing OAICA $VersionPin"
     }
     $zipName = "oaica-windows-amd64.zip"
     $zipUrl = "$DownloadBaseURL/$zipName"

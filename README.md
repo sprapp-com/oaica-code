@@ -26,8 +26,8 @@ against the tag you asked for, and see
 detail.
 
 ```shell
-# pin an exact version — take the tag from the releases page
-OAICA_VERSION=<tag> curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
+# pin an exact version — the version number, or the full tag (oaica-v0.5.46)
+OAICA_VERSION=0.5.46 curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 # fetch from a mirror instead of GitHub (air-gapped hosts)
 OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 ```
@@ -76,6 +76,12 @@ oaica signin                                       # or: export OAICA_API_KEY=..
 oaica run kat-awq "hello"
 oaica launch claude --model kat-awq                 # run Claude Code against it (prompts to install claude)
 ```
+
+Gated models additionally need a one-off licence: `oaica activate <key>` once
+per machine (or `export OAICA_LICENSE_KEY=...`), which stores the activation in
+`~/.oaica/license.json` and revalidates in the background. The licence gate is
+a convenience paywall on the prebuilt binary, not DRM — the source is MIT, so a
+self-build needs no key.
 
 `--yes` is the launcher's own confirm flag, and the command above does not pass
 it: a non-interactive launch without it errors `Claude Code is not installed;
@@ -149,6 +155,7 @@ Remotes are stored in `~/.oaica/remotes.json`. Built-in providers include
 | `oaica plan set\|list\|show\|rm` | Named tier plans (e.g. plan on one model, execute on another) |
 | `oaica config show\|set` | Standing launch tiers: `sonnet_model`, `haiku_model` |
 | `oaica signin` / `oaica signout` | Save or remove your OAICA API key |
+| `oaica activate <key>` | One-time activation of a purchased license (`OAICA_LICENSE_KEY` also works); writes `~/.oaica/license.json` |
 | `oaica site new\|edit\|preview\|deploy` | Optional static site builder |
 | `oaica gpu ps\|clean` | Inspect / clean up local GPU-memory-holding processes |
 | `oaica agent [PROMPT]` | Run a streaming coding agent |

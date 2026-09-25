@@ -146,9 +146,9 @@ it paints instantly while a background refresh rewrites it
 (`pickerCacheGrace`). So a plain `ollama pull <model>` or a
 `~/.oaica/remotes.json` edit is normally visible on the next launch, but
 within the hour it may not be — `oaica model refresh` forces a live probe
-when it is not, and `oaica launch --refresh` (or the picker's own refresh
-row) does the same for one launch. Past the grace window the cache is
-ignored entirely and the full load runs.
+when it is not, and the picker's own refresh row does the same for one
+launch. Past the grace window the cache is ignored entirely and the full
+load runs.
 
 **If Ollama (or a remote) changes its response format**, the picker
 degrades safely instead of corrupting: local models are parsed into typed

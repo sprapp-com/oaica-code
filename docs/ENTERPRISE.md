@@ -22,7 +22,9 @@ describing this binary.
 
 ## Network connections
 
-Eight outbound paths exist. Nothing else in the client opens a socket.
+Eight paths the client itself opens. Nothing else in the client opens a socket.
+(One more exists only through a third-party tool you run deliberately: see
+row 9.)
 
 | # | Destination | When | What is sent | Off switch |
 |---|---|---|---|---|
@@ -34,13 +36,17 @@ Eight outbound paths exist. Nothing else in the client opens a socket.
 | 6 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
 | 7 | `api.lemonsqueezy.com` (`/v1/licenses`) | `oaica activate <key>` once, then a revalidation on `oaica launch` when the stored activation is older than 7 days | The licence key and this machine's activation id; the response says whether the licence is still valid | No switch while the licence gate is in force. A cached activation younger than 7 days makes no call, and an unreachable licence server keeps working for 30 days |
 | 8 | `huggingface.co`, or the router's own storage | Only when you run `oaica pull <model>` | `GET /v1/manifest/<model>` on your endpoint, then the weight bytes from the URL that manifest names — the router's storage, or HuggingFace when the manifest says `source=hf` | `oaica pull` is optional: point `OAICA_HOST` at a model already on disk and pull nothing |
+| 9 | `api.cloudflare.com` (and `*.pages.dev`), **via the `wrangler` CLI** | Only when you run `oaica site deploy DIR` and `wrangler` is installed and authenticated | Your site's build output, uploaded by `wrangler pages deploy` under your own Cloudflare account. The socket is opened by `wrangler`, not by this binary — oaica shells out rather than reimplementing the Pages API | Don't run `oaica site deploy`; the site builder is optional and `oaica site new|edit|preview` stay entirely local |
 
+The endpoint in row 1 defaults to `https://api.oaica.com` (an
 The endpoint in row 1 defaults to `https://api.oaica.com` (an
 OpenAI-compatible router) and is where the work actually goes. If prompts may
 not leave your network, point `oaica` at an endpoint inside it — a remote in
 `~/.oaica/remotes.json`, or `oaica pull` + `oaica serve` for a fully local
-model — and confirm with `oaica doctor`, whose output shows which remote each
-launch would use.
+model — and confirm with `oaica doctor`, which lists every configured remote
+with the route policy it would default a launch to, and probes each one live
+(the resolved policy still depends on the model and on any `--route-policy`
+flag, so doctor narrows the candidates rather than naming one).
 
 Row 5 exists because `oaica launch claude` (and `codex`, `kimi`, `hermes`,
 `opencode`, `dsh`, `pi`, …) will offer to install that agent from its
@@ -180,9 +186,19 @@ the client reads that path.)
 
 Three things you should know rather than assume:
 
-- **Pin the version in production.** `OAICA_VERSION=0.5.46` makes the installer
-  fetch `oaica-v0.5.46`'s assets, and the binary then reports that version. An
-  unpinned install is `releases/latest` at the moment you run it.
+- **Pin the version in production — with the release's own installer.** The
+  `curl …/releases/latest/download/install.sh | bash` line installs the *latest*
+  release's `install.sh`, which then resolves `OAICA_VERSION` to that version's
+  archive: `OAICA_VERSION=0.5.46` fetches `oaica-v0.5.46`'s archive and
+  `SHA256SUMS`, and the binary reports `0.5.46`. An unpinned install is
+  `releases/latest` at the moment you run it. Both spellings of the version are
+  accepted (`0.5.46` and the tag `oaica-v0.5.46`). One caveat before you rely on
+  the pin: **an `install.sh` published before 2026-09-26 ignores
+  `OAICA_VERSION`'s release and fetches its archive from `oaica.com/download`**,
+  the hand-maintained copy — `oaica-v0.5.46`'s asset does exactly this, so
+  pinning to it yields the 0.5.45 binary. Pin against a release whose asset
+  postdates that switch, and check `oaica --version` against the tag you asked
+  for.
 - **A mirror is supported first-class.** `OAICA_DOWNLOAD_BASE` points the
   installer at your own base URL, which wins over version resolution — that is
   the air-gapped path. Stage the archive and `SHA256SUMS` from a release into
@@ -257,9 +273,10 @@ matter for procurement:
 Facts you can verify on your own host, without reading the source:
 
 1. `oaica --version` — the version, and whether it matches what you pinned.
-2. `oaica doctor` — which remotes exist, which are reachable, and which remote
-   a launch would actually use. Read-only; exits non-zero if a configured
-   remote fails.
+2. `oaica doctor` — which remotes exist, which are reachable (a live
+   read-only `GET /models` per remote), and the route policy each would
+   default a launch to. Read-only; exits non-zero if a configured remote
+   fails its probe.
 3. `oaica doctor --report` — redacted support bundle: platform, config paths
    and their permissions, and *which* credentials are set (never their values).
    Safe to attach to a ticket; it refuses to print if it would leak.

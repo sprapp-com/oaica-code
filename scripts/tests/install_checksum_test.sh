@@ -62,6 +62,14 @@ if cmp -s "$ROOT/scripts/install.ps1" "$ROOT/site/install.ps1"; then
 else
     fail "scripts/install.ps1 and site/install.ps1 differ (cp site/install.ps1 scripts/install.ps1)"
 fi
+# The PowerShell installer has no shell harness to exercise (and pwsh is not
+# assumed present), so its version pinning gets a static check instead: the
+# release URL must interpolate the normalised $VersionPin, never
+# $Version.TrimStart('v') — TrimStart drops *every* leading 'v', so the full
+# tag form "oaica-v0.5.46" built "oaica-voaica-v0.5.46", a 404, the same
+# defect the install.sh case above pins (2026-09-26 audit).
+assert_contains "$(cat "$ROOT/scripts/install.ps1")" 'releases/download/oaica-v$VersionPin' "install.ps1: the release URL interpolates the normalised version"
+assert_not_contains "$(cat "$ROOT/scripts/install.ps1")" 'download/oaica-v$($Version.TrimStart' "install.ps1: the release URL does not re-strip only 'v'"
 
 ###########################################
 # 2. Extract the helper block
@@ -224,6 +232,11 @@ rc=0; out=$(run_sh "OAICA_VERSION=0.5.46 release_download_base") || rc=$?
 assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/download/oaica-v0.5.46" "release_download_base: OAICA_VERSION pins that tag"
 rc=0; out=$(run_sh "OAICA_VERSION=v0.5.46 release_download_base") || rc=$?
 assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/download/oaica-v0.5.46" "release_download_base: a leading 'v' is not doubled"
+# The spelling the releases page shows. Only "v" used to be stripped, so this
+# produced "oaica-voaica-v0.5.46" — a 404 for a user copying the tag.
+rc=0; out=$(run_sh "OAICA_VERSION=oaica-v0.5.46 release_download_base") || rc=$?
+assert_eq "$rc" "0" "release_download_base: the full tag form: exit 0"
+assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/download/oaica-v0.5.46" "release_download_base: the tag spelling is not doubled"
 rc=0; out=$(run_sh "OAICA_DOWNLOAD_BASE=https://mirror.example.com/oaica/ release_download_base") || rc=$?
 assert_eq "$out" "https://mirror.example.com/oaica" "release_download_base: OAICA_DOWNLOAD_BASE overrides, trailing slash dropped"
 rc=0; out=$(run_sh "OAICA_VERSION=0.5.46 OAICA_DOWNLOAD_BASE=https://mirror.example.com/oaica release_download_base") || rc=$?

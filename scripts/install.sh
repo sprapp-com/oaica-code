@@ -81,7 +81,14 @@ release_download_base() {
     fi
     repo="${OAICA_RELEASE_REPO:-sprapp-com/oaica-code}"
     if [ -n "${OAICA_VERSION:-}" ]; then
-        printf 'https://github.com/%s/releases/download/oaica-v%s' "$repo" "${OAICA_VERSION#v}"
+        # Either spelling pins: a bare semver (0.5.46) or the full tag the
+        # releases page shows (oaica-v0.5.46). Only "v" used to be stripped,
+        # so a tag produced the tag prefix twice — "oaica-voaica-v0.5.46",
+        # a 404 — which is exactly what a user copying the tag from the
+        # releases page typed (2026-09-26 audit).
+        ver="${OAICA_VERSION#oaica-v}"
+        ver="${ver#v}"
+        printf 'https://github.com/%s/releases/download/oaica-v%s' "$repo" "$ver"
         return 0
     fi
     printf 'https://github.com/%s/releases/latest/download' "$repo"
@@ -190,7 +197,10 @@ fi
 ###########################################
 # Uninstall
 ###########################################
-# OAICA_UNINSTALL=1 curl -fsSL https://oaica.com/install.sh | bash
+# curl -fsSL https://oaica.com/install.sh | OAICA_UNINSTALL=1 bash
+# The variable must go to `bash`, not to `curl` — `OAICA_UNINSTALL=1 curl … |
+# bash` sets it only in curl's environment, so the piped shell never sees it
+# and the install runs instead of the uninstall.
 if [ -n "${OAICA_UNINSTALL:-}" ]; then
     UNINSTALL_SUDO=
     [ "$(id -u)" -ne 0 ] && available sudo && UNINSTALL_SUDO="sudo"

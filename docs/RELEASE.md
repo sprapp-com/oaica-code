@@ -13,10 +13,17 @@ Linux box. Two things ship per release and they must stay in sync:
    (There is no `oaica-com` project; `/mnt/ext9/cloudflare-pages/oaica-com`
    on the laptop is a stale copy of the landing page only.)
 
-   Pages serves only the *scripts* now — they fetch the archive and its
-   checksum from the GitHub release for the version being installed, so the
+   The scripts in `site/` are fixed: they fetch the archive and its checksum
+   from the GitHub release for the version being installed, so the
    hand-maintained `site/download/` copy is no longer on the install path and
-   a Pages deploy can no longer ship a wrong binary.
+   a Pages deploy can no longer ship a wrong binary. **But a Pages deploy is a
+   manual `wrangler pages deploy` that nothing forces anyone to run, so
+   "fixed in `site/`" and "fixed on oaica.com" are different states.** As of
+   2026-09-26 the deployed copy is *still* the old script: `curl
+   https://oaica.com/install.sh` returns one that hardcodes
+   `https://oaica.com/download`, and that path still serves
+   `version=0.5.45`. Until someone deploys, oaica.com is not on the new code —
+   check the live script, not `site/`, before claiming otherwise.
 
    The mirror is a convenience, not the install path: `README.md` and
    `docs/ENTERPRISE.md` both hand users the release's own
