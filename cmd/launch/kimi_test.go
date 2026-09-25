@@ -551,6 +551,12 @@ exit 0
 		t.Setenv("PATH", tmpDir)
 		kimiGOOS = "linux"
 		writeFakeBinary(t, tmpDir, "curl")
+		// Stub the installer download: the real fetchInstallerScript makes a
+		// live HTTPS request to code.kimi.com, so these subtests either paid a
+		// 10s TLS timeout or passed on whatever the network happened to do —
+		// a test whose result depends on someone else's server (2026-09-26).
+		restore := stubFetchInstallerScript(t)
+		defer restore()
 		if err := os.WriteFile(filepath.Join(tmpDir, "bash"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatalf("failed to write fake bash: %v", err)
 		}
@@ -575,6 +581,12 @@ exit 0
 		t.Setenv("PATH", tmpDir)
 		kimiGOOS = "linux"
 		writeFakeBinary(t, tmpDir, "curl")
+		// Stub the installer download: the real fetchInstallerScript makes a
+		// live HTTPS request to code.kimi.com, so these subtests either paid a
+		// 10s TLS timeout or passed on whatever the network happened to do —
+		// a test whose result depends on someone else's server (2026-09-26).
+		restore := stubFetchInstallerScript(t)
+		defer restore()
 		if err := os.WriteFile(filepath.Join(tmpDir, "bash"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatalf("failed to write fake bash: %v", err)
 		}
