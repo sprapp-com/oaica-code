@@ -142,6 +142,17 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 	}
 
 	report := ModelSyncReport{URL: display, FromCache: fromCache}
+	// Membership is checked by TRIMMED id, because that is what the add loop
+	// stores (see the TrimSpace below). Looking up the raw catalog key made
+	// --prune delete the very row the same run had just added whenever a
+	// catalog key carried whitespace — one command reporting a model as both
+	// added and pruned (2026-09-26 audit).
+	inCatalog := make(map[string]bool, len(catalog.Models))
+	for listed := range catalog.Models {
+		if id := strings.TrimSpace(listed); id != "" {
+			inCatalog[id] = true
+		}
+	}
 	for _, listed := range catalog.SortedIDs() {
 		// The manifest keys on the exact id, and `model add` trims while this
 		// loop used to store the catalog key verbatim — so a stray space in a
@@ -222,7 +233,7 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 				if entry.SourceURL != "" && entry.SourceURL != display {
 					continue
 				}
-				if _, inCatalog := catalog.Models[id]; inCatalog {
+				if inCatalog[id] {
 					continue
 				}
 				m.Remove(id)

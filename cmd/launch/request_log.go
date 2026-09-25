@@ -182,7 +182,7 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 				Timestamp:        time.Now().UTC().Format(time.RFC3339),
 				Model:            modelField.Model,
 				Path:             r.URL.Path,
-				Backend:          redactCredentials(targetBaseURL),
+				Backend:          redactBaseURL(targetBaseURL),
 				LastMessageLen:   lastLen,
 				TotalMessagesLen: totalLen,
 				HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),

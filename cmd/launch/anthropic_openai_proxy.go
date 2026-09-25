@@ -1403,7 +1403,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			Timestamp:        time.Now().UTC().Format(time.RFC3339),
 			Model:            anthReq.Model,
 			Path:             r.URL.Path,
-			Backend:          route.Label + " " + redactCredentials(route.BaseURL),
+			Backend:          route.Label + " " + redactBaseURL(route.BaseURL),
 			LastMessageLen:   lastLen,
 			TotalMessagesLen: totalLen,
 			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
@@ -1485,6 +1485,17 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	respBody, err := io.ReadAll(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+err.Error())
+		return
+	}
+	// An upstream can answer a JSON error object over HTTP 200 (vLLM and this
+	// fleet's own gateway both do), and the streaming path refuses that shape
+	// (see upstreamErrorMessage). Here it decoded as an empty response: the
+	// client got no content and stop_reason "", the prompt estimate was
+	// written into input_tokens, and the route's breaker recorded a healthy
+	// 200 — a dead turn reported as a successful one that consumed tokens
+	// (2026-09-26 audit).
+	if msg := upstreamErrorMessage(string(respBody)); msg != "" {
+		writeAnthropicError(w, http.StatusBadGateway, "upstream error: "+msg)
 		return
 	}
 	var oaiResp openAIChatResponse
@@ -1795,9 +1806,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 	}
 	events := conv.Process(doneResp)
-	if cached > 0 {
+	if finalUsage != nil {
+		// The converter only overwrites message_start's seeded estimate when
+		// PromptEvalCount > 0, which is right for a done event that states
+		// nothing — but here the upstream DID state usage, and an upstream
+		// that reports the whole prompt as cache-read leaves the uncached
+		// count at 0. The converter then kept the pre-turn estimate, so the
+		// client was told input_tokens = the full prompt AND
+		// cache_read_input_tokens = the same full prompt: 2x the real prompt
+		// for a fully-cached turn, and Claude Code's context meter and
+		// auto-compaction sum both fields (2026-09-26 audit). Usage was
+		// stated, so this owns the field.
 		for i := range events {
 			if d, ok := events[i].Data.(anthropic.MessageDeltaEvent); ok {
+				d.Usage.InputTokens = finalUsage.PromptTokens - cached
 				d.Usage.CacheReadInputTokens = cached
 				events[i].Data = d
 			}

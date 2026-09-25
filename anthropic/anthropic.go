@@ -923,7 +923,29 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 	}
 
 	for _, tc := range r.Message.ToolCalls {
-		if c.toolCallsSent[tc.ID] {
+		argsJSON, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			slog.Error("failed to marshal tool arguments", "error", err, "tool_id", tc.ID)
+			continue
+		}
+
+		// An upstream that omits tool-call ids used to lose calls here: the
+		// dedup map is keyed by id, so every id-less call after the first
+		// looked like one already sent and was skipped — two parallel calls
+		// in, one out, still reported as stop_reason "tool_use"
+		// (2026-09-26 audit; several OpenAI-compatible GGUF backends send no
+		// id). Such a message offers only the call itself as identity, so
+		// name+arguments becomes the key (two genuinely different parallel
+		// calls differ in arguments; two identical ones are
+		// indistinguishable), and the client gets a stable synthesized id to
+		// echo back in tool_result.
+		key := tc.ID
+		id := tc.ID
+		if key == "" {
+			key = "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
+			id = "call_" + shortToolCallID(key)
+		}
+		if c.toolCallsSent[key] {
 			continue
 		}
 
@@ -952,11 +974,6 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			c.textStarted = false
 		}
 
-		argsJSON, err := json.Marshal(tc.Function.Arguments)
-		if err != nil {
-			slog.Error("failed to marshal tool arguments", "error", err, "tool_id", tc.ID)
-			continue
-		}
 		events = append(events, StreamEvent{
 			Event: "content_block_start",
 			Data: ContentBlockStartEvent{
@@ -964,7 +981,7 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 				Index: c.contentIndex,
 				ContentBlock: ContentBlock{
 					Type:  "tool_use",
-					ID:    tc.ID,
+					ID:    id,
 					Name:  tc.Function.Name,
 					Input: api.NewToolCallFunctionArguments(),
 				},
@@ -991,7 +1008,7 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			},
 		})
 
-		c.toolCallsSent[tc.ID] = true
+		c.toolCallsSent[key] = true
 		c.contentIndex++
 	}
 
@@ -1066,6 +1083,21 @@ func generateID(prefix string) string {
 // GenerateMessageID generates a unique message ID
 func GenerateMessageID() string {
 	return generateID("msg")
+}
+
+// shortToolCallID derives a stable, opaque id for a tool call the upstream
+// sent without one. Deterministic (same call, same id) so a re-Process of the
+// same id-less message dedups instead of emitting the block twice, and unique
+// per distinct call so two parallel calls stay two blocks. FNV-1a, hex — small
+// enough to sit inside a tool_use id, and collision-resistant across the few
+// calls one message carries.
+func shortToolCallID(key string) string {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return strconv.FormatUint(uint64(h), 16)
 }
 
 func resolveImageSource(source *ImageSource) (api.ImageData, error) {

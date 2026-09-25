@@ -87,7 +87,7 @@ func TestModelInventoryResolveDoesNotRefreshCloudMiss(t *testing.T) {
 func TestPickerCacheRoundTripAndTTL(t *testing.T) {
 	withTempOaicaHome(t)
 	models := []LaunchModel{{Name: "oaica-35b-a3b-vision", Remote: true}, {Name: "ollama/kat-awq"}}
-	savePickerCache(models)
+	savePickerCache(models, pickerInputFingerprint())
 	got, stale, ok := loadPickerCache()
 	if !ok || stale || len(got) != 2 || got[0].Name != "oaica-35b-a3b-vision" {
 		t.Fatalf("round trip: ok=%v stale=%v models=%v", ok, stale, got)
@@ -129,7 +129,7 @@ func TestPickerCacheIsVoidedByARemotesEdit(t *testing.T) {
 
 	// A cache written by a launch a moment ago: the config as it was, which
 	// knows nothing of the box about to be added.
-	savePickerCache([]LaunchModel{{Name: "old/model", Remote: true}})
+	savePickerCache([]LaunchModel{{Name: "old/model", Remote: true}}, pickerInputFingerprint())
 	if _, stale, ok := loadPickerCache(); !ok || stale {
 		t.Fatalf("premise broken: a fresh cache must load (ok=%v stale=%v)", ok, stale)
 	}

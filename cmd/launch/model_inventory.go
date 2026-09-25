@@ -42,7 +42,28 @@ type LaunchModel struct {
 	// display-only picker id (ollama-cloud catalog: "ollama/gpt-oss" →
 	// upstream "gpt-oss:cloud"). Empty = Name is itself upstream.
 	Upstream string
+	// LiveSource names the RUNTIME source a row was built from, when that
+	// source is process state rather than configuration: liveSourceDaemon (the
+	// local Ollama daemon's /api/tags list) or liveSourceLocal (a running
+	// `oaica serve`, from local_servers.json plus its own /health probe).
+	// Empty = the row comes from a file or a fetched document.
+	//
+	// The cache-hit path re-derives every row carrying one of these and drops
+	// the cached copy, which is what makes `ollama pull`/`ollama rm` and a
+	// crashed `oaica serve` show up on the very next launch. Only the PRODUCER
+	// can label a row this way: the name alone cannot. "ollama/<id>" is both a
+	// daemon row (a bare local model, prefixed for the picker) and an
+	// ollama-cloud catalogue row; "<model>:local" is not a daemon row at all.
+	// A name-shaped predicate got both of those wrong in opposite directions
+	// (2026-09-26 audit).
+	LiveSource string `json:"live_source,omitempty"`
 }
+
+// The two live row families, as stamped on LaunchModel.LiveSource.
+const (
+	liveSourceDaemon = "daemon"
+	liveSourceLocal  = "local"
+)
 
 type modelInfo = LaunchModel
 
@@ -126,15 +147,19 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 	if !force {
 		models, stale, ok := loadPickerCache()
 		if ok {
-			// The daemon's own list is the one source a cache cannot hold. It
-			// is runtime state with no file behind it, so `ollama pull` and
-			// `ollama rm` would be invisible for up to pickerCacheTTL — while
-			// `oaica model refresh`'s help promises a pull is discoverable on
-			// the next launch. It is also the one source that is cheap to
-			// re-read (a loopback /api/tags), so re-read it here and merge it
-			// in, leaving the expensive parts — the per-remote sweeps and the
-			// router — to the cache.
-			models = mergeLiveDaemonRows(ctx, i.client, models)
+			// Runtime state is what a cache cannot hold: the daemon's own model
+			// list (`ollama pull`/`ollama rm`), and a `oaica serve` that has
+			// started or died since the cache was written. Both are cheap to
+			// re-derive — a loopback /api/tags and a loopback /health — so they
+			// are re-derived here and the cached copies dropped, leaving the
+			// expensive parts (the per-remote sweeps and the router) to the
+			// cache. `oaica model refresh`'s help promises a pull is
+			// discoverable on the next launch; a picked "<model>:local" row
+			// whose server is gone is worse than a miss, since
+			// oaicaResolveHostForModel falls through to the CLOUD host for a
+			// tag no live server matches — the menu would route to a backend it
+			// does not name.
+			models = mergeLiveRows(ctx, i.client, models)
 			i.models = models
 			i.err = nil
 			i.loaded = true
@@ -148,6 +173,18 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 			return cloneLaunchModels(i.models), nil
 		}
 	}
+
+	// The fingerprint of the configuration this full load is about to read from,
+	// taken BEFORE the first source is touched. It is what savePickerCache
+	// stamps onto the rows below, and it must be the configuration they were
+	// actually built from: reading it at save time instead (the shape before
+	// this) recorded a mid-load edit — `oaica remote add` in another terminal, a
+	// concurrent launch, any of the cross-process writers the cache documents —
+	// as the provenance of rows that predate it. The cache then validated
+	// against the NEW configuration while holding the OLD rows, so the next
+	// launch trusted it and served a menu for a configuration it had never seen
+	// (2026-09-26 audit). Taken early, that same edit simply voids the cache.
+	inputs := pickerInputFingerprint()
 
 	// LOCAL models first, and independently of the router. A self-hosted user
 	// may have no router at all; a hosted user's router may be down. Neither
@@ -205,15 +242,31 @@ func (i *modelInventory) load(ctx context.Context, force bool) ([]LaunchModel, e
 			continue
 		}
 		seen[e.ID] = true
-		models = append(models, LaunchModel{Name: e.ID, Remote: true, Upstream: e.Upstream}.WithCloudLimits())
+		models = append(models, LaunchModel{
+			Name:       e.ID,
+			Remote:     true,
+			Upstream:   e.Upstream,
+			LiveSource: liveSourceForEntry(e.ID),
+		}.WithCloudLimits())
 	}
 
 	i.models = models
 	i.err = nil
 	i.loaded = true
-	savePickerCache(models)
+	savePickerCache(models, inputs)
 
 	return cloneLaunchModels(i.models), i.err
+}
+
+// liveSourceForEntry reports which live family a router/user-remote/cloud
+// entry belongs to, by the id the producer gave it: a "<model>:local" entry is
+// the local-serve family (see oaicaLiveModelEntriesErr). Everything else is
+// file- or document-backed and carries no live source.
+func liveSourceForEntry(id string) string {
+	if strings.HasSuffix(id, oaicaLocalTagSuffix) {
+		return liveSourceLocal
+	}
+	return ""
 }
 
 // daemonPickerRows reads the local daemon's model list and names the rows the
@@ -239,43 +292,79 @@ func daemonPickerRows(ctx context.Context, client *api.Client) ([]LaunchModel, b
 		if !strings.Contains(lm.Name, "/") && !strings.HasSuffix(lm.Name, oaicaLocalTagSuffix) {
 			lm.Name = ollamaPickerPrefix + lm.Name
 		}
+		lm.LiveSource = liveSourceDaemon
 		out = append(out, lm)
 	}
 	return out, true
 }
 
-// isDaemonRow reports whether a picker row came from the local daemon (or the
-// router's ":local" merge of a live `oaica serve`), i.e. the rows
-// mergeLiveDaemonRows replaces with a live read.
-func isDaemonRow(name string) bool {
-	return strings.HasPrefix(name, ollamaPickerPrefix) || strings.HasSuffix(name, oaicaLocalTagSuffix)
+// localServePickerRows lists the `oaica serve` instances running on this
+// machine as their "<model>:local" rows — the same rows the full load merges
+// out of oaicaLiveModelEntriesErr, derived the same way (the registry file plus
+// each origin's /health probe) so a cache hit and a forced load agree.
+//
+// Skipped when OAICA_HOST is set, matching the full load: pinning to one host
+// on purpose should not mix this machine's own servers into the menu.
+func localServePickerRows() []LaunchModel {
+	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" {
+		return nil
+	}
+	entries := oaicaLocalServerEntries()
+	out := make([]LaunchModel, 0, len(entries))
+	for _, e := range entries {
+		if e.Model == "" {
+			continue
+		}
+		out = append(out, LaunchModel{
+			Name:       e.Model + oaicaLocalTagSuffix,
+			Remote:     true,
+			LiveSource: liveSourceLocal,
+		}.WithCloudLimits())
+	}
+	return out
 }
 
-// mergeLiveDaemonRows replaces the cached daemon rows with a live read of the
-// daemon's list, keeping every other cached row and its order. A daemon that
-// does not answer leaves the cached list untouched — the cache is still the
-// better answer for everything else, and an unreachable daemon is not a reason
-// to empty the menu.
-func mergeLiveDaemonRows(ctx context.Context, client *api.Client, cached []LaunchModel) []LaunchModel {
-	live, ok := daemonPickerRows(ctx, client)
-	if !ok {
-		return cached
+// mergeLiveRows re-derives the live row families on a cache hit and replaces
+// their cached copies, keeping every other cached row and its order.
+//
+// What counts as live is the row's source, not its name (see
+// LaunchModel.LiveSource): the daemon family is dropped only when the daemon
+// actually answered — an unreachable daemon is not evidence that its models
+// were removed, and emptying that part of the menu for a transient blip is
+// worse than a stale row. The local-serve family is recomputed
+// unconditionally: local_servers.json plus a /health probe is readable with no
+// daemon involved at all, so a `oaica serve` that died since the cache was
+// written disappears even when the daemon is unreachable.
+func mergeLiveRows(ctx context.Context, client *api.Client, cached []LaunchModel) []LaunchModel {
+	daemonRows, daemonOK := daemonPickerRows(ctx, client)
+	localRows := localServePickerRows()
+
+	out := make([]LaunchModel, 0, len(cached)+len(daemonRows)+len(localRows))
+	seen := make(map[string]bool, len(cached)+len(daemonRows)+len(localRows))
+	drop := func(lm LaunchModel) bool {
+		switch lm.LiveSource {
+		case liveSourceDaemon:
+			return daemonOK // replaced by the live read below
+		case liveSourceLocal:
+			return true // always recomputed from the registry + /health
+		}
+		return false
 	}
-	out := make([]LaunchModel, 0, len(cached)+len(live))
-	seen := make(map[string]bool, len(cached)+len(live))
 	for _, m := range cached {
-		if isDaemonRow(m.Name) || seen[m.Name] {
+		if seen[m.Name] || drop(m) {
 			continue
 		}
 		seen[m.Name] = true
 		out = append(out, m)
 	}
-	for _, m := range live {
-		if seen[m.Name] {
-			continue
+	for _, live := range [][]LaunchModel{daemonRows, localRows} {
+		for _, m := range live {
+			if seen[m.Name] {
+				continue
+			}
+			seen[m.Name] = true
+			out = append(out, m)
 		}
-		seen[m.Name] = true
-		out = append(out, m)
 	}
 	return out
 }
@@ -326,6 +415,12 @@ type pickerCacheFile struct {
 //   - opencodeAuthPaths: the credential that GATES a whole provider's rows
 //     can be written by `opencode auth login`, a file read through a helper
 //     exactly like authStorePath() — which was fingerprinted.
+//   - api_key: the ROUTER credential `oaica signin` writes. The router's
+//     catalogue is per-account (a pro key lists rows a free key does not), so
+//     re-signing in or rotating the key changes the answer while no other
+//     fingerprinted file moves. Recorded by content digest like every other
+//     input, never verbatim — docs/ENTERPRISE.md's rule that a credential must
+//     not reach a cache.
 func pickerCacheInputPaths() []string {
 	out := make([]string, 0, 8)
 	add := func(p string) {
@@ -345,6 +440,9 @@ func pickerCacheInputPaths() []string {
 		add(p)
 	}
 	if p, err := ollamaCloudCachePath(); err == nil {
+		add(p)
+	}
+	if p, err := oaicaLaunchSavedAPIKeyPath(); err == nil {
 		add(p)
 	}
 	if p, err := modelManifestPath(); err == nil {
@@ -390,6 +488,19 @@ func pickerEnvFingerprint() map[string]string {
 		// The NAME of the variable that is set, not its value: a variable name
 		// is not a secret, and the name is all the fingerprint needs.
 		out["cred:"+e.Name] = keyEnvNameSet(e.APIKeyEnv)
+	}
+	// The ROUTER credential itself, however it is spelled (OAICA_API_KEY, the
+	// ~/.oaica/api_key file `oaica signin` writes, or OAICA_HOST's userinfo —
+	// oaicaLaunchAPIKeyForEnv resolves all three). Unlike a provider key, its
+	// identity and not just its presence decides the answer: the router's
+	// catalogue is per-account, so a re-signed-in or rotated key turns a
+	// working picker into an empty one until the TTL lapses (2026-09-26
+	// audit). Hashed, never raw — same rule as OAICA_HOST above.
+	if key := oaicaLaunchAPIKeyForEnv(); key != "" {
+		sum := sha256.Sum256([]byte(key))
+		out["cred:OAICA_API_KEY"] = fmt.Sprintf("%x", sum[:8])
+	} else {
+		out["cred:OAICA_API_KEY"] = "unset"
 	}
 	return out
 }
@@ -456,12 +567,20 @@ func pickerCachePath() (string, error) {
 	return filepath.Join(home, ".oaica", "picker_cache.json"), nil
 }
 
-func savePickerCache(models []LaunchModel) {
+// savePickerCache writes the rows and the configuration they were BUILT FROM.
+// inputs is a parameter, not computed here, and that is the whole point: it is
+// taken before the load reads its sources, so a config edit made while the
+// load was probing (a `oaica remote add` in another terminal, a concurrent
+// launch) cannot be recorded as this file's provenance. Stamping the
+// post-edit fingerprint onto pre-edit rows made the cache claim an answer it
+// never had, which is the round-2 "the remote I just added is not on the menu"
+// defect through a race window (2026-09-26 audit).
+func savePickerCache(models []LaunchModel, inputs map[string]string) {
 	path, err := pickerCachePath()
 	if err != nil || len(models) == 0 {
 		return
 	}
-	b, err := json.Marshal(pickerCacheFile{SavedAt: time.Now(), TTLSecond: pickerCacheTTL.Seconds(), Models: models, Inputs: pickerInputFingerprint()})
+	b, err := json.Marshal(pickerCacheFile{SavedAt: time.Now(), TTLSecond: pickerCacheTTL.Seconds(), Models: models, Inputs: inputs})
 	if err != nil {
 		return
 	}

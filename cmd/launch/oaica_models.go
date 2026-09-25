@@ -184,15 +184,26 @@ func oaicaLaunchAPIKeyForEnv() string {
 // invocation is a fresh process with no env var, so without this fallback
 // every launch after the first sign-in silently 401s again.
 func oaicaLaunchSavedAPIKey() string {
-	home, err := os.UserHomeDir()
+	path, err := oaicaLaunchSavedAPIKeyPath()
 	if err != nil {
 		return ""
 	}
-	b, err := os.ReadFile(filepath.Join(home, ".oaica", "api_key"))
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// oaicaLaunchSavedAPIKeyPath is ~/.oaica/api_key, the file `oaica signin`
+// writes. Named so the picker cache can fingerprint it by path (see
+// pickerCacheInputPaths) without either side re-spelling the location.
+func oaicaLaunchSavedAPIKeyPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".oaica", "api_key"), nil
 }
 
 type oaicaModelEntry struct {

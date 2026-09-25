@@ -144,10 +144,23 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 			p.PrimaryContext = v
 		}
 	}
+	// "A different leg" means a different base URL OR a different upstream
+	// model: --model box/small --sonnet-model box/big is the documented
+	// same-remote split, and both legs need their own window — the URL-only
+	// guard skipped the secondary entirely, so SecondaryContext stayed 0, the
+	// sonnet route got no context-fit ceiling (the clamp is gated on
+	// ContextWindow > 0), and envVars advertised the primary's small window
+	// to every sonnet/subagent session (2026-09-26 audit). The two legs share
+	// a base URL but serve different windows only by coincidence. Conversely,
+	// two names for the SAME leg reuse the primary's answer instead of asking
+	// again.
 	if p.SecondaryName != p.PrimaryName {
-		if r, _ := p.Routes.resolve(p.SecondaryName); r.BaseURL != "" &&
-			r.BaseURL != p.Routes.Default.BaseURL {
-			p.SecondaryContext = remoteContextWindowFn(r)
+		if r, _ := p.Routes.resolve(p.SecondaryName); r.BaseURL != "" {
+			if sameRoute(r, p.Routes.Default) {
+				p.SecondaryContext = p.PrimaryContext
+			} else {
+				p.SecondaryContext = remoteContextWindowFn(r)
+			}
 		}
 		if p.SecondaryContext <= 0 {
 			if v, ok := contextWindowFromManifest(p.SecondaryName); ok {
@@ -161,9 +174,18 @@ func (p *tierPlan) withContextWindows() *tierPlan {
 	// had nothing to fall back to for that specific combination even
 	// though the haiku leg's real window IS knowable, same as secondary's.
 	if p.HaikuName != p.PrimaryName && p.HaikuName != p.SecondaryName {
-		if r, _ := p.Routes.resolve(p.HaikuName); r.BaseURL != "" &&
-			r.BaseURL != p.Routes.Default.BaseURL {
-			p.HaikuContext = remoteContextWindowFn(r)
+		if r, _ := p.Routes.resolve(p.HaikuName); r.BaseURL != "" {
+			sec, _ := p.Routes.resolve(p.SecondaryName)
+			switch {
+			case sameRoute(r, p.Routes.Default):
+				// The same leg under another name — reuse the answer already
+				// probed for it rather than asking the upstream twice.
+				p.HaikuContext = p.PrimaryContext
+			case sameRoute(r, sec):
+				p.HaikuContext = p.SecondaryContext
+			default:
+				p.HaikuContext = remoteContextWindowFn(r)
+			}
 		}
 		if p.HaikuContext <= 0 {
 			if v, ok := contextWindowFromManifest(p.HaikuName); ok {
@@ -277,6 +299,22 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 			p.Routes.Oversize.ContextWindow = w.n
 		}
 	}
+	// The oversize leg is ALSO appended to Fallbacks as a struct copy, made in
+	// buildTierPlan before any window was known. Left at 0 it was invisible to
+	// both consumers of that copy: the proxy's context-fit clamp is gated on
+	// ContextWindow > 0, so the failover that a first failure hands the request
+	// to — the request most likely to be oversized — had no ceiling at all;
+	// and escalationTarget ranks legs by ContextWindow while deduping on base
+	// URL, so the zero-window copy came first and shadowed the real
+	// 262144-token leg, which could then never win an `auto` escalation
+	// (2026-09-26 audit).
+	if p.Routes.Oversize.BaseURL != "" && p.Routes.Oversize.ContextWindow > 0 {
+		for i := range p.Routes.Fallbacks {
+			if sameRoute(p.Routes.Fallbacks[i], p.Routes.Oversize) && p.Routes.Fallbacks[i].ContextWindow == 0 {
+				p.Routes.Fallbacks[i].ContextWindow = p.Routes.Oversize.ContextWindow
+			}
+		}
+	}
 	// Family routes are copies taken in buildTierPlan, i.e. BEFORE these
 	// windows were known. Refresh them from ByModel, which was just updated, so
 	// a request that arrives on a Claude family id (Claude Code's own
@@ -286,6 +324,20 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 	// to carry a large prompt.
 	p.Routes.FamilyLegs = tierFamilyRoutes(*p)
 	return p
+}
+
+// sameRoute reports whether two proxy routes address the same upstream LEG —
+// the same base URL AND the same upstream model. Two names for one leg (an
+// alias, or the same model reached under two ids) answer the same window, while
+// two legs on one remote (--model box/small --sonnet-model box/big) do not, and
+// treating those as one is what left a same-remote split's sonnet leg
+// unprobed, unclamped, and advertised with the primary's window
+// (2026-09-26 audit).
+func sameRoute(a, b proxyRoute) bool {
+	if a.BaseURL == "" || b.BaseURL == "" {
+		return false
+	}
+	return a.BaseURL == b.BaseURL && a.UpstreamModel == b.UpstreamModel
 }
 
 // maxOutputTokensReserve is Claude Code's fixed max_tokens request (32000,

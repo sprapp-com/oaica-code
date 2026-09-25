@@ -22,7 +22,7 @@ describing this binary.
 
 ## Network connections
 
-Eight paths the client itself opens. Nothing else in the client opens a socket.
+Nine paths the client itself opens. Nothing else in the client opens a socket.
 (One more exists only through a third-party tool you run deliberately: see
 row 9.)
 
@@ -33,12 +33,12 @@ row 9.)
 | 3 | `github.com/sprapp-com/oaica-code/releases/latest/download/VERSION.txt` | At most once per 20h, from any command that would print the update notice | A plain GET for the release's version file; **sends no body, no identifiers**. The request reveals your IP and that oaica is installed | `OAICA_NO_UPDATE_CHECK=1` |
 | 4 | `raw.githubusercontent.com` | Only when you run `oaica remote sync`, `oaica model sync` or `oaica model cloud-limits sync` **without** `--url` | A GET for that catalog's JSON in this repository | Pass `--url` (a `file://` path works) and the default is never contacted; or don't run the sync commands |
 | 5 | Agent installers at the vendor's own host — `claude.ai`, `code.kimi.com`, `dev.meta.ai`, `hermes-agent.nousresearch.com`, `opencode.ai`, `qwen-code-assets.oss-cn-hangzhou.aliyuncs.com` | Only when you run `oaica launch <agent>` for an agent that is not installed and you confirm the install | A GET for the vendor's own installer script, which it then runs | Don't launch that agent; install it yourself first, or from your own mirror |
-| 6 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
+| 6 | `registry.npmjs.org` | Only when you run `oaica launch <agent>` for an agent that ships on npm — `pi`, `cline`, `openclaw`, `dsh` — and you confirm the install | A GET for the package's version metadata, then the `npm install -g` it runs (`@ollama/pi-web-search`, `cline@latest`, `openclaw@latest`, `@deepseek-ai/dsh@latest`). `pi` additionally checks its web-search package version | Decline the prompt, or install the agent yourself first, or from your own npm mirror — none of these installers run unprompted. `PI_OFFLINE=1` additionally skips `pi`'s web-search version check |
 | 7 | `api.lemonsqueezy.com` (`/v1/licenses`) | `oaica activate <key>` once, then a revalidation on `oaica launch` when the stored activation is older than 7 days | The licence key and this machine's activation id; the response says whether the licence is still valid | No switch for a purchased key while the licence gate is in force; a cached activation younger than 7 days makes no call, and an unreachable licence server keeps working for 30 days. **One published key bypasses the gate and this call entirely:** the string `OAICA-TEST-DEV-FREE` is compiled into the binary (`cmd/launch/license.go`), activates locally, and never revalidates. It is in the public source, it is not a secret, and any build-from-source can remove the gate anyway — the licence is a convenience paywall on the prebuilt binary, not a control that resists a determined user. Do not treat it as one when threat-modelling |
 | 8 | `huggingface.co`, or the router's own storage | Only when you run `oaica pull <model>` | `GET /v1/manifest/<model>` on your endpoint, then the weight bytes from the URL that manifest names — the router's storage, or HuggingFace when the manifest says `source=hf`. On a HuggingFace URL, and only there, the request carries your HuggingFace token as a bearer header if one is present (`HF_TOKEN`, else `~/.huggingface/token`) — a speed-up for a public repo, not a requirement; a URL naming any other host is fetched anonymously, so a manifest cannot direct that token somewhere else | `oaica pull` is optional: point `OAICA_HOST` at a model already on disk and pull nothing. Unset `HF_TOKEN` and move `~/.huggingface/token` aside and the download still works, unauthenticated |
 | 9 | `api.cloudflare.com` (and `*.pages.dev`), **via the `wrangler` CLI** | Only when you run `oaica site deploy DIR` and `wrangler` is installed and authenticated | Your site's build output, uploaded by `wrangler pages deploy` under your own Cloudflare account. The socket is opened by `wrangler`, not by this binary — oaica shells out rather than reimplementing the Pages API | Don't run `oaica site deploy`; the site builder is optional and `oaica site new|edit|preview` stay entirely local |
+| 10 | `ollama.com` (Ollama's own cloud — a different host from `oaica.com` in row 2) | Two paths: the picker inventory scrapes `https://ollama.com/search?c=cloud` on a cache miss, to list the `:cloud` catalogue (also on `oaica model refresh`); and `oaica launch claude-desktop` validates the Ollama API key you give it | The scrape is an unauthenticated GET of a public search page — no credential, no payload, the same request your browser makes. The key check is `GET https://ollama.com/v1/models` carrying your `OLLAMA_API_KEY` as a bearer header; it is the only path in this table that sends a credential to a host other than your own endpoint | The scrape is skipped entirely when `OAICA_HOST` is set, and `~/.oaica/cache/models/ollama-cloud.json` serves it within its TTL otherwise (so it is not a per-launch request); skip `oaica launch claude-desktop`, or launch a model through your own endpoint, and no key reaches `ollama.com` |
 
-The endpoint in row 1 defaults to `https://api.oaica.com` (an
 The endpoint in row 1 defaults to `https://api.oaica.com` (an
 OpenAI-compatible router) and is where the work actually goes. If prompts may
 not leave your network, point `oaica` at an endpoint inside it — a remote in
@@ -53,7 +53,9 @@ Row 5 exists because `oaica launch claude` (and `codex`, `kimi`, `hermes`,
 publisher when it is missing, after a prompt that says so. Those agents are not
 part of this repository, are not pinned or audited by it, and once installed
 they keep their own update and login behaviour — including talking to their own
-vendors' backends if you sign in to them natively. In a controlled environment,
+vendors' backends if you sign in to them natively. A few of them (`pi`, `cline`,
+`openclaw`, `dsh`) install from npm rather than from a publisher script, which
+is row 6. In a controlled environment,
 install the agents from your own package mirror and let `oaica launch` find them
 already on `PATH`. Catalog metadata can be synced from an internal mirror
 instead of GitHub: `oaica remote sync --url`, `oaica model sync --url` and
@@ -65,13 +67,14 @@ HTTP URLs (row 4).
 There is none. No analytics, no crash reporting, no usage beacons, no
 "anonymous" install ID. Grep the tree for `telemetry`, `analytics`, `sentry`,
 `posthog`, `segment` and you will find the TUI's own render helpers and
-nothing else. Two outbound requests happen without you asking, and neither
-carries a payload: row 3's version GET, and row 7's licence revalidation for an
-install that is already activated (at most once per 7 days, and it sends only
-the key and activation id you already stored). Every other non-model path is
-behind a prompt you answer, or behind a command you typed (`oaica launch pi` is
-the one to know about: it asks before installing its web-search package, and
-row 6 lists what that touches).
+nothing else. Three outbound requests happen without you asking, and none of
+them carries a payload: row 3's version GET; row 7's licence revalidation for
+an install that is already activated (at most once per 7 days, and it sends
+only the key and activation id you already stored); and row 10's ollama.com
+scrape of a public search page, which sends no credential at all. Every other
+non-model path is behind a prompt you answer, or behind a command you typed
+(`oaica launch <agent>` is the one to know about: it asks before installing an
+agent or its packages, and rows 5 and 6 list the hosts that touches).
 
 ## Files on disk
 
