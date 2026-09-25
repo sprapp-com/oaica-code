@@ -826,16 +826,6 @@ func newProxySessionID() (string, error) {
 	return "oaica-session-" + hex.EncodeToString(b), nil
 }
 
-// redactURL strips userinfo from a URL for logs.
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	u.User = nil
-	return u.String()
-}
-
 // proxyUpstreamClient bounds connection setup, never the response: a slow
 // local model may legitimately stream for longer than any fixed timeout,
 // and the request already carries the caller's context, which cancels
@@ -1351,7 +1341,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.BaseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
+			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
 			return
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
@@ -1371,7 +1361,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// (route_policy.go): consecutive failures escalate the session to
 			// the stronger secondary leg.
 			table.escalations.recordFail(table.SessionID, route.BaseURL)
-			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
 			return
 		}
 		defer resp.Body.Close()
@@ -1400,7 +1390,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			Timestamp:        time.Now().UTC().Format(time.RFC3339),
 			Model:            anthReq.Model,
 			Path:             r.URL.Path,
-			Backend:          route.Label + " " + redactURL(route.BaseURL),
+			Backend:          route.Label + " " + redactCredentials(route.BaseURL),
 			LastMessageLen:   lastLen,
 			TotalMessagesLen: totalLen,
 			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
@@ -1694,7 +1684,7 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
 		return
 	}
 	defer resp.Body.Close()
@@ -1752,7 +1742,7 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 	req.Header.Set(headerName, headerValue)
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
 		return
 	}
 	defer resp.Body.Close()
@@ -1947,7 +1937,7 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
+		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactCredentials(err.Error()))
 		return
 	}
 	defer resp.Body.Close()
@@ -1997,9 +1987,9 @@ func writeUpstreamError(w http.ResponseWriter, resp *http.Response, text string)
 		if v := resp.Header.Get("Retry-After"); v != "" {
 			w.Header().Set("Retry-After", v)
 		}
-		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
+		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactCredentials(text)))
 	default:
-		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
+		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactCredentials(text)))
 	}
 }
 

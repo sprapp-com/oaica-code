@@ -434,7 +434,9 @@ const remoteModelsFetchTimeout = 2 * time.Second
 func fetchRemoteModels(r userRemote) ([]string, error) {
 	req, err := http.NewRequest(http.MethodGet, r.openAIBase()+"/models", nil)
 	if err != nil {
-		return nil, err
+		// redactErr: the picker's warning would otherwise print the remote's
+		// URL, key included, when the URL carries the key as userinfo.
+		return nil, redactErr(err)
 	}
 	if k := r.key(); k != "" {
 		if r.Descriptor().Wire == "anthropic" {
@@ -448,7 +450,7 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 	}
 	resp, err := (&http.Client{Timeout: remoteModelsFetchTimeout}).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

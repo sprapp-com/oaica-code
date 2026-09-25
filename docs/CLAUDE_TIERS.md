@@ -257,6 +257,14 @@ a configured remote's `/models` probe fails or its `route_policy` is invalid,
 so cron/scripts can grep. An unreachable local daemon does NOT fail: it
 prints "unreachable (fine ...)".
 
+`oaica doctor --report` prints the same checks plus an environment section
+(version, platform, `~/.oaica` paths with their file modes, which credential
+environment variables are set, how many providers are in `auth.json`) and
+refuses to print at all if any credential value would appear in the output —
+the text is scanned against every key the client holds before it is written.
+Credential-embedded remote URLs (`https://KEY@host/v1`) print redacted in both
+modes, including inside transport error messages.
+
 ## Interactive launch wizard (2026-08-31)
 
 A plain interactive `oaica launch claude` (no tier/policy/oversize/plan/shard

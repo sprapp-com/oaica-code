@@ -137,7 +137,7 @@ Remotes are stored in `~/.oaica/remotes.json`. Built-in providers include
 | `oaica site new\|edit\|preview\|deploy` | Optional static site builder |
 | `oaica gpu ps\|clean` | Inspect / clean up local GPU-memory-holding processes |
 | `oaica agent [PROMPT]` | Run a streaming coding agent |
-| `oaica doctor` | Read-only check of launch routing: remote reachability, route policies, daemon leg (exit 1 on a failed remote probe) |
+| `oaica doctor` | Read-only check of launch routing: remote reachability, route policies, daemon leg (exit 1 on a failed remote probe). Add `--report` for a redacted support bundle (version, platform, config paths and permissions, which credentials are set) — safe to paste into a ticket |
 | `oaica usage` | Summarize this machine's launch traffic (`~/.oaica/requests.log`): requests, errors, routing per model/backend |
 | `oaica auth login\|list\|logout` | Store model-provider credentials in `~/.oaica/auth.json` |
 | `oaica provider login\|list\|logout` | Same `~/.oaica/auth.json` store as `oaica auth` (hidden alias) |

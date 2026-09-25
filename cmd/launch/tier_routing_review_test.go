@@ -269,10 +269,13 @@ func TestShowOrPull_SourcePrefixedModelNeverPulls(t *testing.T) {
 }
 
 func TestRedactURL(t *testing.T) {
-	if got := redactURL("http://user:s3cret@box:8080/v1"); strings.Contains(got, "s3cret") || got != "http://box:8080/v1" {
+	// REDACTED@ rather than dropping the userinfo: a reader of a log line
+	// should see that a credential was configured here, not be unable to tell
+	// a credential-bearing URL from a plain one.
+	if got := redactCredentials("http://user:s3cret@box:8080/v1"); strings.Contains(got, "s3cret") || got != "http://REDACTED@box:8080/v1" {
 		t.Fatalf("got %q", got)
 	}
-	if got := redactURL("https://api.oaica.com/v1"); got != "https://api.oaica.com/v1" {
+	if got := redactCredentials("https://api.oaica.com/v1"); got != "https://api.oaica.com/v1" {
 		t.Fatalf("got %q", got)
 	}
 }
