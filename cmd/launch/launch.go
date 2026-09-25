@@ -396,27 +396,47 @@ Examples:
 			// Tier flags travel as passthrough (tier_routing.go consumes
 			// them from the extra args); copy passArgs first — it aliases
 			// args' backing array, and append could clobber it.
+			//
+			// Gated on Changed, not on a non-empty value: an empty value is
+			// not "the flag was not passed". Reading `--oversize=` (or
+			// `--sonnet-model=`, or `--plan=`, or a "$VAR" that expanded to
+			// nothing) as absent dropped the flag here, so tier_routing.go's
+			// refusals — which exist precisely for the empty spelling — never
+			// fired and a plan's stored leg was inherited instead, silently
+			// (2026-09-26 audit). The empty value now travels and is refused
+			// by name.
+			// ...and only for the runner that reads them back: injecting them
+			// for every integration put `--plan p` in `codex`'s argv, where
+			// codex rejected it ("error: unexpected argument '--plan' found",
+			// exit 2) — a flag the user aimed at oaica, not at the agent
+			// (2026-09-26 audit). Silently dropping them for the others would
+			// be no better: the caller would read a saved plan's absence as its
+			// contents, so they are refused by name instead.
 			tierPrepend := passArgs[:0:0]
-			if planFlag != "" {
-				tierPrepend = append(tierPrepend, "--plan", planFlag)
-			}
-			if sonnetFlag != "" {
-				tierPrepend = append(tierPrepend, "--sonnet-model", sonnetFlag)
-			}
-			if haikuFlag != "" {
-				tierPrepend = append(tierPrepend, "--haiku-model", haikuFlag)
-			}
-			if oversizeFlag != "" {
-				tierPrepend = append(tierPrepend, "--oversize", oversizeFlag)
-			}
-			if policyFlag != "" {
-				tierPrepend = append(tierPrepend, "--route-policy", policyFlag)
-			}
-			if wizardFlag {
-				tierPrepend = append(tierPrepend, "--wizard")
-			}
-			for _, s := range shardFlags {
-				tierPrepend = append(tierPrepend, "--shard", s)
+			if integrationConsumesTierFlags(name) {
+				if cmd.Flags().Changed("plan") {
+					tierPrepend = append(tierPrepend, "--plan", planFlag)
+				}
+				if cmd.Flags().Changed("sonnet-model") {
+					tierPrepend = append(tierPrepend, "--sonnet-model", sonnetFlag)
+				}
+				if cmd.Flags().Changed("haiku-model") {
+					tierPrepend = append(tierPrepend, "--haiku-model", haikuFlag)
+				}
+				if cmd.Flags().Changed("oversize") {
+					tierPrepend = append(tierPrepend, "--oversize", oversizeFlag)
+				}
+				if cmd.Flags().Changed("route-policy") {
+					tierPrepend = append(tierPrepend, "--route-policy", policyFlag)
+				}
+				if wizardFlag {
+					tierPrepend = append(tierPrepend, "--wizard")
+				}
+				for _, s := range shardFlags {
+					tierPrepend = append(tierPrepend, "--shard", s)
+				}
+			} else if passed := firstTierFlagPassed(cmd); passed != "" {
+				return fmt.Errorf("%s does not take %s — tier routing (planning on one model, executing on another) is a Claude Code feature; drop the flag or launch claude instead", name, passed)
 			}
 			passArgs = append(tierPrepend, passArgs...)
 
@@ -884,6 +904,46 @@ func (c *launcherClient) launchSingleIntegration(ctx context.Context, name strin
 // selectable model, not just the resolved target.
 type fullModelChoicesRunner interface {
 	WantsFullModelChoices() bool
+}
+
+// tierFlagsConsumer marks the runner that reads the launcher-level tier flags
+// back out of the passthrough list (tier_routing.go's extractors). Only Claude
+// Code has tiers to route: every other integration was handed these flags
+// verbatim, and each one rejects an argument it does not know —
+// `oaica launch codex --model kat-awq --plan p` put `--plan p` in codex's argv,
+// where it died with "unexpected argument '--plan' found", exit 2, pointing at
+// a flag the user never meant for codex at all (2026-09-26 audit).
+type tierFlagsConsumer interface {
+	ConsumesTierFlags() bool
+}
+
+// tierFlagNames are those flags in flag-name form, in the order a refusal
+// should name them. Order matters only for the message: the first one the
+// caller passed is the one worth quoting.
+var tierFlagNames = []string{"plan", "sonnet-model", "haiku-model", "oversize", "route-policy", "wizard", "shard"}
+
+// firstTierFlagPassed names the first launcher-level tier flag the caller
+// actually passed ("" when none), so a refusal can quote it instead of listing
+// every flag the integration does not support.
+func firstTierFlagPassed(cmd *cobra.Command) string {
+	for _, f := range tierFlagNames {
+		if cmd.Flags().Changed(f) {
+			return "--" + f
+		}
+	}
+	return ""
+}
+
+// integrationConsumesTierFlags reports whether `name`'s runner reads the tier
+// flags. An unknown name is not a consumer: it cannot have been resolved to
+// the Claude runner.
+func integrationConsumesTierFlags(name string) bool {
+	spec, err := LookupIntegrationSpec(name)
+	if err != nil || spec == nil {
+		return false
+	}
+	_, ok := spec.Runner.(tierFlagsConsumer)
+	return ok
 }
 
 func (c *launcherClient) launchEditorIntegration(ctx context.Context, name string, runner Runner, editor Editor, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {

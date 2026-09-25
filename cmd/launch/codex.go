@@ -387,7 +387,7 @@ func writeCodexNamedProfileConfig(profilePath, profileName, model, modelCatalogP
 	if err != nil {
 		return err
 	}
-	if err := codexValidateProfileConfigText(parsed, profileName, modelID, modelCatalogPath, baseURL); err != nil {
+	if err := codexValidateProfileConfigText(parsed, profileName, modelID, modelCatalogPath, baseURL, codexWireFor(model)); err != nil {
 		return err
 	}
 
@@ -456,7 +456,14 @@ func codexProviderHeaderFor(profileName string) string {
 	return fmt.Sprintf("[model_providers.%s]", profileName)
 }
 
-func codexValidateProfileConfigText(config codexParsedConfig, profileName, model, modelCatalogPath, baseURL string) error {
+// codexValidateProfileConfigText checks the config just written against what
+// was intended to be written. `wire` is passed in rather than recomputed here:
+// the value written is codexWireFor(the picker model), while this validator is
+// handed the bare upstream model id — a user-remote model resolves to "chat" at
+// the write site and "responses" here, so every `oaica launch codex --model
+// <remote>/<id>` failed its own self-check with "missing wire_api =
+// \"responses\"" before codex ever ran (2026-09-26 audit).
+func codexValidateProfileConfigText(config codexParsedConfig, profileName, model, modelCatalogPath, baseURL, wire string) error {
 	if config.Exists("profiles", profileName) {
 		return fmt.Errorf("generated Codex config still contains legacy profiles.%s table", profileName)
 	}
@@ -466,7 +473,7 @@ func codexValidateProfileConfigText(config codexParsedConfig, profileName, model
 	}{
 		{[]string{"model_providers", profileName, "name"}, codexProviderName},
 		{[]string{"model_providers", profileName, "base_url"}, baseURL},
-		{[]string{"model_providers", profileName, "wire_api"}, "responses"},
+		{[]string{"model_providers", profileName, "wire_api"}, wire},
 	} {
 		if got, ok := config.String(check.path...); !ok || got != check.want {
 			return fmt.Errorf("generated Codex config missing %s = %q", strings.Join(check.path, "."), check.want)

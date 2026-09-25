@@ -1193,3 +1193,69 @@ func TestOversizeSameBackendError_RedactsBasicCredentials(t *testing.T) {
 		t.Errorf("the error should name the backend with a redacted credential, got %q", err.Error())
 	}
 }
+
+// A tier flag's value slot used to take whatever token followed it, including
+// another flag: `--sonnet-model --wizard` set the sonnet tier to the literal
+// string "--wizard" and consumed the wizard flag, so the wizard never ran, no
+// warning was printed, and the bogus id was exported to the child, where the
+// first subagent request failed against a model of that name. No model id,
+// plan name or policy begins with "--", so every such case is a missing value
+// and is refused by name (2026-09-26 audit).
+func TestRun_TierFlagValueIsNotAnotherFlag(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+
+	for _, c := range []struct {
+		flag string
+		args []string
+	}{
+		{"--sonnet-model", []string{"--sonnet-model", "--wizard"}},
+		{"--haiku-model", []string{"--haiku-model", "--wizard"}},
+		{"--oversize", []string{"--oversize", "--wizard"}},
+		{"--plan", []string{"--plan", "--wizard"}},
+		{"--route-policy", []string{"--route-policy", "--wizard"}},
+		{"--shard", []string{"--shard", "--wizard"}},
+	} {
+		err := (&Claude{}).Run("box/kat-awq", nil, c.args)
+		if err == nil {
+			t.Errorf("%s followed by a flag was accepted; want an error naming %s", c.flag, c.flag)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.flag) {
+			t.Errorf("%s: error %q does not name the flag", c.flag, err.Error())
+		}
+	}
+}
+
+// The "--oversize="-style empty value was refused by Run, but `oaica launch`
+// dropped any tier flag whose value was empty before building the passthrough
+// list, so the refusal never fired from the CLI and a plan's stored leg was
+// inherited instead — byte-identical to passing no flag at all (2026-09-26
+// audit). Run-level coverage of the empty spellings, which is what the CLI
+// path must now deliver intact.
+func TestRun_EmptyTierValueIsRefusedNotInherited(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+
+	for _, c := range []struct {
+		flag string
+		args []string
+	}{
+		{"--sonnet-model", []string{"--sonnet-model="}},
+		{"--haiku-model", []string{"--haiku-model="}},
+		{"--plan", []string{"--plan="}},
+	} {
+		err := (&Claude{}).Run("box/kat-awq", nil, c.args)
+		if err == nil || !strings.Contains(err.Error(), c.flag) {
+			t.Errorf("%s= gave %v, want an error naming the empty value", c.flag, err)
+		}
+	}
+}

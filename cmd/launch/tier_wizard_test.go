@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -469,11 +470,18 @@ func TestRunTierWizard_AutoResolvesToRecommended(t *testing.T) {
 	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
 	models := testLaunchModels("kat-awq", "kat-awq-7b", "big-box/glm-9")
 	models[2].Recommended = true // big-box/glm-9
-	// First selection = items[0] = "auto" (auto leads the step).
+	// "(same as primary)" leads and "auto" sits behind it: the step's default
+	// must not add a split the user did not ask for. "auto" used to lead, so
+	// pressing Enter at this step — the same key that walks every other step —
+	// rerouted all subagent traffic to the recommended model, possibly a
+	// different provider at a different price (2026-09-26 audit).
 	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
 		if title == "Sonnet/subagent tier (secondary model)" {
-			if items[0].Name != "auto" {
-				t.Fatalf("auto must lead the secondary step, got %q", items[0].Name)
+			if items[0].Name != "(same as primary)" {
+				t.Fatalf("the no-op row must lead the secondary step, got %q", items[0].Name)
+			}
+			if !slices.ContainsFunc(items, func(it SelectionItem) bool { return it.Name == "auto" }) {
+				t.Fatal("auto must still be offered when a recommendation exists")
 			}
 			return "auto", nil
 		}
@@ -714,5 +722,56 @@ func TestTierWizardTierItems_KeepRowLeadsAndSameAsPrimaryClears(t *testing.T) {
 	}
 	if c.HaikuModel != "" {
 		t.Fatalf("(same as primary) did not clear the saved haiku tier: %+v", c)
+	}
+}
+
+// A blank answer at the save prompt SKIPS. It used to be rewritten to the
+// last-used plan's name while the prompt said "blank = skip", so Enter — the
+// reflex key — replaced that plan's stored tiers with whatever the walk chose,
+// silently, and the plan it destroyed was the one the same session had just
+// offered to reuse (2026-09-26 audit).
+func TestTierWizardSavePrompt_BlankDoesNotOverwriteAnExistingPlan(t *testing.T) {
+	withTempOaicaHome(t)
+	if err := PlanSet("prod", TierPlanProfile{Model: "big-box/glm-9", SonnetModel: "zai/glm-4.5-air", OversizeModel: "big-box/glm-9"}); err != nil {
+		t.Fatal(err)
+	}
+
+	origSelect, origRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
+	var prompt string
+	tierWizardReadLine = func(p string) (string, error) {
+		prompt = p // blank: the user pressed Enter at the save prompt
+		return "", nil
+	}
+	answers := []string{tierWizardScratch}
+	i := 0
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if i < len(answers) {
+			a := answers[i]
+			i++
+			return a, nil
+		}
+		return items[0].Name, nil
+	}
+
+	c, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b"), "kat-awq", "", "", "", "")
+	if err != nil {
+		t.Fatalf("runTierWizard: %v", err)
+	}
+	if c.PlanName != "" {
+		t.Fatalf("PlanName = %q, want empty — a blank answer saves nothing", c.PlanName)
+	}
+	got, err := PlanGet("prod")
+	if err != nil {
+		t.Fatalf("the saved plan is gone: %v", err)
+	}
+	if got.Model != "big-box/glm-9" || got.SonnetModel != "zai/glm-4.5-air" || got.OversizeModel != "big-box/glm-9" {
+		t.Fatalf("blank overwrote the saved plan: %+v", got)
+	}
+	if strings.Contains(prompt, "blank = skip") && !strings.Contains(prompt, "overwrite") {
+		t.Errorf("the prompt must name the plan a typed name would replace: %q", prompt)
+	}
+	if !strings.Contains(prompt, "prod") {
+		t.Errorf("the prompt must name the plan a typed name would replace: %q", prompt)
 	}
 }

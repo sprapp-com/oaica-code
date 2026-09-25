@@ -256,6 +256,32 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 	return launchEndpoint{}, fmt.Errorf("model %q not found: not a user remote (~/.oaica/remotes.json); %s", model, strings.Join(tried, "; "))
 }
 
+// tierValueFlags are the launcher-level flags whose value slot holds a value,
+// never another flag. A flag in that slot is a missing value: the extractors
+// take whatever token follows, so `--sonnet-model --wizard` pinned the sonnet
+// tier to the literal string "--wizard" AND consumed the wizard flag — the
+// wizard never ran, nothing warned, and the bogus id was exported to the
+// child, where the first subagent request failed against a model of that name
+// (2026-09-26 audit). No model id, plan name, policy or shard spec begins with
+// "--", so this is always the caller's mistake, refused by name like the empty
+// values below.
+var tierValueFlags = []string{
+	"--sonnet-model", "--haiku-model", "--oversize", "--plan", "--route-policy", "--shard",
+}
+
+// flagSwallowedValue reports the token consumed as name's value when that
+// token is itself a flag, for the space spelling ("--name --other"). The
+// "--name=--other" spelling is the caller typing that string as the value
+// deliberately, and is left to the flag's own validation.
+func flagSwallowedValue(args []string, name string) string {
+	for i, a := range args {
+		if a == name && i+1 < len(args) && strings.HasPrefix(args[i+1], "--") {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 // oversizeNoneValue is the --oversize value that means "no oversize leg",
 // which is how a plan's stored leg is dropped for one launch. It is spelled
 // because no model id can be: an empty value is what an unset shell variable
@@ -1018,6 +1044,13 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// different thing from "the flag was not passed", and the extractors cannot
 	// tell them apart once they have stripped it.
 	rawArgs := args
+	// Checked before the extractors strip them: a flag in a tier flag's value
+	// slot is a missing value, not a value (see tierValueFlags).
+	for _, name := range tierValueFlags {
+		if got := flagSwallowedValue(args, name); got != "" {
+			return fmt.Errorf("%s needs a value, got the flag %q — an argument beginning with \"--\" cannot be its value", name, got)
+		}
+	}
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
@@ -1042,6 +1075,20 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	}
 	if flagPassed(rawArgs, "--oversize") && oversizeModel == "" {
 		return fmt.Errorf("--oversize needs a model — use --oversize none to drop a plan's stored leg")
+	}
+	// The same rule for the tiers with no "none" spelling: an empty value
+	// cannot say "clear this tier", and it used to be dropped before it ever
+	// reached here, silently inheriting a plan's or the standing config's
+	// model instead (2026-09-26 audit). Omit the flag to inherit; there is no
+	// value that means clear, so say so rather than guess.
+	if flagPassed(rawArgs, "--sonnet-model") && sonnetModel == "" {
+		return fmt.Errorf("--sonnet-model needs a model id — omit the flag to keep the configured tier, or pass one to replace it")
+	}
+	if flagPassed(rawArgs, "--haiku-model") && haikuModel == "" {
+		return fmt.Errorf("--haiku-model needs a model id — omit the flag to keep the configured tier, or pass one to replace it")
+	}
+	if flagPassed(rawArgs, "--plan") && planName == "" {
+		return fmt.Errorf("--plan needs a plan name — omit the flag to launch without one")
 	}
 	// "--oversize none" is that drop, spelled rather than implied (an empty
 	// value cannot say it: see above).

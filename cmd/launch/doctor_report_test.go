@@ -149,8 +149,8 @@ func TestDoctorReport_ScansEveryKeyFile(t *testing.T) {
 		serveKey   = "sk-serve-apikey-0123456789"
 	)
 	files := map[string]string{
-		"api_key":     signinKey + "\n",
-		"license_key": licenseKey + "\n",
+		"api_key":      signinKey + "\n",
+		"license_key":  licenseKey + "\n",
 		"license.json": `{"key":"` + jsonKey + `","instance_id":"i","instance_name":"n"}`,
 		// `oaica serve --api-key K` records K here, so it is a credential
 		// file like the other three (2026-09-26 audit).

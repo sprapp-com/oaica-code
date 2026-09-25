@@ -11,7 +11,8 @@ package launch
 //	        skipped and the plan resolves exactly as a typed --plan.
 //	Step 2  Sonnet/subagent tier (secondary) — same list, leading with
 //	        "keep <model>" when ~/.oaica/config.json has a sonnet_model
-//	        (Enter keeps it), then "auto"/"(same as primary)" and the rest.
+//	        (Enter keeps it), then "(same as primary)" (Enter keeps the
+//	        single-model launch), then "auto", then the rest.
 //	Step 3  Haiku/background tier — same list, same "keep" row for
 //	        haiku_model, then "(same as primary)" and the rest. No "auto":
 //	        unlike Sonnet, there is no "best recommended model" concept for
@@ -32,6 +33,9 @@ package launch
 // After step 5 a one-line preview prints (e.g.
 // `fallback: a <-> b · oversize: c (256k) · policy: auto`) and the
 // choice can be saved as a named plan (`oaica plan`, tier_plan_profiles.go).
+// The save prompt's default is to save NOTHING: a blank answer skips, and
+// replacing an existing plan takes typing its name (the prompt names it) —
+// Enter must not be able to overwrite a saved plan.
 //
 // The wizard runs ONLY for interactive, picker-driven launches: a launch
 // whose primary came from an explicit --model flag, a non-interactive
@@ -365,12 +369,19 @@ func tierWizardTierItems(models []LaunchModel, names []string, primary string, w
 		// label names both sources rather than guessing wrong.
 		lead = append(lead, SelectionItem{Name: keep, Description: "your tier for this launch (--sonnet-model/--haiku-model or ~/.oaica/config.json) — enter keeps it", Recommended: true})
 	}
+	// "(same as primary)" leads, then "auto": the step's default must be the
+	// one that changes nothing. With "auto" ahead of it, Enter at this step
+	// rerouted every subagent request to the best recommended model while the
+	// primary stayed put — a split the user never asked for, reachable by
+	// pressing the same key they pressed on every other step (2026-09-26
+	// audit). "auto" stays one row away, still marked recommended, and the
+	// drop below still removes it when there is no recommendation to pick.
 	autoIdx := -1
+	lead = append(lead, SelectionItem{Name: "(same as primary)", Description: "route this tier to " + primary, Recommended: true})
 	if withAuto {
 		autoIdx = len(lead)
 		lead = append(lead, SelectionItem{Name: "auto", Description: "let OAICA pick this tier (best recommended model) — recommended", Recommended: true})
 	}
-	lead = append(lead, SelectionItem{Name: "(same as primary)", Description: "route this tier to " + primary, Recommended: true})
 	items = lead
 	// tierItemName namespaces every row by its provider so the stored plan
 	// is unambiguous at launch (resolveSecondaryEndpoint's explicit forms):
@@ -747,26 +758,24 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 
 	fmt.Fprintf(os.Stderr, "%s\n", tierWizardPreview(primary, c))
 
-	// Plan save: Enter reuses the last saved plan name when there is one
-	// (plans.json last_used), blank only when none exists. Reaching this
-	// prompt means the user walked the tiers — i.e. they did NOT take the
-	// reuse step at the top — so the default is only ever accepted by someone
-	// who read it, and the wording says plainly that it REPLACES that plan's
-	// tiers rather than adding one ("enter = dev" read like a save-as).
+	// Plan save: blank SKIPS, always. The prompt used to promise "blank =
+	// skip" while quietly rewriting a blank answer to the last-used plan's
+	// name — so Enter, the reflex key, replaced that plan's stored tiers with
+	// whatever this walk chose, with no warning and nothing to undo it. The
+	// prompt still names the plan that a typed name would replace, so
+	// overwriting is one keystroke more expensive and visible (2026-09-26
+	// audit).
 	last, _ := PlanLastUsed()
+	last = strings.TrimSpace(last)
 	prompt := "Save as plan (name, blank = skip)"
-	defaultName := ""
 	if last != "" {
-		defaultName = last
-		prompt += ", enter = overwrite " + last
+		prompt += ", type " + last + " to overwrite it"
 	}
 	name, err := tierWizardReadLine(prompt + ": ")
 	if err != nil && name == "" {
 		return c, err
 	}
-	if name == "" {
-		name = defaultName
-	}
+	name = strings.TrimSpace(name)
 	if name != "" {
 		desc := "interactive launch wizard"
 		if err := PlanSet(name, TierPlanProfile{

@@ -250,6 +250,14 @@ func (c *Claude) modelEnvVars(model string) []string {
 // selectable model, not just the resolved primary (see launch.go).
 func (c *Claude) WantsFullModelChoices() bool { return true }
 
+// ConsumesTierFlags: the tier flags (--plan/--sonnet-model/--haiku-model/
+// --oversize/--route-policy/--wizard/--shard) describe Claude Code's tier
+// split, and Run reads them out of the passthrough args with the extractors in
+// tier_routing.go. No other integration has a tier to route, so launch.go
+// neither injects them for those nor passes them through (see
+// integrationConsumesTierFlags).
+func (c *Claude) ConsumesTierFlags() bool { return true }
+
 // planPickerPrefix marks saved tier plans in the launch picker; selecting
 // one replays the whole stored choice (see tier_plan_profiles.go).
 const planPickerPrefix = "plan/"
