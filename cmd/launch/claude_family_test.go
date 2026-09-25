@@ -646,6 +646,42 @@ func TestRun_TypedPolicyAndOversizeSurviveTheWizard(t *testing.T) {
 	}
 }
 
+// `--wizard --plan x` ran nothing at all: the gate skips the wizard whenever a
+// plan is present, so the flag was silently dropped, while
+// docs/CLAUDE_TIERS.md promised --wizard forced the steps past that gate.
+// Running the wizard is not the fix: its first step offers the last-used plan
+// (and Enter there would REPLACE the typed one), and its tier steps lead with
+// the standing ~/.oaica/config.json tiers rather than the plan's, so its
+// Enter-key defaults would drop the plan's tiers. The combination is refused by
+// name instead, and the doc says so (2026-09-26 audit).
+func TestRun_WizardWithPlanIsRefusedNotIgnored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, true)
+	withWizardEligibleLaunch(t)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	if err := PlanSet("p", TierPlanProfile{Model: "box/kat-awq"}); err != nil {
+		t.Fatal(err)
+	}
+
+	old := tierWizardSelect
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		t.Fatalf("the wizard ran for a launch that also named --plan (%s)", title)
+		return "", nil
+	}
+	t.Cleanup(func() { tierWizardSelect = old })
+
+	err := (&Claude{}).Run("box/kat-awq", nil, []string{"--wizard", "--plan", "p"})
+	if err == nil || !strings.Contains(err.Error(), "--wizard") || !strings.Contains(err.Error(), "plan") {
+		t.Fatalf("err = %v, want a refusal naming the conflict — a flag that silently does nothing is what the audit found", err)
+	}
+}
+
 // A remote's own remotes.json route_policy governs the launch, and the wizard
 // must not silently outrank it. The policy step pre-selects "auto" and any
 // Enter answers it — and the wizard's answer beats everything (the caller

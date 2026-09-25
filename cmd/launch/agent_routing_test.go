@@ -260,6 +260,51 @@ func TestTierFlagExtractors_TrimTheirValues(t *testing.T) {
 	}
 }
 
+// Every launcher-level flag is documented "not forwarded to the child binary",
+// and a repeated flag is an ordinary thing to type (a shell one-liner that
+// appends, a wrapper script). extractRoutePolicy/extractOversizeModel returned
+// at their FIRST match, so the second occurrence stayed in the passthrough args
+// and reached Claude Code, which does not know either flag — the launch died
+// with Claude Code's own usage error while the value the launcher actually used
+// was the earlier one. A repeat now strips every occurrence, last one wins,
+// matching the tier extractors next to them.
+func TestTierFlagExtractors_StripEveryOccurrence(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		args  []string
+		value string // the LAST occurrence wins, as it does for the tier flags
+		rest  []string
+	}{
+		{
+			name:  "--route-policy",
+			args:  []string{"--route-policy", "local-only", "--route-policy=auto", "--verbose"},
+			value: "auto",
+			rest:  []string{"--verbose"},
+		},
+		{
+			name:  "--oversize",
+			args:  []string{"--oversize=box/big", "--oversize", "zai/glm-4.6", "--verbose"},
+			value: "zai/glm-4.6",
+			rest:  []string{"--verbose"},
+		},
+	} {
+		var value string
+		var rest []string
+		switch c.name {
+		case "--route-policy":
+			value, rest = extractRoutePolicy(c.args)
+		case "--oversize":
+			value, rest = extractOversizeModel(c.args)
+		}
+		if value != c.value {
+			t.Errorf("%s extracted %q, want %q — the last occurrence, as the tier extractors do", c.name, value, c.value)
+		}
+		if got := strings.Join(rest, " "); got != strings.Join(c.rest, " ") {
+			t.Errorf("%s left %q in the pass-through args, want %q — the child binary does not know this flag", c.name, got, strings.Join(c.rest, " "))
+		}
+	}
+}
+
 func mustSonnet(args []string) string   { v, _ := extractSonnetModel(args); return v }
 func mustHaiku(args []string) string    { v, _ := extractHaikuModel(args); return v }
 func mustOversize(args []string) string { v, _ := extractOversizeModel(args); return v }

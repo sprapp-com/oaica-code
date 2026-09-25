@@ -1021,6 +1021,18 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	if picked, ok := strings.CutPrefix(model, planPickerPrefix); ok && planName == "" {
 		planName, model = picked, ""
 	}
+	// Refused by name, not ignored — checked AFTER the unwrap above so both
+	// spellings of "this launch uses a plan" are covered. The gate below skips
+	// the wizard whenever a plan is present, so the combination did nothing at
+	// all while docs/CLAUDE_TIERS.md promised --wizard forced the steps past
+	// that gate. Honouring it is not the fix either: the wizard's first step
+	// offers the LAST-USED plan (Enter there would replace this one), and its
+	// tier steps lead with the standing ~/.oaica/config.json tiers rather than
+	// the plan's, so their Enter-key defaults would drop the plan's tiers
+	// (2026-09-26 audit).
+	if wizardForced && planName != "" {
+		return fmt.Errorf("launch wizard: --wizard cannot be combined with --plan %s — a plan supplies the tiers, and the wizard would offer to swap the plan out; drop --plan to walk them, or pick a plan from inside the wizard", planName)
+	}
 	// The wizard runs BEFORE the plan block (not after it) because its first
 	// step can hand back a plan name: "reuse the plan I used here last time"
 	// is only reachable from inside the wizard, and the answer has to take the

@@ -358,3 +358,13 @@ skipped only when a tier/policy/oversize/plan/shard flag was passed. It never
 runs non-interactively: scripts and cron see no wizard at all, so their behavior
 is byte-identical. `--wizard` forces the steps past that gate and errors with
 `launch wizard: --wizard requires an interactive session` when non-interactive.
+
+One flag it does not force past is `--plan`, and that combination is refused
+rather than ignored: `launch wizard: --wizard cannot be combined with --plan
+<name>`. A plan already supplies the tiers, and two of the wizard's own
+behaviours would turn "adjust this plan" into "replace it" — its first step
+offers the plan used last *from this directory* (Enter there would swap the
+typed plan out), and its tier steps lead with the standing
+`~/.oaica/config.json` tiers rather than the plan's, so their Enter-key defaults
+would drop the plan's tiers. Drop `--plan` to walk the tiers from scratch, or
+run without `--wizard` to use the plan as saved.

@@ -699,8 +699,12 @@ func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval 
 
 // extractRoutePolicy pulls a launcher-level "--route-policy <p>" (or
 // "--route-policy=<p>") out of the passthrough args, mirroring
-// extractSonnetModel. Not forwarded to the child binary.
-func extractRoutePolicy(args []string) (string, []string) {
+// extractSonnetModel — including its shape: EVERY occurrence is stripped and
+// the last one wins. Returning at the first match left a repeated flag in the
+// passthrough args, where Claude Code — which has no such flag — failed the
+// launch while the launcher ran the earlier value (2026-09-26 audit). Not
+// forwarded to the child binary.
+func extractRoutePolicy(args []string) (policy string, rest []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -708,13 +712,15 @@ func extractRoutePolicy(args []string) (string, []string) {
 			// Trimmed: the policy is matched exactly, so a padded value
 			// (" local-only") failed with a message quoting surrounding
 			// whitespace the user cannot see they typed.
-			p := strings.TrimSpace(args[i+1])
-			return p, append(args[:i:i], args[i+2:]...)
+			policy = strings.TrimSpace(args[i+1])
+			i++
 		case strings.HasPrefix(a, "--route-policy="):
-			return strings.TrimSpace(strings.TrimPrefix(a, "--route-policy=")), append(args[:i:i], args[i+1:]...)
+			policy = strings.TrimSpace(strings.TrimPrefix(a, "--route-policy="))
+		default:
+			rest = append(rest, a)
 		}
 	}
-	return "", args
+	return policy, rest
 }
 
 // primaryRoutePolicy is the route_policy a user remote declares for the
@@ -747,21 +753,25 @@ func primaryRoutePolicy(model string) string {
 // the larger-context leg that serves requests the current leg cannot hold
 // (the auto-compaction call near a ceiling, mostly). Same picker vocabulary
 // as --sonnet-model: "<remote>/<id>", "router/<id>", "<id>:local", bare id.
-// Not forwarded to the child binary.
-func extractOversizeModel(args []string) (string, []string) {
+// Like extractRoutePolicy, every occurrence is stripped and the last one wins:
+// a repeat used to be forwarded to the child binary, which does not know the
+// flag. Not forwarded to the child binary.
+func extractOversizeModel(args []string) (model string, rest []string) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--oversize" && i+1 < len(args):
 			// Trimmed for the same reason as --sonnet-model: a padded value
 			// silently routes the leg to the primary's remote.
-			m := strings.TrimSpace(args[i+1])
-			return m, append(args[:i:i], args[i+2:]...)
+			model = strings.TrimSpace(args[i+1])
+			i++
 		case strings.HasPrefix(a, "--oversize="):
-			return strings.TrimSpace(strings.TrimPrefix(a, "--oversize=")), append(args[:i:i], args[i+1:]...)
+			model = strings.TrimSpace(strings.TrimPrefix(a, "--oversize="))
+		default:
+			rest = append(rest, a)
 		}
 	}
-	return "", args
+	return model, rest
 }
 
 // extractShardFlags pulls every repeatable "--shard <model>:<weight>" (or
