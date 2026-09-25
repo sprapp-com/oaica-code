@@ -642,7 +642,7 @@ func TestBuildTierPlan_NativeTierFamiliesRouteToTheirLeg(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan.HaikuName, plan.Haiku = "claude/haiku", haiku
-	plan.Routes.NativeTiers = nativeTierRoutes(plan)
+	plan.Routes.FamilyLegs = tierFamilyRoutes(plan)
 	if route, _ = plan.Routes.resolve("claude-haiku-4-5-20251001"); route.Label != routeFor(haiku).Label {
 		t.Fatalf("with --haiku-model claude/haiku the haiku id resolved to %q, want that leg (%q)", route.Label, routeFor(haiku).Label)
 	}

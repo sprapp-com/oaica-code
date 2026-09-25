@@ -345,15 +345,16 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 	if isBareRouterSKU(sonnetModel) {
 		return resolveLaunchEndpoint("router/" + sonnetModel)
 	}
-	// A native Claude tier ("claude/sonnet", "anthropic/opus") is an explicit
-	// cross-provider choice in the same sense router/<id> is: it names the
-	// user's own Anthropic login, never a model on the primary's remote.
-	// Without this it fell through to sameRemote() below and oaica handed the
-	// remote the LITERAL id "claude/sonnet" as an upstream model — a tier the
-	// user asked for silently became a bogus model name on the primary's
-	// endpoint (found 2026-09-25 while fixing the bare-alias env bug; a native
-	// PRIMARY escaped it because its legs never reach this branch).
-	if _, ok := nativeClaudeModelTier(sonnetModel); ok {
+	// A bare Claude tier name ("claude/sonnet", "anthropic/opus") is a native
+	// tier, never a model id any remote serves: Claude Code's own tier words
+	// are reserved here, so nothing is taken from a remote. Checked BEFORE the
+	// remote lookups because the primary's-remote fallback below accepts ANY
+	// "<primary>/<id>" — the literal string "claude/sonnet" included, which is
+	// not a model name at all. Without this the id was handed to the remote as
+	// an upstream model and the tier the user asked for silently became a bad
+	// model name (found 2026-09-25 while fixing the bare-alias env bug; a
+	// native PRIMARY escaped it because its legs never reach this branch).
+	if tier, ok := nativeClaudeModelTier(sonnetModel); ok && isBareClaudeTier(tier) {
 		return resolveLaunchEndpoint(sonnetModel)
 	}
 	explicit := strings.HasSuffix(sonnetModel, oaicaLocalTagSuffix) ||
@@ -377,6 +378,19 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 	// there under the namespaced form; otherwise pass it through unchanged.
 	if ep, ok := resolveRemoteEndpoint(primary.Name + "/" + sonnetModel); ok {
 		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
+	}
+	if tier, ok := nativeClaudeModelTier(sonnetModel); ok && tier != "" {
+		// A native-shaped id no remote claimed, on a primary that is not a
+		// user remote (router/daemon/local): the user's own Anthropic login is
+		// the only owner left, and the alternative is sameRemote()'s literal
+		// string. An aggregator's "anthropic/<slug>" never reaches this line
+		// for a user-remote primary — the prefixed lookup above claims it,
+		// which is the pre-existing un-namespaced contract.
+		//
+		// Deliberately NOT a remote-enumeration check: bareRemoteModelIndex()
+		// sweeps every remote's /models (seconds per unreachable host) and
+		// this runs on the launch's critical path.
+		return resolveLaunchEndpoint(sonnetModel)
 	}
 	return sameRemote(primary, sonnetModel), nil
 }
@@ -451,12 +465,12 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 	// set to sentinel ids and only the SONNET slot's value ever reached the
 	// wire). The request then arrives carrying a real Anthropic id
 	// ("claude-haiku-4-5-20251001") that means nothing to a local/remote leg.
-	// Registering the plan's native legs by FAMILY is what keeps a tier split
-	// honest in that mode: the haiku slot reaches the haiku leg the user
-	// configured instead of silently falling to the primary's model — on a
-	// claude/opus primary that was every background call (title generation,
-	// topic detection) billed at Opus rates.
-	plan.Routes.NativeTiers = nativeTierRoutes(plan)
+	// Registering the plan's legs by FAMILY is what keeps a tier split honest
+	// in that mode: the haiku slot reaches the haiku leg the user configured
+	// instead of silently falling to the primary's model — on a claude/opus
+	// primary that was every background call (title generation, topic
+	// detection) billed at Opus rates.
+	plan.Routes.FamilyLegs = tierFamilyRoutes(plan)
 
 	// Route-policy fallback legs (route_policy.go): the OTHER legs of the
 	// plan, deduped by base URL. A plan with both legs on one remote has
@@ -485,43 +499,92 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 // (~/.oaica/config.json, user_config.go) to tiers neither a flag nor a plan
 // filled. Flag > plan > config > wizard/default — this is the config step of
 // that ladder, kept as its own function so the precedence is testable without
-// running a launch.
-func standingTierModels(sonnetModel, haikuModel string) (string, string) {
+// running a launch. The two bools report which tiers actually came FROM the
+// file, so a later failure can tell a saved value worth forgiving from a flag
+// the user typed (see the retry in Run).
+func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, bool) {
+	sonnetSaved, haikuSaved := false, false
 	if sonnetModel == "" {
-		sonnetModel = UserConfigSonnetModel()
+		if v := UserConfigSonnetModel(); v != "" {
+			sonnetModel, sonnetSaved = v, true
+		}
 	}
 	if haikuModel == "" {
-		haikuModel = UserConfigHaikuModel()
+		if v := UserConfigHaikuModel(); v != "" {
+			haikuModel, haikuSaved = v, true
+		}
 	}
-	return sonnetModel, haikuModel
+	return sonnetModel, haikuModel, sonnetSaved, haikuSaved
 }
 
-// nativeTierRoutes maps Claude model families ("opus", "sonnet", "haiku") to
-// the plan leg that owns them, for the legs that ARE native Anthropic tiers
-// (see proxyRouteTable.NativeTiers for the whole story: opusplan resolves its
-// opus/haiku slots internally, so the client sends real family ids we would
-// otherwise have to send to Default — i.e. to the PRIMARY's model, whatever
-// the user asked the tier for). A leg's own ByModel route is reused when one
-// exists so the family and the picker string can never disagree about the leg
-// they name; otherwise the leg is routed directly.
-func nativeTierRoutes(plan tierPlan) map[string]proxyRoute {
-	var routes map[string]proxyRoute
-	for _, leg := range []struct {
+// tierFamilyRoutes maps Claude model families ("opus", "sonnet", "haiku",
+// "fable") to the plan leg that owns that TIER (see proxyRouteTable.FamilyLegs
+// for the whole story: opusplan resolves its opus/haiku slots internally, so
+// the client sends real family ids we would otherwise have to send to Default
+// — i.e. to the PRIMARY's model, whatever the user asked the tier for).
+//
+// Two passes, most explicit signal first:
+//
+//  1. A leg whose NAME is a native tier claims that family. "--sonnet-model
+//     claude/opus" is the user naming a family for a tier, so it beats the
+//     positional default: the sonnet tier IS Claude's opus.
+//  2. Positional defaults fill the families nothing claimed: the opus slot is
+//     the plan's primary, sonnet the secondary, haiku the haiku leg.
+//
+// Pass 2 is what makes a NON-native haiku leg work at all. Restricting this
+// map to native legs (the first cut of this feature) left the ordinary case
+// broken — a `haiku_model` of "zai-coding-plan/glm-4.5-air" registered no
+// family, so Claude Code's own claude-haiku-4-5-* ids still fell to Default
+// and were billed at the primary's price, which is the exact cost the setting
+// promises to remove. Pass 2 for opus/sonnet is a no-op in that same case
+// (Default is the primary, and the secondary's own id — not a family id — is
+// what the client was told to send), so the blast radius stays the haiku tier.
+//
+// A leg's own ByModel route is reused whenever one exists, so a family route
+// and the picker string can never disagree about the leg they name.
+func tierFamilyRoutes(plan tierPlan) map[string]proxyRoute {
+	legs := []struct {
 		name string
 		ep   launchEndpoint
-	}{{plan.PrimaryName, plan.Primary}, {plan.SecondaryName, plan.Secondary}, {plan.HaikuName, plan.Haiku}} {
-		tier, ok := nativeClaudeModelTier(leg.name)
-		if !ok {
-			continue
+	}{{plan.PrimaryName, plan.Primary}, {plan.SecondaryName, plan.Secondary}, {plan.HaikuName, plan.Haiku}}
+	routeOf := func(leg struct {
+		name string
+		ep   launchEndpoint
+	}) (proxyRoute, bool) {
+		if leg.name == "" {
+			return proxyRoute{}, false
 		}
-		r := routeFor(leg.ep)
 		if existing, ok := plan.Routes.ByModel[leg.name]; ok {
-			r = existing
+			return existing, true
+		}
+		return routeFor(leg.ep), true
+	}
+	var routes map[string]proxyRoute
+	claim := func(family string, leg struct {
+		name string
+		ep   launchEndpoint
+	}) {
+		r, ok := routeOf(leg)
+		if !ok {
+			return
 		}
 		if routes == nil {
 			routes = map[string]proxyRoute{}
 		}
-		routes[tier] = r
+		routes[family] = r
+	}
+	for _, leg := range legs {
+		// An empty tier ("claude/") is a picker typo, not a family: it would
+		// otherwise claim the "" key, which no client id ever produces.
+		if tier, ok := nativeClaudeModelTier(leg.name); ok && tier != "" {
+			claim(tier, leg)
+		}
+	}
+	for i, family := range []string{"opus", "sonnet", "haiku"} {
+		if _, claimed := routes[family]; claimed {
+			continue
+		}
+		claim(family, legs[i])
 	}
 	return routes
 }
@@ -554,8 +617,13 @@ func nativeTierRoutes(plan tierPlan) map[string]proxyRoute {
 // Resolution failing (no Anthropic credential, offline) falls back to the
 // bare tier: the same visible failure as before rather than a silent launch
 // on some other model.
+//
+// An EMPTY tier ("claude/", a truncated picker string) is not a tier at all:
+// resolving it would match the first Anthropic catalog entry, silently
+// pinning the slot to the flagship model. Left alone, so the caller's own
+// value is used and the mistake stays visible.
 func claudeCodeModelAlias(model string) string {
-	if tier, ok := nativeClaudeModelTier(model); ok {
+	if tier, ok := nativeClaudeModelTier(model); ok && tier != "" {
 		return resolveNativeModelAlias(tier)
 	}
 	return model
@@ -687,6 +755,9 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
+	// Set below by standingTierModels: which tiers came from the saved config
+	// rather than a flag/plan. See the buildTierPlan retry for the one use.
+	savedSonnet, savedHaiku := false, false
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
@@ -745,7 +816,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// request for a distinct haiku tier, so it takes a native primary off the
 	// untouched runNative path (which has no env at all and would run its own
 	// built-in Haiku) — that is the intent, not a side effect.
-	sonnetModel, haikuModel = standingTierModels(sonnetModel, haikuModel)
+	sonnetModel, haikuModel, savedSonnet, savedHaiku = standingTierModels(sonnetModel, haikuModel)
 	if briefMode {
 		// Claude Code's own flag, not a bespoke mechanism — see
 		// briefModeSystemPrompt's doc for why this exact wording and why
@@ -776,7 +847,27 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 
 	plan, err := buildTierPlan(model, sonnetModel, haikuModel, forceTools)
 	if err != nil {
-		return err
+		// A saved preference (~/.oaica/config.json) must never be able to
+		// break every launch: the model it names can be decommissioned, or the
+		// remote holding it removed, long after the user set it — and the
+		// error buildTierPlan returns names a FLAG ("--haiku-model: ...") the
+		// user never typed on this command line. Retry once without the saved
+		// values, which are the only inputs a past `oaica config set` could
+		// have invalidated. A bad flag still fails immediately, as before.
+		if !savedSonnet && !savedHaiku {
+			return err
+		}
+		dropSaved := func(v string, saved bool) string {
+			if saved {
+				return ""
+			}
+			return v
+		}
+		fmt.Fprintf(os.Stderr, "config: %v — ignoring the saved tier(s) for this launch; fix with `oaica config set sonnet-model|haiku-model <model>`, or clear with `-`\n", err)
+		plan, err = buildTierPlan(model, dropSaved(sonnetModel, savedSonnet), dropSaved(haikuModel, savedHaiku), forceTools)
+		if err != nil {
+			return err
+		}
 	}
 	// Policy precedence: --route-policy flag > primary remote's
 	// route_policy (remotes.json) > local-first (parseRoutePolicy default).

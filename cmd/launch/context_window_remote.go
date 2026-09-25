@@ -224,6 +224,14 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 			p.Routes.ByModel[p.Haiku.UpstreamModel] = r
 		}
 	}
+	// Family routes are copies taken in buildTierPlan, i.e. BEFORE these
+	// windows were known. Refresh them from ByModel, which was just updated, so
+	// a request that arrives on a Claude family id (Claude Code's own
+	// opus/haiku slots) hits the same clamp ceiling as the leg it names —
+	// without this a family-routed request skipped the context-fit clamp
+	// entirely (ContextWindow 0), on exactly the background calls most likely
+	// to carry a large prompt.
+	p.Routes.FamilyLegs = tierFamilyRoutes(*p)
 	return p
 }
 

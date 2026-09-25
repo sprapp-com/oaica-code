@@ -16,7 +16,7 @@ package launch
 // haiku_model. It is the tier worth setting: Claude Code sends its background
 // work there (conversation titles, topic detection, subagent spawning), so a
 // haiku tier left on the primary bills invisible traffic at primary prices —
-// see tier_routing.go's buildTierPlan and NativeTiers for the mechanics.
+// see tier_routing.go's buildTierPlan and tierFamilyRoutes for the mechanics.
 //
 // Same atomic-write convention as plans.json / remotes.json.
 

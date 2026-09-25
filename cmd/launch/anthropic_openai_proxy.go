@@ -734,19 +734,22 @@ type proxyRouteTable struct {
 	// localities and the breaker like everything else. ContextWindow is
 	// probed at launch (withContextWindows) and must exceed the primary's.
 	Oversize proxyRoute
-	// NativeTiers maps a Claude model FAMILY ("opus", "sonnet", "haiku",
-	// "fable") to the plan leg that should serve it, for the native tiers of
-	// the plan. Built by buildTierPlan. See resolve() for why it exists:
-	// Claude Code's opusplan mode resolves its opus and haiku slots from its
-	// OWN built-in catalog, NOT from ANTHROPIC_DEFAULT_{OPUS,HAIKU}_MODEL, so
-	// the request arrives carrying a real Anthropic id ("claude-haiku-4-5-…")
-	// no matter what we put in the environment — probing 2026-09-25 set both
-	// vars to sentinel values and watched only the sonnet slot's value reach
-	// the wire. Without this map such an id can only fall to Default, which
-	// silently sends the subagent/haiku tier to the PRIMARY's model (the
-	// token-cost bug this fixed). Empty = every family id goes to Default
-	// (the pre-existing behaviour, byte-identical for a single-leg plan).
-	NativeTiers map[string]proxyRoute
+	// FamilyLegs maps a Claude model FAMILY ("opus", "sonnet", "haiku",
+	// "fable") to the plan leg that owns that TIER. Built by buildTierPlan
+	// (tierFamilyRoutes). See resolve() for why it exists: Claude Code's
+	// opusplan mode resolves its opus and haiku slots from its OWN built-in
+	// catalog, NOT from ANTHROPIC_DEFAULT_{OPUS,HAIKU}_MODEL, so the request
+	// arrives carrying a real Anthropic id ("claude-haiku-4-5-…") no matter
+	// what we put in the environment — probing 2026-09-25 set both vars to
+	// sentinel values and watched only the sonnet slot's value reach the
+	// wire. Without this map such an id can only fall to Default, which sends
+	// the haiku tier to the PRIMARY's model — the token-cost bug this fixed,
+	// and one it only actually fixes when the configured haiku leg is
+	// reachable by family, native or not (a haiku_model pointing at a remote
+	// or router leg is the common case). Empty = every family id goes to
+	// Default (the pre-existing behaviour, byte-identical for a single-leg
+	// plan).
+	FamilyLegs map[string]proxyRoute
 }
 
 // authorized reports whether r presents the table's client token.
@@ -929,9 +932,9 @@ func (t proxyRouteTable) resolve(requested string) (proxyRoute, string) {
 	// those regardless of our ANTHROPIC_DEFAULT_HAIKU_MODEL, and no backend
 	// of ours knows them — forwarding raw made the upstream 404. Map them
 	// onto the leg that owns that family when the plan has one
-	// (NativeTiers), else onto the default leg as before.
+	// (FamilyLegs), else onto the default leg as before.
 	if family, ok := claudeModelFamily(requested); ok {
-		if r, ok := t.NativeTiers[family]; ok {
+		if r, ok := t.FamilyLegs[family]; ok {
 			return r, r.UpstreamModel
 		}
 		return t.Default, t.Default.UpstreamModel
@@ -1790,7 +1793,10 @@ func resolveNativeModelAliasUncached(model string) string {
 	if err != nil {
 		return model
 	}
-	req.Header.Set(auth.Header, auth.Value)
+	// applyNativeAnthropicAuth, not a bare Set: an OAuth bearer needs the
+	// anthropic-beta header too (see its doc) and this GET has no client
+	// request whose headers could supply it.
+	applyNativeAnthropicAuth(req, auth)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {

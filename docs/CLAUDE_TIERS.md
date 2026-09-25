@@ -8,16 +8,31 @@ an env var the launcher sets:
 | Plan mode under `/model opusplan`; `/model opus`; `--model opus` | Opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` |
 | Execution under `/model opusplan`; `/model sonnet`; `--model sonnet` | Sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` |
 | Subagents | — | `CLAUDE_CODE_SUBAGENT_MODEL` (= the Sonnet model) |
-| Quick background calls (titles, summaries) | Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` (= the primary) |
+| Quick background calls (titles, summaries) | Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` (= the primary unless `--haiku-model`/`haiku_model` sets a tier) |
 
-The launcher always passes `--model <primary>` to Claude Code, so **with a
-plain launch every main-conversation request goes to the primary**. The
+The launcher passes `--model <primary>` to Claude Code, so **with a plain
+launch every main-conversation request goes to the primary**. The
 `--sonnet-model` backend is reached three ways: `/model opusplan` (plans on
 the primary, executes on the secondary), `/model sonnet` / `--model sonnet`
 (main conversation on the secondary), and subagents (always the secondary).
-Haiku-tier background calls stay on the primary in every mode. `--model
-opus` / `--model sonnet` pin the *main conversation* only; subagents and
-Haiku calls keep their env-var tiers.
+`--model opus` / `--model sonnet` pin the *main conversation* only;
+subagents and Haiku calls keep their env-var tiers.
+
+**`--haiku-model` (or the standing `haiku_model` key) is the tier worth
+setting** (2026-09-25): Claude Code sends its background work there, and a
+haiku tier left unset bills it at the primary's price — the primary's model
+serves every title-generation and topic-detection call. With a tier split the
+launch runs `--model opusplan`, in which Claude Code resolves its **opus and
+haiku slots from its own built-in catalog**, ignoring
+`ANTHROPIC_DEFAULT_{OPUS,HAIKU}_MODEL` entirely (probed against 2.1.282:
+only the Sonnet slot's value ever reached the wire). Those requests therefore
+arrive carrying real Anthropic family ids (`claude-haiku-4-5-20251001`), and
+the proxy maps them onto the leg the plan owns for that tier
+(`proxyRouteTable.FamilyLegs`, built by `tierFamilyRoutes`) — the opus slot to
+the primary, sonnet to the secondary, haiku to the haiku leg, whether those
+legs are native (`claude/haiku`) or an ordinary remote/router model
+(`zai-coding-plan/glm-4.5-air`). A leg literally named for a tier
+(`--sonnet-model claude/opus`) claims that family outright.
 
 Every request carries the resolved model id. The launcher runs ONE local
 Anthropic→OpenAI translation proxy with a **routing table keyed by that id**,
@@ -54,7 +69,15 @@ every place that was tried (and the fix when the router rejected the key).
   does not enumerate it (`muse-spark-1.2` on opencode-go, `openai/gpt-5` on
   an OpenRouter remote). A bare id that other remotes or the router also
   serve is never silently rerouted. To leave the primary's remote, be
-  explicit: `<remote>/<id>`, `<model>:local`, `router/<id>`, `ollama/<id>`.
+  explicit: `<remote>/<id>`, `<model>:local`, `router/<id>`, `ollama/<id>`,
+  or a native Anthropic tier.
+- `claude/<tier>` / `anthropic/<tier>` (`claude/sonnet`, `anthropic/opus`,
+  `claude/haiku`) is the user's own Anthropic login, spent through the
+  passthrough leg — the same reserved meaning it has as a primary. Bare tier
+  names win outright (no remote serves a model named `sonnet`); the
+  ambiguous `anthropic/<slug>` shape still prefers a remote that enumerates
+  it, so an aggregator's own Claude slug (`anthropic/claude-sonnet-4.5` on an
+  OpenRouter primary) keeps going to that remote.
 - Primary on the router / daemon / `oaica serve`: the secondary resolves
   with the primary table above.
 
@@ -218,11 +241,15 @@ picker:
 1. **Primary model** — the existing picker (unchanged).
 2. **Sonnet/subagent tier** — same picker list, `(same as primary)` first and
    the default (Enter keeps the single-model launch).
-3. **Compaction/oversize model** — only models whose PROBED context window
+3. **Haiku tier** — the cheap leg for Claude Code's background work; same
+   picker list, `(same as primary)` default. Setting this is the one step
+   that removes real spend (see the tier table above), so it is worth a
+   deliberate choice.
+4. **Compaction/oversize model** — only models whose PROBED context window
    (the same 2s `/models` probe the proxy uses) is strictly larger than the
    primary's qualify; `(none — fail honestly at the ceiling)` is the default.
    With no probe answer and no larger model, the step offers nothing.
-4. **Route policy** — the six `--route-policy` values, `local-first` default
+5. **Route policy** — the six `--route-policy` values, `local-first` default
    (`weighted` is available here too, but the wizard has no step for setting
    per-leg weights — use `--shard`/`remotes.json` `weight` for that).
 
@@ -232,10 +259,17 @@ skips): `oaica plan list` / `oaica plan show NAME` show the oversize +
 policy columns, `oaica plan set NAME --model a --sonnet-model b --oversize c
 --route-policy remote-first` builds one by hand.
 
-Precedence is unchanged and now covers the stored fields: **flag >
-plan > remotes.json `route_policy` > local-first**. Old plans.json files
-missing `oversize_model`/`route_policy` load unchanged (missing = empty =
-today's defaults).
+Precedence for both non-primary tiers is the same ladder: **flag >
+`--plan`'s stored field > `~/.oaica/config.json`
+(`sonnet_model`/`haiku_model`, set with `oaica config set`) > wizard >
+same-as-primary**. A saved value that no longer resolves is reported and
+ignored for that launch rather than failing it — a stale key must not break
+every launch in the fleet. `oaica config show` prints both keys and the file
+path.
+
+Plan > remotes.json `route_policy` > local-first also still holds for the
+route policy. Old plans.json files missing `oversize_model`/`route_policy`
+load unchanged (missing = empty = today's defaults).
 
 Flag-only and non-interactive launches (`--model`, `--yes`, scripts, cron)
 never see the wizard — their behavior is byte-identical.

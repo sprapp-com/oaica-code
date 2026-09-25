@@ -98,13 +98,21 @@ func TestStandingTierModels_PreferenceFillsOnlyTheGaps(t *testing.T) {
 	if err := UserConfigSetHaikuModel("zai-coding-plan/glm-4.5-air"); err != nil {
 		t.Fatal(err)
 	}
-	sonnet, haiku := standingTierModels("", "")
+	sonnet, haiku, sonnetSaved, haikuSaved := standingTierModels("", "")
 	if sonnet != "zai-coding-plan/glm-4.6" || haiku != "zai-coding-plan/glm-4.5-air" {
 		t.Fatalf("standingTierModels(\"\", \"\") = %q, %q, want the saved pair", sonnet, haiku)
 	}
-	sonnet, haiku = standingTierModels("box/kat-awq", "")
+	if !sonnetSaved || !haikuSaved {
+		t.Fatalf("standingTierModels(\"\", \"\") reported saved=%v/%v, want both true (they came from the file)", sonnetSaved, haikuSaved)
+	}
+	sonnet, haiku, sonnetSaved, haikuSaved = standingTierModels("box/kat-awq", "")
 	if sonnet != "box/kat-awq" || haiku != "zai-coding-plan/glm-4.5-air" {
 		t.Fatalf("standingTierModels(flag, \"\") = %q, %q — a flag must win, config fills the rest", sonnet, haiku)
+	}
+	// The flags matter downstream: a value the user typed is not forgiven by
+	// the buildTierPlan retry, so the saved-marker must be false for it.
+	if sonnetSaved || !haikuSaved {
+		t.Fatalf("standingTierModels(flag, \"\") reported saved=%v/%v, want false/true", sonnetSaved, haikuSaved)
 	}
 }
 

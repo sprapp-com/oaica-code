@@ -54,13 +54,19 @@ Hosted models: `oaica-35b-a3b-vision` (262k context, vision, MTP) and
 
 Multi-model launches (v0.5.0+): a plain interactive
 `oaica launch claude` walks a wizard — primary, then Sonnet/execution
-tier, then a compaction/oversize model (only models with a probed LARGER
+tier, then the Haiku tier (Claude Code's background work: titles, topic
+detection — leaving it unset bills those calls at the primary's price),
+then a compaction/oversize model (only models with a probed LARGER
 context window are offered), then a route
 policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)
 with cross-leg failover via a health circuit breaker — and can save the
 whole setup as a named plan. Same knobs exist as flags
-(`--sonnet-model`, `--oversize`, `--route-policy`) and are validated by
-`oaica doctor`. `weighted` splits HEALTHY traffic across legs by weight
+(`--sonnet-model`, `--haiku-model`, `--oversize`, `--route-policy`) and are
+validated by `oaica doctor`. Set the tiers once with
+`oaica config set sonnet-model <model>` / `oaica config set haiku-model
+<model>` and every later `oaica launch claude` uses them (a flag or a plan
+still wins; `oaica config show` lists them). `weighted` splits HEALTHY
+traffic across legs by weight
 (session-sticky consistent hash) instead of only failing over — set
 weights via `remotes.json`'s `"weight"` or the repeatable
 `--shard <model>:<weight>` flag. Details: docs/CLAUDE_TIERS.md.
@@ -98,6 +104,7 @@ Remotes are stored in `~/.oaica/remotes.json`. Built-in providers include
 | `oaica remote add\|list\|show\|rm` | Manage user-defined OpenAI-compatible endpoints |
 | `oaica model add\|list\|show\|rm\|refresh\|alias` | Manage the local model manifest (context window, engine, launch flags) |
 | `oaica plan set\|list\|show\|rm` | Named tier plans (e.g. plan on one model, execute on another) |
+| `oaica config show\|set` | Standing launch tiers: `sonnet_model`, `haiku_model` |
 | `oaica signin` / `oaica signout` | Save or remove your OAICA API key |
 | `oaica site new\|edit\|preview\|deploy` | Optional static site builder |
 | `oaica gpu ps\|clean` | Inspect / clean up local GPU-memory-holding processes |
@@ -115,6 +122,7 @@ Everything lives under `~/.oaica/`:
 | Path | Contents |
 |---|---|
 | `~/.oaica/api_key` | Saved OAICA API key (`oaica signin`) |
+| `~/.oaica/config.json` | Standing launch tiers — `sonnet_model`, `haiku_model` (`oaica config`) |
 | `~/.oaica/license_key` | Saved license key |
 | `~/.oaica/models.json` | Local model manifest (`oaica model`) |
 | `~/.oaica/plans.json` | Named tier plans (`oaica plan`) |

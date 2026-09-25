@@ -18,6 +18,7 @@ package launch
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +58,27 @@ func resolveNativeAnthropicAuth() (nativeAnthropicAuth, bool) {
 		return nativeAnthropicAuth{}, false
 	}
 	return nativeAnthropicAuth{Header: "Authorization", Value: "Bearer " + token}, true
+}
+
+// oauthBetaHeaderValue is the anthropic-beta value an OAuth bearer from
+// `claude /login` requires — Anthropic rejects the bearer without it. Claude
+// Code sends it on every request it makes, so the passthrough routes inherit
+// it by forwarding the client's headers verbatim (anthropicModelsPassthrough)
+// and never need this constant. A request oaica builds on its OWN behalf has
+// no client to copy headers from; resolveNativeModelAliasUncached's /v1/models
+// GET is the one such request, and without this header an OAuth-only user's
+// lookup 401s — which is what made the native alias resolution silently
+// no-op for exactly the users the native picker rows exist for.
+const oauthBetaHeaderValue = "oauth-2025-04-20"
+
+// applyNativeAnthropicAuth puts auth on req the way the corresponding live
+// Anthropic request would carry it: the credential header, plus the beta
+// header when the credential is an OAuth bearer.
+func applyNativeAnthropicAuth(req *http.Request, auth nativeAnthropicAuth) {
+	req.Header.Set(auth.Header, auth.Value)
+	if auth.Header == "Authorization" {
+		req.Header.Set("anthropic-beta", oauthBetaHeaderValue)
+	}
 }
 
 // readClaudeOAuthAccessTokenFn is a var so tests can point it at a fixture
