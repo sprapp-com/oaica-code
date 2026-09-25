@@ -11,17 +11,22 @@ import (
 
 func TestBillingPlanLabel(t *testing.T) {
 	cases := map[string]string{
-		"opencode-go/glm-5.3-flash":      "Coding Plan (zen — shared subscription)",
-		"opencode-go/glm-5.1":            "Coding Plan (zen — shared subscription)",
-		"opencode-go/kimi-k2.6":          "Coding Plan (zen — shared subscription)",
-		"zai/glm-5.3":                    "API Plan (Z.AI — per-token key)",
-		"zai-coding-plan/glm-5.3":        "Coding Plan (Z.AI — subscription)",
-		"moonshot/kimi-k3":               "API Plan (Moonshot/Kimi — per-token key)",
-		"minimax/minimax-m2.7":           "API Plan (MiniMax — per-token key)",
-		"minimax-coding-plan/MiniMax-M3": "Coding Plan (MiniMax — subscription)",
-		"kimi-code-plan-global/k3":       "Coding Plan (Kimi — subscription)",
-		"glm-5.3-flash":                  "",
-		"box/glm-5.3-flash":              "",
+		"opencode-go/glm-5.3-flash":         "Coding Plan (OpenCode Go — subscription)",
+		"opencode-go/glm-5.1":               "Coding Plan (OpenCode Go — subscription)",
+		"opencode-go/kimi-k2.6":             "Coding Plan (OpenCode Go — subscription)",
+		"opencode/glm-5.3":                  "API Plan (OpenCode Zen — per-token key)",
+		"zai/glm-5.3":                       "API Plan (Z.AI — per-token key)",
+		"zai-coding-plan/glm-5.3":           "Coding Plan (Z.AI — subscription)",
+		"moonshot/kimi-k3":                  "API Plan (Moonshot/Kimi — per-token key)",
+		"minimax/minimax-m2.7":              "API Plan (MiniMax — per-token key)",
+		"minimax-coding-plan/MiniMax-M3":    "Coding Plan (MiniMax — subscription)",
+		"minimax-cn-coding-plan/MiniMax-M3": "Coding Plan (MiniMax China — subscription)",
+		"kimi-code-plan-global/k3":          "Coding Plan (Kimi — subscription)",
+		"kimi-code-plan-cn/k3":              "Coding Plan (Kimi China — subscription)",
+		"xiaomi-token-plan-ams/mimo-v2":     "Token Plan (Xiaomi Europe — subscription)",
+		"stepfun-step-plan/step-3":          "Step Plan (StepFun China — subscription)",
+		"glm-5.3-flash":                     "",
+		"box/glm-5.3-flash":                 "",
 	}
 	for name, want := range cases {
 		if got := billingPlanLabel(name); got != want {
