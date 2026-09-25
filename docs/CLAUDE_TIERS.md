@@ -31,8 +31,12 @@ the proxy maps them onto the leg the plan owns for that tier
 (`proxyRouteTable.FamilyLegs`, built by `tierFamilyRoutes`) — the opus slot to
 the primary, sonnet to the secondary, haiku to the haiku leg, whether those
 legs are native (`claude/haiku`) or an ordinary remote/router model
-(`zai-coding-plan/glm-4.5-air`). A leg literally named for a tier
-(`--sonnet-model claude/opus`) claims that family outright.
+(`zai-coding-plan/glm-4.5-air`). A leg literally named for a tier claims that
+family — but only on the SONNET slot (`--sonnet-model claude/opus`), the one
+slot whose env value the launcher controls; a leg on the opus or haiku slot
+may only claim its own slot's family, so `--haiku-model claude/opus` cannot
+take the opus family (the main plan-mode conversation) off the configured
+primary.
 
 Every request carries the resolved model id. The launcher runs ONE local
 Anthropic→OpenAI translation proxy with a **routing table keyed by that id**,
@@ -261,11 +265,22 @@ policy columns, `oaica plan set NAME --model a --sonnet-model b --oversize c
 
 Precedence for both non-primary tiers is the same ladder: **flag >
 `--plan`'s stored field > `~/.oaica/config.json`
-(`sonnet_model`/`haiku_model`, set with `oaica config set`) > wizard >
-same-as-primary**. A saved value that no longer resolves is reported and
-ignored for that launch rather than failing it — a stale key must not break
-every launch in the fleet. `oaica config show` prints both keys and the file
-path.
+(`sonnet_model`/`haiku_model`, set with `oaica config set`; a key is cleared
+with `oaica config set <key> -`) > wizard > same-as-primary**.
+
+A saved value that fails to RESOLVE is reported and ignored for that launch
+rather than failing it — a stale key must not break every launch in the fleet
+— and only the failing tier is dropped: the other saved key still applies
+(2026-09-25; dropping both would re-bill Claude Code's background work at the
+primary's price, the cost `haiku_model` exists to remove). "Fails to resolve"
+means what `buildTierPlan` can detect before anything starts: a name no
+remote/router/daemon/local serve answers for. A saved value that resolves to a
+real backend but the backend does not actually serve is NOT detected here — an
+un-namespaced id is passed to the primary's remote on purpose (see
+`--sonnet-model` resolution above), so a typo inside an existing remote fails
+at the first request instead. Check the launch's `tiers:` line, which prints
+what each tier actually resolved to. `oaica config show` prints both keys and
+the file path.
 
 Plan > remotes.json `route_policy` > local-first also still holds for the
 route policy. Old plans.json files missing `oversize_model`/`route_policy`

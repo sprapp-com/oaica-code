@@ -376,21 +376,13 @@ func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launc
 	}
 	// Prefix with the primary's remote name in case the id is enumerated
 	// there under the namespaced form; otherwise pass it through unchanged.
+	// This is the un-namespaced contract, and for a user-remote primary it
+	// always matches (findUserRemoteForModel splits at the first "/" and finds
+	// the primary by name), which is why no native-tier fallback follows it:
+	// a primary that is NOT a user remote already returned the native endpoint
+	// at the top of this function, and every other spelling was handled above.
 	if ep, ok := resolveRemoteEndpoint(primary.Name + "/" + sonnetModel); ok {
 		return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
-	}
-	if tier, ok := nativeClaudeModelTier(sonnetModel); ok && tier != "" {
-		// A native-shaped id no remote claimed, on a primary that is not a
-		// user remote (router/daemon/local): the user's own Anthropic login is
-		// the only owner left, and the alternative is sameRemote()'s literal
-		// string. An aggregator's "anthropic/<slug>" never reaches this line
-		// for a user-remote primary — the prefixed lookup above claims it,
-		// which is the pre-existing un-namespaced contract.
-		//
-		// Deliberately NOT a remote-enumeration check: bareRemoteModelIndex()
-		// sweeps every remote's /models (seconds per unreachable host) and
-		// this runs on the launch's critical path.
-		return resolveLaunchEndpoint(sonnetModel)
 	}
 	return sameRemote(primary, sonnetModel), nil
 }
@@ -495,6 +487,85 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 	return plan, nil
 }
 
+// savedTiersToDrop decides which ~/.oaica/config.json tier(s) a failed
+// buildTierPlan justifies dropping for one launch. buildTierPlan wraps each
+// leg's failure with the flag name for that leg ("--sonnet-model: ..."), which
+// is how the failing tier is identified here; the error text is our own, so
+// the prefixes only change if buildTierPlan's wrapping changes.
+//
+// Dropping only the failing tier is the whole point: both keys are set across
+// the fleet, and a stale sonnet_model must not cost the (healthy) haiku tier —
+// losing it silently re-bills Claude Code's background work at the primary's
+// price, the exact cost `haiku_model` exists to remove.
+//
+// An error naming neither leg or both cannot be attributed to one tier (and is
+// usually the primary's, which no saved tier can influence), so every saved
+// value is dropped: a stale key must never break every launch. A value the
+// user typed on this command line is never forgiven — savedSonnet/savedHaiku
+// say which tiers came from the file at all.
+func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (bool, bool) {
+	if err == nil || (!savedSonnet && !savedHaiku) {
+		return false, false
+	}
+	msg := err.Error()
+	namesSonnet := strings.Contains(msg, "--sonnet-model:")
+	namesHaiku := strings.Contains(msg, "--haiku-model:")
+	if namesSonnet != namesHaiku {
+		return savedSonnet && namesSonnet, savedHaiku && namesHaiku
+	}
+	return savedSonnet, savedHaiku
+}
+
+// resolveTierPlan builds the launch's tier plan, forgiving a stale saved tier.
+//
+// A preference from ~/.oaica/config.json can rot long after the user set it —
+// the model gets decommissioned, its remote is removed — and the error
+// buildTierPlan returns names a FLAG ("--haiku-model: ...") the user never
+// typed on THIS command line. Dropping both saved values at the first failure
+// would be the blunt fix and costs the healthy key (see savedTiersToDrop), so
+// this retries: each attempt drops only the tier the error names, and a second
+// attempt exists because one error can only name one leg — with both keys
+// stale, the first retry fails on the other one. A flag or plan value that
+// fails is returned as-is, as before.
+//
+// The returned tiers are the ones the returned plan was built with.
+func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSonnet, savedHaiku bool) (tierPlan, string, string, error) {
+	// buildTierPlan prints notices as it resolves (price banner, tool-wire
+	// warnings) and an attempt may be discarded below, so buffer them: only
+	// the plan the launch keeps gets to print.
+	var buf strings.Builder
+	planNotices = &buf
+	plan, err := buildTierPlan(model, sonnetModel, haikuModel, forceTools)
+	planNotices = os.Stderr
+	if err == nil {
+		_, _ = io.WriteString(os.Stderr, buf.String())
+		return plan, sonnetModel, haikuModel, nil
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		dropSonnet, dropHaiku := savedTiersToDrop(err, savedSonnet, savedHaiku)
+		if !dropSonnet && !dropHaiku {
+			return tierPlan{}, "", "", err
+		}
+		var dropped []string
+		if dropSonnet {
+			sonnetModel, savedSonnet, dropped = "", false, append(dropped, "sonnet_model")
+		}
+		if dropHaiku {
+			haikuModel, savedHaiku, dropped = "", false, append(dropped, "haiku_model")
+		}
+		fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
+		var retryBuf strings.Builder
+		planNotices = &retryBuf
+		plan, err = buildTierPlan(model, sonnetModel, haikuModel, forceTools)
+		planNotices = os.Stderr
+		if err == nil {
+			_, _ = io.WriteString(os.Stderr, retryBuf.String())
+			return plan, sonnetModel, haikuModel, nil
+		}
+	}
+	return tierPlan{}, "", "", err
+}
+
 // standingTierModels applies the user's saved preferences
 // (~/.oaica/config.json, user_config.go) to tiers neither a flag nor a plan
 // filled. Flag > plan > config > wizard/default — this is the config step of
@@ -527,7 +598,11 @@ func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, b
 //
 //  1. A leg whose NAME is a native tier claims that family. "--sonnet-model
 //     claude/opus" is the user naming a family for a tier, so it beats the
-//     positional default: the sonnet tier IS Claude's opus.
+//     positional default: the sonnet tier IS Claude's opus. That claim is
+//     confined to the SONNET slot (see the loop below): it is the only slot
+//     whose env value the launcher controls, so it is the only place a foreign
+//     family can arrive FROM a leg name. A leg on the opus or haiku slot may
+//     only claim its own slot's family.
 //  2. Positional defaults fill the families nothing claimed: the opus slot is
 //     the plan's primary, sonnet the secondary, haiku the haiku leg.
 //
@@ -573,12 +648,28 @@ func tierFamilyRoutes(plan tierPlan) map[string]proxyRoute {
 		}
 		routes[family] = r
 	}
-	for _, leg := range legs {
+	slotFamilies := []string{"opus", "sonnet", "haiku"}
+	for i, leg := range legs {
 		// An empty tier ("claude/") is a picker typo, not a family: it would
 		// otherwise claim the "" key, which no client id ever produces.
-		if tier, ok := nativeClaudeModelTier(leg.name); ok && tier != "" {
-			claim(tier, leg)
+		tier, ok := nativeClaudeModelTier(leg.name)
+		if !ok || tier == "" {
+			continue
 		}
+		// A leg naming ANOTHER family may only do so on the sonnet slot. That
+		// slot is the one Claude Code lets us set (opusplan resolves its opus
+		// and haiku slots from its own catalog), so "claude/opus" there is a
+		// deliberate statement about the sonnet tier. Elsewhere the same name
+		// moves traffic the user never aimed at it: "--haiku-model claude/opus"
+		// would take the OPUS family — the main plan-mode conversation — off
+		// the configured primary and onto the Anthropic login, and a native
+		// primary named "claude/fable" would take the fable family away from
+		// the haiku leg the plan actually configured. Those legs keep their own
+		// slot's family and let pass 2 place the rest.
+		if i != 1 && tier != slotFamilies[i] {
+			continue
+		}
+		claim(tier, leg)
 	}
 	for i, family := range []string{"opus", "sonnet", "haiku"} {
 		if _, claimed := routes[family]; claimed {
@@ -845,29 +936,18 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		return err
 	}
 
-	plan, err := buildTierPlan(model, sonnetModel, haikuModel, forceTools)
+	plan, effSonnet, effHaiku, err := resolveTierPlan(model, sonnetModel, haikuModel, forceTools, savedSonnet, savedHaiku)
 	if err != nil {
-		// A saved preference (~/.oaica/config.json) must never be able to
-		// break every launch: the model it names can be decommissioned, or the
-		// remote holding it removed, long after the user set it — and the
-		// error buildTierPlan returns names a FLAG ("--haiku-model: ...") the
-		// user never typed on this command line. Retry once without the saved
-		// values, which are the only inputs a past `oaica config set` could
-		// have invalidated. A bad flag still fails immediately, as before.
-		if !savedSonnet && !savedHaiku {
-			return err
-		}
-		dropSaved := func(v string, saved bool) string {
-			if saved {
-				return ""
-			}
-			return v
-		}
-		fmt.Fprintf(os.Stderr, "config: %v — ignoring the saved tier(s) for this launch; fix with `oaica config set sonnet-model|haiku-model <model>`, or clear with `-`\n", err)
-		plan, err = buildTierPlan(model, dropSaved(sonnetModel, savedSonnet), dropSaved(haikuModel, savedHaiku), forceTools)
-		if err != nil {
-			return err
-		}
+		return err
+	}
+	// The saved-config fallback above may have dropped the very tiers that
+	// made this a split — with both gone, a native primary is a plain native
+	// launch again and belongs on the untouched path the earlier check could
+	// not choose (it saw the un-forgiven config values). Only reachable when
+	// a saved value was actually dropped: the earlier check returns runNative
+	// for every other empty-tier native launch.
+	if tier, ok := nativeClaudeModelTier(model); ok && effSonnet == "" && effHaiku == "" {
+		return c.runNative(tier, args)
 	}
 	// Policy precedence: --route-policy flag > primary remote's
 	// route_policy (remotes.json) > local-first (parseRoutePolicy default).

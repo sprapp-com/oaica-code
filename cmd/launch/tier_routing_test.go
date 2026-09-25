@@ -763,4 +763,13 @@ func TestApplyContextWindowsToRoutes_SetsHaikuClamp(t *testing.T) {
 	if r.ContextWindow != 262144 {
 		t.Fatalf("haiku route ContextWindow = %d, want 262144 — the clamp has nothing to enforce without this", r.ContextWindow)
 	}
+	// The family map is built from the pre-probe copies inside buildTierPlan,
+	// so it is rebuilt at the end of this pass: a family-routed request (the
+	// haiku slot's real claude-haiku-4-5-* id) gets the same ceiling as the
+	// leg's own id. Without the rebuild the family route carries window 0 and
+	// the clamp silently allows an over-window request.
+	fam := plan.Routes.FamilyLegs["haiku"]
+	if fam.ContextWindow != 262144 {
+		t.Fatalf("FamilyLegs[haiku] ContextWindow = %d, want the probed 262144", fam.ContextWindow)
+	}
 }

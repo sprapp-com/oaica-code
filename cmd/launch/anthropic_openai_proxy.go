@@ -747,8 +747,13 @@ type proxyRouteTable struct {
 	// and one it only actually fixes when the configured haiku leg is
 	// reachable by family, native or not (a haiku_model pointing at a remote
 	// or router leg is the common case). Empty = every family id goes to
-	// Default (the pre-existing behaviour, byte-identical for a single-leg
-	// plan).
+	// Default: identical to the pre-2026-09-25 behaviour for every id a
+	// single-leg plan carries (its Default.UpstreamModel IS the requested
+	// bare id). The one difference is ids the family matcher now recognises
+	// as Claude-shaped where the old predicate did not — a bare "fable",
+	// "anthropic" or "anthropic-<x>" — which used to be forwarded upstream
+	// verbatim and now take the default leg's model instead (strictly a fix:
+	// no backend serves those as model names).
 	FamilyLegs map[string]proxyRoute
 }
 

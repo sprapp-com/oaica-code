@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
@@ -113,6 +114,38 @@ func TestStandingTierModels_PreferenceFillsOnlyTheGaps(t *testing.T) {
 	// the buildTierPlan retry, so the saved-marker must be false for it.
 	if sonnetSaved || !haikuSaved {
 		t.Fatalf("standingTierModels(flag, \"\") reported saved=%v/%v, want false/true", sonnetSaved, haikuSaved)
+	}
+}
+
+// Which saved key a launch failure may drop. The retry's whole reason for
+// existing is that a config value can rot; its whole reason for being per-tier
+// is that BOTH keys are set across the fleet, so dropping the healthy one
+// alongside the stale one silently re-bills Claude Code's background work at
+// the primary's price.
+func TestSavedTiersToDrop(t *testing.T) {
+	sonnetErr := errors.New("--sonnet-model: no model named \"oaica/retired\" anywhere")
+	haikuErr := errors.New("--haiku-model: remote \"zai\" is not configured")
+	primaryErr := errors.New("no model named \"box/kat-awq\" anywhere")
+	bothErr := errors.New("--sonnet-model: x\n--haiku-model: y")
+	cases := []struct {
+		name                    string
+		err                     error
+		savedSonnet, savedHaiku bool
+		wantSonnet, wantHaiku   bool
+	}{
+		{"sonnet leg fails, both saved", sonnetErr, true, true, true, false},
+		{"haiku leg fails, both saved", haikuErr, true, true, false, true},
+		{"sonnet leg fails, only haiku saved", sonnetErr, false, true, false, false},
+		{"nothing saved", sonnetErr, false, false, false, false},
+		{"primary fails, both saved", primaryErr, true, true, true, true},
+		{"error names both legs", bothErr, true, true, true, true},
+		{"no error at all", nil, true, true, false, false},
+	}
+	for _, c := range cases {
+		gotSonnet, gotHaiku := savedTiersToDrop(c.err, c.savedSonnet, c.savedHaiku)
+		if gotSonnet != c.wantSonnet || gotHaiku != c.wantHaiku {
+			t.Errorf("%s: savedTiersToDrop = %v/%v, want %v/%v", c.name, gotSonnet, gotHaiku, c.wantSonnet, c.wantHaiku)
+		}
 	}
 }
 

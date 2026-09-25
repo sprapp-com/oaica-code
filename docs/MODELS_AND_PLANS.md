@@ -100,9 +100,12 @@ field, so a `--plan` launch that wants weighting still needs `--shard` (or
 `remotes.json` weights) passed alongside `--plan` on the command line.
 
 The same setup can be built interactively: a plain `oaica launch claude`
-(no flags) walks a wizard — primary, Sonnet tier, compaction model
-(offering only models with a probed-larger window), route policy — and
-offers to save the result as a plan.
+(no flags) walks a wizard — primary, Sonnet tier, Haiku tier (Claude Code's
+background work), compaction model (offering only models with a
+probed-larger window), route policy — and offers to save the result as a
+plan. The two secondary tiers can also be set once for every launch with
+`oaica config set sonnet-model <model>` / `oaica config set haiku-model
+<model>` (a flag or a plan still wins).
 
 ```shell
 oaica plan list

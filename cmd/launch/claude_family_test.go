@@ -155,6 +155,49 @@ func TestBuildTierPlan_NativePrimaryWithRemoteHaikuLeg(t *testing.T) {
 	}
 }
 
+// A leg named for ANOTHER family may only claim it on the SONNET slot — the one
+// slot whose env value the launcher sets (opusplan resolves its opus and haiku
+// slots from Claude Code's own catalog), so "claude/opus" there is a statement
+// about the sonnet tier. On any other slot the same name moves traffic the user
+// never aimed at that leg: a claude/opus HAIKU leg would take the opus family
+// (under opusplan, the main plan-mode conversation) off the configured primary
+// and onto the Anthropic login.
+func TestTierFamilyRoutes_OnlyTheSonnetSlotClaimsAForeignFamily(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	stubNativeModelCatalog(t, map[string]string{"opus": "claude-opus-4-5-20251101"})
+
+	plan, err := buildTierPlan("box/kat-awq", "", "claude/opus", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, model := plan.Routes.resolve("claude-opus-4-5-20251101")
+	if route.BaseURL != "http://box:8080/v1" || model != "kat-awq" {
+		t.Fatalf("opus id resolved to %+v/%q, want the primary remote (a haiku leg's name must not claim the opus family)", route, model)
+	}
+	// The haiku tier the user named still serves the haiku family, via the
+	// positional pass — only the FOREIGN claim is restricted.
+	route, _ = plan.Routes.resolve("claude-haiku-4-5-20251001")
+	if !route.NativePassthrough {
+		t.Fatalf("haiku id resolved to %+v, want the native haiku leg the plan configured", route)
+	}
+
+	// And the documented case is untouched: a SECONDARY named for another
+	// family claims it, which is the only way the sonnet tier can be pointed
+	// at a family other than its own slot's.
+	plan, err = buildTierPlan("box/kat-awq", "claude/opus", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, _ = plan.Routes.resolve("claude-opus-4-5-20251101")
+	if !route.NativePassthrough {
+		t.Fatalf("opus id resolved to %+v, want the native secondary leg (--sonnet-model claude/opus)", route)
+	}
+}
+
 // An empty tier is a truncated picker string, not a family: it must not claim
 // the "" key, and it must not resolve to the first Anthropic catalog entry.
 func TestTierFamilyRoutes_EmptyTierClaimsNothing(t *testing.T) {

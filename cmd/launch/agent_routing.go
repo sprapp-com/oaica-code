@@ -3,11 +3,20 @@ package launch
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	"github.com/ollama/ollama/api"
 )
+
+// planNotices is where the plan builder's user-facing notices go: the price
+// banner and the tool-wire warning printed while endpoints resolve. A variable
+// rather than os.Stderr straight, so resolveTierPlan can buffer the output of a
+// build attempt it may throw away (the stale-saved-tier retry) instead of
+// printing the same banner twice — and so the notices shown always describe the
+// plan the launch actually uses.
+var planNotices io.Writer = os.Stderr
 
 // AgentModelMeta carries the model metadata the agent command needs to
 // configure its shim and tool gating. Zero values mean "unknown"; consumers
@@ -97,7 +106,7 @@ func printPriceBanner(ep RemoteEndpoint) {
 	if ep.PriceInputPerM <= 0 && ep.PriceOutputPerM <= 0 {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s%s: $%.2f/M in, $%.2f/M out%s\n",
+	fmt.Fprintf(planNotices, "%s%s: $%.2f/M in, $%.2f/M out%s\n",
 		ansiYellow, ep.Name, ep.PriceInputPerM, ep.PriceOutputPerM, ansiReset)
 }
 
@@ -115,7 +124,7 @@ func gateRemoteToolsEndpoint(ep RemoteEndpoint, wants ToolWire, force bool) erro
 	// OpenAI-wire integration — doesn't need --force-tools typed every
 	// launch. Still visible: same stderr warning either way.
 	if force || ep.ForceTools {
-		fmt.Fprintf(os.Stderr, "%sWarning: %s%s\n", ansiYellow, reason, ansiReset)
+		fmt.Fprintf(planNotices, "%sWarning: %s%s\n", ansiYellow, reason, ansiReset)
 		return nil
 	}
 	return fmt.Errorf("%s", reason)

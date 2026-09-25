@@ -61,11 +61,12 @@ context window are offered), then a route
 policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)
 with cross-leg failover via a health circuit breaker — and can save the
 whole setup as a named plan. Same knobs exist as flags
-(`--sonnet-model`, `--haiku-model`, `--oversize`, `--route-policy`) and are
-validated by `oaica doctor`. Set the tiers once with
+(`--sonnet-model`, `--haiku-model`, `--oversize`, `--route-policy`). Set the
+tiers once with
 `oaica config set sonnet-model <model>` / `oaica config set haiku-model
 <model>` and every later `oaica launch claude` uses them (a flag or a plan
-still wins; `oaica config show` lists them). `weighted` splits HEALTHY
+still wins; `oaica config show` lists them, `oaica config set <key> -` clears
+one). `weighted` splits HEALTHY
 traffic across legs by weight
 (session-sticky consistent hash) instead of only failing over — set
 weights via `remotes.json`'s `"weight"` or the repeatable
