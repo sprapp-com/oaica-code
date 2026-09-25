@@ -264,10 +264,20 @@ type tierPlan struct {
 }
 
 func routeFor(ep launchEndpoint) proxyRoute {
+	// Wire decides the passthrough: a user remote declaring wire "anthropic"
+	// (z.ai's coding plan, MiniMax's /anthropic, ...) speaks the same wire the
+	// proxy receives, so it is forwarded untranslated to its OWN /v1/messages
+	// from BaseURL with its own key — the same path a native claude/* tier
+	// takes to api.anthropic.com, minus the native credential
+	// (anthropicPassthroughTarget picks the upstream). Without this, the
+	// translation path POSTs <base>/chat/completions at an Anthropic-shaped
+	// endpoint and the vendor answers 404 ("502 upstream HTTP 404" in Claude
+	// Code) — the failure that shipped as zai-coding-plan, 2026-09-25.
 	return proxyRoute{
 		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, UpstreamModel: ep.UpstreamModel,
 		Label:             string(ep.Source) + ":" + ep.Name,
-		NativePassthrough: ep.Source == sourceNativeAnthropic,
+		Wire:              ep.Wire,
+		NativePassthrough: ep.Source == sourceNativeAnthropic || ep.Wire == "anthropic",
 		Weight:            ep.Weight,
 	}
 }

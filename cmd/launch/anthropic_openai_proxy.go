@@ -494,7 +494,11 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	}
 	return token, RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
 		ClientToken: token,
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+			// An anthropic-wire remote is forwarded untranslated to its own
+			// /messages (see routeFor's doc for why); a single-leg launch of
+			// one takes exactly the same path as a tier-planned one.
+			NativePassthrough: remote.Descriptor().Wire == "anthropic"},
 	})
 }
 
@@ -510,7 +514,11 @@ func StartAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel
 	}
 	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
 		ClientToken: token,
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name},
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+			// An anthropic-wire remote is forwarded untranslated to its own
+			// /messages (see routeFor's doc for why); a single-leg launch of
+			// one takes exactly the same path as a tier-planned one.
+			NativePassthrough: remote.Descriptor().Wire == "anthropic"},
 	}) }()
 	return token, nil
 }
@@ -567,6 +575,20 @@ type proxyRoute struct {
 	// failover-only leg, so this field is additive and changes nothing
 	// for callers that never set it.
 	Weight int
+	// Wire is the protocol this route's upstream speaks: "" / "openai" means
+	// the OpenAI-translation path (<base>/chat/completions, the default)
+	// and "anthropic" means the remote serves /v1/messages natively.
+	//
+	// An anthropic-wire REMOTE (BaseURL set) rides the same passthrough a
+	// native claude/* leg does — its Anthropic body goes upstream untouched
+	// except for the model id (anthropicPassthroughTarget). This matters
+	// because the translation path is the only way a remote could otherwise
+	// be reached, and it cannot reach an Anthropic endpoint at all: z.ai's
+	// /api/anthropic answers 404 {"detail":"Not Found"} to /chat/completions
+	// (2026-09-25, "502 upstream HTTP 404" in Claude Code). opencode talks
+	// to these plans through the Anthropic SDK and never had the problem;
+	// this is that, in our proxy.
+	Wire string
 }
 
 // oaicaDisplayModelSuffix marks a DisplayModel id as OAICA's own, not
@@ -582,6 +604,35 @@ const oaicaDisplayModelSuffix = "-oaica"
 // value resolved at launch time otherwise — either because the remote uses
 // a literal api_key (KeyEnv empty) or because the env var is unset right
 // now (rare; keeps old behavior rather than suddenly sending no credential).
+// anthropicPassthroughTarget resolves where an anthropic-wire route's
+// /v1/messages request goes and which credential it carries. Empty ok means
+// the route is not an Anthropic-wire passthrough at all (the caller then
+// takes the OpenAI-translation path).
+//
+// A remote's BaseURL already carries its version prefix (".../v1"), so the
+// upstream is BaseURL + "/messages" — the same arithmetic the OpenAI path
+// does with "/chat/completions". A native claude/* leg has no BaseURL and
+// resolves the credential the user's own `claude /login` stored
+// (native_anthropic_auth.go), which is what running unproxied would have
+// used.
+func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, headerValue string, ok bool) {
+	if route.Wire != "anthropic" {
+		return "", "", "", false
+	}
+	if route.BaseURL != "" {
+		key := route.resolveKey()
+		if key == "" {
+			return "", "", "", false
+		}
+		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, true
+	}
+	auth, found := resolveNativeAnthropicAuth()
+	if !found {
+		return "", "", "", false
+	}
+	return nativeAnthropicUpstream, auth.Header, auth.Value, true
+}
+
 func (route proxyRoute) resolveKey() string {
 	if route.KeyEnv != "" {
 		if v := strings.TrimSpace(os.Getenv(route.KeyEnv)); v != "" {
@@ -888,6 +939,19 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 		if table.Default.NativePassthrough {
+			if table.Default.Wire == "anthropic" && table.Default.BaseURL != "" {
+				// Anthropic-wire remote: its own /v1/models, authenticated the
+				// way the vendor expects (x-api-key). A 404 here is harmless —
+				// context_window_remote.go falls back to the catalog's
+				// declared window.
+				key := table.Default.resolveKey()
+				if key == "" {
+					writeAnthropicError(w, http.StatusUnauthorized, "no credential for "+table.Default.Label)
+					return
+				}
+				anthropicModelsPassthrough(w, r, strings.TrimRight(table.Default.BaseURL, "/")+"/models", "x-api-key", key)
+				return
+			}
 			nativeAnthropicModelsPassthrough(w, r)
 			return
 		}
@@ -933,6 +997,27 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// mixing a native primary with a native secondary still lands each
 		// request on the right upstream model.
 		if route, _, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
+			if route.Wire == "anthropic" && route.BaseURL != "" {
+				// An Anthropic-wire REMOTE (a plan row like zai-coding-plan).
+				// Its upstream wants the plan's own model id, not the picker
+				// string Claude Code sent ("zai-coding-plan/glm-5.3" →
+				// "glm-5.3"); everything else in the body goes through
+				// untouched. A native claude/* leg needs no rewrite — its
+				// UpstreamModel is the CLI alias the client already sent.
+				rewritten, rerr := rewriteAnthropicRequestModel(body, route.UpstreamModel)
+				if rerr != nil {
+					writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for anthropic remote: "+rerr.Error())
+					return
+				}
+				upstream, headerName, headerValue, ok := route.anthropicPassthroughTarget()
+				if !ok {
+					writeAnthropicError(w, http.StatusUnauthorized,
+						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
+					return
+				}
+				anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue)
+				return
+			}
 			nativeAnthropicPassthrough(w, r, body)
 			return
 		}
@@ -1058,13 +1143,31 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// which Anthropic's wire API does not accept on
 						// its own — confirmed live, "model: fable" not
 						// found, 2026-09-02).
-						realModel := resolveNativeModelAlias(over.UpstreamModel)
+						// A REMOTE anthropic-wire leg (over.Wire == "anthropic",
+						// over.BaseURL set) is the one exception: its
+						// UpstreamModel is already the vendor's real id
+						// ("glm-5.3"), not a claude-tier alias, so it goes
+						// through unchanged and out to the remote's own
+						// /messages with the remote's key.
+						realModel := over.UpstreamModel
+						if over.Wire != "anthropic" {
+							realModel = resolveNativeModelAlias(over.UpstreamModel)
+						}
 						nativeBody, rerr := rewriteAnthropicRequestModel(body, realModel)
 						if rerr != nil {
 							writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for oversize crossover: "+rerr.Error())
 							return
 						}
 						w.Header().Set("X-Oaica-Route", over.Label)
+						if over.Wire == "anthropic" {
+							upstream, headerName, headerValue, ok := over.anthropicPassthroughTarget()
+							if !ok {
+								writeAnthropicError(w, http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
+								return
+							}
+							anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue)
+							return
+						}
 						nativeAnthropicPassthrough(w, r, nativeBody)
 						return
 					}
@@ -1472,7 +1575,14 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
 		return
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nativeAnthropicModelsUpstream, nil)
+	anthropicModelsPassthrough(w, r, nativeAnthropicModelsUpstream, auth.Header, auth.Value)
+}
+
+// anthropicModelsPassthrough relays GET /v1/models to an Anthropic-wire
+// upstream (api.anthropic.com, or a plan row's own base) with the same
+// credential handling as messages.
+func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream, headerName, headerValue string) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream, nil)
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
 		return
@@ -1485,7 +1595,7 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set(auth.Header, auth.Value)
+	req.Header.Set(headerName, headerValue)
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactURL(err.Error()))
@@ -1642,8 +1752,17 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
 		return
 	}
+	anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value)
+}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, nativeAnthropicUpstream, bytes.NewReader(body))
+// anthropicPassthrough forwards an Anthropic-wire request to an
+// Anthropic-wire upstream, byte-for-byte, with the credential injected under
+// headerName (api.anthropic.com wants x-api-key or an OAuth bearer; the
+// vendors behind a plan row want x-api-key). Everything else in
+// nativeAnthropicPassthrough's doc applies: no translation, no clamp, no
+// ledger, streaming relayed as it arrives.
+func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue string) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
 		return
@@ -1662,7 +1781,7 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set(auth.Header, auth.Value)
+	req.Header.Set(headerName, headerValue)
 
 	// Long timeout, not proxyPassThrough's 30s: this carries real
 	// completions, which can run minutes on a large request (same

@@ -593,7 +593,15 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (
 			// (routeLocality returns the same "local"/"remote" strings).
 			return route, false
 		}
-		if t.breakers.open(nativeOversizeBreakerKey) {
+		// An anthropic-wire REMOTE oversize leg (BaseURL set — the plan rows)
+		// is breaker-keyed on its own base URL, not the native constant: the
+		// two are different upstreams and one being down says nothing about
+		// the other.
+		key := nativeOversizeBreakerKey
+		if t.Oversize.BaseURL != "" {
+			key = t.Oversize.BaseURL
+		}
+		if t.breakers.open(key) {
 			return route, false
 		}
 		return t.Oversize, true
@@ -634,6 +642,17 @@ func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval 
 		legs = append(legs, t.Oversize)
 	}
 	for _, r := range legs {
+		// An anthropic-wire remote leg is NOT probed: GET <base>/models is an
+		// OpenAI-shaped probe, and a vendor that serves /messages there need
+		// not serve /models at all (the plan rows' base carries an /anthropic
+		// path — z.ai answers 404 for anything but the Anthropic surface). A
+		// 404 would open the breaker and silently retire a working leg from
+		// both fallback and oversize selection. Unprobed legs read as healthy
+		// (routeBreakers.open is false for an unknown key), matching how a
+		// native-anthropic leg is treated (it has no BaseURL to probe at all).
+		if r.Wire == "anthropic" {
+			continue
+		}
 		if r.BaseURL != "" && !seen[r.BaseURL] {
 			seen[r.BaseURL] = true
 			urls = append(urls, r.BaseURL)

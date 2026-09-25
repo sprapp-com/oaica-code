@@ -3,14 +3,17 @@ package launch
 // provider_catalog_wire_test.go — invariants between a catalog row's ENDPOINT
 // and its declared WIRE, checked over the whole table.
 //
-// Why this file exists: `zai-coding-plan` points at z.ai's Anthropic-compatible
-// path (https://api.z.ai/api/anthropic) and must declare wire "anthropic". A
-// catalog rewrite (5426c932) re-emitted providers.json from a copy taken before
-// 196130d8 added the field, so the row silently fell back to the default openai
-// wire — oaica then POSTed /chat/completions at an Anthropic-shaped endpoint and
-// z.ai answered 404 {"detail":"Not Found"}, surfacing in Claude Code as
-// "502 upstream HTTP 404". Nothing failed to build, nothing failed to parse,
-// and no test looked at the pairing. These tests do.
+// Why this file exists: `zai-coding-plan` pointed at z.ai's Anthropic-compatible
+// path (https://api.z.ai/api/anthropic) while declaring (after a bad re-emit, see
+// 5426c932) the default openai wire — oaica then POSTed /chat/completions at an
+// Anthropic-shaped endpoint and z.ai answered 404 {"detail":"Not Found"},
+// surfacing in Claude Code as "502 upstream HTTP 404". Nothing failed to build,
+// nothing failed to parse, and no test looked at the pairing. These tests do.
+//
+// The rule the pair must satisfy (2026-09-25, second revision): a row's base and
+// its wire are ONE decision. An /anthropic base is only reachable with wire
+// "anthropic" (the proxy forwards to <base>/v1/messages untranslated); anything
+// else is reached through the OpenAI translation path (<base>/chat/completions).
 
 import (
 	"strings"
@@ -20,59 +23,77 @@ import (
 // anthropicEndpointShaped reports whether a base URL is an Anthropic-compatible
 // endpoint — the vendor documents it as an ANTHROPIC_BASE_URL, so requests go
 // to <base>/v1/messages with an x-api-key header, never to /chat/completions.
+// api.anthropic.com itself counts (the `anthropic` row, the origin of the
+// shape); vendors mirror it under an /anthropic path.
 func anthropicEndpointShaped(baseURL string) bool {
 	b := strings.ToLower(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
-	return strings.HasSuffix(b, "/anthropic") || strings.Contains(b, "/anthropic/")
+	return b == "https://api.anthropic.com" ||
+		strings.HasSuffix(b, "/anthropic") || strings.Contains(b, "/anthropic/")
 }
 
-// No catalog row may point at a vendor's Anthropic-compatible path.
-//
-// oaica's translation proxy has exactly one upstream form, <base>/chat/
-// completions (anthropic_openai_proxy.go); the Anthropic passthrough exists
-// only for api.anthropic.com itself (proxyRoute.NativePassthrough, set from
-// sourceNativeAnthropic). A row on an /anthropic path therefore cannot be
-// driven by any launch: z.ai answered 404 {"detail":"Not Found"} to
-// /anthropic/v1/chat/completions and MiniMax 404 "404 page not found" —
-// surfacing as "502 upstream HTTP 404" in Claude Code. The plan rows were
-// repointed at each vendor's OpenAI-compatible path (zai-coding-plan →
-// /api/coding/paas/v4, the form models.dev declares; minimax-* →
-// api.minimax.io / api.minimax.cn). This test keeps the next such row out:
-// if an Anthropic-native remote is genuinely wanted, it needs a passthrough
-// route first, not a base_url.
-func TestCatalog_NoRowPointsAtAnAnthropicPath(t *testing.T) {
+// Base and wire must agree, in both directions: an /anthropic base reached on
+// the openai wire answers 404 to /chat/completions (the shipped bug), and a
+// vendor's plain OpenAI base reached on the anthropic wire gets an untranslated
+// /v1/messages it does not serve.
+func TestCatalog_WireMatchesEndpointShape(t *testing.T) {
 	for _, e := range providerCatalog() {
-		if !anthropicEndpointShaped(e.BaseURL) {
-			continue
-		}
 		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
-		t.Errorf("%s: base_url %q is an Anthropic-shaped endpoint but the proxy only ever POSTs %s — repoint the row at the vendor's OpenAI-compatible path, or give it a passthrough route",
-			e.Name, e.BaseURL, r.openAIBase()+"/chat/completions")
+		wire := r.Descriptor().Wire
+		anthropicShaped := anthropicEndpointShaped(e.BaseURL)
+		switch {
+		case anthropicShaped && wire != "anthropic":
+			t.Errorf("%s: base_url %q is an Anthropic-shaped endpoint but wire = %q — the proxy would POST %s at it; give the row \"wire\": \"anthropic\"",
+				e.Name, e.BaseURL, wire, r.openAIBase()+"/chat/completions")
+		case !anthropicShaped && wire == "anthropic":
+			t.Errorf("%s: wire = \"anthropic\" but base_url %q is not an Anthropic-shaped endpoint — the proxy would POST %s at it",
+				e.Name, e.BaseURL, r.openAIBase()+"/messages")
+		}
 	}
 }
 
-// The verified endpoint each plan row must reach. These are live-curl results,
-// not guesses: a "fix the URL" edit that looks plausible but was never tried
-// against the vendor is exactly what produced the 404s above.
+// The endpoint each plan row must reach, and the credential surface it reaches
+// it on. These are live-curl results, not guesses: a "fix the URL" edit that
+// looks plausible but was never tried against the vendor is exactly what
+// produced the 404s above.
 func TestCatalog_PlanRowsHitTheVerifiedEndpoint(t *testing.T) {
-	want := map[string]string{
-		"zai-coding-plan":        "https://api.z.ai/api/coding/paas/v4/chat/completions",
-		"zai":                    "https://api.z.ai/api/paas/v4/chat/completions",
-		"minimax-coding-plan":    "https://api.minimax.io/v1/chat/completions",
-		"minimax-cn-coding-plan": "https://api.minimax.cn/v1/chat/completions",
+	want := map[string]struct {
+		url  string
+		wire string
+	}{
+		// Anthropic-compatible surface, verified 200 with this plan's own key.
+		"zai-coding-plan": {"https://api.z.ai/api/anthropic/v1/messages", "anthropic"},
+		// Anthropic-compatible surface, verified 200 with this plan's own key.
+		"minimax-coding-plan": {"https://api.minimax.io/anthropic/v1/messages", "anthropic"},
+		// Route existence + wire confirmed (Anthropic-shaped 401, out-of-region
+		// key); no valid CN key available here, so not verified end to end.
+		"minimax-cn-coding-plan": {"https://api.minimax.cn/anthropic/v1/messages", "anthropic"},
+		// Per-token platform API, OpenAI-compatible: coding-plan keys are
+		// rejected here (429 "no resource package"), this is the 'zai' row.
+		"zai": {"https://api.z.ai/api/paas/v4/chat/completions", "openai"},
 	}
 	seen := 0
 	for _, e := range providerCatalog() {
-		wantURL, ok := want[e.Name]
+		wantRow, ok := want[e.Name]
 		if !ok {
 			continue
 		}
 		seen++
 		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
-		if got := r.openAIBase() + "/chat/completions"; got != wantURL {
-			t.Errorf("%s: upstream %q, want the verified %q", e.Name, got, wantURL)
+		upstream := r.openAIBase() + "/chat/completions"
+		if r.Descriptor().Wire == "anthropic" {
+			target, _, _, ok := routeFor(launchEndpoint{Source: sourceUserRemote, RemoteEndpoint: RemoteEndpoint{
+				Name: e.Name, BaseURL: r.openAIBase(), UpstreamModel: "m", Wire: r.Descriptor().Wire, Token: "sk-x",
+			}}).anthropicPassthroughTarget()
+			if !ok {
+				t.Fatalf("%s: no passthrough target resolved for an anthropic-wire row", e.Name)
+			}
+			upstream = target
 		}
-		if r.Descriptor().Wire != "openai" {
-			t.Errorf("%s: wire = %q, want openai (these plans are driven through the OpenAI translation proxy)", e.Name, r.Descriptor().Wire)
+		if upstream != wantRow.url {
+			t.Errorf("%s: upstream %q, want the verified %q", e.Name, upstream, wantRow.url)
+		}
+		if r.Descriptor().Wire != wantRow.wire {
+			t.Errorf("%s: wire = %q, want %q", e.Name, r.Descriptor().Wire, wantRow.wire)
 		}
 	}
 	if seen != len(want) {
