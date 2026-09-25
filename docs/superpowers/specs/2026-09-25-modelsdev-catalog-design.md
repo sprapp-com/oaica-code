@@ -109,6 +109,13 @@ synced copy at `~/.oaica/cache/providers/oaica.json`. Three sections:
   display metadata.
 - `limits` — context/output limits for ids models.dev does not carry.
 
+Shipped ahead of this plan, as the first slice of the overlay: `providers.json` rows now
+carry an optional `models` map (bare upstream id → context/output) for providers whose
+`/v1/models` sweep cannot answer for them. z.ai's Coding Plan and MiniMax's serve no model
+list at all on their Anthropic-compatible endpoints, and a key-gated sweep can be refused,
+so without a declared list a billed plan had no rows in the picker at all. Providers that
+do answer `/v1/models` declare nothing and are unaffected — swept ids win any collision.
+
 This file supersedes both `providers/providers.json` and `cloud_limits/cloud_limits.json`.
 Because all three sources are embedded, the merge is a one-time content move, not a
 migration users have to perform — no compatibility shim is needed and no user loses data.
@@ -281,7 +288,10 @@ corrupt or unreadable file degrades to an empty section, never an error.
 `oaica model catalog sync` follows `model_sync.go` exactly: `If-None-Match` with the
 stored ETag, a 304 reuses the cached body, and a network failure falls back to the last
 good copy. `--url` is accepted, and `file://` paths work for air-gapped hosts and tests.
-`oaica provider sync` keeps its role but now targets `oaica.json`.
+`oaica remote sync` keeps its role but now targets `oaica.json`. (That is the
+implemented command name — it was written as `oaica provider sync` earlier in
+this document's drafting, which is not a command that exists; `oaica provider`
+has no `sync` subcommand, `launch.ProviderSync` is wired to `remoteSyncCmd`.)
 
 **Divergence from opencode, deliberately.** opencode treats the catalog as live
 infrastructure: it re-fetches whenever the cached file is older than 5 minutes, guards the

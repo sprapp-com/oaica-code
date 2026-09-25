@@ -55,6 +55,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -573,6 +574,59 @@ func writeAtomic(path string, b []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// remoteLaunchModels turns one remote's swept model ids into picker rows,
+// falling back to (and filling in from) the ids the provider catalog
+// declares. A provider that declares its models still has rows to offer
+// when the sweep cannot run — the Anthropic-compatible subscription
+// endpoints (z.ai's Coding Plan, MiniMax's) serve no model list at all, and
+// a key-gated sweep can be refused — so only a remote with neither a sweep
+// nor a declared list is a real error. Swept ids keep the live list's
+// ordering and win any id collision; declared-only ids are appended in
+// sorted order, since a map has none.
+func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]LaunchModel, error) {
+	declared := providerCatalogDeclaredModels(r.Name)
+	if sweepErr != nil && len(declared) == 0 {
+		return nil, sweepErr
+	}
+	d := r.Descriptor()
+	rm := make([]LaunchModel, 0, len(sweptIDs)+len(declared))
+	seen := make(map[string]bool, len(sweptIDs))
+	for _, id := range sweptIDs {
+		// Namespaced so two boxes serving the same model stay distinct,
+		// and so the picker shows WHERE a model runs.
+		display := remoteDisplayID(id)
+		seen[display] = true
+		rm = append(rm, LaunchModel{
+			Name:         r.Name + "/" + display,
+			Remote:       true,
+			Wire:         d.Wire,
+			ToolFormat:   d.ToolFormat,
+			ToolReliable: d.ToolReliable,
+		}.WithCloudLimits())
+	}
+	extra := make([]string, 0, len(declared))
+	for id := range declared {
+		if !seen[id] {
+			extra = append(extra, id)
+		}
+	}
+	sort.Strings(extra)
+	for _, id := range extra {
+		lim := declared[id]
+		rm = append(rm, LaunchModel{
+			Name:            r.Name + "/" + id,
+			Remote:          true,
+			ToolCapable:     true,
+			ContextLength:   lim.Context,
+			MaxOutputTokens: lim.Output,
+			Wire:            d.Wire,
+			ToolFormat:      d.ToolFormat,
+			ToolReliable:    d.ToolReliable,
+		}.WithCloudLimits())
+	}
+	return rm, nil
+}
+
 func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 	remotes, err := loadUserRemotes()
 	if err != nil {
@@ -590,23 +644,10 @@ func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 		go func(i int, r userRemote) {
 			defer wg.Done()
 			ids, ferr := fetchRemoteModelsCached(r)
-			if ferr != nil {
-				results[i] = result{err: ferr}
+			rm, rerr := remoteLaunchModels(r, ids, ferr)
+			if rerr != nil {
+				results[i] = result{err: rerr}
 				return
-			}
-			d := r.Descriptor()
-			rm := make([]LaunchModel, 0, len(ids))
-			for _, id := range ids {
-				// Namespaced so two boxes serving the same model stay distinct,
-				// and so the picker shows WHERE a model runs.
-				display := remoteDisplayID(id)
-				rm = append(rm, LaunchModel{
-					Name:         r.Name + "/" + display,
-					Remote:       true,
-					Wire:         d.Wire,
-					ToolFormat:   d.ToolFormat,
-					ToolReliable: d.ToolReliable,
-				}.WithCloudLimits())
 			}
 			results[i] = result{models: rm}
 		}(i, r)

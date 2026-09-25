@@ -11,14 +11,17 @@ import (
 
 func TestBillingPlanLabel(t *testing.T) {
 	cases := map[string]string{
-		"opencode-go/glm-5.3-flash": "Coding Plan (zen — shared subscription)",
-		"opencode-go/glm-5.1":       "Coding Plan (zen — shared subscription)",
-		"zai/glm-5.3":               "API Plan (Z.AI — per-token key)",
-		"moonshot/kimi-k3":          "API Plan (Moonshot/Kimi — per-token key)",
-		"minimax/minimax-m2.7":      "API Plan (MiniMax — per-token key)",
-		"opencode-go/kimi-k2.6":     "",
-		"glm-5.3-flash":             "",
-		"box/glm-5.3-flash":         "",
+		"opencode-go/glm-5.3-flash":      "Coding Plan (zen — shared subscription)",
+		"opencode-go/glm-5.1":            "Coding Plan (zen — shared subscription)",
+		"opencode-go/kimi-k2.6":          "Coding Plan (zen — shared subscription)",
+		"zai/glm-5.3":                    "API Plan (Z.AI — per-token key)",
+		"zai-coding-plan/glm-5.3":        "Coding Plan (Z.AI — subscription)",
+		"moonshot/kimi-k3":               "API Plan (Moonshot/Kimi — per-token key)",
+		"minimax/minimax-m2.7":           "API Plan (MiniMax — per-token key)",
+		"minimax-coding-plan/MiniMax-M3": "Coding Plan (MiniMax — subscription)",
+		"kimi-code-plan-global/k3":       "Coding Plan (Kimi — subscription)",
+		"glm-5.3-flash":                  "",
+		"box/glm-5.3-flash":              "",
 	}
 	for name, want := range cases {
 		if got := billingPlanLabel(name); got != want {

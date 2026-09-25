@@ -1,13 +1,15 @@
 package launch
 
 import (
+	"fmt"
 	"testing"
 )
 
 // findBuiltinRemote returns a pointer to the entry named name, or nil.
-// zai-coding-plan is always present in builtinRemotes() output (unlike
-// every env-gated builtin), so tests asserting "gated when env unset" for
-// a DIFFERENT builtin must look up by name rather than assume length/index.
+// Every builtin is env-gated, so tests asserting "gated when env unset" for
+// one provider must look up by name rather than assume an index or length —
+// shared env vars (zai and zai-coding-plan both key off Z_AI_API_KEY) mean
+// setting one provider's key can add more than one row.
 func findBuiltinRemote(t *testing.T, remotes []userRemote, name string) *userRemote {
 	t.Helper()
 	for i := range remotes {
@@ -61,7 +63,7 @@ func clearAllCatalogKeys(t *testing.T) {
 	t.Helper()
 	for _, p := range providerCatalog() {
 		if p.APIKeyEnv == "" {
-			continue // e.g. opencode-go: reference-only catalog entry, no env var
+			continue // a catalog row with no credential (e.g. a reference-only entry) is never a builtin
 		}
 		t.Setenv(p.APIKeyEnv, "")
 	}
@@ -164,5 +166,68 @@ func TestBuiltinRemotes_MergedIntoLoad(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("builtin %s not merged into loadUserRemotes(): %+v", zaiName, remotes)
+	}
+}
+
+// A provider whose catalog row declares its models must still produce picker
+// rows when /v1/models cannot be swept: z.ai's Coding Plan and MiniMax's
+// serve no model list at all on their Anthropic-compatible endpoints, so
+// without the declared list a paid plan would be invisible in the picker.
+func TestRemoteLaunchModels_DeclaredCatalogModelsSurviveFailedSweep(t *testing.T) {
+	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1", Wire: "anthropic"}
+	models, err := remoteLaunchModels(r, nil, fmt.Errorf("HTTP 404"))
+	if err != nil {
+		t.Fatalf("remoteLaunchModels() error = %v, want the declared list to absorb a failed sweep", err)
+	}
+	declared := providerCatalogDeclaredModels("minimax-coding-plan")
+	if len(models) != len(declared) {
+		t.Fatalf("rows = %d, want one per declared model (%d)", len(models), len(declared))
+	}
+	var m3 *LaunchModel
+	for i := range models {
+		if models[i].Name == "minimax-coding-plan/MiniMax-M3" {
+			m3 = &models[i]
+		}
+	}
+	if m3 == nil {
+		t.Fatalf("MiniMax-M3 missing from %v", models)
+	}
+	if m3.ContextLength != declared["MiniMax-M3"].Context || m3.ContextLength == 0 {
+		t.Fatalf("MiniMax-M3 context = %d, want the declared %d", m3.ContextLength, declared["MiniMax-M3"].Context)
+	}
+	if !m3.ToolCapable || !m3.Remote || m3.Wire != "anthropic" {
+		t.Fatalf("MiniMax-M3 = %+v, want a tool-capable remote row on the anthropic wire", *m3)
+	}
+}
+
+// A remote with neither a sweep nor a declared list must keep reporting the
+// sweep failure — the picker's error list is how the user learns a box is
+// unreachable.
+func TestRemoteLaunchModels_UndeclaredRemoteStillReportsSweepFailure(t *testing.T) {
+	if _, err := remoteLaunchModels(userRemote{Name: "somebox", BaseURL: "http://box/v1"}, nil, fmt.Errorf("dial tcp: refused")); err == nil {
+		t.Fatal("remoteLaunchModels() = nil error, want the sweep failure surfaced")
+	}
+}
+
+// Swept ids must keep their own list order and win a collision with a
+// declared id, so a provider that DOES answer /v1/models is unaffected by
+// having a declared list as well.
+func TestRemoteLaunchModels_SweptIDsWinAndKeepOrder(t *testing.T) {
+	r := userRemote{Name: "minimax-coding-plan", BaseURL: "https://api.minimax.io/anthropic/v1"}
+	models, err := remoteLaunchModels(r, []string{"Custom-Live", "MiniMax-M3"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models[0].Name != "minimax-coding-plan/Custom-Live" || models[1].Name != "minimax-coding-plan/MiniMax-M3" {
+		t.Fatalf("swept ids lost their order: %v, %v", models[0].Name, models[1].Name)
+	}
+	var m3Count int
+	for _, m := range models {
+		if m.Name == "minimax-coding-plan/MiniMax-M3" {
+			m3Count++
+		}
+	}
+	if m3Count != 1 {
+		t.Fatalf("MiniMax-M3 appears %d times, want once (swept id wins over the declared duplicate)", m3Count)
 	}
 }

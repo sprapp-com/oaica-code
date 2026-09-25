@@ -71,7 +71,24 @@ type providerCatalogEntry struct {
 	// KeyURL is where a user without a key yet can get one — surfaced by
 	// ensureRemoteAPIKeyForModel's interactive prompt. Optional.
 	KeyURL string `json:"key_url,omitempty"`
-	Notes  string `json:"notes,omitempty"`
+	// Models declares this provider's model ids and their windows, keyed by
+	// the bare id the provider expects upstream. It exists for providers
+	// whose /v1/models sweep cannot answer: the Anthropic-compatible
+	// subscription endpoints (z.ai's Coding Plan, MiniMax's) serve no model
+	// list at all, and a key-gated sweep can be refused, so without this a
+	// billed plan's rows would never reach the picker. Providers that do
+	// answer /v1/models need nothing here — the sweep still supplies them,
+	// and its ids win when both know a model.
+	Models map[string]providerCatalogModelLimit `json:"models,omitempty"`
+	Notes  string                               `json:"notes,omitempty"`
+}
+
+// providerCatalogModelLimit is one declared model's windows. Tool calling is
+// not a field because every entry currently shipped supports it (models.dev
+// agrees); add one here rather than assuming if that ever stops being true.
+type providerCatalogModelLimit struct {
+	Context int `json:"context"`
+	Output  int `json:"output"`
 }
 
 type providerCatalogFile struct {
@@ -154,8 +171,9 @@ func providerCatalogAsUserRemotes() []userRemote {
 // <model>" picker id — the data-driven replacement for billingPlanLabel's
 // old hardcoded per-vendor string matches. modelRest is the part after the
 // first "/"; entries with a PlanLabelModelPrefix only label rows whose
-// model id starts with it (e.g. opencode-go's Coding Plan label is
-// "glm-*"-only, not every model that aggregator proxies).
+// model id starts with it (for a provider whose one subscription covers
+// only part of what it proxies — set the prefix on THAT provider's row and
+// the label stops at that boundary).
 func providerPlanLabel(providerName, modelRest string) string {
 	for _, e := range providerCatalog() {
 		if e.Name != providerName {
@@ -167,6 +185,18 @@ func providerPlanLabel(providerName, modelRest string) string {
 		return e.PlanLabel
 	}
 	return ""
+}
+
+// providerCatalogDeclaredModels returns the model ids (and windows) the
+// catalog declares for a provider, keyed by the bare upstream id. Empty for
+// every provider whose /v1/models sweep can answer for itself.
+func providerCatalogDeclaredModels(providerName string) map[string]providerCatalogModelLimit {
+	for _, e := range providerCatalog() {
+		if e.Name == providerName {
+			return e.Models
+		}
+	}
+	return nil
 }
 
 // providerKeyURL looks up the catalog's key_url for a provider name, for
