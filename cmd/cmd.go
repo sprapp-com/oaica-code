@@ -2910,7 +2910,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			path, _ := launch.UserConfigPath()
 			fmt.Printf("config:       %s\n", path)
 			fmt.Printf("sonnet_model: %s\n", orDashStr(c.SonnetModel, "(unset — flag/plan/wizard decide)"))
-			fmt.Printf("haiku_model:  %s\n", orDashStr(c.HaikuModel, "(same as the sonnet tier)"))
+			fmt.Printf("haiku_model:  %s\n", orDashStr(c.HaikuModel, "(unset — background work bills on the primary)"))
 			return nil
 		},
 	}

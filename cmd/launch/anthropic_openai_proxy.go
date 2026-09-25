@@ -967,10 +967,19 @@ func claudeModelFamily(model string) (string, bool) {
 			return tier, true
 		}
 	}
-	// An id we don't recognize the tier of, but shaped like an Anthropic one
-	// (claude-3-5-sonnet-20241022): same handling as the "claude" family —
-	// the default leg owns it, never a raw forward to an upstream that would
-	// 404 it.
+	// Legacy versioned ids put the date and generation BEFORE the tier
+	// (claude-3-5-sonnet-20241022, claude-3-opus-20240229) — those reached the
+	// un-tagged fallback below and so billed the primary leg whatever the user
+	// had configured for that tier. Match the tier as a hyphen-delimited
+	// SEGMENT instead; the id got here by starting with "claude-", so a
+	// segment match cannot fire on a foreign id. List order breaks any tie.
+	for _, tier := range []string{"opus", "sonnet", "haiku", "fable"} {
+		if strings.Contains(bare, "-"+tier+"-") || strings.HasSuffix(bare, "-"+tier) {
+			return tier, true
+		}
+	}
+	// Still no tier in it: shaped like an Anthropic id, so the default leg
+	// owns it — never a raw forward to an upstream that would 404 it.
 	return "claude", true
 }
 
