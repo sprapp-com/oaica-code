@@ -42,7 +42,12 @@ the remote leg); and `--haiku-model claude/opus` cannot take the opus family
 the opus or haiku slot only claims its own slot's family. A tier name outside
 those three slots (`--haiku-model claude/fable`) always claims, since no slot
 owns that family and the alternative is the primary's model, which cannot serve
-an Anthropic id at all.
+an Anthropic id at all. If a sonnet leg's claim collides with a haiku leg the plan
+also configured (`--sonnet-model claude/haiku --haiku-model zai/glm-4.5-air`),
+the sonnet leg wins that family — deliberately: the sonnet slot's env value is
+the one producing those ids, and the alternative (the configured haiku leg
+serving the execution turns Claude Code sends with them) would put your main
+coding traffic on a cheap background model.
 
 Every request carries the resolved model id. The launcher runs ONE local
 Anthropic→OpenAI translation proxy with a **routing table keyed by that id**,
@@ -288,12 +293,12 @@ at the first request instead. Check the launch's `tiers:` line, which prints
 what each tier actually resolved to. `oaica config show` prints both keys and
 the file path.
 
-One case is dropped without attribution: when the failure names no tier at all
-(it is the primary's, which no saved value can influence), BOTH saved keys are
-ignored for that launch, and the warning says so in those words rather than
-blaming a value the error never named. The launch then normally fails on the
-real error — the drop is only insurance that a stale key can never be the thing
-that breaks every launch in the fleet.
+One case is dropped without attribution: when the failure names no tier, or
+names both (it is then the primary's error, which no saved value can influence),
+BOTH saved keys are ignored for that launch, and the warning says so in those
+words rather than blaming a value the error never named. The launch then
+normally fails on the real error — the drop is only insurance that a stale key
+can never be the thing that breaks every launch in the fleet.
 
 Plan > remotes.json `route_policy` > local-first also still holds for the
 route policy. Old plans.json files missing `oversize_model`/`route_policy`

@@ -243,24 +243,26 @@ func TestTierFamilyRoutes_SlotRuleKeepsTheConfiguredLegReachable(t *testing.T) {
 // with the passthrough args only) would drop it silently — a flag that cannot
 // work must not evaporate (round-4 audit).
 func TestNativeTierOnly_ExplicitFlagsKeepThePlanPath(t *testing.T) {
-	shards := map[string]int{"box/kat-awq": 3}
+	// --route-policy and --shard are deliberately NOT inputs: with no second
+	// leg they have nothing to act on (the policy only governs failover
+	// between legs, and a --shard id that matches no existing leg is already
+	// a silent no-op), so they must not block the native fast path. They are
+	// validated before this check instead — a typo'd policy is reported on
+	// every launch, native or not.
 	cases := []struct {
-		name                                   string
-		model, sonnet, haiku, oversize, policy string
-		shards                                 map[string]int
-		wantTier                               string
-		wantOK                                 bool
+		name                           string
+		model, sonnet, haiku, oversize string
+		wantTier                       string
+		wantOK                         bool
 	}{
-		{"plain native launch", "claude/opus", "", "", "", "", nil, "opus", true},
-		{"native with a haiku split", "claude/opus", "", "zai/glm-4.5-air", "", "", nil, "", false},
-		{"native with --oversize", "claude/opus", "", "", "zai/glm-4.6", "", nil, "", false},
-		{"native with --route-policy", "claude/opus", "", "", "", "auto", nil, "", false},
-		{"native with --shard", "claude/opus", "", "", "", "", shards, "", false},
-		{"empty tier is not native", "claude/", "", "", "", "", nil, "", false},
-		{"non-native primary", "box/kat-awq", "", "", "", "", nil, "", false},
+		{"plain native launch", "claude/opus", "", "", "", "opus", true},
+		{"native with a haiku split", "claude/opus", "", "zai/glm-4.5-air", "", "", false},
+		{"native with --oversize", "claude/opus", "", "", "zai/glm-4.6", "", false},
+		{"empty tier is not native", "claude/", "", "", "", "", false},
+		{"non-native primary", "box/kat-awq", "", "", "", "", false},
 	}
 	for _, c := range cases {
-		tier, ok := nativeTierOnly(c.model, c.sonnet, c.haiku, c.oversize, c.policy, c.shards)
+		tier, ok := nativeTierOnly(c.model, c.sonnet, c.haiku, c.oversize)
 		if ok != c.wantOK || tier != c.wantTier {
 			t.Errorf("%s: nativeTierOnly = %q/%v, want %q/%v", c.name, tier, ok, c.wantTier, c.wantOK)
 		}

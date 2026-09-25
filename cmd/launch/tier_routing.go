@@ -555,7 +555,7 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 		if attributed {
 			fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
 		} else {
-			fmt.Fprintf(os.Stderr, "config: %v — the saved tiers (%s) are the only inputs this launch did not take from its command line, so they are the only ones a past `oaica config set` could have invalidated; retrying without them. `oaica config show` lists them, `oaica config set sonnet-model|haiku-model -` clears one\n", err, strings.Join(dropped, " + "))
+			fmt.Fprintf(os.Stderr, "config: %v — the saved tier(s) %s are the only inputs a past `oaica config set` could have invalidated, so the launch retries without them. `oaica config show` lists them, `oaica config set sonnet-model|haiku-model -` clears one\n", err, strings.Join(dropped, " + "))
 		}
 		var retryBuf strings.Builder
 		plan, err = buildTierPlanBuffered(model, sonnetModel, haikuModel, forceTools, &retryBuf)
@@ -602,15 +602,18 @@ func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, b
 }
 
 // nativeTierOnly reports whether this launch has nothing for the local proxy
-// to do: a native primary, no tier split, and no --oversize/--route-policy/
-// --shard. Those three flags are consumed by the launcher (extractOversizeModel
-// / extractRoutePolicy / extractShardFlags) and re-applied on the PLAN path, so
-// runNative — which execs Claude Code with the passthrough args only — would
-// drop them silently. An explicit flag that cannot work must not evaporate.
-func nativeTierOnly(model, sonnetModel, haikuModel, oversizeModel, policyArg string, shardWeights map[string]int) (string, bool) {
+// to do: a native primary, no tier split, and no --oversize. --oversize is
+// consumed by the launcher (extractOversizeModel) and re-applied on the PLAN
+// path, and it adds a real leg (the larger-window crossover), so runNative —
+// which execs Claude Code with the passthrough args only — would drop it
+// silently. --route-policy and --shard are deliberately NOT part of this test:
+// with no second leg there is nothing to fall back to or to weight, so both are
+// inert (docs/CLAUDE_TIERS.md), and keeping the untouched path is worth more
+// than routing an inert flag through a proxy. A malformed --route-policy is
+// still reported, because Run validates it before this check.
+func nativeTierOnly(model, sonnetModel, haikuModel, oversizeModel string) (string, bool) {
 	tier, ok := nativeClaudeModelTier(model)
-	if !ok || tier == "" || sonnetModel != "" || haikuModel != "" ||
-		oversizeModel != "" || policyArg != "" || len(shardWeights) != 0 {
+	if !ok || tier == "" || sonnetModel != "" || haikuModel != "" || oversizeModel != "" {
 		return "", false
 	}
 	return tier, true
@@ -992,8 +995,17 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// args only, so those flags would be dropped silently — and
 	// `--oversize <bigger-remote>` alongside a native primary is a supported
 	// setup (see the oversize block below), not a request to ignore it.
+	// A policy the user typed is validated even when the launch turns out to
+	// need no proxy at all: a single native leg has nothing to fall back to, so
+	// the policy is inert, but a typo must not pass unnoticed — this is the same
+	// message the plan path returns, and the same one a --plan value gets.
+	if policyArg != "" {
+		if _, err := parseRoutePolicy(policyArg); err != nil {
+			return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only, weighted", policyArg)
+		}
+	}
 	nativeOnly := func(sonnet, haiku string) (string, bool) {
-		return nativeTierOnly(model, sonnet, haiku, oversizeModel, policyArg, shardWeights)
+		return nativeTierOnly(model, sonnet, haiku, oversizeModel)
 	}
 	if tier, ok := nativeOnly(sonnetModel, haikuModel); ok {
 		return c.runNative(tier, args)
@@ -1139,8 +1151,16 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
 	}
 	if plan.Routes.Oversize.BaseURL != "" {
-		fmt.Fprintf(os.Stderr, "oversize: >%dk-token requests -> %s (%s)\n",
-			plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
+		// A native primary has no probed window (PrimaryContext 0), so the
+		// threshold is unknown rather than zero: say so instead of printing
+		// ">0k-token requests", which reads as a bug in the launch.
+		if plan.PrimaryContext > 0 {
+			fmt.Fprintf(os.Stderr, "oversize: >%dk-token requests -> %s (%s)\n",
+				plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
+		} else {
+			fmt.Fprintf(os.Stderr, "oversize: requests past the primary's window -> %s (%s)\n",
+				plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
+		}
 	}
 
 	// Default model mode: with a tier split configured, launch straight

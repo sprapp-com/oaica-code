@@ -152,16 +152,14 @@ sudo rm /usr/local/bin/oaica   # or: rm ~/.local/bin/oaica
 ```
 
 Removing the binary is the whole uninstall. Your data stays in `~/.oaica` — the
-API key, `config.json`, `plans.json`, `remotes.json`, `models.json`, and every
-pulled GGUF under `models/`. Delete individual files if you want to drop a
-particular thing, and only wipe the directory when you really mean to lose all
-of it (that includes downloaded model weights):
-
-```shell
-rm -f ~/.oaica/config.json     # standing tiers only
-rm -f ~/.oaica/plans.json      # named plans only
-rm -rf ~/.oaica                # EVERYTHING — keys, plans, remotes, model weights
-```
+API key, `config.json` (standing tiers), `plans.json` (named plans),
+`remotes.json`, `models.json`, and every pulled GGUF under `models/`. Nothing
+here needs to be deleted to uninstall, and no command in this file deletes it
+for you. If you do want a clean slate later, know what is at stake first: the
+whole directory holds your keys, plans, remotes and downloaded model weights,
+so deleting any part of it is meant to be a deliberate act, not a step in
+uninstalling. Prefer targeted removal over the directory — and never the
+directory while model weights you still want are in it.
 
 ## Docs
 

@@ -126,14 +126,12 @@ sudo rm /usr/local/bin/oaica   # or: rm ~/.local/bin/oaica
 ```
 
 Removing the binary is the whole uninstall. Your data stays in `~/.oaica`
-(saved API key, `config.json`, `plans.json`, `remotes.json`, `models.json`,
-and every pulled GGUF under `models/`). Delete only what you mean to lose:
-
-```shell
-rm -f ~/.oaica/config.json     # standing tiers only
-rm -f ~/.oaica/plans.json      # named plans only
-rm -rf ~/.oaica                # EVERYTHING — keys, plans, remotes, model weights
-```
+(saved API key, `config.json` standing tiers, `plans.json` named plans,
+`remotes.json`, `models.json`, and every pulled GGUF under `models/`) — none of
+it needs to go for an uninstall, and no command here will remove it for you.
+That directory is your keys, plans, remotes and downloaded model weights in
+one place; treat clearing any of it as a deliberate act, not an uninstall step,
+and prefer removing individual files over the directory itself.
 
 If you installed `llama-server` separately via a package manager, remove it
 with that package manager if you no longer need it.
