@@ -622,7 +622,19 @@ func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, head
 	if route.BaseURL != "" {
 		key := route.resolveKey()
 		if key == "" {
-			return "", "", "", false
+			// The `anthropic` catalog row is api.anthropic.com itself: a user
+			// who signed in with `claude /login` has an OAuth session there
+			// and no API key at all, so fall back to the native credential
+			// (ANTHROPIC_API_KEY or that session) rather than refusing. Any
+			// other vendor's keyless row still fails closed.
+			if !isAnthropicAPIBase(route.BaseURL) {
+				return "", "", "", false
+			}
+			auth, found := resolveNativeAnthropicAuth()
+			if !found {
+				return "", "", "", false
+			}
+			return strings.TrimRight(route.BaseURL, "/") + "/messages", auth.Header, auth.Value, true
 		}
 		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, true
 	}
@@ -631,6 +643,33 @@ func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, head
 		return "", "", "", false
 	}
 	return nativeAnthropicUpstream, auth.Header, auth.Value, true
+}
+
+// anthropicRemoteModelsTarget is anthropicPassthroughTarget's /models
+// sibling: same upstream base and same credential, one path segment over, for
+// proxying GET /v1/models. Ok is false for a native claude/* leg (no BaseURL
+// to list from) — its caller forwards to api.anthropic.com instead.
+func (route proxyRoute) anthropicRemoteModelsTarget() (upstream, headerName, headerValue string, ok bool) {
+	if route.BaseURL == "" {
+		return "", "", "", false
+	}
+	upstream, headerName, headerValue, ok = route.anthropicPassthroughTarget()
+	if !ok {
+		return "", "", "", false
+	}
+	return strings.TrimSuffix(upstream, "/messages") + "/models", headerName, headerValue, true
+}
+
+// isAnthropicAPIBase reports whether a route's base URL points at
+// api.anthropic.com itself (the `anthropic` catalog row), where the native
+// credential — an OAuth session from `claude /login` or ANTHROPIC_API_KEY —
+// is a valid substitute for a per-row key.
+func isAnthropicAPIBase(baseURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "api.anthropic.com")
 }
 
 func (route proxyRoute) resolveKey() string {
@@ -939,17 +978,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 		if table.Default.NativePassthrough {
-			if table.Default.Wire == "anthropic" && table.Default.BaseURL != "" {
+			if upstream, headerName, headerValue, ok := table.Default.anthropicRemoteModelsTarget(); ok {
 				// Anthropic-wire remote: its own /v1/models, authenticated the
-				// way the vendor expects (x-api-key). A 404 here is harmless —
+				// way the vendor expects (x-api-key, or the native credential
+				// for api.anthropic.com itself). A 404 here is harmless —
 				// context_window_remote.go falls back to the catalog's
 				// declared window.
-				key := table.Default.resolveKey()
-				if key == "" {
-					writeAnthropicError(w, http.StatusUnauthorized, "no credential for "+table.Default.Label)
-					return
-				}
-				anthropicModelsPassthrough(w, r, strings.TrimRight(table.Default.BaseURL, "/")+"/models", "x-api-key", key)
+				anthropicModelsPassthrough(w, r, upstream, headerName, headerValue)
 				return
 			}
 			nativeAnthropicModelsPassthrough(w, r)
