@@ -261,12 +261,17 @@ picker:
    that removes real spend (see the tier table above), so it is worth a
    deliberate choice.
 4. **Compaction/oversize model** — only models whose PROBED context window
-   (the same 2s `/models` probe the proxy uses) is strictly larger than the
-   primary's qualify; `(none — fail honestly at the ceiling)` is the default.
-   With no probe answer and no larger model, the step offers nothing.
-5. **Route policy** — the six `--route-policy` values, `local-first` default
-   (`weighted` is available here too, but the wizard has no step for setting
-   per-leg weights — use `--shard`/`remotes.json` `weight` for that).
+   (the same 2s `/models` probe the proxy uses) is at least the primary's
+   qualify (`>=` is deliberate: an equal-window independent backend can still
+   take over when the primary fails near the ceiling, even though the size
+   crossover itself only fires for a strictly larger one — see below);
+   `(none — fail honestly at the ceiling)` is the default. With no probe
+   answer and no qualifying model, the step offers nothing.
+5. **Route policy** — five of the six `--route-policy` values
+   (`auto` first and the default, then `local-first`, `remote-first`,
+   `local-only`, `remote-only`). `weighted` is not offered: the wizard has no
+   step for setting per-leg weights, so use `--shard` /
+   `remotes.json` `"weight"` to pick it.
 
 A one-line preview prints (e.g. `fallback: a <-> b · oversize: c (256k) ·
 policy: remote-first`) and the choice can be saved as a named plan (blank

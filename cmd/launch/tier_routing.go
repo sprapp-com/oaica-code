@@ -999,8 +999,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// --oversize/--route-policy/--shard must keep the launch on the plan path
 	// even with no tier split: runNative execs Claude Code with the passthrough
 	// args only, so those flags would be dropped silently — and
-	// `--oversize <bigger-remote>` alongside a native primary is a supported
-	// setup (see the oversize block below), not a request to ignore it.
+	// `--oversize <bigger-remote>` alongside a native primary is a request to
+	// ignore it, not a typo to swallow silently. The plan path is where the
+	// launch can at least REPORT what the leg will do: the crossover is only
+	// reached for a leg whose window is known, so against a native primary it
+	// covers that split's overflow and never the primary's own requests (see
+	// the oversize block below).
 	// A policy the user typed is validated even when the launch turns out to
 	// need no proxy at all: a single native leg has nothing to fall back to, so
 	// the policy is inert, but a typo must not pass unnoticed — this is the same
@@ -1157,15 +1161,20 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		fmt.Fprintf(os.Stderr, "route policy: %s (fallback legs: %d)\n", policy, len(plan.Routes.Fallbacks)-1)
 	}
 	if plan.Routes.Oversize.BaseURL != "" {
-		// A native primary has no probed window (PrimaryContext 0), so the
-		// threshold is unknown rather than zero: say so instead of printing
-		// ">0k-token requests", which reads as a bug in the launch.
+		// The crossover is decided against the SERVING leg's window
+		// (oversizeSwap bails when route.ContextWindow <= 0, and the handler
+		// skips its whole clamp block for such a route), so a named threshold
+		// only exists once the primary's window is known. A native primary is
+		// never probed, so it has none: printing ">0k-token requests" reads as
+		// a bug, and promising the crossover would be false — the primary's own
+		// requests cannot trigger it. Say which legs it does cover instead of
+		// naming a threshold that does not exist.
 		if plan.PrimaryContext > 0 {
 			fmt.Fprintf(os.Stderr, "oversize: >%dk-token requests -> %s (%s)\n",
 				plan.PrimaryContext/1024, plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
 		} else {
-			fmt.Fprintf(os.Stderr, "oversize: requests past the primary's window -> %s (%s)\n",
-				plan.Routes.Oversize.Label, plan.Routes.Oversize.UpstreamModel)
+			fmt.Fprintf(os.Stderr, "oversize: %s covers split tiers only — the primary's context window is unknown (a native primary is never probed), so a primary request can never trigger the crossover\n",
+				plan.Routes.Oversize.Label)
 		}
 	}
 

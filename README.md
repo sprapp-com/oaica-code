@@ -57,8 +57,10 @@ Multi-model launches (v0.5.0+): a plain interactive
 tier, then the Haiku tier (Claude Code's background work: titles, topic
 detection — unset, a split launch bills those calls at the primary's price,
 while a plain native launch keeps Claude Code's own Haiku),
-then a compaction/oversize model (only models with a probed LARGER
-context window are offered), then a route
+then a compaction/oversize model (only models whose probed
+context window is at least the primary's are offered — an equal
+window can still take over when the primary fails, though the size
+crossover itself needs strictly larger), then a route
 policy (`--route-policy local-first|remote-first|auto|local-only|remote-only|weighted`)
 with cross-leg failover via a health circuit breaker — and can save the
 whole setup as a named plan. Same knobs exist as flags

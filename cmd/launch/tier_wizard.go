@@ -374,8 +374,11 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	sonnetItems, autoSecondary := tierWizardTierItems(models, names, primary, true)
 	haikuItems, _ := tierWizardTierItems(models, names, primary, false)
 
-	// Step 4 — route policy. Every value --route-policy accepts; local-first
-	// first (the default), same ordering as `oaica doctor`'s legend.
+	// Step 4 — route policy. `auto` first and pre-selected: it is the wizard's
+	// default (a plain launch has no explicit policy to honor), and today it
+	// starts from local-first. `weighted` is deliberately absent — the wizard
+	// has no step for per-leg weights, so picking it here could only ever
+	// behave as plain failover; use --shard / remotes.json "weight".
 	policyItems := []SelectionItem{
 		{Name: string(RouteAuto), Description: "let OAICA route on failure — recommended (today: local-first, prefer a local backend, else any healthy alternate)"},
 		{Name: string(RouteLocalFirst), Description: "on failure prefer a local backend, else any healthy alternate"},
