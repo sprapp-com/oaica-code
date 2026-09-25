@@ -3,6 +3,7 @@ package launch
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,34 @@ import (
 	"testing"
 	"time"
 )
+
+type proxyRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f proxyRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestProxyUpstreamRetryDo_ExhaustedTransportFailuresReturnError(t *testing.T) {
+	oldClient := proxyUpstreamClient
+	oldRetries := proxyUpstreamMaxRetries
+	proxyUpstreamMaxRetries = 1
+	proxyUpstreamClient = &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection reset by peer")
+	})}
+	t.Cleanup(func() {
+		proxyUpstreamClient = oldClient
+		proxyUpstreamMaxRetries = oldRetries
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "http://upstream.test/chat/completions", bytes.NewReader([]byte(`{}`)))
+	resp, err := proxyUpstreamRetryDo(req, []byte(`{}`))
+	if err == nil {
+		t.Fatal("proxyUpstreamRetryDo returned nil error after transport failure")
+	}
+	if resp != nil {
+		t.Fatalf("proxyUpstreamRetryDo response = %#v, want nil", resp)
+	}
+}
 
 // TestNormalizeSystemFirst verifies the proxy folds every system message into a
 // SINGLE leading system message. Some Anthropic→OpenAI translations place a

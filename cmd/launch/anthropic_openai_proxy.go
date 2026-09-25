@@ -761,6 +761,7 @@ func proxyUpstreamRetryable(resp *http.Response) bool {
 
 func proxyUpstreamRetryDo(req *http.Request, reqBytes []byte) (*http.Response, error) {
 	var lastResp *http.Response
+	var lastErr error
 	for attempt := 0; attempt < proxyUpstreamMaxRetries; attempt++ {
 		attemptReq := req
 		if attempt > 0 {
@@ -778,7 +779,11 @@ func proxyUpstreamRetryDo(req *http.Request, reqBytes []byte) (*http.Response, e
 			if req.Context().Err() != nil {
 				return nil, err
 			}
+			lastErr = err
 			lastResp = nil
+			if attempt == proxyUpstreamMaxRetries-1 {
+				return nil, lastErr
+			}
 			delay := proxyUpstreamRetryDelay(nil, attempt)
 			select {
 			case <-time.After(delay):
@@ -799,6 +804,9 @@ func proxyUpstreamRetryDo(req *http.Request, reqBytes []byte) (*http.Response, e
 			}
 		}
 		return resp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	return lastResp, nil
 }
