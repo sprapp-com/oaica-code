@@ -1217,20 +1217,18 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 	if err != nil {
 		return "", err
 	}
-	// Native "claude/<tier>" entries only make sense for the Claude Code
-	// integration (commandName is the integration name; the generic select
-	// path passes ""). They run Claude Code's own Anthropic auth.
-	if commandName == "claude" {
-		items = append(items, nativeClaudePickerModels...)
-		// Saved tier plans one keystroke away: "plan/<name>" entries resolve
-		// the whole stored choice (primary, secondary, oversize, policy).
-		items = append(items, pickerPlanItems()...)
-	}
-	// Native Codex: Codex's own ChatGPT-plan login spends itself, so its
-	// models come from the plan, not from our inventory — the row has to be
-	// offered regardless of what the catalog holds (codex.go).
-	if commandName == "codex" {
-		items = append(items, nativeCodexPickerModels...)
+	// Native passthrough rows (claude/<tier>, codex/native): the vendor CLI
+	// runs with its own login, so those models come from the plan rather than
+	// our inventory and the row is offered regardless of what the catalog
+	// holds. Which integration gets which rows is DATA — native_integration.go.
+	if native := nativePickerItemsFor(commandName); len(native) > 0 {
+		items = append(items, native...)
+		// Saved tier plans one keystroke away, Claude Code only: "plan/<name>"
+		// entries resolve the whole stored choice (primary, secondary,
+		// oversize, policy) — see tier_plan_profiles.go.
+		if commandName == "claude" {
+			items = append(items, pickerPlanItems()...)
+		}
 	}
 
 	for {
@@ -1250,7 +1248,7 @@ func (c *launcherClient) selectSingleModelWithSelectorReady(ctx context.Context,
 		// "ollama/<name>" is picker display only; the daemon and every
 		// saved config know the bare id.
 		selected = stripOllamaPickerNames([]string{selected})[0]
-		if isNativeClaudeModel(selected) || isNativeCodexModel(selected) {
+		if isNativeModel(selected) {
 			// Native entries bypass OAICA readiness entirely — Codex's own
 			// ChatGPT login spends itself, so there is nothing to prepare.
 			recordModelPick(selected)
@@ -1497,7 +1495,7 @@ func (c *launcherClient) ensureModelsReadyFor(ctx context.Context, models []stri
 	// (2026-09-02) even though the picker path always worked.
 	pending := models[:0:0]
 	for _, model := range models {
-		if !isNativeClaudeModel(model) && !isNativeCodexModel(model) {
+		if !isNativeModel(model) {
 			pending = append(pending, model)
 		}
 	}
@@ -1688,7 +1686,7 @@ func (c *launcherClient) singleModelUsable(ctx context.Context, name string, inv
 	}
 	// "claude/<tier>" native entries need no OAICA readiness — they route to
 	// Claude Code's own Anthropic auth (see Claude.runNative).
-	if isNativeClaudeModel(name) || isNativeCodexModel(name) || isPlanPickerModel(name) {
+	if isNativeModel(name) || isPlanPickerModel(name) {
 		return true
 	}
 	if isCloudModelName(name) {

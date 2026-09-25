@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -108,6 +109,52 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	return nil
 }
 
+// AuthLoginVia delegates a login to the tool that owns the credential
+// instead of prompting for a key oaica would store itself: `oaica auth login
+// --via opencode zai-coding-plan` runs opencode's own `auth login`, so the
+// secret lands in the store opencode already reads and there is never a second
+// copy to keep in sync. It exists because reusing those logins is the whole
+// point (auth_external.go) — a provider opencode already knows how to
+// authenticate needs no oaica-specific flow.
+//
+// The argv comes from the source's own declaration (externalLoginArgv), the
+// same one `oaica auth list` prints, so the command a user is told to run and
+// the command this executes can never drift.
+func AuthLoginVia(out io.Writer, provider, via string) error {
+	provider = strings.TrimSpace(provider)
+	via = strings.TrimSpace(via)
+	if provider == "" {
+		return fmt.Errorf("usage: oaica auth login --via %s <provider>", via)
+	}
+	argv, ok := externalLoginArgv(via, provider)
+	if !ok {
+		return fmt.Errorf("unknown credential source %q — supported: %s", via, strings.Join(externalAuthSourceNames(), ", "))
+	}
+	bin := argv[0]
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		return fmt.Errorf("%s is not installed (or not on PATH), so its stored login cannot be created — install it, or run `oaica auth login %s` to store a key with oaica instead", bin, provider)
+	}
+	fmt.Fprintf(out, "Delegating to %s — the credential stays in that tool's own store; oaica reads it, never copies it.\n", strings.Join(argv, " "))
+	cmd := exec.Command(path, argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s failed: %w", strings.Join(argv, " "), err)
+	}
+	// Prove the credential is actually readable through the path oaica will
+	// use, rather than trusting that the delegated command did what we think.
+	if key := externalAuthKey(via, provider); key != "" {
+		fmt.Fprintf(out, "%s now authenticates via %s (%s).\n", provider, via, maskKey(key))
+		return nil
+	}
+	if cred, ok := externalAuthFor(via, provider); ok && cred.Reason != "" {
+		return fmt.Errorf("%s is still not usable: %s", provider, cred.Reason)
+	}
+	return fmt.Errorf("%s finished but no usable credential for %q is readable in %s's store — check the provider id it expects", strings.Join(argv, " "), provider, via)
+}
+
 func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, known bool) (string, error) {
 	if known {
 		fmt.Fprintf(out, "%s — %s\n", provider, entry.BaseURL)
@@ -195,14 +242,36 @@ func AuthList(out io.Writer) error {
 			width = len(e.Name)
 		}
 	}
-	fmt.Fprintf(out, "%-*s  %-9s  %-22s  %s\n", width, "PROVIDER", "STATUS", "CREDENTIAL", "PLAN")
+	// CREDENTIAL is wide enough for the longest actionable value it can hold
+	// ("run: opencode auth login minimax-coding-plan"), so the PLAN column
+	// stays aligned instead of wrapping into a paragraph.
+	const credWidth = 46
+	fmt.Fprintf(out, "%-*s  %-9s  %-*s  %s\n", width, "PROVIDER", "STATUS", credWidth, "CREDENTIAL", "PLAN")
+	// Reasons a present-but-unusable external credential could not be used
+	// (an expired OAuth token): printed under the table so the CREDENTIAL
+	// column can stay narrow and the user learns WHY, not just "needs key".
+	var notes []string
 	for _, e := range entries {
 		status, cred := "not set", "-"
+		external, hasExternal := externalAuthFor(e.AuthVia, e.Name)
+		externalCmd := externalLoginArgvString(e.AuthVia, e.Name)
 		switch {
 		case e.APIKeyEnv != "" && strings.TrimSpace(os.Getenv(e.APIKeyEnv)) != "":
 			status, cred = "ready", "env:"+e.APIKeyEnv
 		case stored[e.Name]:
 			status, cred = "ready", "stored"
+		case hasExternal && external.Key != "":
+			// Another agent CLI's own login, reused (auth_external.go) — no
+			// oaica copy exists and none is needed.
+			status, cred = "ready", external.Source
+		case hasExternal && external.Reason != "":
+			status, cred = "needs key", "run: "+externalCmd
+			notes = append(notes, fmt.Sprintf("%s: %s", e.Name, external.Reason))
+		case e.AuthVia != "" && externalStoreExists(e.AuthVia):
+			// Declared as reusable, that tool is installed, but it has no entry
+			// for this provider yet: point at the tool's own login, which is
+			// the whole point of auth_via — one login serves both.
+			status, cred = "needs key", "run: "+externalCmd
 		case e.APIKeyEnv != "":
 			status, cred = "needs key", "run: oaica auth login "+e.Name
 		}
@@ -210,7 +279,13 @@ func AuthList(out io.Writer) error {
 		if plan == "" {
 			plan = "-"
 		}
-		fmt.Fprintf(out, "%-*s  %-9s  %-22s  %s\n", width, e.Name, status, cred, plan)
+		fmt.Fprintf(out, "%-*s  %-9s  %-*s  %s\n", width, e.Name, status, credWidth, cred, plan)
+	}
+	if len(notes) > 0 {
+		fmt.Fprintln(out, "\nA stored login oaica could not use:")
+		for _, n := range notes {
+			fmt.Fprintf(out, "  %s\n", n)
+		}
 	}
 
 	// Store-only entries (a user remote the catalog does not carry) would

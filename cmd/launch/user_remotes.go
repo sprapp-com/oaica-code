@@ -114,6 +114,13 @@ type userRemote struct {
 	// leg). 0 (the default) means this remote is never chosen by weighted
 	// distribution — it stays failover-only, unaffected by this field.
 	Weight int `json:"weight,omitempty"`
+	// AuthVia names an external credential store to reuse a login from
+	// (auth_external.go) — "opencode" today. Set on the catalog rows whose
+	// credential opencode already owns (`zai-coding-plan`, `minimax-coding-plan`,
+	// ...), so a user who ran `opencode auth login` does not have to hand oaica
+	// the same key a second time. Off by default and opt-in by name: see
+	// provider_catalog.go's note on why a bare id match is not enough.
+	AuthVia string `json:"auth_via,omitempty"`
 }
 
 type userRemotesFile struct {
@@ -121,9 +128,12 @@ type userRemotesFile struct {
 }
 
 // key resolves the bearer: the environment first (a secret stays off disk),
-// then the `oaica auth login` store (auth_store.go), then an api_key written
-// inline in remotes.json. Every credential path ends here, so a provider
-// logged in interactively works everywhere an env var does.
+// then the `oaica auth login` store (auth_store.go), then an external store
+// this row declared (auth_external.go — another agent CLI's own login, reused
+// rather than re-prompted), then an api_key written inline in remotes.json.
+// Every credential path ends here, so a provider logged in interactively — by
+// oaica or by opencode — works everywhere an env var does. A key the user
+// explicitly handed oaica outranks one another tool left on disk.
 func (r userRemote) key() string {
 	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
 		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
@@ -131,6 +141,9 @@ func (r userRemote) key() string {
 		}
 	}
 	if v := storedAuthKey(r.Name); v != "" {
+		return v
+	}
+	if v := externalAuthKey(r.AuthVia, r.Name); v != "" {
 		return v
 	}
 	return strings.TrimSpace(r.APIKey)
@@ -181,8 +194,10 @@ func userRemotesPath() string {
 }
 
 // builtinRemotes returns remotes that oaica knows about without config,
-// active while a credential exists — either the catalog row's own env var or
-// an `oaica auth login` entry. No key, nothing to route through, no row.
+// active while a credential exists — the catalog row's own env var, an `oaica
+// auth login` entry, or a login this row's auth_via declares that another
+// agent CLI already stores (auth_external.go). No key, nothing to route
+// through, no row.
 // Sourced entirely from providerCatalog() (provider_catalog.go): the
 // embedded default (cmd/launch/providers/providers.json) plus whatever
 // `oaica remote sync` has pulled down. Adding a provider, adding a new
@@ -198,6 +213,10 @@ func builtinRemotes() []userRemote {
 			continue
 		}
 		if hasStoredAuth(p.Name) {
+			out = append(out, p)
+			continue
+		}
+		if externalAuthKey(p.AuthVia, p.Name) != "" {
 			out = append(out, p)
 		}
 	}

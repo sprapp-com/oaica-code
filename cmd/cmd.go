@@ -66,6 +66,14 @@ func init() {
 		return runTUIMultiSelector(title, items, preChecked, updates)
 	}
 
+	// The picker's "(no matches)" line: answers a search for a provider this
+	// build knows but cannot offer rows for (no credential yet) with the
+	// command that enables it, instead of the bare "(no matches)" that reads
+	// as "not supported" (cmd/launch/picker_needs_key.go). The catalog lives in
+	// the launch package, so the hint is asked for from there; the TUI only
+	// renders what it is given.
+	tui.NoMatchHint = launch.PickerNoMatchHint
+
 	launch.DefaultSignIn = func(modelName, signInURL string) (string, error) {
 		userName, err := tui.RunSignIn(modelName, signInURL)
 		if errors.Is(err, tui.ErrCancelled) {
@@ -2633,14 +2641,21 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			Args:  cobra.MaximumNArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				key, _ := cmd.Flags().GetString("key")
+				via, _ := cmd.Flags().GetString("via")
 				provider := ""
 				if len(args) > 0 {
 					provider = args[0]
+				}
+				// --via delegates to the tool that already owns the
+				// credential (e.g. opencode), so no second copy is stored.
+				if via != "" {
+					return launch.AuthLoginVia(os.Stdout, provider, via)
 				}
 				return launch.AuthLogin(os.Stdout, provider, key)
 			},
 		}
 		login.Flags().String("key", "", "API key (otherwise prompted for, hidden). Visible in shell history — prefer the prompt")
+		login.Flags().String("via", "", "Delegate to another tool's login instead of storing a key here (e.g. --via opencode)")
 		list = &cobra.Command{
 			Use:   "list",
 			Short: "List providers and whether they can authenticate",

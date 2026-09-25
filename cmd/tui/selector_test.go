@@ -1333,3 +1333,67 @@ func TestUpdateNavigation_UpReachesOAIACrossSections(t *testing.T) {
 		t.Fatalf("up again should land on first OAICA row, cursor=%d", m.cursor)
 	}
 }
+
+// The "(no matches)" state is the one place the picker can explain a provider
+// it knows but cannot offer rows for. The hook is optional: with none set, and
+// with a hook that has nothing to say, the state renders exactly as before.
+func TestNoMatchHintLine(t *testing.T) {
+	orig := NoMatchHint
+	t.Cleanup(func() { NoMatchHint = orig })
+
+	NoMatchHint = nil
+	if got := noMatchHintLine("minimax"); got != "" {
+		t.Fatalf("noMatchHintLine() with no hook = %q, want empty", got)
+	}
+
+	NoMatchHint = func(string) string { return "" }
+	if got := noMatchHintLine("minimax"); got != "" {
+		t.Fatalf("noMatchHintLine() with a silent hook = %q, want empty", got)
+	}
+
+	// An empty filter is not a search: the hint is for a query, not the
+	// unfiltered list.
+	var got string
+	NoMatchHint = func(q string) string {
+		got = q
+		return "minimax-coding-plan is a provider oaica knows — needs a key"
+	}
+	if line := noMatchHintLine("  "); line != "" {
+		t.Fatalf("noMatchHintLine() on a blank filter = %q, want empty", line)
+	}
+	if got != "" {
+		t.Fatalf("the hook was called with %q for a blank filter", got)
+	}
+
+	line := noMatchHintLine("minimax")
+	if got != "minimax" {
+		t.Fatalf("hook received query %q, want the filter text", got)
+	}
+	if !strings.Contains(line, "minimax-coding-plan") {
+		t.Fatalf("hint line = %q, want the hook's text rendered", line)
+	}
+	if !strings.HasSuffix(line, "\n") {
+		t.Fatalf("hint line = %q, want a trailing newline so the rows below stay aligned", line)
+	}
+}
+
+// A render pass over a filtered picker with an empty result must include the
+// hint, not just a bare "(no matches)".
+func TestRenderContent_NoMatchesShowsHint(t *testing.T) {
+	orig := NoMatchHint
+	t.Cleanup(func() { NoMatchHint = orig })
+	NoMatchHint = func(string) string { return "zai is a provider oaica knows — needs a key" }
+
+	m := selectorModel{
+		title:  "Select model:",
+		items:  []SelectItem{{Name: "ollama/qwen3:8b"}},
+		filter: "zai",
+	}
+	content := m.renderContent()
+	if !strings.Contains(content, "(no matches)") {
+		t.Fatalf("expected the no-matches state:\n%s", content)
+	}
+	if !strings.Contains(content, "zai is a provider oaica knows") {
+		t.Fatalf("expected the hint under the no-matches line:\n%s", content)
+	}
+}

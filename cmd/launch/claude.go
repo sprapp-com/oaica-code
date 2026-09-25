@@ -88,25 +88,6 @@ var nativeClaudePickerModels = []ModelItem{
 	{Name: "anthropic/fable", Description: "Claude Code native, Anthropic subscription (alias of claude/fable)"},
 }
 
-// isNativeClaudeModel reports whether name selects the native (non-OAICA)
-// Claude Code path: "claude/<tier>" or its "anthropic/<tier>" alias, e.g.
-// "claude/opus" / "anthropic/opus".
-func isNativeClaudeModel(model string) bool {
-	return strings.HasPrefix(model, "claude/") || strings.HasPrefix(model, "anthropic/")
-}
-
-// nativeClaudeModelTier splits "claude/opus" (or "anthropic/opus") into the
-// Claude Code --model alias ("opus"). ok is false for anything that is not a
-// native entry.
-func nativeClaudeModelTier(model string) (string, bool) {
-	for _, p := range []string{"claude/", "anthropic/"} {
-		if rest, ok := strings.CutPrefix(model, p); ok {
-			return rest, true
-		}
-	}
-	return "", false
-}
-
 // runNative execs the real Claude Code binary with an untouched environment —
 // no ANTHROPIC_BASE_URL/AUTH_TOKEN injection, no translation proxy. The tier
 // becomes Claude Code's own --model alias; a user-supplied --model in extra

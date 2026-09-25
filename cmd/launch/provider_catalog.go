@@ -18,6 +18,16 @@ package launch
 //     name; the embedded list still fills in anything sync hasn't fetched
 //     (or never will, e.g. an air-gapped host).
 //
+// HAZARD — the cache layer overrides by name WHOLESALE, not per field. A row
+// in ~/.oaica/cache/providers/providers.json replaces the embedded row
+// entirely, so a field added to the embedded copy in a newer binary is
+// INVISIBLE on any host whose cache was synced before that field existed —
+// there is no merge, and no error. Concretely: the auth_via rows (credential
+// reuse from another tool, auth_external.go) read as untagged on a host
+// holding a pre-auth_via cache, so reuse silently does nothing there until
+// `oaica remote sync` fetches the updated file. Diagnosing this means looking
+// at the cache file, not the embedded one (2026-09-25: "the feature is inert
+// on the real box" was exactly this).
 // A user's own ~/.oaica/remotes.json entry of the same name still wins
 // over BOTH layers (loadUserRemotes' existing dedupe) — the catalog only
 // ever supplies a default, never overrides a user's explicit config.
@@ -71,6 +81,13 @@ type providerCatalogEntry struct {
 	// KeyURL is where a user without a key yet can get one — surfaced by
 	// ensureRemoteAPIKeyForModel's interactive prompt. Optional.
 	KeyURL string `json:"key_url,omitempty"`
+	// AuthVia names an external credential store whose login for THIS
+	// provider id may be reused instead of asking for a key again
+	// (auth_external.go) — "opencode" today. Opt-in per row, deliberately:
+	// two tools naming a provider the same thing is a coincidence, not
+	// evidence that one's stored key belongs to the other, so a row that says
+	// nothing here can never source a credential from another tool's disk.
+	AuthVia string `json:"auth_via,omitempty"`
 	// Models declares this provider's model ids and their windows, keyed by
 	// the bare id the provider expects upstream. It exists for providers
 	// whose /v1/models sweep cannot answer: the Anthropic-compatible
@@ -162,6 +179,7 @@ func providerCatalogAsUserRemotes() []userRemote {
 			Wire:       e.Wire,
 			ToolFormat: e.ToolFormat,
 			APIKeyEnv:  e.APIKeyEnv,
+			AuthVia:    e.AuthVia,
 		})
 	}
 	return out

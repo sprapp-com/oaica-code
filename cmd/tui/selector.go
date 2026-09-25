@@ -573,6 +573,30 @@ func renderSectionRows(s *strings.Builder, cursor int, filtered []SelectItem, id
 	}
 }
 
+// NoMatchHint, when set, supplies one extra line for the picker's "(no
+// matches)" state given the text the user has typed. It exists because the
+// most confusing empty result is not a typo — it is a provider the caller
+// knows about but cannot offer rows for (no key stored, so there is no
+// endpoint to launch), where "no matches" reads as "not supported". The caller
+// owns that knowledge, so it supplies the sentence; this package only renders
+// it. Empty string means render nothing, which is the default for every query
+// that means nothing special.
+var NoMatchHint func(query string) string
+
+// noMatchHintLine renders that line, styled like the "(no matches)" text it
+// follows. Filtering by a single character is left alone: the hook receives
+// every query, and callers decide their own threshold.
+func noMatchHintLine(filter string) string {
+	if NoMatchHint == nil || strings.TrimSpace(filter) == "" {
+		return ""
+	}
+	hint := NoMatchHint(filter)
+	if strings.TrimSpace(hint) == "" {
+		return ""
+	}
+	return selectorItemStyle.Render(selectorDescStyle.Render(hint)) + "\n"
+}
+
 // selectorNameWidth returns the display width of the longest name in the
 // row set, used to align the two-column table's right-hand metadata column.
 // Names render in monospace-ish terminal cells, so plain len() is a close
@@ -658,6 +682,7 @@ func (m selectorModel) renderContent() string {
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
 		s.WriteString("\n")
+		s.WriteString(noMatchHintLine(m.filter))
 	} else if m.filter != "" {
 		s.WriteString(sectionHeaderStyle.Render("Top Results"))
 		s.WriteString("\n")
@@ -792,6 +817,7 @@ func (m selectorModel) RenderCompactContent(maxItems int) string {
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
 		s.WriteString("\n")
+		s.WriteString(noMatchHintLine(m.filter))
 	} else {
 		maxItems = max(1, maxItems)
 		start := 0
@@ -1363,6 +1389,7 @@ func (m multiSelectorModel) View() string {
 	if len(filtered) == 0 {
 		s.WriteString(selectorItemStyle.Render(selectorDescStyle.Render("(no matches)")))
 		s.WriteString("\n")
+		s.WriteString(noMatchHintLine(m.filter))
 	} else if m.filter != "" {
 		// Filtering: flat scroll through all matches
 		displayCount := min(len(filtered), maxSelectorItems)

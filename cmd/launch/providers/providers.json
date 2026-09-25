@@ -27,21 +27,21 @@
       "gpt-5.6-terra": {"context": 1050000, "output": 128000}
     }
     },
-    {"name": "google", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key_env": "GEMINI_API_KEY"},
-    {"name": "groq", "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
-    {"name": "mistral", "base_url": "https://api.mistral.ai/v1", "api_key_env": "MISTRAL_API_KEY"},
-    {"name": "deepseek", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"},
-    {"name": "xai", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY"},
+    {"name": "google", "auth_via": "opencode", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key_env": "GEMINI_API_KEY"},
+    {"name": "groq", "auth_via": "opencode", "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
+    {"name": "mistral", "auth_via": "opencode", "base_url": "https://api.mistral.ai/v1", "api_key_env": "MISTRAL_API_KEY"},
+    {"name": "deepseek", "auth_via": "opencode", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"},
+    {"name": "xai", "auth_via": "opencode", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY"},
     {"name": "together", "base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
     {"name": "fireworks", "base_url": "https://api.fireworks.ai/inference/v1", "api_key_env": "FIREWORKS_API_KEY"},
-    {"name": "cerebras", "base_url": "https://api.cerebras.ai/v1", "api_key_env": "CEREBRAS_API_KEY"},
-    {"name": "perplexity", "base_url": "https://api.perplexity.ai", "api_key_env": "PERPLEXITY_API_KEY"},
-    {"name": "alibaba", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY"},
+    {"name": "cerebras", "auth_via": "opencode", "base_url": "https://api.cerebras.ai/v1", "api_key_env": "CEREBRAS_API_KEY"},
+    {"name": "perplexity", "auth_via": "opencode", "base_url": "https://api.perplexity.ai", "api_key_env": "PERPLEXITY_API_KEY"},
+    {"name": "alibaba", "auth_via": "opencode", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY"},
     {"name": "moonshot", "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY", "plan_label": "API Plan (Moonshot/Kimi — per-token key)"},
     {"name": "zhipu", "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key_env": "ZHIPU_API_KEY"},
-    {"name": "openrouter", "base_url": "https://openrouter.ai/api", "tool_format": "tool_calls", "api_key_env": "OPENROUTER_API_KEY", "notes": "~400 models, ids keep their vendor/ prefix."},
-    {"name": "ollama-cloud", "base_url": "https://ollama.com", "tool_format": "tool_calls", "api_key_env": "OLLAMA_API_KEY", "notes": "ollama.com hosted models, no local daemon/signin needed."},
-    {"name": "zai", "base_url": "https://api.z.ai/api/paas", "version": "v4", "api_key_env": "Z_AI_API_KEY", "plan_label": "API Plan (Z.AI — per-token key)", "notes": "Pay-per-token platform API. Keys off Z_AI_API_KEY; models.dev names the same credential ZHIPU_API_KEY.",
+    {"name": "openrouter", "auth_via": "opencode", "base_url": "https://openrouter.ai/api", "tool_format": "tool_calls", "api_key_env": "OPENROUTER_API_KEY", "notes": "~400 models, ids keep their vendor/ prefix."},
+    {"name": "ollama-cloud", "auth_via": "opencode", "base_url": "https://ollama.com", "tool_format": "tool_calls", "api_key_env": "OLLAMA_API_KEY", "notes": "ollama.com hosted models, no local daemon/signin needed."},
+    {"name": "zai", "auth_via": "opencode", "base_url": "https://api.z.ai/api/paas", "version": "v4", "api_key_env": "Z_AI_API_KEY", "plan_label": "API Plan (Z.AI — per-token key)", "notes": "Pay-per-token platform API. Keys off Z_AI_API_KEY; models.dev names the same credential ZHIPU_API_KEY.",
      "models": {
       "glm-4.5": {"context": 131072, "output": 98304},
       "glm-4.5-air": {"context": 131072, "output": 98304},
@@ -63,7 +63,7 @@
       "glm-5v-turbo": {"context": 200000, "output": 131072}
     }
     },
-    {"name": "zai-coding-plan", "base_url": "https://api.z.ai/api/anthropic", "tool_format": "tool_calls", "api_key_env": "Z_AI_API_KEY", "plan_label": "Coding Plan (Z.AI — subscription)", "key_url": "https://z.ai/manage-apikey/apikey-list", "notes": "Flat-fee GLM Coding Plan on the Anthropic-compatible endpoint, so Claude Code drives it directly. Z.AI also serves the same models OpenAI-compatible at /api/coding/paas/v4 (models.dev uses that form); the anthropic path is the one that works as an ANTHROPIC_BASE_URL. Keys off Z_AI_API_KEY — the variable our fleet exports for this plan.",
+    {"name": "zai-coding-plan", "auth_via": "opencode", "base_url": "https://api.z.ai/api/anthropic", "tool_format": "tool_calls", "api_key_env": "Z_AI_API_KEY", "plan_label": "Coding Plan (Z.AI — subscription)", "key_url": "https://z.ai/manage-apikey/apikey-list", "notes": "Flat-fee GLM Coding Plan on the Anthropic-compatible endpoint, so Claude Code drives it directly. Z.AI also serves the same models OpenAI-compatible at /api/coding/paas/v4 (models.dev uses that form); the anthropic path is the one that works as an ANTHROPIC_BASE_URL. Keys off Z_AI_API_KEY — the variable our fleet exports for this plan.",
      "models": {
       "glm-4.7": {"context": 204800, "output": 131072},
       "glm-5-turbo": {"context": 200000, "output": 131072},
@@ -74,7 +74,7 @@
       "glm-5.3-highspeed": {"context": 1000000, "output": 131072}
     }
     },
-    {"name": "minimax", "base_url": "https://api.minimax.io/v1", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "API Plan (MiniMax — per-token key)", "notes": "Pay-per-token MiniMax platform API (OpenAI-compatible). The subscription path to the same models is 'minimax-coding-plan' — different endpoint shape, same model ids. models.dev lists both under the Anthropic endpoint; the OpenAI one is what this row speaks.",
+    {"name": "minimax", "auth_via": "opencode", "base_url": "https://api.minimax.io/v1", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "API Plan (MiniMax — per-token key)", "notes": "Pay-per-token MiniMax platform API (OpenAI-compatible). The subscription path to the same models is 'minimax-coding-plan' — different endpoint shape, same model ids. models.dev lists both under the Anthropic endpoint; the OpenAI one is what this row speaks.",
      "models": {
       "MiniMax-M2": {"context": 204800, "output": 131072},
       "MiniMax-M2.1": {"context": 204800, "output": 131072},
@@ -85,7 +85,7 @@
       "MiniMax-M3": {"context": 1000000, "output": 512000}
     }
     },
-    {"name": "minimax-coding-plan", "base_url": "https://api.minimax.io/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax — subscription)", "key_url": "https://platform.minimax.io/user-center/basic-information/interface-key",
+    {"name": "minimax-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.io/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax — subscription)", "key_url": "https://platform.minimax.io/user-center/basic-information/interface-key",
      "models": {
       "MiniMax-M2": {"context": 204800, "output": 131072},
       "MiniMax-M2.1": {"context": 204800, "output": 131072},
@@ -96,7 +96,7 @@
       "MiniMax-M3": {"context": 1048576, "output": 512000}
     }
     },
-    {"name": "kimi-code-plan-global", "base_url": "https://api.kimi.ai/coding/v1", "tool_format": "tool_calls", "api_key_env": "KIMI_API_KEY", "plan_label": "Coding Plan (Kimi — subscription)", "key_url": "https://platform.moonshot.ai/console/api-keys",
+    {"name": "kimi-code-plan-global", "auth_via": "opencode", "base_url": "https://api.kimi.ai/coding/v1", "tool_format": "tool_calls", "api_key_env": "KIMI_API_KEY", "plan_label": "Coding Plan (Kimi — subscription)", "key_url": "https://platform.moonshot.ai/console/api-keys",
      "models": {
       "k3": {"context": 1048576, "output": 131072},
       "k3-256k": {"context": 262144, "output": 131072},
@@ -104,7 +104,7 @@
       "kimi-for-coding-highspeed": {"context": 262144, "output": 32768}
     }
     },
-    {"name": "opencode-go", "base_url": "https://opencode.ai/zen/go/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_GO_API_KEY", "plan_label": "Coding Plan (OpenCode Go — subscription)",
+    {"name": "opencode-go", "auth_via": "opencode", "base_url": "https://opencode.ai/zen/go/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_GO_API_KEY", "plan_label": "Coding Plan (OpenCode Go — subscription)",
      "models": {
       "deepseek-v4-flash": {"context": 1000000, "output": 384000},
       "deepseek-v4-flash-vision-exp": {"context": 1000000, "output": 384000},
@@ -149,7 +149,7 @@
       "space-bunny-free": {"context": 1048576, "output": 524288}
     }
     },
-    {"name": "alibaba-coding-plan", "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Alibaba — subscription)",
+    {"name": "alibaba-coding-plan", "auth_via": "opencode", "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Alibaba — subscription)",
      "models": {
       "MiniMax-M2.5": {"context": 196608, "output": 24576},
       "glm-4.7": {"context": 202752, "output": 16384},
@@ -165,7 +165,7 @@
       "qwen3.7-plus": {"context": 1000000, "output": 64000}
     }
     },
-    {"name": "alibaba-coding-plan-cn", "base_url": "https://coding.dashscope.aliyuncs.com/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Alibaba China — subscription)",
+    {"name": "alibaba-coding-plan-cn", "auth_via": "opencode", "base_url": "https://coding.dashscope.aliyuncs.com/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Alibaba China — subscription)",
      "models": {
       "MiniMax-M2.5": {"context": 196608, "output": 24576},
       "glm-4.7": {"context": 202752, "output": 16384},
@@ -181,7 +181,7 @@
       "qwen3.7-plus": {"context": 1000000, "output": 64000}
     }
     },
-    {"name": "alibaba-token-plan", "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Alibaba — subscription)",
+    {"name": "alibaba-token-plan", "auth_via": "opencode", "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Alibaba — subscription)",
      "models": {
       "MiniMax-M2.5": {"context": 196608, "output": 32768},
       "deepseek-v3.2": {"context": 131072, "output": 65536},
@@ -213,7 +213,7 @@
       "wan2.7-image-pro": {"context": 8192, "output": 0}
     }
     },
-    {"name": "alibaba-token-plan-cn", "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Alibaba China — subscription)",
+    {"name": "alibaba-token-plan-cn", "auth_via": "opencode", "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "tool_format": "tool_calls", "api_key_env": "ALIBABA_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Alibaba China — subscription)",
      "models": {
       "MiniMax-M2.5": {"context": 196608, "output": 32768},
       "deepseek-v3.2": {"context": 131072, "output": 65536},
@@ -281,7 +281,7 @@
       "mai-code-1.1-flash": {"context": 256000, "output": 128000}
     }
     },
-    {"name": "kimi-code-plan-cn", "base_url": "https://api.kimi.com/coding/v1", "tool_format": "tool_calls", "api_key_env": "KIMI_API_KEY", "plan_label": "Coding Plan (Kimi China — subscription)", "key_url": "https://platform.moonshot.cn/console/api-keys",
+    {"name": "kimi-code-plan-cn", "auth_via": "opencode", "base_url": "https://api.kimi.com/coding/v1", "tool_format": "tool_calls", "api_key_env": "KIMI_API_KEY", "plan_label": "Coding Plan (Kimi China — subscription)", "key_url": "https://platform.moonshot.cn/console/api-keys",
      "models": {
       "k3": {"context": 1048576, "output": 131072},
       "k3-256k": {"context": 262144, "output": 131072},
@@ -289,12 +289,12 @@
       "kimi-for-coding-highspeed": {"context": 262144, "output": 32768}
     }
     },
-    {"name": "kuae-cloud-coding-plan", "base_url": "https://coding-plan-endpoint.kuaecloud.net/v1", "tool_format": "tool_calls", "api_key_env": "KUAE_API_KEY", "plan_label": "Coding Plan (KUAE Cloud — subscription)",
+    {"name": "kuae-cloud-coding-plan", "auth_via": "opencode", "base_url": "https://coding-plan-endpoint.kuaecloud.net/v1", "tool_format": "tool_calls", "api_key_env": "KUAE_API_KEY", "plan_label": "Coding Plan (KUAE Cloud — subscription)",
      "models": {
       "GLM-4.7": {"context": 204800, "output": 131072}
     }
     },
-    {"name": "minimax-cn-coding-plan", "base_url": "https://api.minimax.cn/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax China — subscription)", "key_url": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+    {"name": "minimax-cn-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.cn/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax China — subscription)", "key_url": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
      "models": {
       "MiniMax-M2": {"context": 204800, "output": 131072},
       "MiniMax-M2.1": {"context": 204800, "output": 131072},
@@ -305,7 +305,7 @@
       "MiniMax-M3": {"context": 1048576, "output": 512000}
     }
     },
-    {"name": "opencode", "base_url": "https://opencode.ai/zen/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_API_KEY", "plan_label": "API Plan (OpenCode Zen — per-token key)",
+    {"name": "opencode", "auth_via": "opencode", "base_url": "https://opencode.ai/zen/v1", "tool_format": "tool_calls", "api_key_env": "OPENCODE_API_KEY", "plan_label": "API Plan (OpenCode Zen — per-token key)",
      "models": {
       "big-pickle": {"context": 200000, "output": 32000},
       "claude-3-5-haiku": {"context": 200000, "output": 8192},
@@ -419,7 +419,7 @@
       "x-preview-f-free": {"context": 1000000, "output": 131072}
     }
     },
-    {"name": "scnet-token-plan", "base_url": "https://api.scnet.cn/api/llm/v1", "tool_format": "tool_calls", "api_key_env": "SCNET_API_KEY", "plan_label": "Token Plan (SCNet — subscription)",
+    {"name": "scnet-token-plan", "auth_via": "opencode", "base_url": "https://api.scnet.cn/api/llm/v1", "tool_format": "tool_calls", "api_key_env": "SCNET_API_KEY", "plan_label": "Token Plan (SCNet — subscription)",
      "models": {
       "DeepSeek-V4-Flash": {"context": 1000000, "output": 384000},
       "DeepSeek-V4-Flash-0731": {"context": 1000000, "output": 384000},
@@ -442,7 +442,7 @@
       "Qwen3.8-Max": {"context": 1000000, "output": 131072}
     }
     },
-    {"name": "stepfun-ai-step-plan", "base_url": "https://api.stepfun.ai/step_plan/v1", "tool_format": "tool_calls", "api_key_env": "STEPFUN_API_KEY", "plan_label": "Step Plan (StepFun Global — subscription)",
+    {"name": "stepfun-ai-step-plan", "auth_via": "opencode", "base_url": "https://api.stepfun.ai/step_plan/v1", "tool_format": "tool_calls", "api_key_env": "STEPFUN_API_KEY", "plan_label": "Step Plan (StepFun Global — subscription)",
      "models": {
       "step-3.5-flash": {"context": 256000, "output": 256000},
       "step-3.5-flash-2603": {"context": 256000, "output": 256000},
@@ -450,7 +450,7 @@
       "step-5-preview": {"context": 1000000, "output": 65536}
     }
     },
-    {"name": "stepfun-step-plan", "base_url": "https://api.stepfun.com/step_plan/v1", "tool_format": "tool_calls", "api_key_env": "STEPFUN_API_KEY", "plan_label": "Step Plan (StepFun China — subscription)",
+    {"name": "stepfun-step-plan", "auth_via": "opencode", "base_url": "https://api.stepfun.com/step_plan/v1", "tool_format": "tool_calls", "api_key_env": "STEPFUN_API_KEY", "plan_label": "Step Plan (StepFun China — subscription)",
      "models": {
       "step-3.5-flash": {"context": 256000, "output": 256000},
       "step-3.5-flash-2603": {"context": 256000, "output": 256000},
@@ -459,7 +459,7 @@
       "step-router-v1": {"context": 256000, "output": 256000}
     }
     },
-    {"name": "tencent-coding-plan", "base_url": "https://api.lkeap.cloud.tencent.com/coding/v3", "tool_format": "tool_calls", "api_key_env": "TENCENT_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Tencent China — subscription)",
+    {"name": "tencent-coding-plan", "auth_via": "opencode", "base_url": "https://api.lkeap.cloud.tencent.com/coding/v3", "tool_format": "tool_calls", "api_key_env": "TENCENT_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Tencent China — subscription)",
      "models": {
       "glm-5": {"context": 202752, "output": 16384},
       "hunyuan-2.0-instruct": {"context": 131072, "output": 16384},
@@ -471,13 +471,13 @@
       "tc-code-latest": {"context": 131072, "output": 16384}
     }
     },
-    {"name": "tencent-token-plan", "base_url": "https://api.lkeap.cloud.tencent.com/plan/v3", "tool_format": "tool_calls", "api_key_env": "TENCENT_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Tencent — subscription)",
+    {"name": "tencent-token-plan", "auth_via": "opencode", "base_url": "https://api.lkeap.cloud.tencent.com/plan/v3", "tool_format": "tool_calls", "api_key_env": "TENCENT_TOKEN_PLAN_API_KEY", "plan_label": "Token Plan (Tencent — subscription)",
      "models": {
       "hy3": {"context": 256000, "output": 128000},
       "hy4-preview": {"context": 1024000, "output": 64000}
     }
     },
-    {"name": "umans-ai-coding-plan", "base_url": "https://api.code.umans.ai/v1", "tool_format": "tool_calls", "api_key_env": "UMANS_AI_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Umans AI — subscription)",
+    {"name": "umans-ai-coding-plan", "auth_via": "opencode", "base_url": "https://api.code.umans.ai/v1", "tool_format": "tool_calls", "api_key_env": "UMANS_AI_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Umans AI — subscription)",
      "models": {
       "umans-coder": {"context": 1048576, "output": 131071},
       "umans-deepseek-v4-flash-0731": {"context": 1048576, "output": 393215},
@@ -488,7 +488,7 @@
       "umans-qwen3.6-35b-a3b": {"context": 262144, "output": 262144}
     }
     },
-    {"name": "volcengine-coding-plan", "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3", "tool_format": "tool_calls", "api_key_env": "ARK_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Volcengine Ark — subscription)",
+    {"name": "volcengine-coding-plan", "auth_via": "opencode", "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3", "tool_format": "tool_calls", "api_key_env": "ARK_CODING_PLAN_API_KEY", "plan_label": "Coding Plan (Volcengine Ark — subscription)",
      "models": {
       "deepseek-v4-flash": {"context": 1000000, "output": 384000},
       "deepseek-v4-pro": {"context": 1000000, "output": 384000},
@@ -502,7 +502,7 @@
       "minimax-m3": {"context": 1048576, "output": 512000}
     }
     },
-    {"name": "xiaomi-token-plan-ams", "base_url": "https://token-plan-ams.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi Europe — subscription)",
+    {"name": "xiaomi-token-plan-ams", "auth_via": "opencode", "base_url": "https://token-plan-ams.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi Europe — subscription)",
      "models": {
       "mimo-v2-pro": {"context": 1048576, "output": 131072},
       "mimo-v2-tts": {"context": 8192, "output": 8192},
@@ -515,7 +515,7 @@
       "mimo-v2.6-pro": {"context": 1048576, "output": 131072}
     }
     },
-    {"name": "xiaomi-token-plan-cn", "base_url": "https://token-plan-cn.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi China — subscription)",
+    {"name": "xiaomi-token-plan-cn", "auth_via": "opencode", "base_url": "https://token-plan-cn.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi China — subscription)",
      "models": {
       "mimo-v2-pro": {"context": 1048576, "output": 131072},
       "mimo-v2-tts": {"context": 8192, "output": 8192},
@@ -528,7 +528,7 @@
       "mimo-v2.6-pro": {"context": 1048576, "output": 131072}
     }
     },
-    {"name": "xiaomi-token-plan-sgp", "base_url": "https://token-plan-sgp.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi Singapore — subscription)",
+    {"name": "xiaomi-token-plan-sgp", "auth_via": "opencode", "base_url": "https://token-plan-sgp.xiaomimimo.com/v1", "tool_format": "tool_calls", "api_key_env": "XIAOMI_API_KEY", "plan_label": "Token Plan (Xiaomi Singapore — subscription)",
      "models": {
       "mimo-v2-pro": {"context": 1048576, "output": 131072},
       "mimo-v2-tts": {"context": 8192, "output": 8192},
@@ -541,12 +541,12 @@
       "mimo-v2.6-pro": {"context": 1048576, "output": 131072}
     }
     },
-    {"name": "zenifra", "base_url": "https://ai.zenifra.com/v1", "tool_format": "tool_calls", "api_key_env": "ZENIFRA_AI_KEY", "plan_label": "API Plan (Zenifra — per-token key)",
+    {"name": "zenifra", "auth_via": "opencode", "base_url": "https://ai.zenifra.com/v1", "tool_format": "tool_calls", "api_key_env": "ZENIFRA_AI_KEY", "plan_label": "API Plan (Zenifra — per-token key)",
      "models": {
       "alibaba/qwen3.6-35b-a3b": {"context": 262144, "output": 65536}
     }
     },
-    {"name": "zenmux", "base_url": "https://zenmux.ai/api/v1", "tool_format": "tool_calls", "api_key_env": "ZENMUX_API_KEY", "plan_label": "API Plan (ZenMux — per-token key)",
+    {"name": "zenmux", "auth_via": "opencode", "base_url": "https://zenmux.ai/api/v1", "tool_format": "tool_calls", "api_key_env": "ZENMUX_API_KEY", "plan_label": "API Plan (ZenMux — per-token key)",
      "models": {
       "anthropic/claude-3.5-haiku": {"context": 200000, "output": 64000},
       "anthropic/claude-3.7-sonnet": {"context": 200000, "output": 64000},
@@ -672,7 +672,7 @@
       "z-ai/glm-image": {"context": 10240, "output": 0}
     }
     },
-    {"name": "zhipuai-coding-plan", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4", "tool_format": "tool_calls", "api_key_env": "ZHIPU_API_KEY", "plan_label": "Coding Plan (Zhipu AI — subscription)", "key_url": "https://open.bigmodel.cn/usercenter/apikeys",
+    {"name": "zhipuai-coding-plan", "auth_via": "opencode", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4", "tool_format": "tool_calls", "api_key_env": "ZHIPU_API_KEY", "plan_label": "Coding Plan (Zhipu AI — subscription)", "key_url": "https://open.bigmodel.cn/usercenter/apikeys",
      "models": {
       "glm-4.6v": {"context": 128000, "output": 32768},
       "glm-5.3": {"context": 1000000, "output": 131072},

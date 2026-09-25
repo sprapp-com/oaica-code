@@ -26,6 +26,11 @@ import (
 //   - OAICA_AUTH_FILE → a path that does not exist, so a credential stored by
 //     `oaica auth login` on the developer's box cannot make a
 //     gate-on-no-credential assertion pass for the wrong reason.
+//   - OPENCODE_AUTH_FILE → the same, for the external-store reuse chain
+//     (auth_external.go): without it, a developer who has ever run `opencode
+//     auth login` would see the auth_via catalog rows appear in every picker
+//     test, and a gate assertion would pass for a reason the test never set
+//     up. Tests that exercise reuse point it at their own fixture.
 //
 // Tests that need any of these still opt in explicitly (writeRemotes,
 // writeDescriptorRemotesFile, t.Setenv("Z_AI_API_KEY", ...), t.Setenv(
@@ -47,4 +52,5 @@ func hermeticTestEnv() {
 	os.Setenv("OAICA_HOST", "http://127.0.0.1:1")
 	os.Setenv("OAICA_API_KEY", "")
 	os.Setenv("OAICA_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-auth.json"))
+	os.Setenv("OPENCODE_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-opencode-auth.json"))
 }

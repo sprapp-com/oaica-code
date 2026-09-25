@@ -37,24 +37,11 @@ func (c *Codex) String() string { return "Codex" }
 const codexNativePrefix = "codex/native"
 
 // nativeCodexPickerModels are the picker's native Codex rows. Appended by
-// selectSingleModelWithSelectorReady when the integration is codex.
+// selectSingleModelWithSelectorReady when the integration is codex, via
+// nativePickerItemsFor (native_integration.go), which is also where this row's
+// id prefix, model-value mapping and argv builder live.
 var nativeCodexPickerModels = []ModelItem{
 	{Name: codexNativePrefix, Description: "Codex native (your ChatGPT plan login) — bypasses OAICA billing"},
-}
-
-// isNativeCodexModel reports whether name selects the native Codex path.
-func isNativeCodexModel(name string) bool {
-	return name == codexNativePrefix || strings.HasPrefix(name, codexNativePrefix+"/")
-}
-
-// nativeCodexModelID is the model id to pass to `codex -m`, or "" to let
-// Codex's own config choose. "codex/native" → "", "codex/native/gpt-6-sol" →
-// "gpt-6-sol".
-func nativeCodexModelID(name string) string {
-	if !strings.HasPrefix(name, codexNativePrefix) {
-		return ""
-	}
-	return strings.TrimPrefix(strings.TrimPrefix(name, codexNativePrefix), "/")
 }
 
 // codexNativeArgs builds the argv for a native run: no --profile, no -c
