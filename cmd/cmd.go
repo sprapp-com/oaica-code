@@ -791,7 +791,7 @@ func oaicaLocalModelHint(cmd *cobra.Command, name string) string {
 
 // SigninHandler prompts for an OAICA_API_KEY (the client-facing key the
 // api.oaica.com router requires — separate from ADMIN_KEY / provider
-// registration, see cmd/oaica_client.go and the authCmd family below) and
+// registration, see cmd/oaica_client.go and the routerCmd family below) and
 // persists it to disk so it doesn't need to be exported every session.
 // Rewritten from upstream Ollama's ollama.com OAuth-signin flow, which
 // doesn't apply here — this fork never talks to ollama.com.
@@ -2612,47 +2612,68 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 
 	remoteCmd.AddCommand(remoteAddCmd, remoteListCmd, remoteShowCmd, remoteRemoveCmd, remoteSyncCmd)
 
-	// provider — stored provider credentials (~/.oaica/auth.json), so a paid
-	// plan is usable without exporting an env var first. Env vars still win.
-	// Named `provider`, NOT `auth`: authCmd (below) already owns `oaica auth`
-	// for the api.oaica.com router's operator-only provider registry, which
-	// is a different thing entirely — that edits what the ROUTER serves, this
-	// holds the credential THIS machine sends.
-	providerCmd := &cobra.Command{
-		Use:   "provider",
+	// auth — stored provider credentials (~/.oaica/auth.json), so a paid plan
+	// is usable without exporting an env var first. Env vars still win.
+	//
+	// Verb shape is opencode's (`opencode auth login|list|logout`): same
+	// muscle memory, same words for the same job. NOT ollama's `signin`, which
+	// means "log into the ollama.com account" — one identity, no notion of a
+	// per-provider key. oaica's own router account is exactly that, so it
+	// keeps `oaica signin` to itself, and the operator registry that edits
+	// what the ROUTER serves is `oaica router login|list|logout` (below) —
+	// three names for three different credentials, no overlap.
+	//
+	// `oaica provider login|list|logout` is kept as a hidden alias: that is
+	// what shipped first, and what the fleet builds and the picker's own hint
+	// text already say.
+	newAuthSubcommands := func() (login, list, logout *cobra.Command) {
+		login = &cobra.Command{
+			Use:   "login [PROVIDER]",
+			Short: "Store an API key for a provider or plan",
+			Args:  cobra.MaximumNArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				key, _ := cmd.Flags().GetString("key")
+				provider := ""
+				if len(args) > 0 {
+					provider = args[0]
+				}
+				return launch.AuthLogin(os.Stdout, provider, key)
+			},
+		}
+		login.Flags().String("key", "", "API key (otherwise prompted for, hidden). Visible in shell history — prefer the prompt")
+		list = &cobra.Command{
+			Use:   "list",
+			Short: "List providers and whether they can authenticate",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return launch.AuthList(os.Stdout)
+			},
+		}
+		logout = &cobra.Command{
+			Use:     "logout PROVIDER",
+			Aliases: []string{"rm"},
+			Short:   "Remove a provider's stored credential",
+			Args:    cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return launch.AuthLogout(os.Stdout, args[0])
+			},
+		}
+		return login, list, logout
+	}
+
+	authStoreCmd := &cobra.Command{
+		Use:   "auth",
 		Short: "Log in to model providers (~/.oaica/auth.json)",
 	}
-	providerLoginCmd := &cobra.Command{
-		Use:   "login [PROVIDER]",
-		Short: "Store an API key for a provider or plan",
-		Args:  cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			key, _ := cmd.Flags().GetString("key")
-			provider := ""
-			if len(args) > 0 {
-				provider = args[0]
-			}
-			return launch.AuthLogin(os.Stdout, provider, key)
-		},
+	authLoginLocal, authListLocal, authLogoutLocal := newAuthSubcommands()
+	authStoreCmd.AddCommand(authLoginLocal, authListLocal, authLogoutLocal)
+
+	providerCmd := &cobra.Command{
+		Use:    "provider",
+		Short:  authStoreCmd.Short,
+		Hidden: true,
 	}
-	providerLoginCmd.Flags().String("key", "", "API key (otherwise prompted for, hidden). Visible in shell history — prefer the prompt")
-	providerListCmd := &cobra.Command{
-		Use:   "list",
-		Short: "List providers and whether they can authenticate",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return launch.AuthList(os.Stdout)
-		},
-	}
-	providerLogoutCmd := &cobra.Command{
-		Use:     "logout PROVIDER",
-		Aliases: []string{"rm"},
-		Short:   "Remove a provider's stored credential",
-		Args:    cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return launch.AuthLogout(os.Stdout, args[0])
-		},
-	}
+	providerLoginCmd, providerListCmd, providerLogoutCmd := newAuthSubcommands()
 	providerCmd.AddCommand(providerLoginCmd, providerListCmd, providerLogoutCmd)
 
 	// model alias — user shortcuts (~/.oaica/aliases.json), resolved first
@@ -3014,12 +3035,13 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		RunE:   SignoutHandler,
 	}
 
-	// authCmd — opencode-style provider credential management for the
-	// api.oaica.com router's hot-reloadable KV provider registry. Distinct
-	// from signinCmd/loginCmd above (those are OAICA's own OAICA_API_KEY
-	// flow — SigninHandler/SignoutHandler, rewritten from ollama.com's OAuth
-	// sign-in, which this fork never uses). Requires OAICA_ADMIN_KEY, NOT
-	// OAICA_API_KEY
+	// routerCmd — provider credential management for the api.oaica.com
+	// router's hot-reloadable KV provider registry: this edits what the ROUTER
+	// serves to everyone, not what this machine sends (that is `oaica auth`).
+	// Distinct from signinCmd/loginCmd above (those are OAICA's own
+	// OAICA_API_KEY flow — SigninHandler/SignoutHandler, rewritten from
+	// ollama.com's OAuth sign-in, which this fork never uses). Requires
+	// OAICA_ADMIN_KEY, NOT OAICA_API_KEY
 	// — these commands can add/overwrite ANY model backend for every caller
 	// of the router, so they're gated by a separate operator-only credential
 	// that regular /model and /lora usage never needs.
@@ -3090,11 +3112,11 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		},
 	}
 
-	authCmd := &cobra.Command{
-		Use:   "auth",
+	routerCmd := &cobra.Command{
+		Use:   "router",
 		Short: "Manage provider backends on the api.oaica.com router (requires OAICA_ADMIN_KEY)",
 	}
-	authCmd.AddCommand(authLoginCmd, authListCmd, authLogoutCmd)
+	routerCmd.AddCommand(authLoginCmd, authListCmd, authLogoutCmd)
 
 	listCmd := &cobra.Command{
 		Use:     "list",
@@ -3169,6 +3191,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		serveAnthropicProxyCmd,
 		modelCmd,
 		remoteCmd,
+		authStoreCmd,
 		providerCmd,
 		planCmd,
 		configCmd,
@@ -3184,7 +3207,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		psCmd,
 		copyCmd,
 		deleteCmd,
-		authCmd,
+		routerCmd,
 		agentcmd.AgentCmd(oaicaEnsureSignedIn),
 		// oaicaEnsureSignedIn, not checkServerHeartbeat — same dead-local-
 		// server bug as runCmd above; LaunchCmd's PreRunE calls whatever's

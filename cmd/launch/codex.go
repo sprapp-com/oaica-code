@@ -20,6 +20,71 @@ type Codex struct{}
 
 func (c *Codex) String() string { return "Codex" }
 
+// codexNativePrefix selects the native (non-OAICA) Codex path: the real codex
+// binary, untouched environment, no profile/catalog override — so Codex uses
+// its own ~/.codex/auth.json login. `codex /login` with ChatGPT stores
+// `auth_mode: "chatgpt"` (a Plus/Pro/Max subscription) plus an OAuth bearer and
+// the account id; that credential is NOT an API key, so there is nothing for
+// `oaica auth login` to store and no base_url this fork could point Codex at —
+// the ChatGPT backend speaks the Responses API at /backend-api/codex and
+// expects Codex's own account header. Mirroring the `claude/<tier>` native
+// entries (claude.go) is the whole integration: run the vendor's own CLI, let
+// it spend the user's own subscription.
+//
+// "codex/native/<model-id>" pins a model the plan exposes (e.g.
+// "codex/native/gpt-6-sol"); the bare "codex/native" passes no -m at all and
+// leaves the choice to Codex's own config (its "model" key).
+const codexNativePrefix = "codex/native"
+
+// nativeCodexPickerModels are the picker's native Codex rows. Appended by
+// selectSingleModelWithSelectorReady when the integration is codex.
+var nativeCodexPickerModels = []ModelItem{
+	{Name: codexNativePrefix, Description: "Codex native (your ChatGPT plan login) — bypasses OAICA billing"},
+}
+
+// isNativeCodexModel reports whether name selects the native Codex path.
+func isNativeCodexModel(name string) bool {
+	return name == codexNativePrefix || strings.HasPrefix(name, codexNativePrefix+"/")
+}
+
+// nativeCodexModelID is the model id to pass to `codex -m`, or "" to let
+// Codex's own config choose. "codex/native" → "", "codex/native/gpt-6-sol" →
+// "gpt-6-sol".
+func nativeCodexModelID(name string) string {
+	if !strings.HasPrefix(name, codexNativePrefix) {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(name, codexNativePrefix), "/")
+}
+
+// codexNativeArgs builds the argv for a native run: no --profile, no -c
+// overrides, no catalog path — only an optional -m and whatever the user
+// passed through. Kept separate from args() (which is all about the OAICA
+// profile) so a test can pin the shape without exec'ing anything.
+func codexNativeArgs(modelID string, extra []string) []string {
+	var args []string
+	if strings.TrimSpace(modelID) != "" {
+		args = append(args, "-m", modelID)
+	}
+	return append(args, extra...)
+}
+
+// runNative execs the real codex binary with an untouched environment, the way
+// Claude.runNative does for Claude Code's own login. No config is written, so
+// nothing needs restoring afterwards.
+func (c *Codex) runNative(modelID string, extra []string) error {
+	if err := checkCodexVersion(); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "codex native: running Codex with your own ChatGPT plan login (not OAICA)")
+	cmd := exec.Command("codex", codexNativeArgs(modelID, extra)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ() // deliberately untouched — Codex reads ~/.codex/auth.json
+	return cmd.Run()
+}
+
 const (
 	codexProfileName           = "ollama-launch"
 	codexProviderName          = "Ollama"
@@ -50,6 +115,11 @@ func (c *Codex) args(model, modelCatalogPath string, extra []string) ([]string, 
 
 func (c *Codex) Run(model string, models []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
+	if isNativeCodexModel(model) {
+		// No tool gate either: that gate reasons about an OAICA remote's
+		// tool-call format, and a native run never touches one.
+		return c.runNative(nativeCodexModelID(model), args)
+	}
 	if err := gateOpenAITools(model, forceTools); err != nil {
 		return err
 	}

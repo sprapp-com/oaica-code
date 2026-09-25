@@ -4,7 +4,7 @@ package launch
 // tool format, plan label) as DATA, not Go code. Adding a provider, a new
 // billing plan for an existing one (e.g. z.ai's Coding Plan alongside its
 // pay-per-token API), or fixing an endpoint URL is a providers.json edit +
-// `oaica provider sync`, never a recompile — same principle as
+// `oaica remote sync`, never a recompile — same principle as
 // model_sync.go's hosted model catalog, applied to the OTHER thing that
 // used to live only in Go source (catalogProviders used to be a literal
 // slice here; see git history around 2026-09-17 for the before/after).
@@ -12,7 +12,7 @@ package launch
 // Two layers, lowest priority first:
 //  1. providersEmbeddedDefault (go:embed providers/providers.json) — ships
 //     inside the binary so a fresh install works fully offline.
-//  2. ~/.oaica/cache/providers/providers.json — pulled by `oaica provider
+//  2. ~/.oaica/cache/providers/providers.json — pulled by `oaica remote
 //     sync` from the hosted URL, same ETag/offline-fallback shape as
 //     model_sync.go. Present entries override the embedded default by
 //     name; the embedded list still fills in anything sync hasn't fetched

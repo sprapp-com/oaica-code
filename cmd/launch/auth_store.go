@@ -1,6 +1,6 @@
 package launch
 
-// auth_store.go — `oaica provider login`'s credential store, the piece that lets
+// auth_store.go — `oaica auth login`'s credential store, the piece that lets
 // a provider be used WITHOUT exporting an env var first. Until this existed
 // a built-in provider was gated on `os.Getenv(APIKeyEnv)` alone
 // (user_remotes.go's builtinRemotes), so a subscription plan a user had
@@ -142,7 +142,7 @@ func hasStoredAuth(provider string) bool {
 }
 
 // maskKey renders a key for display without printing it: enough to tell two
-// keys apart in `oaica provider list`, not enough to use.
+// keys apart in `oaica auth list`, not enough to use.
 func maskKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {

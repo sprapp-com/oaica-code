@@ -301,7 +301,7 @@ func TestAuthList_ReportsStatusesAndMasksKeys(t *testing.T) {
 		"stored",
 		"env:" + ollamaCloudEnvKey,
 		"needs key",
-		"run: oaica provider login " + zaiName,
+		"run: oaica auth login " + zaiName,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("AuthList() output missing %q:\n%s", want, got)

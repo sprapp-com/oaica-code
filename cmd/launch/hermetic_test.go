@@ -24,7 +24,7 @@ import (
 //     without leaving the machine.
 //   - OAICA_API_KEY → empty, so no test's output depends on a shell key.
 //   - OAICA_AUTH_FILE → a path that does not exist, so a credential stored by
-//     `oaica provider login` on the developer's box cannot make a
+//     `oaica auth login` on the developer's box cannot make a
 //     gate-on-no-credential assertion pass for the wrong reason.
 //
 // Tests that need any of these still opt in explicitly (writeRemotes,

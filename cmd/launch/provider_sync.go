@@ -1,6 +1,6 @@
 package launch
 
-// provider_sync.go — `oaica provider sync`: pull the hosted provider
+// provider_sync.go — `oaica remote sync`: pull the hosted provider
 // catalog so a new provider, a new billing plan on an existing one, or an
 // endpoint fix reaches every user with one command, same shape as
 // model_sync.go's `oaica model sync`.

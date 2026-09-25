@@ -1,6 +1,6 @@
 package launch
 
-// auth_cli.go — `oaica provider login/list/logout`, the CLI over auth_store.go.
+// auth_cli.go — `oaica auth login/list/logout`, the CLI over auth_store.go.
 // Same shape as remote_cli.go: each verb is a thin function writing to an
 // io.Writer so cmd/cmd.go stays a one-line RunE.
 //
@@ -42,7 +42,7 @@ func knownAuthProvider(name string) (providerCatalogEntry, bool) {
 func AuthLogin(out io.Writer, provider, key string) error {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
-		return fmt.Errorf("usage: oaica provider login <provider> — run `oaica provider list` for the providers oaica knows")
+		return fmt.Errorf("usage: oaica auth login <provider> — run `oaica auth list` for the providers oaica knows")
 	}
 
 	entry, known := knownAuthProvider(provider)
@@ -62,7 +62,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("%q is not a provider oaica knows (neither in the provider catalog nor in ~/.oaica/remotes.json). Run `oaica provider list` to see the catalog, or `oaica remote add %s --base-url ...` first", provider, provider)
+			return fmt.Errorf("%q is not a provider oaica knows (neither in the provider catalog nor in ~/.oaica/remotes.json). Run `oaica auth list` to see the catalog, or `oaica remote add %s --base-url ...` first", provider, provider)
 		}
 		provider = strings.ToLower(provider)
 	} else {
@@ -71,7 +71,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 
 	if key == "" {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			return fmt.Errorf("%s needs a key: pass --key (or run `oaica provider login %s` interactively to enter it hidden)", provider, provider)
+			return fmt.Errorf("%s needs a key: pass --key (or run `oaica auth login %s` interactively to enter it hidden)", provider, provider)
 		}
 		var err error
 		key, err = promptAuthKey(out, provider, entry, known)
@@ -139,14 +139,14 @@ func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, k
 func AuthLogout(out io.Writer, provider string) error {
 	provider = strings.TrimSpace(provider)
 	if provider == "" {
-		return fmt.Errorf("usage: oaica provider logout <provider>")
+		return fmt.Errorf("usage: oaica auth logout <provider>")
 	}
 	f, path, err := loadAuthStore()
 	if err != nil {
 		return err
 	}
 	if _, ok := f.Providers[provider]; !ok {
-		// Case-insensitive fallback: `oaica provider logout ZAI` should work.
+		// Case-insensitive fallback: `oaica auth logout ZAI` should work.
 		for name := range f.Providers {
 			if strings.EqualFold(name, provider) {
 				provider = name
@@ -204,7 +204,7 @@ func AuthList(out io.Writer) error {
 		case stored[e.Name]:
 			status, cred = "ready", "stored"
 		case e.APIKeyEnv != "":
-			status, cred = "needs key", "run: oaica provider login "+e.Name
+			status, cred = "needs key", "run: oaica auth login "+e.Name
 		}
 		plan := e.PlanLabel
 		if plan == "" {
@@ -230,7 +230,7 @@ func AuthList(out io.Writer) error {
 		}
 	}
 
-	fmt.Fprintln(out, "\n`oaica provider login <provider>` stores a key in ~/.oaica/auth.json (0600).")
+	fmt.Fprintln(out, "\n`oaica auth login <provider>` stores a key in ~/.oaica/auth.json (0600).")
 	fmt.Fprintln(out, "An env var named in the CREDENTIAL column still wins over a stored key.")
 	return nil
 }

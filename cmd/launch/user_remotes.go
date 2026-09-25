@@ -121,7 +121,7 @@ type userRemotesFile struct {
 }
 
 // key resolves the bearer: the environment first (a secret stays off disk),
-// then the `oaica provider login` store (auth_store.go), then an api_key written
+// then the `oaica auth login` store (auth_store.go), then an api_key written
 // inline in remotes.json. Every credential path ends here, so a provider
 // logged in interactively works everywhere an env var does.
 func (r userRemote) key() string {
@@ -182,7 +182,7 @@ func userRemotesPath() string {
 
 // builtinRemotes returns remotes that oaica knows about without config,
 // active while a credential exists — either the catalog row's own env var or
-// an `oaica provider login` entry. No key, nothing to route through, no row.
+// an `oaica auth login` entry. No key, nothing to route through, no row.
 // Sourced entirely from providerCatalog() (provider_catalog.go): the
 // embedded default (cmd/launch/providers/providers.json) plus whatever
 // `oaica remote sync` has pulled down. Adding a provider, adding a new
