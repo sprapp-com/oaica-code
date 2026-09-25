@@ -443,6 +443,10 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	serverToolUseBlocks := 0
 	webSearchToolResultBlocks := 0
 	thinkingBlocks := 0
+	redactedThinkingBlocks := 0
+	documentBlocks := 0
+	documentTextBlocks := 0
+	documentBinaryBlocks := 0
 	unknownBlocks := 0
 
 	for _, block := range msg.Content {
@@ -506,6 +510,37 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				thinking = *block.Thinking
 			}
 
+		case "redacted_thinking":
+			// Encrypted reasoning Anthropic re-sends alongside a thinking block
+			// when extended thinking is on. There is nothing usable in it on
+			// this wire (api.Message.Thinking is not emitted as OpenAI
+			// messages, and the payload is opaque), so it is dropped
+			// deliberately rather than landing in the unknown-blocks counter
+			// where a silent content loss would hide.
+			redactedThinkingBlocks++
+
+		case "document":
+			// A file the client attached. The OpenAI wire has no document
+			// block, but a document with a TEXT source carries its content
+			// inline (source.data) -- dropping it silently told the model
+			// nothing about a file the user can see in the transcript, and the
+			// client keeps sending it on later turns, so the prompt grows
+			// without ever gaining the content. Keep a text source; a base64
+			// document (PDF and friends) still has no representation here and
+			// is counted, not silently ignored.
+			documentBlocks++
+			if block.Source != nil {
+				if block.Source.Type == "text" && block.Source.Data != "" {
+					textContent.WriteString(block.Source.Data)
+					if !strings.HasSuffix(block.Source.Data, "\n") {
+						textContent.WriteString("\n")
+					}
+					documentTextBlocks++
+				} else {
+					documentBinaryBlocks++
+				}
+			}
+
 		case "server_tool_use":
 			serverToolUseBlocks++
 			toolCalls = append(toolCalls, api.ToolCall{
@@ -557,6 +592,10 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		"server_tool_use", serverToolUseBlocks,
 		"web_search_result", webSearchToolResultBlocks,
 		"thinking", thinkingBlocks,
+		"redacted_thinking", redactedThinkingBlocks,
+		"document", documentBlocks,
+		"document_text", documentTextBlocks,
+		"document_binary_dropped", documentBinaryBlocks,
 		"unknown", unknownBlocks,
 		"messages", TraceAPIMessages(messages),
 	)

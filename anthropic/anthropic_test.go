@@ -155,7 +155,7 @@ func TestFromMessagesRequest_WithImage(t *testing.T) {
 			{
 				Role: "user",
 				Content: []ContentBlock{
-					{Type: "text", Text: ptr("What's in this image?")},
+					{Type: "text", Text: strPtrT("What's in this image?")},
 					{
 						Type: "image",
 						Source: &ImageSource{
@@ -355,7 +355,7 @@ func TestFromMessagesRequest_WithToolResultFollowedByUserText(t *testing.T) {
 					},
 					{
 						Type: "text",
-						Text: ptr("Please describe it."),
+						Text: strPtrT("Please describe it."),
 					},
 				},
 			},
@@ -646,7 +646,7 @@ func TestFromMessagesRequest_ThinkingOnlyBlock(t *testing.T) {
 				Content: []ContentBlock{
 					{
 						Type:     "thinking",
-						Thinking: ptr("Let me think about this..."),
+						Thinking: strPtrT("Let me think about this..."),
 					},
 				},
 			},
@@ -1315,7 +1315,7 @@ func TestContentBlockJSON_EmptyFieldsPresent(t *testing.T) {
 			name: "text block includes empty text field",
 			block: ContentBlock{
 				Type: "text",
-				Text: ptr(""),
+				Text: strPtrT(""),
 			},
 			wantKeys: []string{"type", "text"},
 		},
@@ -1323,7 +1323,7 @@ func TestContentBlockJSON_EmptyFieldsPresent(t *testing.T) {
 			name: "thinking block includes empty thinking field",
 			block: ContentBlock{
 				Type:     "thinking",
-				Thinking: ptr(""),
+				Thinking: strPtrT(""),
 			},
 			wantKeys: []string{"type", "thinking"},
 		},
@@ -1331,7 +1331,7 @@ func TestContentBlockJSON_EmptyFieldsPresent(t *testing.T) {
 			name: "text block with content",
 			block: ContentBlock{
 				Type: "text",
-				Text: ptr("hello"),
+				Text: strPtrT("hello"),
 			},
 			wantKeys: []string{"type", "text"},
 		},
@@ -1367,14 +1367,14 @@ func TestContentBlockJSON_NonToolBlocksDoNotIncludeInput(t *testing.T) {
 			name: "text block",
 			block: ContentBlock{
 				Type: "text",
-				Text: ptr("hello"),
+				Text: strPtrT("hello"),
 			},
 		},
 		{
 			name: "thinking block",
 			block: ContentBlock{
 				Type:     "thinking",
-				Thinking: ptr("let me think"),
+				Thinking: strPtrT("let me think"),
 			},
 		},
 		{
@@ -1608,11 +1608,11 @@ func TestEstimateTokens_WithThinking(t *testing.T) {
 				Content: []ContentBlock{
 					{
 						Type:     "thinking",
-						Thinking: ptr("Let me think about this carefully..."),
+						Thinking: strPtrT("Let me think about this carefully..."),
 					},
 					{
 						Type: "text",
-						Text: ptr("Here is my response."),
+						Text: strPtrT("Here is my response."),
 					},
 				},
 			},
@@ -1956,3 +1956,61 @@ func TestCitation(t *testing.T) {
 		t.Errorf("cited_text mismatch: expected 'Some cited text...', got %q", unmarshaled.CitedText)
 	}
 }
+
+// A document block with a TEXT source carries its content inline (source.data).
+// It used to fall into the unknown-blocks default and vanish: the model was
+// told nothing about a file the user can see in the transcript, while the
+// client kept re-sending it on every later turn, so the prompt grew without
+// ever gaining the content. redacted_thinking is dropped on purpose (opaque,
+// and api.Message.Thinking is not emitted on this wire) and no longer hides in
+// that same counter.
+func TestConvertMessage_TextDocumentKeptRedactedThinkingDropped(t *testing.T) {
+	text := "invoice total: 42 MYR"
+	redacted := "b3BhcXVl"
+	msg := MessageParam{
+		Role: "user",
+		Content: []ContentBlock{
+			{Type: "document", Source: &ImageSource{Type: "text", MediaType: "text/plain", Data: text}},
+			{Type: "redacted_thinking", Signature: redacted},
+			{Type: "text", Text: strPtrT("what is the total?")},
+		},
+	}
+	got, err := convertMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want one message, got %+v", got)
+	}
+	if !strings.Contains(got[0].Content, text) {
+		t.Errorf("the document's text source was dropped: %q", got[0].Content)
+	}
+	if !strings.Contains(got[0].Content, "what is the total?") {
+		t.Errorf("the text block was dropped: %q", got[0].Content)
+	}
+	if strings.Contains(got[0].Content, redacted) {
+		t.Errorf("the redacted thinking payload must not reach the prompt: %q", got[0].Content)
+	}
+
+	// A base64 document has no representation on this wire — it must still
+	// produce the surrounding text rather than fail the whole request.
+	b64msg := MessageParam{
+		Role: "user",
+		Content: []ContentBlock{
+			{Type: "document", Source: &ImageSource{Type: "base64", MediaType: "application/pdf", Data: "JVBERi0="}},
+			{Type: "text", Text: strPtrT("summarise this")},
+		},
+	}
+	got2, err := convertMessage(b64msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got2) != 1 || !strings.Contains(got2[0].Content, "summarise this") {
+		t.Fatalf("want the text kept alongside a binary document, got %+v", got2)
+	}
+	if strings.Contains(got2[0].Content, "JVBERi0=") {
+		t.Errorf("base64 document bytes must not be pasted into the prompt: %q", got2[0].Content)
+	}
+}
+
+func strPtrT(s string) *string { return &s }

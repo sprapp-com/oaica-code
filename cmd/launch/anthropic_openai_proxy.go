@@ -341,21 +341,42 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 // Concatenate all system content into ONE leading system message and keep the
 // non-system messages in their original order.
 func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
-	var system []string
-	var rest []openAIMessage
-	sawSystem := false
+	// Leave an already-ordered conversation byte-for-byte alone. The rewrite
+	// below is only needed for a system message that arrives AFTER a non-system
+	// one, and applying it unconditionally re-rendered the common case too:
+	// several leading system messages were concatenated into one string, so the
+	// prompt the upstream received differed from the prompt the client sent
+	// (and from the previous turn's, defeating any prefix cache keyed on the
+	// rendered text). Identity here is what makes the common path a no-op.
+	ordered := true
+	blank := false
+	seenNonSystem := false
 	for _, m := range msgs {
 		if m.Role == "system" {
-			sawSystem = true
+			if seenNonSystem {
+				ordered = false
+				break
+			}
+			if strings.TrimSpace(m.Content) == "" {
+				blank = true
+			}
+			continue
+		}
+		seenNonSystem = true
+	}
+	if ordered && !blank {
+		return msgs
+	}
+	var system []string
+	var rest []openAIMessage
+	for _, m := range msgs {
+		if m.Role == "system" {
 			if strings.TrimSpace(m.Content) != "" {
 				system = append(system, m.Content)
 			}
 			continue
 		}
 		rest = append(rest, m)
-	}
-	if !sawSystem {
-		return msgs
 	}
 	if len(system) == 0 {
 		return rest // all system messages were blank — drop them
@@ -1412,7 +1433,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// the child (audit 2026-09-01 L1): url.Error embeds the full URL
 			// — userinfo in a misconfigured remotes.json base_url would land
 			// in an LLM-driven child's context.
-			writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
+			writeUpstreamError(w, resp, text)
 			return
 		}
 
@@ -1957,6 +1978,31 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 }
 
 // writeAnthropicError emits an Anthropic-shaped error response.
+// writeUpstreamError re-emits a non-200 upstream response. It keeps the
+// upstream's OWN retry contract for the statuses Claude Code understands --
+// 429 (rate_limit_error) with Retry-After, 503/529 (overloaded_error) -- and
+// collapses everything else to a 502.
+//
+// Every non-200 used to become an unconditional 502 with no Retry-After, so a
+// rate-limited or draining replica looked to Claude Code like a broken proxy:
+// it retried immediately, and each retry re-sent the whole prompt, which is
+// exactly the prefill the 429 was rejecting (a replica under per-key
+// concurrency pressure got hammered instead of backed off). 401/403 stay a
+// 502 on purpose: they mean OUR key for that remote is wrong, and handing
+// Claude Code an authentication_error would send it into its own login flow.
+// (2026-09-26 audit.)
+func writeUpstreamError(w http.ResponseWriter, resp *http.Response, text string) {
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable, 529:
+		if v := resp.Header.Get("Retry-After"); v != "" {
+			w.Header().Set("Retry-After", v)
+		}
+		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
+	default:
+		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactURL(text)))
+	}
+}
+
 func writeAnthropicError(w http.ResponseWriter, code int, msg string) {
 	errResp := anthropic.NewError(code, msg)
 	w.Header().Set("Content-Type", "application/json")

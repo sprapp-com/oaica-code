@@ -71,6 +71,20 @@ func TestNormalizeSystemFirst(t *testing.T) {
 		t.Errorf("normalizeSystemFirst(single) changed it: %+v", out)
 	}
 
+	// Already ordered with no blank: returned as-is, boundaries intact. This
+	// is the common Claude Code shape and the reason the rewrite below is
+	// gated -- joining several leading system messages re-rendered a prompt
+	// the upstream had already seen, which defeats a prefix cache keyed on
+	// the rendered text (2026-09-26 audit).
+	ordered := []openAIMessage{
+		{Role: "system", Content: "sys-a"},
+		{Role: "system", Content: "sys-b"},
+		{Role: "user", Content: "hello"},
+	}
+	if out := normalizeSystemFirst(ordered); !reflect.DeepEqual(out, ordered) {
+		t.Errorf("normalizeSystemFirst(ordered) rewrote it: %+v", out)
+	}
+
 	// Empty system content is dropped, not emitted as a blank first message.
 	blank := []openAIMessage{{Role: "system", Content: "  "}, {Role: "user", Content: "y"}}
 	if out := normalizeSystemFirst(blank); len(out) != 1 || out[0].Role != "user" {
@@ -619,5 +633,72 @@ func TestProxyRewritesResponseModelWhenDisplayModelSet(t *testing.T) {
 	}
 	if parsed.Model != "claude-sonnet-5-oaica" {
 		t.Errorf("response model = %q, want DisplayModel %q — the client must never see the real oaica id when DisplayModel is set", parsed.Model, "claude-sonnet-5-oaica")
+	}
+}
+
+// TestProxyUpstreamErrorKeepsRetryContract: every non-200 used to be rewritten
+// to a bare 502 with no Retry-After, so Claude Code read a rate-limited or
+// draining replica as a broken proxy and retried at once — each retry
+// re-sending the whole prompt, which is the prefill the upstream had just
+// rejected. The upstream's own status and Retry-After must survive for the
+// statuses Claude Code understands; everything else (401/403 above all, which
+// would send Claude Code into its own login flow) stays a 502.
+func TestProxyUpstreamErrorKeepsRetryContract(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	cases := []struct {
+		upstream int
+		want     int
+	}{
+		{http.StatusTooManyRequests, http.StatusTooManyRequests},
+		{http.StatusServiceUnavailable, http.StatusServiceUnavailable},
+		{529, 529},
+		{http.StatusUnauthorized, http.StatusBadGateway},
+		{http.StatusForbidden, http.StatusBadGateway},
+		{http.StatusInternalServerError, http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		// A 1s hint, not 7: the proxy re-tries 429/503 internally before it
+		// gives up, and a long Retry-After would make the assertion a slow
+		// sleep (the forwarded value is what this checks, not the duration).
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if tc.upstream == http.StatusTooManyRequests {
+				w.Header().Set("Retry-After", "1")
+			}
+			w.WriteHeader(tc.upstream)
+			w.Write([]byte(`{"error":{"message":"busy"}}`))
+		}))
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{Default: proxyRoute{
+			BaseURL: upstream.URL + "/v1", UpstreamModel: "kat-awq", Label: "box/kat-awq",
+		}})
+		body := `{"model":"kat-awq","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`
+		resp, err := http.Post("http://"+ln.Addr().String()+"/v1/messages", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotRetry := resp.Header.Get("Retry-After")
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ln.Close()
+		upstream.Close()
+
+		if resp.StatusCode != tc.want {
+			t.Errorf("upstream %d -> %d, want %d (body %s)", tc.upstream, resp.StatusCode, tc.want, raw)
+		}
+		// The retry hint matters only where the status is passed through: a
+		// child that backs off on a 429 will otherwise back off on a guess.
+		wantRetry := ""
+		if tc.upstream == http.StatusTooManyRequests {
+			wantRetry = "1"
+		}
+		if gotRetry != wantRetry {
+			t.Errorf("upstream %d: Retry-After = %q, want %q", tc.upstream, gotRetry, wantRetry)
+		}
+		if raw == nil || !strings.Contains(string(raw), "error") {
+			t.Errorf("upstream %d: want an Anthropic error envelope, got %s", tc.upstream, raw)
+		}
 	}
 }
