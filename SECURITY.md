@@ -45,19 +45,25 @@ Relevant when assessing an issue, and when deciding what to report:
 - **What leaves the machine.** Prompts, attachments and tool output go to the
   endpoint you selected (`api.oaica.com` by default, or a remote you
   configured). There is no telemetry, no crash reporting, and no analytics.
-  The one unprompted request the client makes is an update check: a plain GET
-  of the release's `VERSION.txt`, at most once per 20 hours, with no body and
-  no identifiers — it tells that host your IP and that oaica is installed, and
-  `OAICA_NO_UPDATE_CHECK=1` turns it off. `oaica launch <agent>` will also
-  offer to run an agent's own vendor installer when that agent is missing, and
-  `oaica launch pi` asks before installing its npm-hosted web-search package
-  (`PI_OFFLINE=1` suppresses that entirely); every one of those asks first, and
-  the full list of destinations is in
+  Two requests happen without you asking, and neither carries a payload: an
+  update check — a plain GET of the release's `VERSION.txt`, at most once per
+  20 hours, with no body and no identifiers, which tells that host your IP and
+  that oaica is installed (`OAICA_NO_UPDATE_CHECK=1` turns it off) — and, on an
+  install that has been activated, a revalidation of that licence at most once
+  every 7 days, sending only the key and activation id already stored. Beyond
+  those: `oaica launch <agent>` offers to run an agent's own vendor installer
+  when that agent is missing, `oaica launch pi` asks before installing its
+  npm-hosted web-search package (`PI_OFFLINE=1` suppresses that entirely), the
+  `oaica … sync` commands read a catalog from GitHub unless you pass `--url`,
+  and `oaica pull` fetches weights from the URL your router's manifest names.
+  Every one of those asks first or is a command you typed; hosts, payloads and
+  off switches for all eight paths are in
   [docs/ENTERPRISE.md](docs/ENTERPRISE.md#network-connections).
 - **Files written.** Configuration and state live under `~/.oaica/` (config,
   plans, remotes, caches, usage counters). Installers write the binary into a
-  directory on `PATH` and nothing else; the macOS/Linux installer cleans up
-  `$TMPDIR` on exit.
+  directory on `PATH` and nothing else, and remove a `lib/oaica` directory left
+  by older versions of the script; the macOS/Linux installer cleans up `$TMPDIR`
+  on exit.
 - **Installer trust chain.** Archives are fetched from the GitHub release named
   by the version being installed and verified against that release's
   `SHA256SUMS` before extraction. When verification is impossible (no
@@ -65,14 +71,18 @@ Relevant when assessing an issue, and when deciding what to report:
   continue; a **mismatch** retries three times and then fails. Windows binaries
   are not Authenticode-signed (no code-signing certificate yet) — the checksum,
   and the build provenance attestation below, are the integrity signals.
-- **Build provenance.** Every release asset carries a Sigstore (keyless)
-  attestation that it was built by this repository's `release.yaml` from a
-  specific commit. Verify:
+- **Build provenance.** Releases built by this repository's `release.yaml`
+  carry a Sigstore (keyless) attestation that each asset was built by that
+  workflow from a specific commit. Releases published before the attestation
+  step was added do not, so verify before you rely on it:
   ```
   gh attestation verify oaica-linux-amd64.tar.zst -R sprapp-com/oaica-code
   ```
-  Each release also ships a CycloneDX SBOM (`oaica-<version>.sbom.cdx.json`)
-  listing the Go modules and versions in the binaries.
+  Those releases also ship a CycloneDX SBOM (`oaica-<version>.sbom.cdx.json`)
+  listing the Go modules and versions in the binaries. Both are produced by
+  `release.yaml`, so a release predating that step has neither; the
+  [installation doc](docs/ENTERPRISE.md#installing-pinning-air-gapped) says
+  which ones do.
 
 ## Supply-chain practices in this repository
 

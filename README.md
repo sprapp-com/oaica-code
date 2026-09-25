@@ -13,13 +13,21 @@ irm https://github.com/sprapp-com/oaica-code/releases/latest/download/install.ps
 
 The installers are the release's own assets — written by the same workflow that
 builds the archives — and they fetch the archive **and** its checksum from that
-same release, so what you install is always the artifact CI built from the tag.
+same release, so what you install is the artifact CI built from the tag.
 `oaica.com/install.sh` serves a published copy of the same script; prefer the
 release URL, which cannot lag behind it.
 
+One caveat, because it is invisible from the outside: an `install.sh` asset
+published before 2026-09-26 fetches its archive from `oaica.com/download`
+instead of from its own release, so installing from such a release gets you the
+hand-maintained copy — 0.5.45 while the tag read 0.5.46. Check `oaica --version`
+against the tag you asked for, and see
+[docs/ENTERPRISE.md](docs/ENTERPRISE.md#installing-pinning-air-gapped) for the
+detail.
+
 ```shell
-# pin an exact version
-OAICA_VERSION=0.5.46 curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
+# pin an exact version — take the tag from the releases page
+OAICA_VERSION=<tag> curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 # fetch from a mirror instead of GitHub (air-gapped hosts)
 OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 ```
@@ -27,9 +35,14 @@ OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://github.com/
 Prefer a manual download? Every archive is attached to the
 [GitHub releases](https://github.com/sprapp-com/oaica-code/releases) together
 with `SHA256SUMS`, `VERSION.txt`, and the install scripts themselves. The
-archive extracts to `bin/oaica`, so either extract into `~/.local`
-(`tar -C ~/.local -xzf oaica-*.tar.gz`) or move `bin/oaica` onto your `PATH`
-yourself (e.g. `/usr/local/bin`).
+archive extracts to `bin/oaica`; extract it where you want it, then put
+`bin/oaica` on your `PATH` (e.g. `/usr/local/bin`).
+
+```shell
+tar -C ~/.local -xzf oaica-linux-amd64.tgz           # Linux: .tgz needs only tar
+tar -C ~/.local --zstd -xf oaica-linux-amd64.tar.zst # Linux: the .tar.zst variant needs zstd
+unzip -d ~/.local oaica-darwin-arm64.zip             # macOS (arm64; amd64 for Intel)
+```
 
 **Current release:** see the [latest GitHub
 release](https://github.com/sprapp-com/oaica-code/releases/latest) — the tag and

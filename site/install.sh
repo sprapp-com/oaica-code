@@ -337,12 +337,14 @@ if [ -d "$OAICA_INSTALL_DIR/lib/oaica" ] ; then
 fi
 status "Installing oaica to $OAICA_INSTALL_DIR"
 $SUDO install -o0 -g0 -m755 -d $BINDIR
-$SUDO install -o0 -g0 -m755 -d "$OAICA_INSTALL_DIR/lib/oaica"
+# No $OAICA_INSTALL_DIR/lib/oaica: upstream Ollama unpacked a server there,
+# this fork ships one binary in bin/. The cleanup directly above removes the
+# directory older versions of this installer left behind (2026-09-26 audit).
 download_and_extract "$DOWNLOAD_BASE" "$OAICA_INSTALL_DIR" "oaica-linux-${ARCH}"
 
 if [ "$OAICA_INSTALL_DIR/bin/oaica" != "$BINDIR/oaica" ] ; then
     status "Making oaica accessible in the PATH in $BINDIR"
-    $SUDO ln -sf "$OAICA_INSTALL_DIR/oaica" "$BINDIR/oaica"
+    $SUDO ln -sf "$OAICA_INSTALL_DIR/bin/oaica" "$BINDIR/oaica"
 fi
 
 

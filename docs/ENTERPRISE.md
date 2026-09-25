@@ -22,15 +22,18 @@ describing this binary.
 
 ## Network connections
 
-Exactly five outbound paths exist. Nothing else in the client opens a socket.
+Eight outbound paths exist. Nothing else in the client opens a socket.
 
 | # | Destination | When | What is sent | Off switch |
 |---|---|---|---|---|
 | 1 | Your model endpoint | Every model call | Your prompts, attachments and tool output — the traffic you asked for | Choose the endpoint (`OAICA_HOST`, a remote, or a local `oaica serve`) |
 | 2 | `oaica.com` | Install and upgrade only | Nothing; it serves the install scripts | Install from the GitHub release instead |
 | 3 | `github.com/sprapp-com/oaica-code/releases/latest/download/VERSION.txt` | At most once per 20h, from any command that would print the update notice | A plain GET for the release's version file; **sends no body, no identifiers**. The request reveals your IP and that oaica is installed | `OAICA_NO_UPDATE_CHECK=1` |
-| 4 | Vendor installers for optional integrations | Only when you run `oaica launch <agent>` for an agent that is not installed and you confirm the install | The vendor's own installer download | Don't launch that agent; install it yourself first |
-| 5 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
+| 4 | `raw.githubusercontent.com` | Only when you run `oaica remote sync`, `oaica model sync` or `oaica model cloud-limits sync` **without** `--url` | A GET for that catalog's JSON in this repository | Pass `--url` (a `file://` path works) and the default is never contacted; or don't run the sync commands |
+| 5 | Agent installers at the vendor's own host — `claude.ai`, `code.kimi.com`, `dev.meta.ai`, `hermes-agent.nousresearch.com`, `opencode.ai`, `qwen-code-assets.oss-cn-hangzhou.aliyuncs.com` | Only when you run `oaica launch <agent>` for an agent that is not installed and you confirm the install | A GET for the vendor's own installer script, which it then runs | Don't launch that agent; install it yourself first, or from your own mirror |
+| 6 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
+| 7 | `api.lemonsqueezy.com` (`/v1/licenses`) | `oaica activate <key>` once, then a revalidation on `oaica launch` when the stored activation is older than 7 days | The licence key and this machine's activation id; the response says whether the licence is still valid | No switch while the licence gate is in force. A cached activation younger than 7 days makes no call, and an unreachable licence server keeps working for 30 days |
+| 8 | `huggingface.co`, or the router's own storage | Only when you run `oaica pull <model>` | `GET /v1/manifest/<model>` on your endpoint, then the weight bytes from the URL that manifest names — the router's storage, or HuggingFace when the manifest says `source=hf` | `oaica pull` is optional: point `OAICA_HOST` at a model already on disk and pull nothing |
 
 The endpoint in row 1 defaults to `https://api.oaica.com` (an
 OpenAI-compatible router) and is where the work actually goes. If prompts may
@@ -39,7 +42,7 @@ not leave your network, point `oaica` at an endpoint inside it — a remote in
 model — and confirm with `oaica doctor`, whose output shows which remote each
 launch would use.
 
-Row 4 exists because `oaica launch claude` (and `codex`, `kimi`, `hermes`,
+Row 5 exists because `oaica launch claude` (and `codex`, `kimi`, `hermes`,
 `opencode`, `dsh`, `pi`, …) will offer to install that agent from its
 publisher when it is missing, after a prompt that says so. Those agents are not
 part of this repository, are not pinned or audited by it, and once installed
@@ -49,18 +52,20 @@ install the agents from your own package mirror and let `oaica launch` find them
 already on `PATH`. Catalog metadata can be synced from an internal mirror
 instead of GitHub: `oaica remote sync --url`, `oaica model sync --url` and
 `oaica model cloud-limits sync --url` all accept `file://` paths and plain
-HTTP URLs.
+HTTP URLs (row 4).
 
 ### Telemetry
 
 There is none. No analytics, no crash reporting, no usage beacons, no
 "anonymous" install ID. Grep the tree for `telemetry`, `analytics`, `sentry`,
 `posthog`, `segment` and you will find the TUI's own render helpers and
-nothing else. Row 3 is the only unprompted outbound request the client makes,
-and it carries no payload — every other non-model path is behind a prompt you
-answer, or behind a command you typed (`oaica launch pi` is the one to know
-about: it asks before installing its web-search package, and row 5 lists what
-that touches).
+nothing else. Two outbound requests happen without you asking, and neither
+carries a payload: row 3's version GET, and row 7's licence revalidation for an
+install that is already activated (at most once per 7 days, and it sends only
+the key and activation id you already stored). Every other non-model path is
+behind a prompt you answer, or behind a command you typed (`oaica launch pi` is
+the one to know about: it asks before installing its web-search package, and
+row 6 lists what that touches).
 
 ## Files on disk
 
@@ -145,13 +150,26 @@ curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/ins
 refreshed by a manual Cloudflare Pages deploy — it can lag a release, so prefer
 the release URL above.
 
+One caveat on that URL, because it is not obvious from the script itself: an
+`install.sh` **asset published before 2026-09-26** fetches its archive from
+`https://oaica.com/download`, the hand-maintained copy, rather than from the
+release it came in. Installing from such a release gets you whatever that copy
+holds, which was 0.5.45 while the release tag said 0.5.46. The fix is in the
+script as of the commit that switched it to the release URL; if you pin an
+earlier release, or install without pinning and find `oaica --version` disagrees
+with the tag, that is the reason, and the remedy is to build from source or
+install a release whose asset postdates it.
+
 What the installer does, in order: resolve the release for the version being
 installed, download the archive **and that release's `SHA256SUMS`**, verify the
 archive's SHA-256, extract `bin/oaica` into a temporary directory, then install
 it as `/usr/local/bin/oaica` (mode `755`), using `sudo` when that directory is
 not writable. The temporary directory is removed on exit via an `EXIT` trap.
 It does not touch your shell profile, does not install a service, and writes
-nothing outside the temp dir and the binary's destination.
+nothing outside the temp dir and the binary's destination. (It does *remove*
+one thing: a `lib/oaica` directory under the install prefix, left by versions
+of this script that unpacked upstream Ollama's server layout there. Nothing in
+the client reads that path.)
 
 Three things you should know rather than assume:
 
@@ -168,8 +186,13 @@ Three things you should know rather than assume:
   three times and then fails. In a high-assurance environment, verify the
   archive yourself before installing — the digests are all in the release.
 
-Every release asset also carries a keyless Sigstore attestation and a
-CycloneDX SBOM:
+Releases built by `.github/workflows/release.yaml` also carry a keyless Sigstore
+attestation and a CycloneDX SBOM, which is what current `main` builds. The
+releases published before this session's changes to that workflow do **not** —
+`gh attestation verify` reports no attestations for `oaica-v0.5.46`, and it
+ships no `.sbom.cdx.json` asset — so treat the verify command as a property of
+the workflow (verify it against a release the workflow built) before relying on
+it for a binary you already have:
 
 ```shell
 gh attestation verify oaica-linux-amd64.tar.zst -R sprapp-com/oaica-code

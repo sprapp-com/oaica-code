@@ -39,9 +39,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      # The version the latest release claims, read from its own VERSION.txt.
-      EXPECTED: ${{ steps.published.outputs.version || steps.published_win.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -72,8 +69,15 @@ jobs:
       # installer only edits the PATH of the process it runs in.
       - name: Install from the release and check version (unix)
         if: runner.os != 'Windows'
+        env:
+          # The version the latest release claims, read from its own
+          # VERSION.txt. Step-level, not job-level: the `steps` context does
+          # not exist in a job's `env`, so a job-level EXPECTED is either
+          # rejected by the linter or silently empty (2026-09-26 audit).
+          EXPECTED: ${{ steps.published.outputs.version }}
         run: |
           set -eu
+          [ -n "$EXPECTED" ] || { echo "::error::could not read the latest release's VERSION.txt"; exit 1; }
           curl -fsSL "https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh" | sh
           oaica --version
           got="$(oaica --version | awk '{print $NF}')"
@@ -86,7 +90,13 @@ jobs:
       - name: Install from the release and check version (windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          EXPECTED: ${{ steps.published_win.outputs.version }}
         run: |
+          if (-not $env:EXPECTED -or -not $env:EXPECTED.Trim()) {
+            Write-Host "::error::could not read the latest release's VERSION.txt"
+            exit 1
+          }
           irm "https://github.com/sprapp-com/oaica-code/releases/latest/download/install.ps1" | iex
           oaica --version
           $got = (oaica --version) -replace '^oaica\s+', ''

@@ -57,6 +57,10 @@ jobs:
       - name: Build all platform archives
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq zstd zip
+          # VERSION is the tag on a tag push ("oaica-v0.5.47"), so every later
+          # step would otherwise name assets oaica-oaica-v0.5.47.*. Export the
+          # bare version for them through GITHUB_ENV (2026-09-26 audit).
+          echo "RELEASE_VERSION=${VERSION#oaica-v}" >> "$GITHUB_ENV"
           export VERSION="${VERSION#oaica-v}"
           OUT=dist scripts/build_oaica.sh
           cp scripts/install.sh scripts/install.ps1 dist/
@@ -105,7 +109,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/sbom-root
           format: cyclonedx-json
-          output-file: dist/oaica-${{ env.VERSION }}.sbom.cdx.json
+          output-file: dist/oaica-${{ env.RELEASE_VERSION }}.sbom.cdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: Refuse an empty SBOM
@@ -114,7 +118,7 @@ jobs:
         # becomes a release asset.
         run: |
           set -e
-          f="dist/oaica-${VERSION}.sbom.cdx.json"
+          f="dist/oaica-${RELEASE_VERSION}.sbom.cdx.json"
           n="$(jq '(.components // []) | length' "$f")"
           echo "$f lists $n component(s)"
           [ "$n" -gt 0 ] || { echo "the SBOM has no components — it describes nothing, and publishing it claims otherwise"; exit 1; }
