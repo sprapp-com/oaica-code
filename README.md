@@ -7,19 +7,21 @@ optional static site builder (`oaica site new|edit|preview|deploy`).
 **Install**
 
 ```shell
-curl -fsSL https://oaica.com/install.sh | bash    # macOS/Linux
-irm https://oaica.com/install.ps1 | iex           # Windows
+curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash    # macOS/Linux
+irm https://github.com/sprapp-com/oaica-code/releases/latest/download/install.ps1 | iex           # Windows
 ```
 
-Both installers fetch the archive **and** its checksum from the GitHub release
-for the version being installed, so what you install is always the artifact CI
-built from that tag:
+The installers are the release's own assets — written by the same workflow that
+builds the archives — and they fetch the archive **and** its checksum from that
+same release, so what you install is always the artifact CI built from the tag.
+`oaica.com/install.sh` serves a published copy of the same script; prefer the
+release URL, which cannot lag behind it.
 
 ```shell
 # pin an exact version
-OAICA_VERSION=0.5.46 curl -fsSL https://oaica.com/install.sh | bash
+OAICA_VERSION=0.5.46 curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 # fetch from a mirror instead of GitHub (air-gapped hosts)
-OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://oaica.com/install.sh | bash
+OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 ```
 
 Prefer a manual download? Every archive is attached to the

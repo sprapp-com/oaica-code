@@ -134,11 +134,16 @@ user.
 ## Installing, pinning, air-gapped
 
 Installers are the two files in the release's assets
-(`install.sh`, `install.ps1`), also published at oaica.com:
+(`install.sh`, `install.ps1`). Install from the release, which is the artifact
+CI built from the tag:
 
 ```shell
-curl -fsSL https://oaica.com/install.sh | bash
+curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash
 ```
+
+`https://oaica.com/install.sh` serves a published copy of the same script,
+refreshed by a manual Cloudflare Pages deploy — it can lag a release, so prefer
+the release URL above.
 
 What the installer does, in order: resolve the release for the version being
 installed, download the archive **and that release's `SHA256SUMS`**, verify the

@@ -74,19 +74,50 @@ jobs:
           # one, and its checksum must match what SHA256SUMS claims.
           grep -qx "version=${VERSION#oaica-v}" dist/VERSION.txt \
             || { echo "dist/VERSION.txt does not name ${VERSION#oaica-v}:"; cat dist/VERSION.txt; exit 1; }
+          # sha256sum -c only proves the entries SHA256SUMS HAS are right — an
+          # archive missing from the file passes silently, and the installer
+          # then warns-and-continues instead of verifying it. Every archive
+          # must have a line (2026-09-26 audit).
+          for f in oaica-linux-amd64.tar.zst oaica-linux-amd64.tgz \
+                   oaica-linux-arm64.tar.zst oaica-linux-arm64.tgz \
+                   oaica-darwin-amd64.zip oaica-darwin-arm64.zip \
+                   oaica-windows-amd64.zip; do
+            grep -q "  $f\$" dist/SHA256SUMS || { echo "SHA256SUMS has no line for $f:"; cat dist/SHA256SUMS; exit 1; }
+          done
           (cd dist && sha256sum -c SHA256SUMS)
           ls -l dist/
+      - name: Extract the binary the SBOM scans
+        # Scanning dist/ catalogued only the archive FILES: a .tar.zst is
+        # opaque to a package scanner, so the published SBOM listed no Go
+        # modules at all — an attestation that describes nothing, attached to
+        # every release (2026-09-26 audit). syft reads module versions out of
+        # a Go binary, so hand it the extracted one.
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/sbom-root"
+          tar --zstd -xf dist/oaica-linux-amd64.tar.zst -C "$RUNNER_TEMP/sbom-root"
+          ls -l "$RUNNER_TEMP/sbom-root/bin"
       - name: Generate SBOM (CycloneDX)
         # Software bill of materials for the release: every Go module and
         # version that went into these binaries, so a user can check what they
         # are shipping without running a scanner themselves.
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
-          path: dist
+          path: ${{ runner.temp }}/sbom-root
           format: cyclonedx-json
           output-file: dist/oaica-${{ env.VERSION }}.sbom.cdx.json
           upload-artifact: false
           upload-release-assets: false
+      - name: Refuse an empty SBOM
+        # The failure mode above is silent: an SBOM with zero components is a
+        # well-formed file that says nothing. Assert it has contents before it
+        # becomes a release asset.
+        run: |
+          set -e
+          f="dist/oaica-${VERSION}.sbom.cdx.json"
+          n="$(jq '(.components // []) | length' "$f")"
+          echo "$f lists $n component(s)"
+          [ "$n" -gt 0 ] || { echo "the SBOM has no components — it describes nothing, and publishing it claims otherwise"; exit 1; }
       - name: Attest build provenance
         # Signed (Sigstore, keyless) statement that these exact bytes were
         # built by this workflow from this commit. Verify with:
@@ -106,14 +137,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The tag to publish under, derived from VERSION rather than read
+          # from GITHUB_REF_NAME: that is the pushed tag on a tag push, but the
+          # BRANCH ("main") on a workflow_dispatch, so a manual dry_run=false
+          # run used to create a release named after the branch. VERSION is the
+          # version input on a dispatch (2026-09-26 audit).
+          TAG="oaica-v${VERSION#oaica-v}"
           # Idempotent: a release may already exist (created by hand with
           # notes before Actions was enabled on this fork). In that case
           # replace its assets with this build's instead of failing.
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "oaica ${GITHUB_REF_NAME#oaica-v}" \
+            gh release create "$TAG" \
+              --title "oaica ${TAG#oaica-v}" \
               --generate-notes \
               dist/*
           fi

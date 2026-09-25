@@ -18,6 +18,14 @@ Linux box. Two things ship per release and they must stay in sync:
    hand-maintained `site/download/` copy is no longer on the install path and
    a Pages deploy can no longer ship a wrong binary.
 
+   The mirror is a convenience, not the install path: `README.md` and
+   `docs/ENTERPRISE.md` both hand users the release's own
+   `…/releases/latest/download/install.sh`, which cannot lag the release the
+   way a published copy can. `install-smoke.yaml` installs from that URL and
+   asserts the result matches the release's `VERSION.txt`; a separate
+   `continue-on-error` step warns when the oaica.com copy is behind, so the
+   drift is visible without failing the build on a deploy only a human can run.
+
 Why the release is the source of truth: the binary at `oaica.com/download` had
 been hand-built on 2026-08-04 from `329de0bf` with a dirty tree
 (`vcs.modified=true`), then left for three weeks / ~100 commits while `main`

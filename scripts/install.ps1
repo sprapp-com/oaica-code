@@ -230,6 +230,12 @@ function Test-ArchiveChecksum {
 
     $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
     if ($actual -ne $expected.ToUpperInvariant()) {
+        # A rejected archive must not outlive the failure. The throw exits
+        # before the installer's own cleanup step, so the corrupt download —
+        # the one thing here that might have been tampered with — used to be
+        # left sitting in %TEMP% (2026-09-26 audit).
+        Remove-Item $Path -Force -ErrorAction SilentlyContinue
+        Remove-Item $sumsFile -Force -ErrorAction SilentlyContinue
         throw "Checksum mismatch for ${Name}: expected $expected, got $actual. The download is incomplete or corrupt; re-run the installer."
     }
     Write-Host ">>> Checksum OK: $Name"

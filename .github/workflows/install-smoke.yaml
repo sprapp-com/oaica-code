@@ -70,11 +70,11 @@ jobs:
       # Install, then assert the installed binary is the version the release
       # says. The assertion runs in the same step as the install: the
       # installer only edits the PATH of the process it runs in.
-      - name: Install from oaica.com and check version (unix)
+      - name: Install from the release and check version (unix)
         if: runner.os != 'Windows'
         run: |
           set -eu
-          curl -fsSL https://oaica.com/install.sh | sh
+          curl -fsSL "https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh" | sh
           oaica --version
           got="$(oaica --version | awk '{print $NF}')"
           echo "installed=$got published=$EXPECTED"
@@ -83,11 +83,11 @@ jobs:
             exit 1
           }
 
-      - name: Install from oaica.com and check version (windows)
+      - name: Install from the release and check version (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          irm https://oaica.com/install.ps1 | iex
+          irm "https://github.com/sprapp-com/oaica-code/releases/latest/download/install.ps1" | iex
           oaica --version
           $got = (oaica --version) -replace '^oaica\s+', ''
           Write-Host "installed=$got published=$env:EXPECTED"
@@ -95,3 +95,20 @@ jobs:
             Write-Host "::error::installed $got but the latest release is $($env:EXPECTED) - the install path is serving a stale artifact"
             exit 1
           }
+
+      # The release assets are the documented install path (README.md), and the
+      # steps above prove they work. oaica.com serves a PUBLISHED COPY of
+      # install.sh/install.ps1 that is refreshed by a manual Cloudflare Pages
+      # deploy, so it can lag a release by exactly as long as nobody runs one —
+      # it is currently behind, and this step is what makes that visible
+      # without failing the build on an artifact only a deploy can fix
+      # (2026-09-26 audit).
+      - name: Check the oaica.com mirror is current (unix)
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        run: |
+          set -eu
+          live="$(curl -fsSL https://oaica.com/install.sh | grep -c 'releases.*download' || true)"
+          if [ "$live" -eq 0 ]; then
+            echo "::warning::oaica.com/install.sh still fetches from oaica.com/download instead of the release — a Pages deploy of site/ is pending, so the mirror serves a stale installer"
+          fi
