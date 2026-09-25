@@ -325,6 +325,18 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 				if blockMap, ok := block.(map[string]any); ok {
 					if blockMap["type"] == "text" {
 						if text, ok := blockMap["text"].(string); ok {
+							// Blocks are joined, not concatenated: a system
+							// array is how --append-system-prompt arrives, and
+							// gluing two blocks with nothing between them
+							// merges the appended instruction into the
+							// preceding one whenever it does not end in
+							// punctuation. normalizeSystemFirst, which does
+							// the same job for the other wire, separates with
+							// a blank line; this path must agree with it
+							// (2026-09-26 audit).
+							if content.Len() > 0 {
+								content.WriteString("\n\n")
+							}
 							content.WriteString(text)
 						}
 					}
@@ -1002,7 +1014,17 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			})
 		}
 
-		c.inputTokens = r.Metrics.PromptEvalCount
+		// A done event carrying no metrics must not ERASE what message_start
+		// already told the client. The client SDK accumulates input_tokens
+		// (and cache_read_input_tokens) off message_delta whenever the field
+		// is present, so a hard 0 here overwrites a real count — or the
+		// estimate seeded via NewStreamConverter's estimatedInputTokens —
+		// and the session's context accounting silently resets to empty
+		// (2026-09-26 audit). Output is genuinely unknown if absent, so it
+		// still takes the done value.
+		if r.Metrics.PromptEvalCount > 0 {
+			c.inputTokens = r.Metrics.PromptEvalCount
+		}
 		c.outputTokens = r.Metrics.EvalCount
 		stopReason := mapStopReason(r.DoneReason, len(c.toolCallsSent) > 0)
 

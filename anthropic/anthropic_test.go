@@ -91,7 +91,7 @@ func TestFromMessagesRequest_WithSystemPromptArray(t *testing.T) {
 		MaxTokens: 1024,
 		System: []any{
 			map[string]any{"type": "text", "text": "You are helpful."},
-			map[string]any{"type": "text", "text": " Be concise."},
+			map[string]any{"type": "text", "text": "Answer in brief fragments."},
 		},
 		Messages: []MessageParam{
 			{Role: "user", Content: textContent("Hello")},
@@ -107,7 +107,13 @@ func TestFromMessagesRequest_WithSystemPromptArray(t *testing.T) {
 		t.Fatalf("expected 2 messages, got %d", len(result.Messages))
 	}
 
-	if result.Messages[0].Content != "You are helpful. Be concise." {
+	// Blocks are separated, not glued. A system array is how
+	// --append-system-prompt arrives (oaica's own --brief-mode uses it), and
+	// concatenating the blocks merged the appended instruction into the
+	// preceding sentence whenever it did not end in punctuation. The other
+	// wire's normalizeSystemFirst joins with a blank line; this path now
+	// agrees with it (2026-09-26 audit).
+	if result.Messages[0].Content != "You are helpful.\n\nAnswer in brief fragments." {
 		t.Errorf("unexpected system message content: %q", result.Messages[0].Content)
 	}
 }

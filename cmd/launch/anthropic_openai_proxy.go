@@ -206,7 +206,16 @@ func (u *openAIUsage) cachedTokens() int {
 	switch {
 	case u.PromptTokensDetails != nil:
 		c = u.PromptTokensDetails.CachedTokens
-	default:
+	}
+	// The fallback is on the VALUE, not the pointer. prompt_cache_hit_tokens
+	// exists in this struct precisely because "some builds emit only the
+	// other name" — but testing the details object for nil let an upstream
+	// that sends BOTH keys with the details object zeroed (a build that
+	// always emits the object, populated only when it has a hit) report a
+	// fully uncached prompt while its own sibling field said 4096 cached
+	// tokens. The user's cache-efficiency read-out was 0% for a real hit
+	// (2026-09-26 audit).
+	if c == 0 {
 		c = u.PromptCacheHitTokens
 	}
 	if c < 0 {
@@ -1440,10 +1449,21 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		if route.DisplayModel != "" {
 			displayModel = route.DisplayModel
 		}
+		// The converter's fallback for an upstream that reports NO usage:
+		// this session's calibrated tokens-per-byte when it has one, else
+		// chars/4. An upstream that omits usage (a stream that ignores
+		// stream_options.include_usage, a gateway that strips the usage
+		// object) used to produce a hard "input_tokens":0, which Claude Code
+		// believes — its context accounting never grew and auto-compaction
+		// never fired, the 2026-08-30 wall. The converter has carried this
+		// fallback since it was written (anthropic.go's "use actual metrics
+		// if available, otherwise use estimate"); the call site hard-wired
+		// the estimate to 0, which disabled it (2026-09-26 audit).
+		estInputTokens, _, _ := contextFitPlan(calib, calibKey, len(body))
 		if anthReq.Stream {
-			handleStreamResponse(w, resp.Body, displayModel, recordUsage)
+			handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
 		} else {
-			handleNonStreamResponse(w, resp.Body, displayModel, recordUsage)
+			handleNonStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
 		}
 	})
 
@@ -1455,7 +1475,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 // api.ChatResponse, and emits an Anthropic MessagesResponse as JSON.
 // onUsage, when non-nil, is called with the upstream's real
 // usage.prompt_tokens so the caller can calibrate its prompt-size estimate.
-func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int)) {
+// estInputTokens is the prompt count to report in place of a flat zero when
+// the upstream sent no usage object at all.
+func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) {
 	respBody, err := io.ReadAll(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+err.Error())
@@ -1470,6 +1492,12 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		onUsage(oaiResp.Usage.PromptTokens)
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
+	if oaiResp.Usage == nil && estInputTokens > 0 {
+		// No usage object to report. An estimate is the only honest number
+		// available, and it keeps the client's context accounting moving —
+		// see the note at the streaming call site (2026-09-26 audit).
+		chatResp.Metrics.PromptEvalCount = estInputTokens
+	}
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
 	anthResp.Usage.CacheReadInputTokens = oaiResp.Usage.cachedTokens()
 	w.Header().Set("Content-Type", "application/json")
@@ -1483,8 +1511,9 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // writes each returned StreamEvent as an Anthropic SSE event.
 // onUsage, when non-nil, is called with the real usage.prompt_tokens from
 // the stream's final usage-only chunk (stream_options.include_usage) so the
-// caller can calibrate its prompt-size estimate.
-func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int)) {
+// caller can calibrate its prompt-size estimate. estInputTokens is the
+// converter's fallback when no usage chunk ever arrives.
+func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, http.StatusInternalServerError, "streaming not supported by response writer")
@@ -1501,7 +1530,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// (2026-09-26 audit). Headers go out with the first event.
 	started := false
 
-	conv := anthropic.NewStreamConverter(anthropic.GenerateMessageID(), upstreamModel, 0)
+	conv := anthropic.NewStreamConverter(anthropic.GenerateMessageID(), upstreamModel, estInputTokens)
 
 	scanner := bufio.NewScanner(body)
 	// DeepSeek streams can emit sizeable reasoning_content lines; raise the
@@ -1599,6 +1628,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
+	// streamedText counts the characters actually sent to the client, so the
+	// done event can report a usable output count even when the upstream
+	// sent no usage (see the tally below).
+	streamedText := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -1642,6 +1675,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			// Text content delta.
 			if d.Content != "" {
+				streamedText += len(d.Content)
 				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Content: d.Content}}
 				emit(conv.Process(cr))
 			}
@@ -1745,6 +1779,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		cached = finalUsage.cachedTokens()
 		doneResp.Metrics.PromptEvalCount = finalUsage.PromptTokens - cached
 		doneResp.Metrics.EvalCount = finalUsage.CompletionTokens
+	} else {
+		// No usage chunk: report the prompt estimate the converter was
+		// seeded with and what was actually streamed, rather than a hard
+		// "input_tokens":0/output_tokens:0 the client believes — a session
+		// that really did grow then looks flat, and auto-compaction never
+		// fires (2026-09-26 audit).
+		doneResp.Metrics.PromptEvalCount = estInputTokens
+		if streamedText > 0 {
+			doneResp.Metrics.EvalCount = streamedText/4 + 1
+		}
 	}
 	events := conv.Process(doneResp)
 	if cached > 0 {
