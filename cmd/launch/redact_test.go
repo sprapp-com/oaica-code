@@ -54,6 +54,21 @@ func TestRedactCredentials(t *testing.T) {
 			in:   "tried https://sk-aaaaaaaaaa@h1.example/v1 then https://ghu_bbbbbbbbbb@h2.example/v1",
 			want: "tried https://REDACTED@h1.example/v1 then https://REDACTED@h2.example/v1",
 		},
+		{
+			// url.Parse splits userinfo at the LAST "@", so a Basic password
+			// containing one ("user:x@password") is the credential. Matching
+			// only the first "@" printed the password's tail — found leaking
+			// through remote list/show, doctor and the --report scan on
+			// 2026-09-26.
+			name: "Basic password containing an at-sign",
+			in:   "http://user:x@verylongpassword@api.example.test/v1",
+			want: "http://REDACTED@api.example.test/v1",
+		},
+		{
+			name: "three at-signs still collapse to one REDACTED",
+			in:   "https://a@b@c@h.example/v1",
+			want: "https://REDACTED@h.example/v1",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,6 +106,45 @@ func TestRedactErr(t *testing.T) {
 	}
 	if errors.Unwrap(wrapped) != inner {
 		t.Fatalf("Unwrap should return the original error")
+	}
+}
+
+// TestRedactBaseURL covers the shapes a base URL takes that the free-text
+// redactor cannot express: a URL url.Parse rejects (so nothing can be
+// transmitted, but a user can still have pasted it into a ticket) and a
+// userinfo carrying whitespace. Both leaked verbatim from remote list/show and
+// doctor before 2026-09-26's audit.
+func TestRedactBaseURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://sk-key-0123456789@api.example.test/v1", "https://REDACTED@api.example.test/v1"},
+		{"https://user:pass-word@api.example.test/v1", "https://REDACTED@api.example.test/v1"},
+		{"https://sk live SECRETKEY123@api.example.test/v1", "https://REDACTED@api.example.test/v1"},
+		{"https://user:pass@host:notaport/v1", "https://REDACTED@host:notaport/v1"},
+		{"https://api.example.test/v1", "https://api.example.test/v1"},
+		{"http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"},
+	}
+	for _, tc := range cases {
+		if got := redactBaseURL(tc.in); got != tc.want {
+			t.Errorf("redactBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// userinfoSecret is the --report leak scan's input: it must name the
+// credential for the shapes key() cannot see — including one that does not
+// parse, which is exactly the case where the report used to print anyway.
+func TestUserinfoSecret(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://sk-key-0123456789@api.example.test/v1", "sk-key-0123456789"},
+		{"https://user:pass-word@api.example.test/v1", "user:pass-word"},
+		{"https://sk live SECRETKEY123@api.example.test/v1", "sk live SECRETKEY123"},
+		{"https://api.example.test/v1", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := userinfoSecret(tc.in); got != tc.want {
+			t.Errorf("userinfoSecret(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

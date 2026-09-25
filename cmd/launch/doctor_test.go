@@ -7,6 +7,8 @@ package launch
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -77,5 +79,65 @@ func TestDoctor_InvalidPolicyFails(t *testing.T) {
 	out := captureDoctorStdout(t, func() { err = DoctorCmd().RunE(DoctorCmd(), nil) })
 	if err == nil || !strings.Contains(out, "INVALID route_policy") {
 		t.Fatalf("err=%v out:\n%s", err, out)
+	}
+}
+
+// anthropicWireModels answers like an Anthropic endpoint: it refuses a Bearer,
+// and needs the version header alongside the key.
+func anthropicWireModels(gotHeader *http.Header) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gotHeader != nil {
+			*gotHeader = r.Header.Clone()
+		}
+		if r.Header.Get("x-api-key") != "sk-anthropic-key" || r.Header.Get("anthropic-version") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-sonnet-5"}]}`))
+	}))
+}
+
+// probeRemote asks the same /v1/models URL the picker does, so it must
+// authenticate the same way. It sent a Bearer unconditionally, which an
+// anthropic-wire remote answers with 401 — and since the probe became an exit-1
+// gate (TestDoctor_FailingProbeFailsTheCommand), a healthy zai-coding-plan or
+// minimax-coding-plan made `oaica doctor` itself fail (2026-09-26 audit).
+func TestProbeRemote_AnthropicWireUsesXAPIKey(t *testing.T) {
+	var header http.Header
+	srv := anthropicWireModels(&header)
+	defer srv.Close()
+
+	status := probeRemote(userRemote{
+		Name:    "zai-coding-plan",
+		BaseURL: srv.URL,
+		APIKey:  "sk-anthropic-key",
+		Wire:    "anthropic",
+	})
+	if status != "ok" {
+		t.Fatalf("probeRemote on a healthy anthropic-wire remote = %q, want ok", status)
+	}
+	if header.Get("x-api-key") != "sk-anthropic-key" {
+		t.Errorf("probe did not send x-api-key: %v", header)
+	}
+	if header.Get("Authorization") != "" {
+		t.Errorf("probe sent a Bearer to an anthropic-wire remote: %v", header)
+	}
+}
+
+// The same endpoint probed as openai-wire must NOT be quietly accepted: the
+// Bearer branch is a real difference, not a fallback that happens to work, and
+// the wire field is what selects it.
+func TestProbeRemote_OpenAIWireSendsBearerOnly(t *testing.T) {
+	var header http.Header
+	srv := anthropicWireModels(&header)
+	defer srv.Close()
+
+	status := probeRemote(userRemote{Name: "zai", BaseURL: srv.URL, APIKey: "sk-anthropic-key"})
+	if status != "FAIL http 401" {
+		t.Fatalf("openai-wire probe against an anthropic endpoint = %q, want FAIL http 401", status)
+	}
+	if header.Get("Authorization") != "Bearer sk-anthropic-key" {
+		t.Errorf("probe did not send the Bearer: %v", header)
 	}
 }

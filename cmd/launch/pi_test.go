@@ -261,6 +261,22 @@ exit 0
 		t.Cleanup(func() { DefaultConfirmPrompt = oldConfirm })
 	}
 
+	// approveWebSearchConfirm answers the one prompt this integration owns —
+	// the web-search npm install/update, which it used to run unprompted
+	// (2026-09-26 audit) — and fails on any other prompt, so a launch that
+	// starts asking new questions still gets caught.
+	approveWebSearchConfirm := func(t *testing.T) {
+		t.Helper()
+		withConfirm(t, func(prompt string) (bool, error) {
+			lower := strings.ToLower(prompt)
+			if !strings.Contains(lower, "web search") && !strings.Contains(lower, "pi-web-search") {
+				t.Fatalf("did not expect confirmation prompt, got %q", prompt)
+				return false, nil
+			}
+			return true, nil
+		})
+	}
+
 	setCloudStatus := func(t *testing.T, disabled bool) {
 		t.Helper()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -405,10 +421,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedLegacyPiNpm(t, tmpDir)
 
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -466,10 +479,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedBothPiPackagesNpm(t, tmpDir)
 
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -562,10 +572,7 @@ exit 0
 		writeScript(t, filepath.Join(commandDir, "npm"), npmScript)
 		t.Setenv("PATH", commandDir+string(os.PathListSeparator)+filepath.Join(prefix, "bin"))
 
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"--version"}); err != nil {
@@ -602,10 +609,7 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedLegacyPiNpm(t, tmpDir)
 
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		err := p.Run("ignored", nil, nil)
@@ -635,10 +639,7 @@ exit 0
 		setNpmRegistryVersion(t, "1.0.0")
 		seedPiScript(t, tmpDir)
 		seedBrokenPiProbeNpm(t, tmpDir)
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {
@@ -676,10 +677,7 @@ exit 0
 		}
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"session"}); err != nil {
@@ -743,6 +741,8 @@ exit 0
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
 
+		approveWebSearchConfirm(t)
+
 		p := &Pi{}
 		if err := p.Run("ignored", nil, []string{"doctor"}); err != nil {
 			t.Fatalf("Run() error = %v", err)
@@ -771,6 +771,8 @@ exit 0
 		setNpmRegistryVersion(t, "1.0.1")
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
+
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {
@@ -802,10 +804,7 @@ exit 0
 		}
 		seedPiScript(t, tmpDir)
 		seedNpmNoop(t, tmpDir)
-		withConfirm(t, func(prompt string) (bool, error) {
-			t.Fatalf("did not expect confirmation prompt, got %q", prompt)
-			return false, nil
-		})
+		approveWebSearchConfirm(t)
 
 		p := &Pi{}
 		stderr := captureStderr(t, func() {
@@ -854,6 +853,85 @@ exit 0
 		got := string(piCalls)
 		if strings.Contains(got, "list\n") || strings.Contains(got, "install "+piWebSearchSource+"\n") || strings.Contains(got, "update "+piWebSearchSource+"\n") {
 			t.Fatalf("did not expect web search package management calls, got:\n%s", got)
+		}
+		if !strings.Contains(got, "session\n") {
+			t.Fatalf("expected final pi launch call, got:\n%s", got)
+		}
+	})
+
+	// The web-search install is a third-party npm fetch that used to happen
+	// with no prompt at all. Declining it must leave the user's machine
+	// untouched and still launch pi (2026-09-26 audit).
+	t.Run("declined web search install does not touch npm", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+		t.Setenv("PATH", tmpDir)
+		setCloudStatus(t, false)
+		if err := os.WriteFile(filepath.Join(tmpDir, "pi-list.txt"), []byte("User packages:\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		seedPiScript(t, tmpDir)
+		seedNpmNoop(t, tmpDir)
+		withConfirm(t, func(prompt string) (bool, error) { return false, nil }) // the user says no
+
+		p := &Pi{}
+		stderr := captureStderr(t, func() {
+			if err := p.Run("ignored", nil, []string{"session"}); err != nil {
+				t.Fatalf("Run() should continue after a declined web search install, got %v", err)
+			}
+		})
+		if !strings.Contains(stderr, "Skipping "+piWebSearchPkg) {
+			t.Fatalf("expected a skip message naming the declined package, got:\n%s", stderr)
+		}
+
+		piCalls, err := os.ReadFile(filepath.Join(tmpDir, "pi.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(piCalls), "install "+piWebSearchSource+"\n") {
+			t.Fatalf("declined install still ran:\n%s", piCalls)
+		}
+		if !strings.Contains(string(piCalls), "session\n") {
+			t.Fatalf("expected final pi launch call, got:\n%s", piCalls)
+		}
+	})
+
+	// PI_OFFLINE means "do not reach the npm registry from here". It gated only
+	// the version check, so the install path still hit npm with offline mode
+	// set — the opposite of what the flag promises (2026-09-26 audit).
+	t.Run("PI_OFFLINE skips web search package management", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		setTestHome(t, tmpDir)
+		t.Setenv("PATH", tmpDir)
+		t.Setenv("PI_OFFLINE", "1")
+		setCloudStatus(t, false)
+		if err := os.WriteFile(filepath.Join(tmpDir, "pi-list.txt"), []byte("User packages:\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		seedPiScript(t, tmpDir)
+		seedNpmNoop(t, tmpDir)
+		withConfirm(t, func(prompt string) (bool, error) {
+			t.Fatalf("PI_OFFLINE must not prompt to install a package from npm, got %q", prompt)
+			return false, nil
+		})
+
+		p := &Pi{}
+		stderr := captureStderr(t, func() {
+			if err := p.Run("ignored", nil, []string{"session"}); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+		})
+		if !strings.Contains(stderr, "PI_OFFLINE is set; skipping "+piWebSearchPkg+" setup.") {
+			t.Fatalf("expected the offline skip message, got:\n%s", stderr)
+		}
+
+		piCalls, err := os.ReadFile(filepath.Join(tmpDir, "pi.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(piCalls)
+		if strings.Contains(got, "install "+piWebSearchSource+"\n") || strings.Contains(got, "update "+piWebSearchSource+"\n") {
+			t.Fatalf("PI_OFFLINE still reached npm:\n%s", got)
 		}
 		if !strings.Contains(got, "session\n") {
 			t.Fatalf("expected final pi launch call, got:\n%s", got)

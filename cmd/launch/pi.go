@@ -355,6 +355,14 @@ func ensurePiWebSearchPackage(bin string) {
 		fmt.Fprintf(os.Stderr, "%sCloud is disabled; skipping %s setup.%s\n", ansiGray, piWebSearchPkg, ansiReset)
 		return
 	}
+	// PI_OFFLINE means "do not talk to the npm registry from here". It used to
+	// gate only the version check, so the install path still reached npm (and,
+	// when the package was missing, installed it) with offline mode set
+	// (2026-09-26 audit).
+	if piOfflineModeEnabled() {
+		fmt.Fprintf(os.Stderr, "%sPI_OFFLINE is set; skipping %s setup.%s\n", ansiGray, piWebSearchPkg, ansiReset)
+		return
+	}
 
 	fmt.Fprintf(os.Stderr, "%sChecking Pi web search package...%s\n", ansiGray, ansiReset)
 
@@ -365,6 +373,16 @@ func ensurePiWebSearchPackage(bin string) {
 	}
 
 	if !pkg.installed {
+		// Ask first, like every other integration (claude.go, kimi.go,
+		// hermes.go, muse.go all prompt before installing). This one ran the
+		// install unprompted, so `oaica launch pi` fetched and installed a
+		// third-party npm package the user never agreed to (2026-09-26 audit).
+		ok, err := ConfirmPrompt(fmt.Sprintf("Pi web search (%s) is not installed. Install with npm?", piWebSearchSource))
+		if err != nil || !ok {
+			fmt.Fprintf(os.Stderr, "%s  Skipping %s — install it yourself with `%s install %s` if you want it.%s\n",
+				ansiGray, piWebSearchPkg, bin, piWebSearchSource, ansiReset)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "%sInstalling %s...%s\n", ansiGray, piWebSearchPkg, ansiReset)
 		cmd := exec.Command(bin, "install", piWebSearchSource)
 		cmd.Stdout = os.Stdout
@@ -383,6 +401,15 @@ func ensurePiWebSearchPackage(bin string) {
 		return
 	}
 
+	// The update is asked for too: it is still an npm fetch and a rewrite of
+	// the user's installed package, and a declined prompt must leave the
+	// package alone.
+	ok, err := ConfirmPrompt(fmt.Sprintf("A newer %s is available. Update it now?", piWebSearchSource))
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "%s  Keeping the installed %s — update it yourself with `%s update %s`.%s\n",
+			ansiGray, piWebSearchPkg, bin, piWebSearchSource, ansiReset)
+		return
+	}
 	fmt.Fprintf(os.Stderr, "%sUpdating %s...%s\n", ansiGray, piWebSearchPkg, ansiReset)
 	cmd := exec.Command(bin, "update", piWebSearchSource)
 	cmd.Stdout = os.Stdout

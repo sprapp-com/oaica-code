@@ -18,15 +18,39 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/launch"
 )
 
 const oaicaDefaultHost = "https://api.oaica.com"
 
+// oaicaHost is the router URL every request and every message uses. A
+// credential embedded in OAICA_HOST's userinfo is deliberately NOT part of it:
+// it is promoted to the bearer below (see oaicaUserinfoKey), which is what
+// stops the key from riding along in URLs — and therefore in net/http's
+// transport errors, in `ps` output and in every "couldn't reach %s" line this
+// package prints. Same fix, same reasoning as a remote's base_url
+// (launch.splitRemoteUserinfo).
 func oaicaHost() string {
+	clean, _ := launch.SplitUserinfoCredential(oaicaHostRaw())
+	return clean
+}
+
+// oaicaHostRaw is OAICA_HOST as configured, userinfo included. Only the
+// credential promotion needs this.
+func oaicaHostRaw() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_HOST")); h != "" {
 		return strings.TrimRight(h, "/")
 	}
 	return oaicaDefaultHost
+}
+
+// oaicaUserinfoKey is the key OAICA_HOST carried in its userinfo, if any —
+// the last fallback in oaicaAuthorize, since stripping it from the URL would
+// otherwise have silently de-authenticated that setup.
+func oaicaUserinfoKey() string {
+	_, token := launch.SplitUserinfoCredential(oaicaHostRaw())
+	return token
 }
 
 // oaicaAuthorize attaches the bearer token the router requires on every
@@ -38,6 +62,9 @@ func oaicaAuthorize(req *http.Request) {
 	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
 	if key == "" {
 		key = oaicaSavedAPIKey()
+	}
+	if key == "" {
+		key = oaicaUserinfoKey()
 	}
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -101,7 +128,14 @@ func oaicaSaveAPIKey(key string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(key+"\n"), 0o600)
+	if err := os.WriteFile(path, []byte(key+"\n"), 0o600); err != nil {
+		return err
+	}
+	// WriteFile's mode only applies when it creates the file. The usual way
+	// this file comes into being is a hand-created one (or a copy from another
+	// box), which keeps whatever mode it had — so re-assert, the same way the
+	// auth store and remotes.json already do.
+	return os.Chmod(path, 0o600)
 }
 
 func oaicaClearAPIKey() error {
@@ -150,13 +184,17 @@ var oaicaListModelsDetailed = oaicaListModelsDetailedLive
 func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/models", nil)
 	if err != nil {
-		return nil, err
+		// OAICA_HOST can be configured with the key as URL userinfo
+		// (https://KEY@host), and net/http quotes the URL back in its own
+		// transport errors — so both the host we name and the wrapped cause
+		// are redacted before this reaches stderr.
+		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	oaicaAuthorize(req)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

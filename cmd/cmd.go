@@ -2557,7 +2557,9 @@ instead (see cmd/launch/model_manifest.go).`,
 				return err
 			}
 			d := r.Descriptor()
-			fmt.Printf("added %s (%s, wire=%s, tool_format=%s)\n", r.Name, r.BaseURL, d.Wire, d.ToolFormat)
+			// Redacted: --base-url can itself carry the key as userinfo, and
+			// this line lands in the terminal, the CI log and scrollback.
+			fmt.Printf("added %s (%s, wire=%s, tool_format=%s)\n", r.Name, launch.RedactBaseURL(r.BaseURL), d.Wire, d.ToolFormat)
 			return nil
 		},
 	}

@@ -25,7 +25,18 @@ import (
 	"github.com/ollama/ollama/envconfig"
 )
 
+// oaicaLaunchHost is the router URL. A credential in OAICA_HOST's userinfo is
+// not part of it (see oaicaLaunchHostRaw) — it is promoted to the bearer by
+// oaicaLaunchAPIKeyForEnv instead, which keeps the key out of URLs and so out
+// of net/http transport errors, `ps` output and every message that names the
+// host. Same reasoning as a remote's base_url.
 func oaicaLaunchHost() string {
+	clean, _ := splitRemoteUserinfo(oaicaLaunchHostRaw())
+	return clean
+}
+
+// oaicaLaunchHostRaw is OAICA_HOST as configured, userinfo included.
+func oaicaLaunchHostRaw() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_HOST")); h != "" {
 		return strings.TrimRight(h, "/")
 	}
@@ -155,6 +166,12 @@ func oaicaLaunchAPIKeyForEnv() string {
 	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
 	if key == "" {
 		key = oaicaLaunchSavedAPIKey()
+	}
+	if key == "" {
+		// Last: the key OAICA_HOST carried in its userinfo. oaicaLaunchHost
+		// strips it from the URL, so without this the setup would have lost
+		// its credential entirely.
+		_, key = splitRemoteUserinfo(oaicaLaunchHostRaw())
 	}
 	return key
 }

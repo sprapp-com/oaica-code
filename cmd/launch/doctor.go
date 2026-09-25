@@ -44,7 +44,18 @@ func probeRemote(r userRemote) string {
 		return "FAIL " + redactErr(err).Error()
 	}
 	if k := r.key(); k != "" {
-		req.Header.Set("Authorization", "Bearer "+k)
+		if r.Descriptor().Wire == "anthropic" {
+			// Anthropic-wire remotes (zai-coding-plan, minimax-coding-plan,
+			// a raw api.anthropic.com entry) authenticate with x-api-key +
+			// anthropic-version, not a Bearer header — the same branch
+			// fetchRemoteModels takes. Sending a Bearer to them gets a 401, so
+			// doctor reported a healthy remote as FAIL and (since 2026-09-26)
+			// exited 1 on it.
+			req.Header.Set("x-api-key", k)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+k)
+		}
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

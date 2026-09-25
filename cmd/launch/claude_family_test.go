@@ -509,6 +509,43 @@ func TestRun_WizardPickBeatsTheSavedConfigTier(t *testing.T) {
 	}
 }
 
+// "(same as primary)" is the ONLY way to take a standing config split back off,
+// and it has to survive the plan-save prompt at the end of the wizard. It did
+// not: the caller keyed "the wizard handed back a plan name" on PlanName != "",
+// which is true for a plan the user just SAVED as well as one reused — so a
+// save took the reuse branch, skipped the clear, and ~/.oaica/config.json's
+// sonnet_model came straight back into the child's environment, right after the
+// wizard's own preview said the split was gone (2026-09-26 audit).
+func TestRun_WizardClearSurvivesThePlanSave(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	_, envLog := setupWizardConfigTierRun(t, `{"sonnet_model":"zai/glm-4.5-air"}`)
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "Sonnet") {
+			return "(same as primary)", nil // the explicit clear
+		}
+		return "", nil
+	}
+	// A name at the save prompt is what made the bug reachable: it puts the
+	// wizard on the save path with a non-empty PlanName.
+	tierWizardReadLine = func(prompt string) (string, error) { return "clearing-split", nil }
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air") {
+		t.Errorf("saving the plan resurrected the standing sonnet tier the wizard had cleared:\n%s", data)
+	}
+}
+
 // setupWizardConfigTierRun arms an interactive, wizard-eligible launch whose
 // only tier is a standing config sonnet_model, with a fake `claude` that dumps
 // its environment. Returns the temp home and the env dump's path.

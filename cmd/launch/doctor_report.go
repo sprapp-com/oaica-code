@@ -7,8 +7,10 @@ package launch
 //
 //  1. Every value that is a credential anywhere in this client (the
 //     OAICA_API_KEY environment variable, every remote's key from
-//     remotes.json, every key in auth.json) is collected first, and paths are
-//     reported as present/absent plus their file mode — never their contents.
+//     remotes.json, every key in auth.json, and the key files signin and the
+//     licence flow write — ~/.oaica/api_key, license_key, license.json) is
+//     collected first, and paths are reported as present/absent plus their
+//     file mode — never their contents.
 //  2. The rendered text is scanned against those values *before* it is
 //     printed. If one appears, the report is not printed at all and the
 //     command fails: a redaction-by-intention bug must not become a leaked
@@ -17,7 +19,6 @@ package launch
 import (
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -58,13 +59,12 @@ func reportSecrets() []reportSecret {
 			add("the remotes.json key for "+r.Name, r.key())
 			// A key can also arrive as URL userinfo (https://KEY@host/v1),
 			// which key() never sees because the transport, not this client,
-			// turns it into the Authorization header.
-			if u, perr := url.Parse(strings.TrimSpace(r.BaseURL)); perr == nil && u.User != nil {
-				add("the key embedded in the base_url of "+r.Name, u.User.Username())
-				if pw, has := u.User.Password(); has {
-					add("the key embedded in the base_url of "+r.Name, pw)
-				}
-			}
+			// turns it into the Authorization header. userinfoSecret also
+			// answers for a URL url.Parse rejects (a pasted passphrase with a
+			// space, a bad port) — those cannot be transmitted, but they can
+			// still be printed, and a report that prints a typed credential is
+			// the false negative this scan exists to prevent.
+			add("the key embedded in the base_url of "+r.Name, userinfoSecret(r.BaseURL))
 		}
 	}
 	if store, _, err := loadAuthStore(); err == nil {
@@ -77,7 +77,36 @@ func reportSecrets() []reportSecret {
 			add("the auth.json key for "+name, store.Providers[name].Key)
 		}
 	}
+	// The oaica and licence keys live in files the report does not print, but
+	// the scan is only as good as the value list: a key that is missing from
+	// it is a key the report could print without noticing. `oaica signin`
+	// writes ~/.oaica/api_key, `oaica pull`/serve accept ~/.oaica/license_key,
+	// and the launch-side licence state is ~/.oaica/license.json
+	// (launch/license.go). Three files, three places the same key can sit.
+	if home := reportHome(); home != "" {
+		add("the key saved by `oaica signin` (~/.oaica/api_key)",
+			readSecretFile(filepath.Join(home, ".oaica", "api_key")))
+		add("the licence key in ~/.oaica/license_key",
+			readSecretFile(filepath.Join(home, ".oaica", "license_key")))
+	}
+	if f, err := loadLicenseFile(); err == nil {
+		add("the licence key in ~/.oaica/license.json", f.Key)
+	}
 	return secrets
+}
+
+// readSecretFile returns a file's trimmed contents, or "" for any error —
+// missing, unreadable, a directory. Only ever called to feed the leak scan,
+// which compares values and never prints them.
+func readSecretFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // scanReportForSecrets returns the labels of any secrets whose value appears
@@ -141,7 +170,11 @@ func buildDoctorReport() (string, bool) {
 	if home != "" {
 		describeFile(&b, filepath.Join(home, ".oaica", "auth.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "remotes.json"), true)
+		describeFile(&b, filepath.Join(home, ".oaica", "api_key"), true)
+		describeFile(&b, filepath.Join(home, ".oaica", "license_key"), true)
+		describeFile(&b, filepath.Join(home, ".oaica", "license.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "config.json"), false)
+		describeFile(&b, filepath.Join(home, ".oaica", "local_servers.json"), false)
 		describeFile(&b, filepath.Join(home, ".oaica", "cache"), false)
 	} else {
 		fmt.Fprintln(&b, "  (no home directory — cannot list configuration files)")

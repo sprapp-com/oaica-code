@@ -57,7 +57,16 @@ type tierWizardChoice struct {
 	HaikuModel    string // empty = same as primary
 	OversizeModel string // empty = no oversize leg
 	RoutePolicy   string // always a valid policy after the wizard
-	PlanName      string // non-empty when the user saved the choice
+	PlanName      string // non-empty when the wizard handed back a plan (reused or saved)
+	// PlanReused separates the two reasons PlanName is non-empty, because the
+	// caller must treat them differently: a REUSED plan supplies the tiers and
+	// skipped the steps (nothing else to apply), while a just-SAVED plan is
+	// named after answers the user gave here, and those answers must still be
+	// applied. Keying the caller on PlanName != "" alone made a save look like
+	// a reuse, so an answered "(same as primary)" clear was dropped and
+	// ~/.oaica/config.json refilled the tier right after the preview promised
+	// it was gone (2026-09-26 audit).
+	PlanReused bool // the plan came from tierWizardReusedPlan, not the save prompt
 
 	// The flags below say whether an EMPTY value above is an answer or
 	// just an unanswered step. Both readings of "" are real: a step the user
@@ -529,7 +538,7 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 	} else if reused {
 		// Clear the pre-set default: nothing else was answered, and the caller
 		// must treat the policy as unset so the plan's own route_policy wins.
-		c.PlanName, c.RoutePolicy = plan, ""
+		c.PlanName, c.PlanReused, c.RoutePolicy = plan, true, ""
 		return c, nil
 	}
 
@@ -630,7 +639,7 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 					if plan, reused, err := tierWizardReusedPlan(); err != nil {
 						return c, err
 					} else if reused {
-						c.PlanName, c.RoutePolicy = plan, ""
+						c.PlanName, c.PlanReused, c.RoutePolicy = plan, true, ""
 						return c, nil
 					}
 					continue // chose "start from scratch" again: re-ask this step

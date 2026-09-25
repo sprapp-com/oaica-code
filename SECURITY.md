@@ -46,11 +46,13 @@ Relevant when assessing an issue, and when deciding what to report:
   endpoint you selected (`api.oaica.com` by default, or a remote you
   configured). There is no telemetry, no crash reporting, and no analytics.
   The one unprompted request the client makes is an update check: a plain GET
-  of `oaica.com/download/VERSION.txt`, at most once per 20 hours, with no body
-  and no identifiers — it tells that host your IP and that oaica is installed,
-  and `OAICA_NO_UPDATE_CHECK=1` turns it off. `oaica launch <agent>` will also
-  offer to run an agent's own vendor installer when that agent is missing; it
-  asks first, and the full list of destinations is in
+  of the release's `VERSION.txt`, at most once per 20 hours, with no body and
+  no identifiers — it tells that host your IP and that oaica is installed, and
+  `OAICA_NO_UPDATE_CHECK=1` turns it off. `oaica launch <agent>` will also
+  offer to run an agent's own vendor installer when that agent is missing, and
+  `oaica launch pi` asks before installing its npm-hosted web-search package
+  (`PI_OFFLINE=1` suppresses that entirely); every one of those asks first, and
+  the full list of destinations is in
   [docs/ENTERPRISE.md](docs/ENTERPRISE.md#network-connections).
 - **Files written.** Configuration and state live under `~/.oaica/` (config,
   plans, remotes, caches, usage counters). Installers write the binary into a

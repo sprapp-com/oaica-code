@@ -22,14 +22,15 @@ describing this binary.
 
 ## Network connections
 
-Exactly four outbound paths exist. Nothing else in the client opens a socket.
+Exactly five outbound paths exist. Nothing else in the client opens a socket.
 
 | # | Destination | When | What is sent | Off switch |
 |---|---|---|---|---|
 | 1 | Your model endpoint | Every model call | Your prompts, attachments and tool output — the traffic you asked for | Choose the endpoint (`OAICA_HOST`, a remote, or a local `oaica serve`) |
 | 2 | `oaica.com` | Install and upgrade only | Nothing; it serves the install scripts | Install from the GitHub release instead |
-| 3 | `oaica.com/download/VERSION.txt` | At most once per 20h, from any command that would print the update notice | A plain GET; **sends no body, no identifiers**. The request reveals your IP and that oaica is installed | `OAICA_NO_UPDATE_CHECK=1` |
+| 3 | `github.com/sprapp-com/oaica-code/releases/latest/download/VERSION.txt` | At most once per 20h, from any command that would print the update notice | A plain GET for the release's version file; **sends no body, no identifiers**. The request reveals your IP and that oaica is installed | `OAICA_NO_UPDATE_CHECK=1` |
 | 4 | Vendor installers for optional integrations | Only when you run `oaica launch <agent>` for an agent that is not installed and you confirm the install | The vendor's own installer download | Don't launch that agent; install it yourself first |
+| 5 | `registry.npmjs.org` | Only when you run `oaica launch pi`, and you confirm the prompt | A GET for the `@ollama/pi-web-search` package version, and the `pi install`/`pi update` it then runs | Decline the prompt, or set `PI_OFFLINE=1`. The check is skipped in offline mode, and `oaica launch pi` installs Pi itself only after its own prompt |
 
 The endpoint in row 1 defaults to `https://api.oaica.com` (an
 OpenAI-compatible router) and is where the work actually goes. If prompts may
@@ -55,8 +56,11 @@ HTTP URLs.
 There is none. No analytics, no crash reporting, no usage beacons, no
 "anonymous" install ID. Grep the tree for `telemetry`, `analytics`, `sentry`,
 `posthog`, `segment` and you will find the TUI's own render helpers and
-nothing else. The version check in row 3 is the only unprompted outbound
-request the client ever makes, and it carries no payload.
+nothing else. Row 3 is the only unprompted outbound request the client makes,
+and it carries no payload — every other non-model path is behind a prompt you
+answer, or behind a command you typed (`oaica launch pi` is the one to know
+about: it asks before installing its web-search package, and row 5 lists what
+that touches).
 
 ## Files on disk
 
@@ -71,8 +75,10 @@ the modes it actually finds so you can verify that on a given host.
 | `~/.oaica/remotes.json` | Your remotes: base URLs, and any inline `api_key` | **Possibly** |
 | `~/.oaica/config.json`, `plans.json`, `models.json`, `aliases.json` | Tiers, named plans, model manifest, aliases | No |
 | `~/.oaica/model_picks.json`, `picker_cache.json` | Picker frequency and cached inventory | No (no URLs or keys — the cached row is name/metadata only) |
+| `~/.oaica/local_servers.json` | Which `oaica serve` instances are running, and their ports | No |
 | `~/.oaica/requests.log` | One line per launch request: model name, which backend served it (a label, or the endpoint URL with any credential redacted), message *sizes*, timing, status | No — sizes, not content |
 | `~/.oaica/cache/` | Cached catalog and probe answers | No |
+| `~/.oaica/update_check.json` | Last update check: when, and which version was newest | No |
 | `~/.oaica/models/` | Downloaded GGUF weights | No |
 | `~/.oaica/license_key`, `license.json` | Purchased-license state | **Yes** (a licence key, not an API key) |
 
@@ -101,14 +107,29 @@ argument list. Concretely, the client:
   host stays readable so you can still tell *where* a credential is
   configured, which is often what you need in a ticket;
 - refuses to print `oaica doctor --report` at all if any secret value would
-  appear in it, rather than printing a partially-redacted bundle;
+  appear in it, rather than printing a partially-redacted bundle. The scan
+  covers every place a key can sit — the environment, `remotes.json`,
+  `auth.json`, and the `api_key`, `license_key` and `license.json` files — so
+  a value the report does not currently print is still checked against it;
 - promotes a bare `https://<token>@host/v1` remote into a normal bearer token
   and strips it from the URL, so the secret stops travelling in URLs, in
   command lines visible to `ps`, and in `net/http` error text.
 
 A `https://user:password@host/v1` remote is deliberately left intact, because
 that is a real Basic-auth credential and rewriting it would change how the
-request authenticates; it is still redacted wherever it is printed.
+request authenticates; it is still redacted wherever it is printed. The same
+applies to an `OAICA_HOST` that carries a credential: the token is promoted to
+the bearer and stripped from the URL, so it does not appear in error text, in
+`ps`, or in any message naming the host.
+
+One known exception, stated rather than implied: `oaica launch kimi` passes its
+generated configuration to Kimi's own CLI as a `--config <json>` argument, and
+that JSON contains the provider key — so for that one integration the key is in
+the child process's argument list, readable from `/proc/<pid>/cmdline` by any
+local user. Codex, Claude Code, opencode and the rest receive their credentials
+through the environment or a config file instead. If that matters on a shared
+host, don't launch Kimi there, or run it on a machine where you are the only
+user.
 
 ## Installing, pinning, air-gapped
 

@@ -1023,14 +1023,24 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 			return fmt.Errorf("launch wizard: %w", err)
 		}
 		if w.PlanName != "" {
-			// Reused a saved plan: it supplies the tiers, so the steps were
-			// skipped and there is nothing else to apply here. In particular
-			// the policy and the oversize leg are NOT applied from w — both
-			// are unanswered on this path, which is what lets resolvePlanTier
-			// below read them out of the plan (pre-setting the wizard's "auto"
-			// here silently outranked a plan's local-only; 2026-09-26 audit).
+			// Either a reused plan or one just saved; both resolve below
+			// exactly like a typed --plan.
 			planName = w.PlanName
-		} else {
+		}
+		if !w.PlanReused {
+			// A REUSED plan supplies the tiers, so its steps were skipped and
+			// there is nothing else to apply — not even the policy or the
+			// oversize leg, which are unanswered on that path and must stay
+			// unanswered so resolvePlanTier below reads them out of the plan
+			// (pre-setting the wizard's "auto" here silently outranked a
+			// plan's local-only; 2026-09-26 audit).
+			//
+			// Everything else — including the save path — applies the steps
+			// the user actually answered. Gating this on PlanName == "" let a
+			// save masquerade as a reuse, so an answered "(same as primary)"
+			// clear was dropped and the standing ~/.oaica/config.json tier
+			// came back (2026-09-26 audit).
+			//
 			// Only the steps the wizard actually ANSWERED may write the tier
 			// slots: esc on the first step hands back an all-empty choice,
 			// and assigning it unconditionally silently dropped a typed

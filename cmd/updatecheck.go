@@ -25,12 +25,17 @@ import (
 	"github.com/ollama/ollama/version"
 )
 
-// updateCheckURL serves a bare "version=X.Y.Z\ncommit=..." file (see
-// docs/RELEASE.md's release process) -- already the source of truth
-// install.sh and every other version check use, so there's nothing new to
-// keep in sync here. A package var, not a const, so tests can point it at
-// a local httptest server -- see updateCheckURLForTest in the test file.
-var updateCheckURL = "https://oaica.com/download/VERSION.txt"
+// updateCheckURL serves the release's own VERSION.txt -- a bare
+// "version=X.Y.Z\ncommit=..." file. It points at the GitHub release rather
+// than oaica.com/download/, which is what docs/RELEASE.md calls the source of
+// truth: the release asset is written by the same workflow that builds the
+// archives, so it cannot drift. The oaica.com copy is published by a manual
+// Pages deploy nothing forces anyone to run, and it did drift -- on
+// 2026-09-26 it still served 0.5.45 while the newest release was oaica-v0.5.46,
+// so every installed client was told it was up to date (2026-09-26 audit). A
+// package var, not a const, so tests can point it at a local httptest server --
+// see updateCheckURLForTest in the test file.
+var updateCheckURL = "https://github.com/sprapp-com/oaica-code/releases/latest/download/VERSION.txt"
 
 // updateCheckURLForTest points updateCheckURL at url and returns a func
 // that restores the real one -- call via defer.
@@ -185,7 +190,11 @@ func checkForUpdate() {
 	if cache.Notified == latest {
 		return // already told the user about this exact version
 	}
-	fmt.Fprintf(os.Stderr, "\n\033[33m! oaica update available: %s -> %s\033[0m\n  Run: curl -fsSL https://oaica.com/install.sh | bash\n\n",
+	// The install command names the release's own installer, not
+	// oaica.com/install.sh: that copy is published by the same manual Pages
+	// deploy that made this check report a stale version, so following it can
+	// install something older than the notice just announced.
+	fmt.Fprintf(os.Stderr, "\n\033[33m! oaica update available: %s -> %s\033[0m\n  Run: curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash\n\n",
 		version.Version, latest)
 	cache.Notified = latest
 	saveUpdateCheckCache(cache)

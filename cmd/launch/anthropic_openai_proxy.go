@@ -1676,7 +1676,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, nil)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "build request: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "build request: "+redactCredentials(err.Error()))
 		return
 	}
 	if key != "" {
@@ -1728,7 +1728,7 @@ func nativeAnthropicModelsPassthrough(w http.ResponseWriter, r *http.Request) {
 func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream, headerName, headerValue string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream, nil)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
 		return
 	}
 	for k, vs := range r.Header {
@@ -1911,7 +1911,7 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue string) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+err.Error())
+		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactCredentials(err.Error()))
 		return
 	}
 	// Forward the client's own Anthropic-protocol headers (anthropic-

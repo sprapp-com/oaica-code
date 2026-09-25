@@ -130,6 +130,65 @@ func TestDoctorReport_FlagsWorldReadableCredentials(t *testing.T) {
 	}
 }
 
+// TestDoctorReport_ScansEveryKeyFile: the scan is only as good as its value
+// list, and three key files were missing from it — ~/.oaica/api_key (written
+// by `oaica signin`), ~/.oaica/license_key and ~/.oaica/license.json. A key
+// absent from the list is a key the report could start printing without
+// anything noticing, so the list is pinned, not the current rendering.
+func TestDoctorReport_ScansEveryKeyFile(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	dir := filepath.Join(home, ".oaica")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		signinKey  = "sk-signin-file-0123456789"
+		licenseKey = "lic-file-key-0123456789"
+		jsonKey    = "lic-json-key-0123456789"
+	)
+	files := map[string]string{
+		"api_key":     signinKey + "\n",
+		"license_key": licenseKey + "\n",
+		"license.json": `{"key":"` + jsonKey + `","instance_id":"i","instance_name":"n"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	values := map[string]bool{}
+	for _, s := range reportSecrets() {
+		values[s.value] = true
+	}
+	for _, want := range []string{signinKey, licenseKey, jsonKey} {
+		if !values[want] {
+			t.Errorf("the scan does not know about %q — a report containing it would print it", want)
+		}
+	}
+
+	// And the report must show all three files, each mode-annotated as
+	// sensitive, so the user can see where their keys live.
+	report, _ := buildDoctorReport()
+	for _, name := range []string{"api_key", "license_key", "license.json"} {
+		line := ""
+		for _, l := range strings.Split(report, "\n") {
+			if strings.HasSuffix(strings.TrimSpace(l), name) {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("the report does not list %s:\n%s", name, report)
+			continue
+		}
+		if !strings.Contains(line, "present  mode 0600") {
+			t.Errorf("%s should be listed as a present 0600 credential file, got %q", name, line)
+		}
+	}
+}
+
 // TestDoctorCmd_ReportFlagWired keeps the flag honest: `--report` must change
 // what doctor prints, and the default path must not.
 func TestDoctorCmd_ReportFlagWired(t *testing.T) {
