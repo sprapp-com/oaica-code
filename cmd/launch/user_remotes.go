@@ -73,7 +73,13 @@ type userRemote struct {
 	// building endpoint URLs (e.g. "/v1/chat/completions"). Defaults to "v1".
 	// z.ai is the notable exception: it uses "v4"
 	// (https://api.z.ai/api/paas/v4/chat/completions). Leave empty for the
-	// common OpenAI "v1" layout.
+	// common OpenAI "v1" layout. Set it to remoteVersionNone ("none") for an
+	// endpoint whose base_url already ends at the OpenAI root and must not have
+	// a segment appended (Google: ".../v1beta/openai").
+	//
+	// The version belongs in base_url OR in Version, never both: whatever
+	// base_url ends with is preserved and Version is appended to it, so a
+	// version in each place resolves to "/v4/v1" and 404s every request.
 	Version string `json:"version"`
 	// Wire is the request/response protocol the box speaks: "openai"
 	// (/v1/chat/completions, the default) or "anthropic" (/v1/messages). Empty
@@ -455,14 +461,28 @@ func splitRemoteUserinfo(baseURL string) (cleanURL, token string) {
 	return u.String(), token
 }
 
+// remoteVersionNone is the Version value meaning "append no version segment at
+// all". It exists for endpoints whose version is a path segment of base_url
+// itself -- Google's OpenAI-compatible root is
+// "https://generativelanguage.googleapis.com/v1beta/openai", where appending
+// "/v1" gives a 404 (".../openai/v1/chat/completions"). Such a row cannot be
+// fixed by defaulting, because the default is the thing that breaks it.
+const remoteVersionNone = "none"
+
 // openAIBase returns the remote's full OpenAI base including its API version
 // prefix, the value endpoint URLs are appended to. Almost all OpenAI-compatible
 // endpoints version under "v1" ("https://api.deepseek.com/v1/chat/completions");
-// z.ai versions under "v4" ("https://api.z.ai/api/paas/v4/chat/completions").
-// The version defaults to "v1"; set userRemote.Version to override.
+// z.ai versions under "v4" ("https://api.z.ai/api/paas/v4/chat/completions"),
+// as do the other rows that carry their version in the base URL -- the version
+// may live in base_url OR in userRemote.Version, but only in one of them.
+// The version defaults to "v1"; set userRemote.Version to override it, or to
+// remoteVersionNone to append nothing.
 func (r userRemote) openAIBase() string {
 	v := strings.Trim(strings.TrimSpace(r.Version), "/")
-	if v == "" {
+	switch {
+	case strings.EqualFold(v, remoteVersionNone):
+		return remoteBaseURL(r)
+	case v == "":
 		v = "v1"
 	}
 	return remoteBaseURL(r) + "/" + v
