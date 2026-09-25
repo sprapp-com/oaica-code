@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -76,6 +77,16 @@ func DoctorCmd() *cobra.Command {
 					}
 					return fmt.Sprintf("FAIL http %d", resp.StatusCode)
 				}()
+				// A probe that failed is a failure of the CHECK, not just a
+				// line of output: doctor promised exit 1 for scripts (header
+				// above, docs/CLAUDE_TIERS.md, site/index.html) but only a
+				// malformed remotes.json ever set this, so an unreachable
+				// remote or a 401 printed FAIL, then "all checks passed",
+				// exit 0 — a cron job that greps the exit code saw green
+				// (2026-09-26 audit).
+				if strings.HasPrefix(status, "FAIL") {
+					failed = true
+				}
 				policy := r.RoutePolicy
 				if _, perr := parseRoutePolicy(policy); perr != nil {
 					status = "INVALID route_policy " + policy
@@ -106,7 +117,7 @@ func DoctorCmd() *cobra.Command {
 
 			fmt.Printf("\ndefault route policy (per launch: --route-policy flag > the primary remote's route_policy > %s)\n",
 				RouteLocalFirst)
-			fmt.Println("policies: local-first | remote-first | auto | local-only | remote-only")
+			fmt.Println("policies: local-first | remote-first | auto | local-only | remote-only | weighted")
 			fmt.Println("oversize: per-launch --oversize <model> (no remotes.json default yet)")
 
 			if failed {
