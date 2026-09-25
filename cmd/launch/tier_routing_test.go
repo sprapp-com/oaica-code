@@ -967,6 +967,87 @@ func TestEnvVars_TakesTheLargestLegWindowNotThePrimarys(t *testing.T) {
 	}
 }
 
+// A plan's stored oversize leg could not be dropped for one launch: the flag's
+// value is what says "no leg", and an empty value was indistinguishable from
+// "flag not passed", so tier_plan_profiles.go refilled it from the plan. The
+// wizard offered a "none" row but cannot run with a --plan. `--oversize none`
+// is now that answer, spelled rather than implied (2026-09-26 audit).
+func TestRun_OversizeNoneDropsThePlansLeg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"http://zai:8080/v1","api_key":"k2","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	if err := PlanSet("p", TierPlanProfile{Model: "box/kat-awq", OversizeModel: "zai/glm-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	origProbe := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = origProbe })
+	remoteContextWindowFn = func(proxyRoute) int { return 0 }
+
+	models := []LaunchModel{{Name: "box/kat-awq", Remote: true}, {Name: "zai/glm-4.6", Remote: true}}
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--plan", "p", "--oversize", "none"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if strings.Contains(stderr, "oversize: requests past") {
+		t.Errorf("--oversize none did not drop the plan's leg (stderr: %s)", stderr)
+	}
+	// ...and the plan still has it when the flag says nothing.
+	stderr = captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--plan", "p"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "oversize: requests past") {
+		t.Errorf("the plan's stored oversize leg is gone without the flag asking for it (stderr: %s)", stderr)
+	}
+}
+
+// A flag passed with no value is not the same as a flag not passed: reading it
+// as absent silently inherited a plan's stored leg for `--oversize="$LEG"` with
+// LEG unset, and the same for a policy. Both are refused by name now, pointing
+// at the spelling that gets what was meant (2026-09-26 audit).
+func TestRun_EmptyFlagValueIsRefused(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+
+	for _, c := range []struct {
+		flag string
+		args []string
+	}{
+		{"--oversize", []string{"--oversize="}},
+		{"--route-policy", []string{"--route-policy="}},
+		// Trailing with nothing after it at all: the extractor's guard
+		// (i+1 < len(args)) leaves the bare flag in the passthrough list, so
+		// this must be refused too — otherwise it reaches the child as an
+		// unknown arg.
+		{"--oversize", []string{"--oversize"}},
+		{"--route-policy", []string{"--route-policy"}},
+	} {
+		err := (&Claude{}).Run("box/kat-awq", nil, c.args)
+		if err == nil || !strings.Contains(err.Error(), c.flag) {
+			t.Errorf("%s= gave %v, want an error naming the empty value", c.flag, err)
+		}
+	}
+}
+
 // envVars' native-primary fallback (a bare "claude/opus" primary has no probed
 // window of its own) advertised the OAICA leg's RAW window, skipping the
 // output-budget reserve that every other path applies through

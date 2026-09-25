@@ -117,6 +117,20 @@ func daemonHasModelLiveUncached(model string) (bool, bool) {
 	return resp.StatusCode == http.StatusOK, true
 }
 
+// flagPassed reports whether args carries name as a flag, in either spelling
+// ("--x", "--x=…"), including one with an empty value. Run's extractors strip
+// a flag's value and cannot say afterwards whether they ever saw it, which is
+// all the difference between "the caller asked for nothing" and "the caller
+// said nothing" (2026-09-26 audit).
+func flagPassed(args []string, name string) bool {
+	for _, a := range args {
+		if a == name || strings.HasPrefix(a, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 // hasSourcePrefix reports whether model carries one of the explicit source
 // prefixes resolveLaunchEndpoint understands ("router/", "oaica/",
 // "ollama/", "daemon/"). Callers outside this file use it to skip the
@@ -241,6 +255,13 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 	}
 	return launchEndpoint{}, fmt.Errorf("model %q not found: not a user remote (~/.oaica/remotes.json); %s", model, strings.Join(tried, "; "))
 }
+
+// oversizeNoneValue is the --oversize value that means "no oversize leg",
+// which is how a plan's stored leg is dropped for one launch. It is spelled
+// because no model id can be: an empty value is what an unset shell variable
+// produces, and reading THAT as a deliberate drop would silently remove a leg
+// a user meant to keep.
+const oversizeNoneValue = "none"
 
 // daemonEndpoint is the local Ollama daemon's OpenAI-compatible endpoint for
 // one of its own model ids. One definition, so the primary slot and a tier
@@ -993,6 +1014,10 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// "unset", so a typed --sonnet-model was replaced by "" and the launch ran
 	// single-model at the primary's price.
 	wizardEligible := tierWizardEligible(args)
+	// Kept for flagPassed below: "the flag was passed with no value" is a
+	// different thing from "the flag was not passed", and the extractors cannot
+	// tell them apart once they have stripped it.
+	rawArgs := args
 	forceTools, args := extractForceTools(args)
 	sonnetModel, args := extractSonnetModel(args)
 	haikuModel, args := extractHaikuModel(args)
@@ -1007,6 +1032,23 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
 	oversizeModel, args := extractOversizeModel(args)
+	// A flag passed with nothing after it is not "not passed": reading it as
+	// absent silently inherited a plan's stored value for `--oversize="$LEG"`
+	// with LEG unset, and there was no way at all to drop a plan's oversize leg
+	// — the plan refill (tier_plan_profiles.go) fills every empty value, and the
+	// wizard's "none" row is unreachable with a --plan (2026-09-26 audit).
+	if flagPassed(rawArgs, "--route-policy") && policyArg == "" {
+		return fmt.Errorf("--route-policy needs a policy (local-first, remote-first, auto, local-only, remote-only, weighted)")
+	}
+	if flagPassed(rawArgs, "--oversize") && oversizeModel == "" {
+		return fmt.Errorf("--oversize needs a model — use --oversize none to drop a plan's stored leg")
+	}
+	// "--oversize none" is that drop, spelled rather than implied (an empty
+	// value cannot say it: see above).
+	oversizeDeclined := oversizeModel == oversizeNoneValue
+	if oversizeDeclined {
+		oversizeModel = ""
+	}
 	shardWeights, args := extractShardFlags(args)
 	// --wizard forces steps 2-4 even when the eligibility gate would skip
 	// them (a --model launch, mainly); it cannot rescue a non-interactive
@@ -1144,6 +1186,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		policyArg, oversizeModel, err = resolvePlanTier(planName, policyArg, oversizeModel)
 		if err != nil {
 			return fmt.Errorf("--plan: %w", err)
+		}
+		if oversizeDeclined {
+			// `--oversize none` is an ANSWER, the one the wizard's "none" row
+			// gives: the refill just above must not bring the plan's leg back
+			// (2026-09-26 audit).
+			oversizeModel = ""
 		}
 	}
 	// Standing user preference fills what neither a flag nor a plan set:

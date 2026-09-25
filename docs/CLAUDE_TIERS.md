@@ -246,6 +246,13 @@ the permitted side of a pinned policy. Pinned policies (`local-only`,
 serves as a breaker fallback leg and gets the 30s health probe.
 `X-Oaica-Route` always names the leg that actually served.
 
+`--oversize none` drops the leg for one launch — the way to shed an
+oversize model a plan stored, without editing the plan. The value is
+spelled because an *empty* one is not a drop: `--oversize=` (what an unset
+shell variable expands to) is refused by name, same as `--route-policy=`,
+rather than silently reading as "not passed" and letting the plan refill
+the stored leg. Drop the flag to keep the stored value.
+
 remotes.json now accepts `"route_policy": "local-first|remote-first|auto|
 local-only|remote-only|weighted"` per remote as the default for launches
 using it, plus `"weight": N` (see `weighted`, above) to opt that remote
