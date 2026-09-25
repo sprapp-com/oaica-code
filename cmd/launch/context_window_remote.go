@@ -237,9 +237,19 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 	//     --oversize leg was never the winner: escalation went to whichever
 	//     alternate came first, typically the smaller one.
 	//
-	// Keyed by BaseURL, which is how the route table itself keys fallbacks; a
-	// native leg has none and carries no window either way. Only a 0 is
-	// filled, so a leg that already knows its window is never overwritten.
+	// Keyed by BaseURL AND the upstream model, which is how the route table
+	// itself keys fallbacks; a native leg has none and carries no window either
+	// way. Only a 0 is filled, so a leg that already knows its window is never
+	// overwritten.
+	//
+	// The model half is not optional: two legs on ONE remote (--model
+	// box/small --sonnet-model box/big, the documented same-remote split) share
+	// a base URL, and the fallback list holds a single copy of it — the
+	// primary's. Matching on the URL alone stamped the SIBLING's window onto
+	// that copy, so the failover leg claimed a ceiling its own model does not
+	// have: escalationTarget then picked it as the strongest leg (it ranks by
+	// ContextWindow) and oversizeSwap compared against a number nobody probed
+	// (2026-09-26 audit).
 	for _, w := range []struct {
 		ep launchEndpoint
 		n  int
@@ -248,11 +258,15 @@ func (p *tierPlan) applyContextWindowsToRoutes() *tierPlan {
 			continue
 		}
 		for i := range p.Routes.Fallbacks {
-			if p.Routes.Fallbacks[i].BaseURL == w.ep.BaseURL && p.Routes.Fallbacks[i].ContextWindow == 0 {
+			if p.Routes.Fallbacks[i].BaseURL == w.ep.BaseURL &&
+				p.Routes.Fallbacks[i].UpstreamModel == w.ep.UpstreamModel &&
+				p.Routes.Fallbacks[i].ContextWindow == 0 {
 				p.Routes.Fallbacks[i].ContextWindow = w.n
 			}
 		}
-		if p.Routes.Oversize.BaseURL == w.ep.BaseURL && p.Routes.Oversize.ContextWindow == 0 {
+		if p.Routes.Oversize.BaseURL == w.ep.BaseURL &&
+			p.Routes.Oversize.UpstreamModel == w.ep.UpstreamModel &&
+			p.Routes.Oversize.ContextWindow == 0 {
 			p.Routes.Oversize.ContextWindow = w.n
 		}
 	}
@@ -282,19 +296,31 @@ func (p tierPlan) contextEnvVars() []string {
 	if p.PrimaryContext <= 0 {
 		return nil
 	}
-	reserve := maxOutputTokensReserve
-	if m, err := loadModelManifest(); err == nil {
-		if e, ok := m.Get(p.PrimaryName); ok && e.DefaultMaxOutputTokens > 0 {
-			reserve = e.DefaultMaxOutputTokens
-		}
-	}
-	usable := p.PrimaryContext - reserve
-	if usable <= 0 {
-		usable = p.PrimaryContext
-	}
-	v := strconv.Itoa(usable)
+	v := strconv.Itoa(usableContextWindow(p.PrimaryName, p.PrimaryContext))
 	return []string{
 		"CLAUDE_CODE_MAX_CONTEXT_TOKENS=" + v,
 		"CLAUDE_CODE_AUTO_COMPACT_WINDOW=" + v,
 	}
+}
+
+// usableContextWindow is the raw window minus the output budget Claude Code
+// will ask for on top of the input, so the advertised ceiling leaves room for
+// it (vLLM enforces input+output <= max_model_len). A window smaller than the
+// reserve is returned as-is rather than as a negative. The manifest can
+// override the reserve per model (a model that only spends 8k on output does
+// not need 32k held back).
+func usableContextWindow(model string, window int) int {
+	if window <= 0 {
+		return 0
+	}
+	reserve := maxOutputTokensReserve
+	if m, err := loadModelManifest(); err == nil {
+		if e, ok := m.Get(model); ok && e.DefaultMaxOutputTokens > 0 {
+			reserve = e.DefaultMaxOutputTokens
+		}
+	}
+	if usable := window - reserve; usable > 0 {
+		return usable
+	}
+	return window
 }

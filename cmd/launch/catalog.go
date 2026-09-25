@@ -32,8 +32,8 @@ type CatalogVariant struct {
 	// ParamCount, ContextWindow, DeploySizeGB mirror the sizing columns in
 	// sprapp-prism's variant table so the same numbers can drive both the
 	// research doc and a public catalog page without hand-copying.
-	ParamCount    string `json:"param_count,omitempty"`    // free text: "700M", "13B" — matches how the source doc labels these, not always a clean int
-	ContextWindow int    `json:"context_window,omitempty"`
+	ParamCount    string  `json:"param_count,omitempty"` // free text: "700M", "13B" — matches how the source doc labels these, not always a clean int
+	ContextWindow int     `json:"context_window,omitempty"`
 	DeploySizeGB  float64 `json:"deploy_size_gb,omitempty"`
 
 	// Multimodal mirrors the "all 5 ship multimodal" column (vision/audio/OCR).

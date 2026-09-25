@@ -555,7 +555,7 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 		return plan, sonnetModel, haikuModel, nil
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		dropSonnet, dropHaiku, attributed := savedTiersToDrop(err, savedSonnet, savedHaiku)
+		dropSonnet, dropHaiku, _ := savedTiersToDrop(err, savedSonnet, savedHaiku)
 		if !dropSonnet && !dropHaiku {
 			if attempt == 0 && (savedSonnet || savedHaiku) {
 				// Unattributed and there ARE saved tiers: the error cannot be
@@ -582,11 +582,11 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 		if dropHaiku {
 			haikuModel, savedHaiku, dropped = "", false, append(dropped, "haiku_model")
 		}
-		if attributed {
-			fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
-		} else {
-			fmt.Fprintf(os.Stderr, "config: %v — the saved tier(s) %s are the only inputs a past `oaica config set` could have invalidated, so the launch retries without them. `oaica config show` lists them, `oaica config set sonnet-model|haiku-model -` clears one\n", err, strings.Join(dropped, " + "))
-		}
+		// Only an ATTRIBUTED drop can reach here: a drop is reported only when
+		// the error names its leg, and naming it is what sets attributed. The
+		// unattributed case returns above (one identical retry, then fail), so
+		// there is no "we are guessing it was yours" message any more.
+		fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
 		var retryBuf strings.Builder
 		plan, err = buildTierPlanBuffered(model, sonnetModel, haikuModel, forceTools, &retryBuf)
 		if err == nil {
@@ -897,9 +897,20 @@ func (p tierPlan) envVars(anthropicBaseURL, clientToken string) []string {
 	// PRIMARY's window only, and a larger probed sonnet leg (65536 primary vs
 	// 262144 sonnet) was silently dropped, leaving Claude Code to auto-compact
 	// a subagent session at a quarter of the leg's real window (2026-09-26).
-	for _, v := range []int{p.SecondaryContext, p.HaikuContext} {
+	for _, leg := range []struct {
+		name string
+		raw  int
+	}{{p.SecondaryName, p.SecondaryContext}, {p.HaikuName, p.HaikuContext}} {
+		v := leg.raw
 		if v > 0 {
-			v = max(v, p.PrimaryContext)
+			// Compare USABLE windows, not raw ones: the pair already in env
+			// holds PrimaryContext minus the output reserve (contextEnvVars),
+			// so raising it to a RAW leg window would quietly hand back the
+			// 32k that reserve exists to hold — and auto-compact would fire
+			// 32k tokens later, straight into the upstream's "prompt is too
+			// long" 400 that reserving the output budget prevents
+			// (2026-09-26 audit; the removed `continue` had hidden it).
+			v = max(usableContextWindow(leg.name, v), usableContextWindow(p.PrimaryName, p.PrimaryContext))
 			if l, ok := lookupCloudModelLimit(p.PrimaryName); ok && v < l.Context {
 				v = l.Context
 			}
@@ -954,6 +965,10 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// Set below by standingTierModels: which tiers came from the saved config
 	// rather than a flag/plan. See resolveTierPlan for the one use.
 	savedSonnet, savedHaiku := false, false
+	// Set by the wizard: "(same as primary)" is a deliberate CLEAR, and an
+	// empty value that came from an answered step must not be refilled from
+	// ~/.oaica/config.json (see the standingTierModels call below).
+	clearedSonnet, clearedHaiku := false, false
 	planName, args := extractPlanFlag(args)
 	briefMode, args := extractBriefMode(args)
 	policyArg, args := extractRoutePolicy(args)
@@ -1008,26 +1023,46 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 			return fmt.Errorf("launch wizard: %w", err)
 		}
 		if w.PlanName != "" {
-			// Reused a saved plan: it supplies every tier, so the steps were
-			// skipped and there is nothing else to apply here.
+			// Reused a saved plan: it supplies the tiers, so the steps were
+			// skipped and there is nothing else to apply here. In particular
+			// the policy and the oversize leg are NOT applied from w — both
+			// are unanswered on this path, which is what lets resolvePlanTier
+			// below read them out of the plan (pre-setting the wizard's "auto"
+			// here silently outranked a plan's local-only; 2026-09-26 audit).
 			planName = w.PlanName
 		} else {
-			sonnetModel, haikuModel = w.SonnetModel, w.HaikuModel
+			// Only the steps the wizard actually ANSWERED may write the tier
+			// slots: esc on the first step hands back an all-empty choice,
+			// and assigning it unconditionally silently dropped a typed
+			// --sonnet-model (2026-09-26).
+			if w.SonnetAnswered {
+				sonnetModel = w.SonnetModel
+			}
+			if w.HaikuAnswered {
+				haikuModel = w.HaikuModel
+			}
+			// "(same as primary)" is an explicit CLEAR: an empty value from an
+			// ANSWERED step must not be refilled from ~/.oaica/config.json, or
+			// the wizard's only way to take a standing split back off undoes
+			// itself right after the preview promised it was gone.
+			clearedSonnet, clearedHaiku = w.SonnetCleared, w.HaikuCleared
 			// A tier the user left at its saved value is still a saved value
 			// for the stale-tier retry below (forgiven on failure); one they
 			// picked is a choice made on this command line and never is.
-			savedSonnet = fromFileSonnet && w.SonnetModel == cfgSonnet
-			savedHaiku = fromFileHaiku && w.HaikuModel == cfgHaiku
+			savedSonnet = w.SonnetAnswered && fromFileSonnet && w.SonnetModel == cfgSonnet && !w.SonnetCleared
+			savedHaiku = w.HaikuAnswered && fromFileHaiku && w.HaikuModel == cfgHaiku && !w.HaikuCleared
 		}
-		// Flags still win: the wizard only fills what the caller left empty
-		// (--oversize/--route-policy were both overwritten unconditionally
-		// until 2026-09-26, so a typed --wizard + --route-policy launch
-		// silently ran the wizard's "auto" instead — and --shard, which only
-		// means anything under `weighted`, went inert with it).
-		if oversizeModel == "" {
+		// An ANSWERED step is a choice made in this wizard, and the user was
+		// told to run it (--wizard) — so it applies even over a typed
+		// --oversize/--route-policy, which supplies the step's default row
+		// instead. Applying only the answered ones keeps an abandoned wizard
+		// (esc) from wiping a typed flag, and keeps the closing preview from
+		// naming a leg the launch is not going to use (2026-09-26 audit: a
+		// non-Enter pick used to be discarded while the preview showed it).
+		if w.OversizeAnswered {
 			oversizeModel = w.OversizeModel
 		}
-		if policyArg == "" {
+		if w.PolicyAnswered {
 			policyArg = w.RoutePolicy
 		}
 	}
@@ -1051,6 +1086,18 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	// untouched runNative path (which has no env at all and would run its own
 	// built-in Haiku) — that is the intent, not a side effect.
 	sonnetModel, haikuModel, cfgSonnet, cfgHaiku := standingTierModels(sonnetModel, haikuModel)
+	// A wizard answer of "(same as primary)" is a CLEAR, and standingTierModels
+	// cannot tell it apart from an unanswered step: it fills every empty value,
+	// so the standing split came straight back — after the wizard's own preview
+	// had already said it was gone (2026-09-26 audit). Clearing the source flag
+	// along with the value keeps savedSonnet/savedHaiku honest too: a key that
+	// is no longer in use is not a stale key the retry may blame.
+	if clearedSonnet {
+		sonnetModel, cfgSonnet = "", false
+	}
+	if clearedHaiku {
+		haikuModel, cfgHaiku = "", false
+	}
 	// OR, not assignment: the wizard branch above may already have recorded
 	// that a tier came from the file, and this call sees a non-empty value (so
 	// it reports false) — overwriting would lose the attribution the stale-tier
@@ -1259,7 +1306,12 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		// the user unable to tell whether the flag had any effect (2026-09-26).
 		over := plan.Routes.Oversize
 		switch {
-		case over.NativePassthrough:
+		// BaseURL, not NativePassthrough: routeFor marks an anthropic-WIRE
+		// remote passthrough too (a vendor coding plan, e.g. zai/glm-5.3), and
+		// that leg is neither served by the user's Anthropic login nor
+		// unprobed — claiming both was wrong on every count. A truly native
+		// leg is the only one with no base URL (2026-09-26 audit).
+		case over.BaseURL == "":
 			fmt.Fprintf(os.Stderr, "oversize: requests past the serving leg's window -> claude/%s (your own Anthropic login; Anthropic enforces its real window upstream and we never probe it, so this leg needs no size comparison)\n",
 				over.UpstreamModel)
 		case over.ContextWindow > 0:

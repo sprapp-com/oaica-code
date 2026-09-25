@@ -914,10 +914,100 @@ func TestEnvVars_TakesTheLargestLegWindowNotThePrimarys(t *testing.T) {
 	if len(pairs) != 1 {
 		t.Fatalf("CLAUDE_CODE_MAX_CONTEXT_TOKENS appears %d times (%v), want exactly one — os/exec keeps the LAST duplicate, so a second pair makes the child read the smaller leg's window", len(pairs), pairs)
 	}
-	if pairs[0] != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
-		t.Fatalf("window = %q, want the larger probed sonnet leg's 262144 (primary is 65536)", pairs[0])
+	// 230144 = the sonnet leg's 262144 net of the 32000 output budget the
+	// advertisement has to leave room for; the primary's 65536-32000=33536 is
+	// smaller, so the leg wins. Raising the pair to the RAW 262144 would hand
+	// the reserve straight back and let auto-compact fire 32k too late.
+	if pairs[0] != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=230144" {
+		t.Fatalf("window = %q, want the larger probed sonnet leg's usable 230144 (primary is 65536-32000)", pairs[0])
 	}
-	if !slices.Contains(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144") {
+	if !slices.Contains(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW=230144") {
 		t.Fatalf("AUTO_COMPACT_WINDOW was not raised with it: %v", env)
+	}
+}
+
+// A leg's window is keyed by its base URL AND its upstream model. Two legs on
+// ONE remote (`--model box/small --sonnet-model box/big`) share a base URL, and
+// the fallback list holds a single copy of it — the primary's. Keying on the
+// URL alone stamped the SIBLING's window onto that copy, so the failover leg
+// claimed a ceiling its own model does not have: escalationTarget ranks by
+// ContextWindow and would pick it as the strongest leg, and oversizeSwap would
+// compare against a number nothing probed.
+func TestApplyContextWindowsToRoutes_DoesNotStampASiblingsWindow(t *testing.T) {
+	plan := &tierPlan{
+		PrimaryName:      "box/small",
+		SecondaryName:    "box/big",
+		HaikuName:        "box/big",
+		PrimaryContext:   0,      // not enumerable in /models on this remote
+		SecondaryContext: 262144, // ...but its sibling is
+		Primary:          launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://box:8080/v1", UpstreamModel: "small"}},
+		Secondary:        launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://box:8080/v1", UpstreamModel: "big"}},
+		Haiku:            launchEndpoint{RemoteEndpoint: RemoteEndpoint{BaseURL: "http://box:8080/v1", UpstreamModel: "big"}},
+		Routes: proxyRouteTable{
+			Default:   proxyRoute{BaseURL: "http://box:8080/v1", UpstreamModel: "small"},
+			Fallbacks: []proxyRoute{{BaseURL: "http://box:8080/v1", UpstreamModel: "small"}},
+			ByModel: map[string]proxyRoute{
+				"box/small": {BaseURL: "http://box:8080/v1", UpstreamModel: "small"},
+				"box/big":   {BaseURL: "http://box:8080/v1", UpstreamModel: "big", ContextWindow: 262144},
+			},
+			breakers: &routeBreakers{},
+		},
+	}
+	plan.applyContextWindowsToRoutes()
+	if got := plan.Routes.Fallbacks[0].ContextWindow; got != 0 {
+		t.Fatalf("the primary's fallback copy carries %d, want 0 — its own model was never probed, and this copy serves %q",
+			got, plan.Routes.Fallbacks[0].UpstreamModel)
+	}
+	// The sibling's own route keeps the window it was probed for.
+	if got := plan.Routes.ByModel["box/big"].ContextWindow; got != 262144 {
+		t.Fatalf("the probed sibling lost its window: %d", got)
+	}
+}
+
+// The oversize banner's native branch keys on "no base URL", not on
+// NativePassthrough: routeFor marks an anthropic-WIRE remote passthrough too
+// (a vendor coding plan), and that leg is neither served by the user's
+// Anthropic login nor unprobed — the banner claimed both, and named it
+// "claude/<model>" rather than its own label.
+func TestRun_OversizeBannerDoesNotCallAnAnthropicWireRemoteNative(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"https://api.z.ai/api/anthropic","api_key":"k2","wire":"anthropic","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	origProbe := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = origProbe })
+	remoteContextWindowFn = func(r proxyRoute) int {
+		switch {
+		case strings.HasPrefix(r.BaseURL, "http://box:8080"):
+			return 131072
+		case strings.Contains(r.BaseURL, "api.z.ai"):
+			return 204800
+		}
+		return 0
+	}
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", nil, []string{"--oversize", "zai/glm-5.3"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if strings.Contains(stderr, "your own Anthropic login") {
+		t.Errorf("an anthropic-wire REMOTE was described as the user's own Anthropic login:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "oversize: requests past the serving leg's window -> remote:zai (glm-5.3, 200k window)") {
+		t.Errorf("the banner does not name the leg and its probed window:\n%s", stderr)
 	}
 }

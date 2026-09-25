@@ -374,13 +374,13 @@ func TestEnvVars_CloudPrimaryWithLargerSecondaryContext(t *testing.T) {
 	// max so the subagent session isn't silently clamped to the cloud
 	// limit (the "unknown model, assuming 200k" warning scenario).
 	plan := tierPlan{
-		PrimaryName:    "glm-5.2:cloud",
-		SecondaryName:  "oaica-35b-a3b-vision",
-		HaikuName:      "oaica-35b-a3b-vision",
-		PrimaryContext: 202752, // from lookupCloudModelLimit
+		PrimaryName:      "glm-5.2:cloud",
+		SecondaryName:    "oaica-35b-a3b-vision",
+		HaikuName:        "oaica-35b-a3b-vision",
+		PrimaryContext:   202752, // from lookupCloudModelLimit
 		SecondaryContext: 262144,
-		HaikuContext:   262144,
-		Routes:         proxyRouteTable{Default: proxyRoute{BaseURL: "http://x/v1"}},
+		HaikuContext:     262144,
+		Routes:           proxyRouteTable{Default: proxyRoute{BaseURL: "http://x/v1"}},
 	}
 	env := plan.envVars("http://127.0.0.1:1", "tok")
 	var maxCtx, compact string
@@ -392,11 +392,17 @@ func TestEnvVars_CloudPrimaryWithLargerSecondaryContext(t *testing.T) {
 			compact = kv
 		}
 	}
-	if maxCtx != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144" {
-		t.Fatalf("expected max=262144 (max of cloud 202752 + router 262144), got %s", maxCtx)
+	// 230144 = the router leg's 262144 minus the 32000 output budget Claude
+	// Code adds on top of its input (usableContextWindow). The merge takes the
+	// max over USABLE windows, so a probed leg is advertised net of the
+	// reserve; subtracting it is what keeps auto-compact ahead of the
+	// input+output > max_model_len 400. The number this test used to expect
+	// (262144, raw) was the reserve being silently handed back.
+	if maxCtx != "CLAUDE_CODE_MAX_CONTEXT_TOKENS=230144" {
+		t.Fatalf("expected max=230144 (max of cloud 202752 + router 262144-32000), got %s", maxCtx)
 	}
-	if compact != "CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144" {
-		t.Fatalf("expected compact=262144, got %s", compact)
+	if compact != "CLAUDE_CODE_AUTO_COMPACT_WINDOW=230144" {
+		t.Fatalf("expected compact=230144, got %s", compact)
 	}
 }
 

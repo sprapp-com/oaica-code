@@ -119,7 +119,7 @@ type ModelManifestEntry struct {
 // modelManifest is the on-disk container: a map keyed by ID for O(1)
 // lookup plus a stable slice for deterministic listing.
 type modelManifest struct {
-	Version int                            `json:"version"`
+	Version int                           `json:"version"`
 	Models  map[string]ModelManifestEntry `json:"models"`
 }
 

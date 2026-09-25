@@ -647,3 +647,165 @@ func TestRun_NativeOversizeBannerSaysNoComparisonWasMade(t *testing.T) {
 		t.Errorf("the banner claims a size comparison against a window native never probes:\n%s", stderr)
 	}
 }
+
+// Reusing a plan from the wizard's first step must resolve it exactly like a
+// typed --plan — including its route_policy. The wizard used to pre-set its own
+// "auto" on the reuse path, and because "auto" is not empty it outranked both
+// the plan's stored policy and the primary remote's route_policy: a plan
+// deliberately set to local-only (never leave local legs) silently became
+// auto, i.e. allowed crossover to a remote on failure.
+func TestRun_WizardPlanReuseKeepsThePlansRoutePolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	home, _ := setupWizardConfigTierRun(t, `{}`)
+	if err := PlanSet("dev", TierPlanProfile{
+		Model: "box/kat-awq", SonnetModel: "zai/glm-4.6", RoutePolicy: string(RouteLocalOnly),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// PlanSet records the repo it was saved from; launch from the same
+	// directory so "the last plan used here" is the one on offer.
+	if wd, err := os.Getwd(); err == nil {
+		_ = wd
+	}
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		return items[0].Name, nil // the Enter key everywhere
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = (&Claude{}).Run("box/kat-awq", nil, nil)
+	})
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+	if !strings.Contains(stderr, "route policy: local-only") {
+		t.Errorf("the reused plan's route_policy did not survive the wizard (want local-only):\n%s", stderr)
+	}
+	if strings.Contains(stderr, "route policy: auto") {
+		t.Errorf("the wizard's own default outranked the plan:\n%s", stderr)
+	}
+	_ = home
+}
+
+// "(same as primary)" is the wizard's only way to take a standing split back
+// off, and it has to outrank ~/.oaica/config.json — otherwise the config rung
+// refilled the tier the user just removed, after the wizard's own preview had
+// said it was gone.
+func TestRun_WizardSameAsPrimaryBeatsTheStandingConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	_, envLog := setupWizardConfigTierRun(t, `{"sonnet_model":"zai/glm-4.5-air","haiku_model":"zai/glm-4.5-air"}`)
+
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "Sonnet") || strings.Contains(title, "Haiku") {
+			return "(same as primary)", nil
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	if err := (&Claude{}).Run("box/kat-awq", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=zai/glm-4.5-air") {
+		t.Error("the standing sonnet tier came back after the user cleared it (the config rung refills an empty value)")
+	}
+	if strings.Contains(string(data), "ANTHROPIC_DEFAULT_HAIKU_MODEL=zai/glm-4.5-air") {
+		t.Error("the standing haiku tier came back after the user cleared it")
+	}
+	if !strings.Contains(string(data), "ANTHROPIC_DEFAULT_SONNET_MODEL=box/kat-awq") {
+		t.Error("the cleared sonnet tier should fall back to the primary")
+	}
+}
+
+// An ANSWERED wizard step is a choice made in the wizard the user explicitly
+// asked for (--wizard), so it applies even over a typed --oversize /
+// --route-policy — which supplies that step's default row instead. Applying
+// only the answered steps is also what makes the closing preview truthful: the
+// launch now runs what the preview showed, either way.
+func TestRun_WizardAnsweredStepBeatsTheTypedFlag(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setupWizardConfigTierRun(t, `{}`)
+	origProbe := remoteContextWindowFn
+	t.Cleanup(func() { remoteContextWindowFn = origProbe })
+	remoteContextWindowFn = func(r proxyRoute) int {
+		switch strings.TrimRight(r.BaseURL, "/") {
+		case "http://box:8080/v1":
+			return 32768
+		case "http://zai:8080/v1":
+			return 262144
+		}
+		return 0
+	}
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		if strings.Contains(title, "oversize") || strings.Contains(title, "Compaction") {
+			return tierWizardNoOversize, nil // decline the leg this launch
+		}
+		if strings.Contains(title, "policy") {
+			return string(RouteLocalOnly), nil // ...and the typed policy too
+		}
+		if len(items) > 0 {
+			return items[0].Name, nil
+		}
+		return "", nil
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	models := []LaunchModel{{Name: "box/kat-awq", Remote: true}, {Name: "zai/glm-4.6", Remote: true}}
+	stderr := captureStderr(t, func() {
+		if err := (&Claude{}).Run("box/kat-awq", models, []string{"--wizard", "--route-policy", "remote-first", "--oversize", "zai/glm-4.6"}); err != nil {
+			t.Errorf("Run: %v", err)
+		}
+	})
+	if !strings.Contains(stderr, "policy: local-only") {
+		t.Errorf("the wizard's answered policy was discarded in favour of the flag:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "oversize: requests past") {
+		t.Errorf("the declined oversize leg is still in effect:\n%s", stderr)
+	}
+}
+
+// An ABANDONED wizard (esc on the first tier step) must not wipe the typed
+// flags it never asked about.
+func TestRun_AbandonedWizardLeavesTypedFlagsAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude binary is a /bin/sh script")
+	}
+	setupWizardConfigTierRun(t, `{}`)
+	oldSelect, oldRead := tierWizardSelect, tierWizardReadLine
+	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = oldSelect, oldRead })
+	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
+		return tierWizardBack, nil // esc, immediately
+	}
+	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
+
+	// A second leg on another remote is what makes the effective policy
+	// observable (the banner prints only when there is somewhere to fall).
+	var runErr error
+	stderr := captureStderr(t, func() {
+		runErr = (&Claude{}).Run("box/kat-awq", nil, []string{"--wizard", "--route-policy", "remote-first", "--sonnet-model", "zai/glm-4.6"})
+	})
+	t.Logf("runErr=%v stderr=%q", runErr, stderr)
+	if !strings.Contains(stderr, "route policy: remote-first") {
+		t.Errorf("an abandoned wizard wiped the typed --route-policy:\n%s", stderr)
+	}
+}

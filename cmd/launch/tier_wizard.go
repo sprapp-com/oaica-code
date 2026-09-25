@@ -58,6 +58,18 @@ type tierWizardChoice struct {
 	OversizeModel string // empty = no oversize leg
 	RoutePolicy   string // always a valid policy after the wizard
 	PlanName      string // non-empty when the user saved the choice
+
+	// The flags below say whether an EMPTY value above is an answer or
+	// just an unanswered step. Both readings of "" are real: a step the user
+	// never reached (or abandoned with esc) must leave the caller's own value
+	// alone, while "(same as primary)" and "no oversize leg" are deliberate
+	// clears that must not be refilled by ~/.oaica/config.json.
+	SonnetAnswered   bool // the Sonnet step produced a choice (a model or "same as primary")
+	HaikuAnswered    bool // likewise for the Haiku step
+	SonnetCleared    bool // "(same as primary)" was answered
+	HaikuCleared     bool // likewise
+	OversizeAnswered bool // the oversize step produced a choice (a leg or "none")
+	PolicyAnswered   bool // the policy step produced a choice
 }
 
 // tierWizardEligibleLaunch is set per launch by LaunchIntegration (launch.go):
@@ -338,7 +350,11 @@ func tierWizardTierItems(models []LaunchModel, names []string, primary string, w
 	}
 	var lead []SelectionItem
 	if keep != "" {
-		lead = append(lead, SelectionItem{Name: keep, Description: "the tier saved in ~/.oaica/config.json — enter keeps it", Recommended: true})
+		// The caller passes the value in effect, which is the standing config
+		// tier OR a --sonnet-model/--haiku-model typed on this command line
+		// (with --wizard, the only way a typed tier reaches this step), so the
+		// label names both sources rather than guessing wrong.
+		lead = append(lead, SelectionItem{Name: keep, Description: "your tier for this launch (--sonnet-model/--haiku-model or ~/.oaica/config.json) — enter keeps it", Recommended: true})
 	}
 	autoIdx := -1
 	if withAuto {
@@ -430,7 +446,10 @@ func tierWizardReusedPlan() (string, bool, error) {
 	}
 	items := []SelectionItem{}
 	if last != "" {
-		items = append(items, SelectionItem{Name: last, Description: "the last plan launched from this directory — enter reuses it"})
+		// "its tiers", not "it": the primary is the one just picked above, and
+		// a plan's stored Model is not forced on it (the same rule as
+		// --model with --plan).
+		items = append(items, SelectionItem{Name: last, Description: "the last plan launched from this directory — enter reuses its tiers for the model you picked"})
 	}
 	items = append(items, SelectionItem{Name: tierWizardOtherPlan, Description: "pick from your saved plans"})
 	items = append(items, SelectionItem{Name: tierWizardScratch, Description: "choose the tiers for this launch (and optionally save them as a new plan)"})
@@ -444,10 +463,12 @@ func tierWizardReusedPlan() (string, bool, error) {
 		return "", false, err
 	}
 	switch sel {
-	case last, "":
-		if last == "" {
-			return "", false, nil
-		}
+	case "":
+		// No selection at all — cmd/tui's selector returns "" with a nil error
+		// when Enter is pressed on a filter that matches nothing. That is not
+		// an answer, and it must not silently become "reuse the last plan".
+		return "", false, nil
+	case last:
 		return last, true, nil
 	case tierWizardOtherPlan:
 		picked, err := tierWizardSelect("Saved plans", planNameItems(names))
@@ -493,9 +514,12 @@ func planNameItems(names []string) []SelectionItem {
 //
 // A first step is offered when at least one plan exists: reuse the plan used
 // last from this directory (Enter), pick another saved plan, or start from
-// scratch and walk the tiers. A reused plan supplies every tier, so the tier
+// scratch and walk the tiers. A reused plan supplies the tiers, so the tier
 // steps are skipped and the choice comes back in PlanName — the caller
-// resolves it exactly like a typed --plan.
+// resolves it exactly like a typed --plan. Every other field of the returned
+// choice stays UNANSWERED on that path, including RoutePolicy: the plan's own
+// route_policy belongs to resolvePlanTier, and pre-setting "auto" here used to
+// outrank it (the plan's local-only silently became auto; 2026-09-26 audit).
 func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOversize, keepPolicy string) (tierWizardChoice, error) {
 	c := tierWizardChoice{RoutePolicy: string(RouteAuto)}
 	names := launchModelNames(models)
@@ -503,7 +527,9 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 	if plan, reused, err := tierWizardReusedPlan(); err != nil {
 		return c, err
 	} else if reused {
-		c.PlanName = plan
+		// Clear the pre-set default: nothing else was answered, and the caller
+		// must treat the policy as unset so the plan's own route_policy wins.
+		c.PlanName, c.RoutePolicy = plan, ""
 		return c, nil
 	}
 
@@ -570,12 +596,17 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 	// back off of it — every step keeps "empty = keep it" as its default.
 	clearStep := func(i int) {
 		switch i {
+		case 0:
+			// Sonnet: the step is being re-asked, so back to "unset", which
+			// means KEEP the caller's own tier — not the deliberate clear a
+			// "(same as primary)" answer records.
+			c.SonnetModel, c.SonnetCleared, c.SonnetAnswered = "", false, false
 		case 1:
-			c.HaikuModel = ""
+			c.HaikuModel, c.HaikuCleared, c.HaikuAnswered = "", false, false
 		case 2:
-			c.OversizeModel = ""
+			c.OversizeModel, c.OversizeAnswered = "", false
 		case 3:
-			c.RoutePolicy = string(RouteAuto)
+			c.RoutePolicy, c.PolicyAnswered = string(RouteAuto), false
 		}
 	}
 	for i := 0; i < len(steps); {
@@ -590,7 +621,21 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 		}
 		if sel == tierWizardBack {
 			if i == 0 {
-				return c, nil // backed off the first step: launch as-is
+				// Backing off the SONNET step goes back to the plan step — it
+				// IS the previous prompt whenever one was offered, and the doc
+				// above promises esc re-asks it. With no plan step to return
+				// to (no plans saved), the wizard ends as before.
+				if planNames, _ := PlanSortedNames(); len(planNames) > 0 {
+					clearStep(0)
+					if plan, reused, err := tierWizardReusedPlan(); err != nil {
+						return c, err
+					} else if reused {
+						c.PlanName, c.RoutePolicy = plan, ""
+						return c, nil
+					}
+					continue // chose "start from scratch" again: re-ask this step
+				}
+				return c, nil
 			}
 			clearStep(i)
 			i--
@@ -607,6 +652,14 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 		}
 		switch i {
 		case 0:
+			// An ANSWER, like the oversize/policy steps below: esc or an
+			// empty picker result must leave a typed --sonnet-model alone.
+			// It used to be applied unconditionally, so backing out of the
+			// wizard wiped the flag it never asked about (2026-09-26).
+			if sel == "" {
+				break
+			}
+			c.SonnetAnswered = true
 			if sel == "auto" {
 				// Resolved here, not downstream: plans store a concrete
 				// model name, and "auto" has no meaning after launch.
@@ -614,17 +667,24 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 			}
 			// "(same as primary)" is an explicit CLEAR, not "leave what is
 			// there": the step may lead with a saved tier, and without this
-			// there was no row that could take a split back off.
+			// there was no row that could take a split back off. It is
+			// recorded as a clear because "" alone is indistinguishable from
+			// an unanswered step, which the caller refills from
+			// ~/.oaica/config.json.
 			if sel == "(same as primary)" {
-				c.SonnetModel = ""
+				c.SonnetModel, c.SonnetCleared = "", true
 			} else if sel != "" {
-				c.SonnetModel = sel
+				c.SonnetModel, c.SonnetCleared = sel, false
 			}
 		case 1:
+			if sel == "" {
+				break
+			}
+			c.HaikuAnswered = true
 			if sel == "(same as primary)" {
-				c.HaikuModel = ""
+				c.HaikuModel, c.HaikuCleared = "", true
 			} else if sel != "" {
-				c.HaikuModel = sel
+				c.HaikuModel, c.HaikuCleared = sel, false
 			}
 		case 2:
 			if sel == tierWizardScanOversize {
@@ -652,11 +712,24 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 				}
 				continue
 			}
-			if sel != tierWizardNoOversize {
+			// Either row is an ANSWER, including "none": with a --oversize leg
+			// on the command line, picking "none" is how the user declines it,
+			// and an unanswered step (esc, or a picker that returned nothing)
+			// must leave that flag alone.
+			if sel == "" {
+				break
+			}
+			c.OversizeAnswered = true
+			if sel == tierWizardNoOversize {
+				c.OversizeModel = ""
+			} else {
 				c.OversizeModel = sel
 			}
 		case 3:
-			c.RoutePolicy = sel
+			if sel == "" {
+				break
+			}
+			c.RoutePolicy, c.PolicyAnswered = sel, true
 		}
 		i++
 	}
@@ -693,7 +766,12 @@ func runTierWizard(models []LaunchModel, primary, keepSonnet, keepHaiku, keepOve
 			RoutePolicy:   c.RoutePolicy,
 			Description:   desc,
 		}); err != nil {
-			return c, fmt.Errorf("save plan %q: %w", name, err)
+			// A warning, not a failure: every tier question has been answered
+			// by now, and a plans.json we cannot write (corrupt, or read-only
+			// home) must not throw the launch away — the same forgiveness the
+			// plan-reuse step promises for the read side.
+			fmt.Fprintf(os.Stderr, "warning: could not save plan %q (%v) — continuing with the answers above\n", name, err)
+			return c, nil
 		}
 		c.PlanName = name
 		fmt.Fprintf(os.Stderr, "saved plan %q — reuse with `oaica launch claude --plan %s`\n", name, name)

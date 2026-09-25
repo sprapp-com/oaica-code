@@ -37,7 +37,7 @@ type requestLogEntry struct {
 	Backend          string `json:"backend"` // where this request was actually forwarded (cloud router or local server)
 	LastMessageLen   int    `json:"last_message_len"`
 	TotalMessagesLen int    `json:"total_messages_len"`
-	HardSignalMatch  bool   `json:"hard_signal_match"`  // mirrors classifyFlashplan's regex check
+	HardSignalMatch  bool   `json:"hard_signal_match"`    // mirrors classifyFlashplan's regex check
 	WouldBeHardByLen bool   `json:"would_be_hard_by_len"` // mirrors classifyFlashplan's length check
 	StatusCode       int    `json:"status_code"`
 	DurationMs       int64  `json:"duration_ms"`

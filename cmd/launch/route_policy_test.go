@@ -15,13 +15,13 @@ import (
 // and loud failure on a typo.
 func TestParseRoutePolicy(t *testing.T) {
 	for in, want := range map[string]routePolicy{
-		"":              RouteLocalFirst,
-		"local-first":   RouteLocalFirst,
-		"remote-first":  RouteRemoteFirst,
-		"auto":          RouteAuto,
-		"local-only":    RouteLocalOnly,
-		"remote-only":   RouteRemoteOnly,
-		"Remote-First":  RouteRemoteFirst, // lenient on case? No — strict:
+		"":             RouteLocalFirst,
+		"local-first":  RouteLocalFirst,
+		"remote-first": RouteRemoteFirst,
+		"auto":         RouteAuto,
+		"local-only":   RouteLocalOnly,
+		"remote-only":  RouteRemoteOnly,
+		"Remote-First": RouteRemoteFirst, // lenient on case? No — strict:
 	} {
 		if in == "Remote-First" {
 			continue
@@ -39,8 +39,8 @@ func TestParseRoutePolicy(t *testing.T) {
 // TestLocalhostLocality pins the loopback rule the fallback ordering uses.
 func TestLocalhostLocality(t *testing.T) {
 	for url, want := range map[string]string{
-		"http://127.0.0.1:11434/v1": "local",
-		"http://localhost:8081/v1":  "local",
+		"http://127.0.0.1:11434/v1":   "local",
+		"http://localhost:8081/v1":    "local",
 		"https://api.deepseek.com/v1": "remote",
 	} {
 		if got := routeLocality(url); got != want {
@@ -83,10 +83,10 @@ func TestRoutePolicy_FallbackOnOpenBreaker(t *testing.T) {
 	defer upOK.Close()
 
 	table := proxyRouteTable{
-		Policy: RouteLocalFirst,
-		Default: proxyRoute{BaseURL: down.URL, UpstreamModel: "m", Label: "remote:down"},
+		Policy:    RouteLocalFirst,
+		Default:   proxyRoute{BaseURL: down.URL, UpstreamModel: "m", Label: "remote:down"},
 		Fallbacks: []proxyRoute{{BaseURL: upOK.URL, UpstreamModel: "local-m", Label: "daemon:local"}},
-		breakers: &routeBreakers{},
+		breakers:  &routeBreakers{},
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -149,10 +149,10 @@ func TestRoutePolicy_LocalOnlyDoesNotCross(t *testing.T) {
 		want   proxyRoute
 	}{{RouteLocalOnly, localDown}, {RouteRemoteFirst, remoteUp}} {
 		table := proxyRouteTable{
-			Policy:   tc.policy,
-			Default:  localDown,
+			Policy:    tc.policy,
+			Default:   localDown,
 			Fallbacks: []proxyRoute{remoteUp},
-			breakers: &routeBreakers{},
+			breakers:  &routeBreakers{},
 		}
 		for i := 0; i < breakerFailsToOpen; i++ {
 			table.breakers.recordFail(localDown.BaseURL)
@@ -163,6 +163,7 @@ func TestRoutePolicy_LocalOnlyDoesNotCross(t *testing.T) {
 		}
 	}
 }
+
 // TestOversizeSwapRules pins the crossover gate: strictly-larger window,
 // different base URL, healthy breaker, locality pin respected, and the
 // oversized leg itself must be able to hold the request (else no point).
@@ -318,10 +319,10 @@ func TestAutoPolicy_EscalatesToStrongerLeg(t *testing.T) {
 
 	tbl := func(policy routePolicy) proxyRouteTable {
 		return proxyRouteTable{
-			Policy:     policy,
-			Default:    proxyRoute{BaseURL: down.URL, UpstreamModel: "m", Label: "remote:down", ContextWindow: 262144},
-			Fallbacks:  []proxyRoute{{BaseURL: upOK.URL, UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000}},
-			breakers:   &routeBreakers{},
+			Policy:      policy,
+			Default:     proxyRoute{BaseURL: down.URL, UpstreamModel: "m", Label: "remote:down", ContextWindow: 262144},
+			Fallbacks:   []proxyRoute{{BaseURL: upOK.URL, UpstreamModel: "big-m", Label: "remote:big", ContextWindow: 1000000}},
+			breakers:    &routeBreakers{},
 			escalations: &routeEscalations{},
 		}
 	}
@@ -384,7 +385,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks:   []proxyRoute{big},
-			breakers:    &routeBreakers{},
+		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
 	table.escalations.noteLeg(table.SessionID, base.BaseURL)
@@ -423,7 +424,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table2 := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks:   []proxyRoute{big},
-			breakers:    &routeBreakers{},
+		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
 	table.escalations.noteLeg(table.SessionID, base.BaseURL)
@@ -441,7 +442,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table3 := proxyRouteTable{
 		Policy: RouteLocalFirst, Default: base,
 		Fallbacks:   []proxyRoute{big},
-			breakers:    &routeBreakers{},
+		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
 	table.escalations.noteLeg(table.SessionID, base.BaseURL)
@@ -456,7 +457,7 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	table4 := proxyRouteTable{
 		Policy: RouteAuto, Default: base,
 		Fallbacks: []proxyRoute{big},
-			breakers:  &routeBreakers{},
+		breakers:  &routeBreakers{},
 	}
 	if r, _, fb := table4.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
 		t.Errorf("nil escalations must not escalate (got %s, fallback=%v)", r.BaseURL, fb)

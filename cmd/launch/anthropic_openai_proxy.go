@@ -35,8 +35,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -148,8 +148,8 @@ type openAIChatResponse struct {
 			// reasoning_content. Same meaning, different key name; see
 			// reasoningText() below for the field that call sites should
 			// actually read.
-			Reasoning        string `json:"reasoning,omitempty"`
-			ToolCalls        []struct {
+			Reasoning string `json:"reasoning,omitempty"`
+			ToolCalls []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
@@ -175,6 +175,13 @@ type openAIUsage struct {
 	PromptTokensDetails *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details,omitempty"`
+	// prompt_cache_hit_tokens is the same count under DeepSeek's/vLLM's other
+	// name (and the only one some builds emit). Without this fallback a fully
+	// cache-hit turn was reported to Claude Code as a full-prompt fresh input
+	// read — inflating the displayed (and any downstream-billed) token count
+	// on exactly the legs that do cache, which is the user-visible half of
+	// "usage through oaica looks much higher than native" (2026-09-26 audit).
+	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
 }
 
 // reasoningOf returns whichever of reasoning_content / reasoning is
@@ -192,10 +199,16 @@ func reasoningOf(reasoningContent, reasoning string) string {
 // cachedTokens returns the prefix-cache hit count, clamped to the prompt
 // size so a malformed upstream can never yield a negative input_tokens.
 func (u *openAIUsage) cachedTokens() int {
-	if u == nil || u.PromptTokensDetails == nil {
+	if u == nil {
 		return 0
 	}
-	c := u.PromptTokensDetails.CachedTokens
+	c := 0
+	switch {
+	case u.PromptTokensDetails != nil:
+		c = u.PromptTokensDetails.CachedTokens
+	default:
+		c = u.PromptCacheHitTokens
+	}
 	if c < 0 {
 		return 0
 	}
@@ -215,8 +228,8 @@ type openAIStreamChunk struct {
 			ReasoningContent string `json:"reasoning_content,omitempty"`
 			// Reasoning: see the identical field on openAIChatResponse's
 			// Message struct above for why this alias exists.
-			Reasoning        string `json:"reasoning,omitempty"`
-			ToolCalls        []struct {
+			Reasoning string `json:"reasoning,omitempty"`
+			ToolCalls []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id,omitempty"`
 				Type     string `json:"type,omitempty"`
@@ -502,7 +515,6 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	})
 }
 
-
 // StartAnthropicOpenAIProxy is the async form of RunAnthropicOpenAIProxy for
 // callers that must keep resolving (the agent shim path): it generates the
 // per-launch client token, starts the serve loop in a goroutine, and returns
@@ -512,14 +524,16 @@ func StartAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel
 	if err != nil {
 		return "", fmt.Errorf("generate proxy client token: %w", err)
 	}
-	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
-		ClientToken: token,
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
-			// An anthropic-wire remote is forwarded untranslated to its own
-			// /messages (see routeFor's doc for why); a single-leg launch of
-			// one takes exactly the same path as a tier-planned one.
-			NativePassthrough: remote.Descriptor().Wire == "anthropic"},
-	}) }()
+	go func() {
+		_ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+			ClientToken: token,
+			Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: strings.TrimSpace(remote.APIKeyEnv), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+				// An anthropic-wire remote is forwarded untranslated to its own
+				// /messages (see routeFor's doc for why); a single-leg launch of
+				// one takes exactly the same path as a tier-planned one.
+				NativePassthrough: remote.Descriptor().Wire == "anthropic"},
+		})
+	}()
 	return token, nil
 }
 
@@ -829,7 +843,15 @@ var proxyUpstreamClient = &http.Client{Transport: &http.Transport{
 //     caller sees a clean upstream_error instead.
 //   - Idempotency: a completion that never answered did no billed work the
 //     client can observe; the one risk is double-billed hidden work, which
-//     the 429/503 paths (rejected BEFORE backend work) never incur.
+//     the 429/503 paths (rejected BEFORE backend work) never incur. 502/504
+//     do NOT have that property — both mean the request reached a backend (or
+//     a gateway in front of one) that may well have run the whole prefill
+//     before failing to answer, so re-POSTing the body sends that work a
+//     second time; upstream is billed twice and, on a long-prefill timeout,
+//     the retry is very likely to time out the same way. They are surfaced
+//     instead of retried (2026-09-26 audit: the set listed them while this
+//     comment argued only for 429/503, i.e. up to 3 duplicate full-body
+//     sends of a prompt the backend had already processed).
 //   - Backoff: Retry-After honored verbatim (the server tuned it), else
 //     exponential 500ms/1s/2s with ±25% full jitter, 10s ceiling, and the
 //     caller's context always wins (Claude Code disconnect cancels the
@@ -862,9 +884,7 @@ func proxyUpstreamRetryDelay(resp *http.Response, attempt int) time.Duration {
 func proxyUpstreamRetryable(resp *http.Response) bool {
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
+		http.StatusServiceUnavailable:
 		return true
 	}
 	return false

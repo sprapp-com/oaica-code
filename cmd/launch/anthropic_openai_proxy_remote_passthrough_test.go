@@ -86,7 +86,9 @@ func TestRemoteAnthropicWireForwardsToMessagesUntranslated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { _ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{Default: route, ByModel: map[string]proxyRoute{"zai-coding-plan/glm-5.3": route}}) }()
+	go func() {
+		_ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{Default: route, ByModel: map[string]proxyRoute{"zai-coding-plan/glm-5.3": route}})
+	}()
 	time.Sleep(50 * time.Millisecond)
 
 	// A Claude-Code-shaped request: its own x-api-key (the per-launch proxy

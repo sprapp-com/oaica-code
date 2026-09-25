@@ -786,4 +786,3 @@ func extractShardFlags(args []string) (map[string]int, []string) {
 	}
 	return shards, rest
 }
-
