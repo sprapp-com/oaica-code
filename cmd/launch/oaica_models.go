@@ -358,6 +358,11 @@ func isRouterNotModified(err error) bool {
 
 func isRouterAuthErr(err error) bool { return isOaicaRouterAuthErr(err) }
 
+// routerModelFetchTimeout bounds startup/catalog discovery. A cached router
+// catalog remains available on failure, so waiting eight seconds before the
+// picker can render is not useful.
+const routerModelFetchTimeout = 2 * time.Second
+
 func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEntry, string, error) {
 	req, err := http.NewRequest(http.MethodGet, host+"/v1/models", nil)
 	if err != nil {
@@ -367,7 +372,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 		req.Header.Set("If-None-Match", etag)
 	}
 	oaicaLaunchAuthorize(req)
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: routerModelFetchTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("couldn't reach %s: %w", host, err)

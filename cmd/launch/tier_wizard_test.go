@@ -134,7 +134,7 @@ func withStubbedWizardUI(t *testing.T, selectLog *[]string, picks []string, save
 func TestRunTierWizard_SavesPlan(t *testing.T) {
 	withTempOaicaHome(t)
 	var selectLog []string
-	withStubbedWizardUI(t, &selectLog, []string{"kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9", "remote-first"}, "daily-driver")
+	withStubbedWizardUI(t, &selectLog, []string{"kat-awq-7b", "kat-awq-1.5b", tierWizardScanOversize, "big-box/glm-9", "remote-first"}, "daily-driver")
 
 	plan, err := runTierWizard(testLaunchModels("kat-awq", "kat-awq-7b", "kat-awq-1.5b", "big-box/glm-9"), "kat-awq")
 	if err != nil {
@@ -146,8 +146,8 @@ func TestRunTierWizard_SavesPlan(t *testing.T) {
 	if plan.PlanName != "daily-driver" {
 		t.Fatalf("plan name = %q", plan.PlanName)
 	}
-	if len(selectLog) != 4 {
-		t.Fatalf("steps run = %d (%v), want 4 (sonnet, haiku, oversize, policy)", len(selectLog), selectLog)
+	if len(selectLog) != 5 {
+		t.Fatalf("steps run = %d (%v), want 5 (sonnet, haiku, scan, oversize, policy)", len(selectLog), selectLog)
 	}
 	prof, err := PlanGet("daily-driver")
 	if err != nil {
@@ -417,25 +417,17 @@ func TestRunTierWizard_BackNavigationAndLastPlan(t *testing.T) {
 }
 
 // TestRunTierWizard_BackSkipsOverNilStep verifies the fix for a real
-// reported bug: with no oversize candidates (a common case — oversizeItems
-// is nil whenever nothing probes larger than the primary), backing off the
-// Route policy step must land on Haiku, not bounce right back to Route
-// policy. Before the fix, i-=2 followed by the loop's forward-skip-if-nil
-// check landed back on the same nil step and re-advanced past it to the
-// exact step the user just backed off of — Esc/Left looked like it did
-// nothing (2026-09-03).
-func TestRunTierWizard_BackSkipsOverNilStep(t *testing.T) {
+// The quick oversize prompt is always available, so backing off Route policy
+// returns to it, and backing off once more returns to Haiku. This keeps both
+// the default path immediate and back navigation unsurprising.
+func TestRunTierWizard_BackFromPolicyReturnsThroughOversizePrompt(t *testing.T) {
 	withTempOaicaHome(t)
 	origSelect, origRead := tierWizardSelect, tierWizardReadLine
 	t.Cleanup(func() { tierWizardSelect, tierWizardReadLine = origSelect, origRead })
 	tierWizardReadLine = func(prompt string) (string, error) { return "", nil }
 
-	// No tierWizardResolveEndpoint/ProbeWindow stub set up: probedModelWindow
-	// fails closed (real network lookup in a test sandbox), so
-	// oversizeWindowCandidates returns nil and the oversize step is skipped
-	// entirely — exactly the common real-world case this bug hit.
 	var logged []string
-	answers := []string{"kat-awq-7b", "kat-awq-1.5b", tierWizardBack, "kat-awq-1.5b", "remote-first"}
+	answers := []string{"kat-awq-7b", "kat-awq-1.5b", tierWizardNoOversize, tierWizardBack, tierWizardBack, "kat-awq-1.5b", tierWizardNoOversize, "remote-first"}
 	calls := 0
 	tierWizardSelect = func(title string, items []SelectionItem) (string, error) {
 		logged = append(logged, title)
@@ -453,8 +445,11 @@ func TestRunTierWizard_BackSkipsOverNilStep(t *testing.T) {
 	want := []string{
 		"Sonnet/subagent tier (secondary model)",
 		"Haiku/background tier",
+		"Compaction/oversize model",
 		"Route policy (what the launch proxy does when a backend fails)",
-		"Haiku/background tier", // back from policy must re-ask Haiku, skipping the nil oversize step
+		"Compaction/oversize model", // back from policy re-asks oversize
+		"Haiku/background tier",     // then back one more step re-asks Haiku
+		"Compaction/oversize model",
 		"Route policy (what the launch proxy does when a backend fails)",
 	}
 	if len(logged) != len(want) {

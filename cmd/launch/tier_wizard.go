@@ -207,25 +207,49 @@ func oversizeWindowCandidates(models []string, primary string, resolve func(stri
 	if primaryWindow <= 0 {
 		return nil, 0
 	}
-	for _, m := range models {
-		if m == primary {
-			continue
-		}
-		ep, err := resolve(m)
-		if err != nil {
-			continue
-		}
-		// Same base URL as the primary = same failure domain and the same
-		// fit limit; oversizeSwap (route_policy.go) never crosses to it, so
-		// do not offer it.
-		if ep.BaseURL == "" || ep.BaseURL == pr.BaseURL {
-			continue
-		}
-		// A leg on a DIFFERENT backend with at least the primary's window
-		// still qualifies: >= (not just >) because the compaction leg's job
-		// is also to survive the primary failing near the ceiling — an
-		// equal-window leg from another failure domain serves exactly that.
-		if w := probe(routeFor(ep)); w >= primaryWindow {
+	// Resolve and probe candidates concurrently. A full picker can contain
+	// hundreds of entries, and a serial 2-second /models timeout made the
+	// wizard appear hung after the tier choices. A small worker pool limits
+	// the burst against providers while bounding menu latency to the slowest
+	// few probes instead of every candidate.
+	qualifies := make([]bool, len(models))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	workers := 12
+	if len(models) < workers {
+		workers = len(models)
+	}
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				m := models[i]
+				if m == primary {
+					continue
+				}
+				ep, err := resolve(m)
+				if err != nil {
+					continue
+				}
+				// Same base URL as the primary = same failure domain and the same
+				// fit limit; oversizeSwap never crosses to it, so do not offer it.
+				if ep.BaseURL == "" || ep.BaseURL == pr.BaseURL {
+					continue
+				}
+				// >= is intentional: an equal-window independent backend can
+				// still survive a primary failure near the ceiling.
+				qualifies[i] = probe(routeFor(ep)) >= primaryWindow
+			}
+		}()
+	}
+	for i := range models {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	for i, m := range models {
+		if qualifies[i] {
 			cands = append(cands, m)
 		}
 	}
@@ -233,6 +257,7 @@ func oversizeWindowCandidates(models []string, primary string, resolve func(stri
 }
 
 const tierWizardNoOversize = "(none — fail honestly at the ceiling)"
+const tierWizardScanOversize = "(find a compatible oversize model)"
 
 // tierWizardBack is what tierWizardSelect returns when the user pressed
 // esc/←: go back one step (off the first step = abandon the wizard and
@@ -349,28 +374,6 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	sonnetItems, autoSecondary := tierWizardTierItems(models, names, primary, true)
 	haikuItems, _ := tierWizardTierItems(models, names, primary, false)
 
-	// Step 4 — compaction/oversize model. Models whose PROBED window is at
-	// least the primary's on a DIFFERENT backend qualify (see
-	// oversizeWindowCandidates); with no such model (or no answered probe)
-	// the step offers nothing and the ceiling fails honestly.
-	var oversizeItems []SelectionItem
-	var oversizeTitle string
-	if len(names) > 0 {
-		cands, primaryWindow := oversizeWindowCandidates(names, primary, tierWizardResolveEndpoint, tierWizardProbeWindow)
-		if len(cands) > 0 {
-			oversizeItems = []SelectionItem{{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"}}
-			for _, n := range cands {
-				w := probedModelWindow(n)
-				desc := ""
-				if w > 0 {
-					desc = fmt.Sprintf("probed window %dk", w/1024)
-				}
-				oversizeItems = append(oversizeItems, SelectionItem{Name: n, Description: desc, Remote: true})
-			}
-			oversizeTitle = fmt.Sprintf("Compaction/oversize model (at least %s's probed %dk window)", primary, primaryWindow/1024)
-		}
-	}
-
 	// Step 4 — route policy. Every value --route-policy accepts; local-first
 	// first (the default), same ordering as `oaica doctor`'s legend.
 	policyItems := []SelectionItem{
@@ -389,7 +392,14 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 	steps := []wizardStep{
 		{title: "Sonnet/subagent tier (secondary model)", items: sonnetItems, optional: true},
 		{title: "Haiku/background tier", items: haikuItems, optional: true},
-		{title: oversizeTitle, items: oversizeItems, optional: true},
+		// Do not probe the entire catalog on the interactive launch path. A
+		// catalog can have hundreds of remote models, and a context probe can
+		// take seconds each. The default stays the existing honest failure
+		// behavior; discovery is an explicit, opt-in action below.
+		{title: "Compaction/oversize model", items: []SelectionItem{
+			{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"},
+			{Name: tierWizardScanOversize, Description: "probe the catalog for a larger-context fallback (may take a while)"},
+		}, optional: true},
 		{title: "Route policy (what the launch proxy does when a backend fails)", items: policyItems},
 	}
 	// clearStep resets the field the step at index i writes, on stepping
@@ -446,7 +456,29 @@ func runTierWizard(models []LaunchModel, primary string) (tierWizardChoice, erro
 				c.HaikuModel = sel
 			}
 		case 2:
-			if sel != s.items[0].Name {
+			if sel == tierWizardScanOversize {
+				// Scan only after the user explicitly asks for it. Keep this
+				// step selected afterwards so they can choose a discovered
+				// model, or the first "none" row to abandon the fallback.
+				cands, primaryWindow := oversizeWindowCandidates(names, primary, tierWizardResolveEndpoint, tierWizardProbeWindow)
+				if len(cands) > 0 {
+					items := []SelectionItem{{Name: tierWizardNoOversize, Description: "requests that cannot fit fail visibly (today's behavior)"}}
+					for _, n := range cands {
+						w := probedModelWindow(n)
+						desc := ""
+						if w > 0 {
+							desc = fmt.Sprintf("probed window %dk", w/1024)
+						}
+						items = append(items, SelectionItem{Name: n, Description: desc, Remote: true})
+					}
+					steps[i].items = items
+					steps[i].title = fmt.Sprintf("Compaction/oversize model (at least %s's probed %dk window)", primary, primaryWindow/1024)
+				} else {
+					steps[i].items = []SelectionItem{{Name: tierWizardNoOversize, Description: "no compatible larger-context fallback answered"}}
+				}
+				continue
+			}
+			if sel != tierWizardNoOversize {
 				c.OversizeModel = sel
 			}
 		case 3:
