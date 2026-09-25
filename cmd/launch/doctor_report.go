@@ -7,16 +7,18 @@ package launch
 //
 //  1. Every value that is a credential anywhere in this client (the
 //     OAICA_API_KEY environment variable, every remote's key from
-//     remotes.json, every key in auth.json, and the key files signin and the
-//     licence flow write — ~/.oaica/api_key, license_key, license.json) is
-//     collected first, and paths are reported as present/absent plus their
-//     file mode — never their contents.
+//     remotes.json, every key in auth.json, the key files signin and the
+//     licence flow write — ~/.oaica/api_key, license_key, license.json — and
+//     the `oaica serve --api-key` values in local_servers.json) is collected
+//     first, and paths are reported as present/absent plus their file mode —
+//     never their contents.
 //  2. The rendered text is scanned against those values *before* it is
 //     printed. If one appears, the report is not printed at all and the
 //     command fails: a redaction-by-intention bug must not become a leaked
 //     key in someone's support ticket.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -88,11 +90,40 @@ func reportSecrets() []reportSecret {
 			readSecretFile(filepath.Join(home, ".oaica", "api_key")))
 		add("the licence key in ~/.oaica/license_key",
 			readSecretFile(filepath.Join(home, ".oaica", "license_key")))
+		// `oaica serve --api-key K` records K in local_servers.json, so that
+		// file is a fourth credential store — one the report used to describe
+		// as non-sensitive and never scan for (2026-09-26 audit).
+		for _, k := range localServerKeys(home) {
+			add("an `oaica serve --api-key` value in ~/.oaica/local_servers.json", k)
+		}
 	}
 	if f, err := loadLicenseFile(); err == nil {
 		add("the licence key in ~/.oaica/license.json", f.Key)
 	}
 	return secrets
+}
+
+// localServerKeys returns every api_key recorded in
+// ~/.oaica/local_servers.json, the file `oaica serve` writes so `oaica launch`
+// can find a running local server. Only ever called to feed the leak scan,
+// which compares values and never prints them; a malformed or absent file
+// yields no keys, which is why the caller does not treat an error as fatal.
+func localServerKeys(home string) []string {
+	b, err := os.ReadFile(filepath.Join(home, ".oaica", "local_servers.json"))
+	if err != nil {
+		return nil
+	}
+	var entries []struct {
+		APIKey string `json:"api_key"`
+	}
+	if json.Unmarshal(b, &entries) != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		keys = append(keys, e.APIKey)
+	}
+	return keys
 }
 
 // readSecretFile returns a file's trimmed contents, or "" for any error —
@@ -174,7 +205,7 @@ func buildDoctorReport() (string, bool) {
 		describeFile(&b, filepath.Join(home, ".oaica", "license_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "config.json"), false)
-		describeFile(&b, filepath.Join(home, ".oaica", "local_servers.json"), false)
+		describeFile(&b, filepath.Join(home, ".oaica", "local_servers.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "cache"), false)
 	} else {
 		fmt.Fprintln(&b, "  (no home directory — cannot list configuration files)")

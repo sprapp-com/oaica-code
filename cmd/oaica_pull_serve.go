@@ -165,7 +165,14 @@ func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return err
+	}
+	// WriteFile's mode applies only when it creates the file, and this entry
+	// carries the server's --api-key. A hand-created or copied file keeps
+	// whatever mode it had — so re-assert, like the auth store, remotes.json
+	// and the api_key file already do (2026-09-26 audit).
+	return os.Chmod(path, 0o600)
 }
 
 func oaicaUnregisterLocalServer(model string) {
@@ -184,7 +191,10 @@ func oaicaUnregisterLocalServer(model string) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(path, b, 0o600)
+	if os.WriteFile(path, b, 0o600) != nil {
+		return
+	}
+	os.Chmod(path, 0o600)
 }
 
 func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
@@ -222,7 +232,7 @@ type oaicaManifest struct {
 }
 
 func oaicaFetchManifest(model string) (*oaicaManifest, error) {
-	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/manifest/"+model, nil)
+	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaHost()+"/v1/manifest/"+model, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +242,7 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -249,7 +259,7 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 			}
 			return nil, fmt.Errorf("%s", e.Error.Message)
 		}
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, oaicaHost())
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, launch.RedactBaseURL(oaicaHost()))
 	}
 	var m oaicaManifest
 	if err := json.Unmarshal(body, &m); err != nil {

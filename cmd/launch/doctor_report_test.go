@@ -146,11 +146,15 @@ func TestDoctorReport_ScansEveryKeyFile(t *testing.T) {
 		signinKey  = "sk-signin-file-0123456789"
 		licenseKey = "lic-file-key-0123456789"
 		jsonKey    = "lic-json-key-0123456789"
+		serveKey   = "sk-serve-apikey-0123456789"
 	)
 	files := map[string]string{
 		"api_key":     signinKey + "\n",
 		"license_key": licenseKey + "\n",
 		"license.json": `{"key":"` + jsonKey + `","instance_id":"i","instance_name":"n"}`,
+		// `oaica serve --api-key K` records K here, so it is a credential
+		// file like the other three (2026-09-26 audit).
+		"local_servers.json": `[{"model":"kat","origin":"http://127.0.0.1:9/v1","pid":1,"started_at":"t","api_key":"` + serveKey + `"}]`,
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
@@ -162,16 +166,16 @@ func TestDoctorReport_ScansEveryKeyFile(t *testing.T) {
 	for _, s := range reportSecrets() {
 		values[s.value] = true
 	}
-	for _, want := range []string{signinKey, licenseKey, jsonKey} {
+	for _, want := range []string{signinKey, licenseKey, jsonKey, serveKey} {
 		if !values[want] {
 			t.Errorf("the scan does not know about %q — a report containing it would print it", want)
 		}
 	}
 
-	// And the report must show all three files, each mode-annotated as
+	// And the report must show all four files, each mode-annotated as
 	// sensitive, so the user can see where their keys live.
 	report, _ := buildDoctorReport()
-	for _, name := range []string{"api_key", "license_key", "license.json"} {
+	for _, name := range []string{"api_key", "license_key", "license.json", "local_servers.json"} {
 		line := ""
 		for _, l := range strings.Split(report, "\n") {
 			if strings.HasSuffix(strings.TrimSpace(l), name) {

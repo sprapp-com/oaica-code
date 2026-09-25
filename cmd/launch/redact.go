@@ -16,6 +16,8 @@ package launch
 // processes and libraries.
 
 import (
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -82,6 +84,23 @@ func RedactBaseURL(baseURL string) string { return redactBaseURL(baseURL) }
 
 // RedactError is redactErr for callers outside this package.
 func RedactError(err error) error { return redactErr(err) }
+
+// NewRedactedRequest is http.NewRequest with its error run through redactErr.
+//
+// net/http quotes the URL back in its own errors two ways, and both reach
+// stderr: a transport failure ("Post \"https://user:pass@host/v1\": dial tcp
+// ...") and a parse failure ("parse \"https://sk-live-…@ho st/v1\": invalid
+// character \" \" in host name"). The first is handled where the Do error is
+// wrapped; the second is not, because it is returned before any request
+// exists. Callers that build a URL from a user-supplied base URL should use
+// this instead of http.NewRequest (2026-09-26 audit).
+func NewRedactedRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, redactErr(err)
+	}
+	return req, nil
+}
 
 // userinfoSecret returns the credential a base URL carries, for a caller that
 // is deciding whether some text would leak it. It answers for URLs url.Parse

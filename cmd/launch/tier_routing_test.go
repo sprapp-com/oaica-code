@@ -1011,3 +1011,37 @@ func TestRun_OversizeBannerDoesNotCallAnAnthropicWireRemoteNative(t *testing.T) 
 		t.Errorf("the banner does not name the leg and its probed window:\n%s", stderr)
 	}
 }
+
+// A routing mistake must not print a Basic-auth password. `--oversize X`
+// resolving to the same backend as the primary is an error the user hits by
+// picking the wrong model, and its message named the backend URL — which for a
+// `https://user:password@host/v1` remote is a credential (2026-09-26 audit).
+func TestOversizeSameBackendError_RedactsBasicCredentials(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	withInteractiveSession(t, false)
+	writeRemotes(t, `{"remotes":[
+		{"name":"basic","base_url":"https://audituser:s3cretpw@api.example.com/v1","api_key":"k","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Both the primary and the oversize leg name the same remote, which is
+	// the case the error exists to reject.
+	err := (&Claude{}).Run("basic/kat-awq", nil, []string{"--oversize", "basic/two"})
+	if err == nil {
+		t.Fatal("expected the same-backend error")
+	}
+	if strings.Contains(err.Error(), "s3cretpw") {
+		t.Errorf("the password reached the error text: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "REDACTED@api.example.com") {
+		t.Errorf("the error should name the backend with a redacted credential, got %q", err.Error())
+	}
+}

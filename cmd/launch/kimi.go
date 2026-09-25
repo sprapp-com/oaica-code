@@ -49,21 +49,81 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 		return err
 	}
 
-	config, err := buildKimiInlineConfig(model, resolveKimiMaxContextSize(model))
-	if err != nil {
-		return fmt.Errorf("failed to build kimi config: %w", err)
-	}
+	maxContextSize := resolveKimiMaxContextSize(model)
 
 	bin, err := ensureKimiInstalled()
 	if err != nil {
 		return err
 	}
 
+	if kimiCLIKind(bin) == kimiCLIEnvConfig {
+		// Kimi Code CLI: the provider (key included) goes in the child's
+		// environment, which only its owner can read.
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), kimiModelEnv(model, maxContextSize)...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	// Archived kimi-cli: it takes the config as an argument and nothing else,
+	// so the key is unavoidably in the child's argv. See the note on
+	// buildKimiInlineConfig.
+	config, err := buildKimiInlineConfig(model, maxContextSize)
+	if err != nil {
+		return fmt.Errorf("failed to build kimi config: %w", err)
+	}
 	cmd := exec.Command(bin, k.args(config, args)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// How the installed CLI is configured. Kimi Code CLI synthesizes a provider
+// and model from the KIMI_MODEL_* environment variables — Moonshot documents
+// that family as the one channel that reads a credential from the shell
+// instead of config.toml. The archived Python CLI has no such channel and
+// accepts only `--config <json>`.
+const (
+	kimiCLIEnvConfig = "env"
+	kimiCLILegacy    = "legacy"
+)
+
+// kimiCLIKind reports which of the two CLIs `bin` is, by asking it: the
+// archived one has --config-file in its help, the current one has no such
+// option (it reads $KIMI_CODE_HOME/config.toml instead).
+//
+// When the probe fails the answer is the legacy CLI. That is the failing-safe
+// choice: a legacy CLI handed KIMI_MODEL_* silently ignores them and runs its
+// own default model, which looks like success and routes the user's work
+// somewhere they did not choose, whereas a current CLI handed an unknown
+// --config stops with an error.
+func kimiCLIKind(bin string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), kimiModelShowTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--help").CombinedOutput()
+	if err != nil {
+		return kimiCLILegacy
+	}
+	if strings.Contains(string(out), "--config-file") {
+		return kimiCLILegacy
+	}
+	return kimiCLIEnvConfig
+}
+
+// kimiModelEnv is the KIMI_MODEL_* set that replaces buildKimiInlineConfig.
+// Provider type "openai" is Kimi Code CLI's OpenAI-compatible protocol (its
+// default, "kimi", points at Moonshot's own API).
+func kimiModelEnv(model string, maxContextSize int) []string {
+	return []string{
+		"KIMI_MODEL_NAME=" + kimiModelIDFor(model),
+		"KIMI_MODEL_API_KEY=" + kimiKeyFor(model),
+		"KIMI_MODEL_BASE_URL=" + kimiBaseURLFor(model),
+		"KIMI_MODEL_PROVIDER_TYPE=openai",
+		fmt.Sprintf("KIMI_MODEL_MAX_CONTEXT_SIZE=%d", maxContextSize),
+	}
 }
 
 func findKimiBinary() (string, error) {
@@ -192,6 +252,13 @@ func kimiKeyFor(model string) string {
 	return "ollama"
 }
 
+// buildKimiInlineConfig renders the config the ARCHIVED kimi-cli wants.
+//
+// It is passed as one argv element, so the provider key it contains is in the
+// child's command line, readable from /proc/<pid>/cmdline by any local user —
+// a documented exception rather than an oversight (docs/ENTERPRISE.md). The
+// current CLI gets kimiModelEnv instead, which is why this is only reached
+// for a binary whose help still advertises --config-file.
 func buildKimiInlineConfig(model string, maxContextSize int) (string, error) {
 	cfg := map[string]any{
 		"default_model": kimiDefaultModelAlias,
@@ -327,6 +394,16 @@ func checkKimiInstallerDependencies() error {
 	return nil
 }
 
+// The /kimi-code/ path installs Kimi Code CLI, the maintained successor.
+// The bare /install.sh path installs the archived Python kimi-cli, which
+// Moonshot's own docs say "should no longer be installed" (its repo carries
+// the same notice): installing it left every new user on a CLI that ignores
+// the KIMI_MODEL_* variables this integration configures (2026-09-26 audit).
+const (
+	kimiInstallScriptURL   = "https://code.kimi.com/kimi-code/install.sh"
+	kimiInstallScriptURLPS = "https://code.kimi.com/kimi-code/install.ps1"
+)
+
 func kimiInstallerCommand(goos string) (string, []string, error) {
 	switch goos {
 	case "windows":
@@ -335,10 +412,10 @@ func kimiInstallerCommand(goos string) (string, []string, error) {
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"Invoke-RestMethod https://code.kimi.com/install.ps1 | Invoke-Expression",
+			"Invoke-RestMethod " + kimiInstallScriptURLPS + " | Invoke-Expression",
 		}, nil
 	case "darwin", "linux":
-		path, err := fetchInstallerScriptFn("https://code.kimi.com/install.sh")
+		path, err := fetchInstallerScriptFn(kimiInstallScriptURL)
 		if err != nil {
 			return "", nil, err
 		}

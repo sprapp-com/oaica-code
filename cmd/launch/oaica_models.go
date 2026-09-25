@@ -248,7 +248,7 @@ type oaicaRouterError struct {
 }
 
 func (e *oaicaRouterError) Error() string {
-	return fmt.Sprintf("HTTP %d from %s: %s", e.Status, e.Host, e.Body)
+	return fmt.Sprintf("HTTP %d from %s: %s", e.Status, redactBaseURL(e.Host), e.Body)
 }
 
 // isOaicaRouterAuthErr reports whether err is the router rejecting the
@@ -381,7 +381,7 @@ func isRouterAuthErr(err error) bool { return isOaicaRouterAuthErr(err) }
 const routerModelFetchTimeout = 2 * time.Second
 
 func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEntry, string, error) {
-	req, err := http.NewRequest(http.MethodGet, host+"/v1/models", nil)
+	req, err := NewRedactedRequest(http.MethodGet, host+"/v1/models", nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -392,7 +392,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 	client := &http.Client{Timeout: routerModelFetchTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("couldn't reach %s: %w", host, err)
+		return nil, "", redactErr(fmt.Errorf("couldn't reach %s: %w", redactBaseURL(host), err))
 	}
 	defer resp.Body.Close()
 	respETag := resp.Header.Get("ETag")
@@ -412,7 +412,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, respETag, fmt.Errorf("bad response from %s: %w", host, err)
+		return nil, respETag, redactErr(fmt.Errorf("bad response from %s: %w", redactBaseURL(host), err))
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
@@ -535,7 +535,7 @@ type oaicaLoraEntry struct {
 // (needed to build a valid "<model>+<lora>" composite name — the router
 // rejects stacking adapters registered on different backends).
 func oaicaLiveLoraEntries() []oaicaLoraEntry {
-	req, err := http.NewRequest(http.MethodGet, oaicaLaunchHost()+"/v1/lora", nil)
+	req, err := NewRedactedRequest(http.MethodGet, oaicaLaunchHost()+"/v1/lora", nil)
 	if err != nil {
 		return nil
 	}

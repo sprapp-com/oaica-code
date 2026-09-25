@@ -182,7 +182,7 @@ type oaicaModelList struct {
 var oaicaListModelsDetailed = oaicaListModelsDetailedLive
 
 func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
-	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/models", nil)
+	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaHost()+"/v1/models", nil)
 	if err != nil {
 		// OAICA_HOST can be configured with the key as URL userinfo
 		// (https://KEY@host), and net/http quotes the URL back in its own
@@ -200,13 +200,13 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return nil, fmt.Errorf("%s rejected the API key (HTTP %d)\n%s", oaicaHost(), resp.StatusCode, oaicaAuthHint)
+			return nil, launch.RedactError(fmt.Errorf("%s rejected the API key (HTTP %d)\n%s", launch.RedactBaseURL(oaicaHost()), resp.StatusCode, oaicaAuthHint))
 		}
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	var list oaicaModelList
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("bad response from %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("bad response from %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	return list.Data, nil
 }
@@ -321,7 +321,7 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, oaicaHost()+"/v1/chat/completions", bytes.NewReader(buf))
+	req, err := launch.NewRedactedRequest(http.MethodPost, oaicaHost()+"/v1/chat/completions", bytes.NewReader(buf))
 	if err != nil {
 		return "", err
 	}
@@ -330,7 +330,7 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -402,7 +402,7 @@ type oaicaLoraList struct {
 // on/off state — llama-server doesn't expose a GET for that, see
 // prism-api-router/src/index.ts's /v1/lora handler.
 func oaicaListLoras() ([]oaicaLoraListEntry, error) {
-	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/lora", nil)
+	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaHost()+"/v1/lora", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +410,7 @@ func oaicaListLoras() ([]oaicaLoraListEntry, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -419,7 +419,7 @@ func oaicaListLoras() ([]oaicaLoraListEntry, error) {
 	}
 	var list oaicaLoraList
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("bad response from %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("bad response from %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	return list.Data, nil
 }
@@ -441,7 +441,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, oaicaHost()+path, bytes.NewReader(buf))
+	req, err := launch.NewRedactedRequest(http.MethodPost, oaicaHost()+path, bytes.NewReader(buf))
 	if err != nil {
 		return "", err
 	}
@@ -450,7 +450,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -507,7 +507,7 @@ type oaicaProviderList struct {
 // returns secret values — the router's GET response only ever includes
 // hasAuth (bool), never the auth header's actual value.
 func oaicaAuthList() ([]oaicaProviderEntry, error) {
-	req, err := http.NewRequest(http.MethodGet, oaicaHost()+"/v1/admin/providers", nil)
+	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaHost()+"/v1/admin/providers", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +517,7 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -529,7 +529,7 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 	}
 	var list oaicaProviderList
 	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("bad response from %s: %w", oaicaHost(), err)
+		return nil, launch.RedactError(fmt.Errorf("bad response from %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	return list.Data, nil
 }
@@ -564,7 +564,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, oaicaHost()+"/v1/admin/providers", bytes.NewReader(buf))
+	req, err := launch.NewRedactedRequest(http.MethodPost, oaicaHost()+"/v1/admin/providers", bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}
@@ -575,7 +575,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -597,7 +597,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 
 // oaicaAuthLogout removes a provider from the router's live registry.
 func oaicaAuthLogout(name string) error {
-	req, err := http.NewRequest(http.MethodDelete, oaicaHost()+"/v1/admin/providers/"+name, nil)
+	req, err := launch.NewRedactedRequest(http.MethodDelete, oaicaHost()+"/v1/admin/providers/"+name, nil)
 	if err != nil {
 		return err
 	}
@@ -607,7 +607,7 @@ func oaicaAuthLogout(name string) error {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -649,7 +649,7 @@ func oaicaAgentRun(task string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, oaicaAgentHost()+"/generate", bytes.NewReader(buf))
+	req, err := launch.NewRedactedRequest(http.MethodPost, oaicaAgentHost()+"/generate", bytes.NewReader(buf))
 	if err != nil {
 		return "", err
 	}

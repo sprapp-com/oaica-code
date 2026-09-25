@@ -313,14 +313,14 @@ func showOrPullWithPolicy(ctx context.Context, client *api.Client, model string,
 		// A router that is merely unreachable still fails open (local
 		// models must keep working offline).
 		if _, rerr := oaicaFetchCloudModelEntries(); isOaicaRouterAuthErr(rerr) {
-			return fmt.Errorf("%q is not a local model, and %s rejected the API key (%w)\nSet OAICA_API_KEY or run `oaica signin`", model, oaicaLaunchHost(), rerr)
+			return fmt.Errorf("%q is not a local model, and %s rejected the API key (%w)\nSet OAICA_API_KEY or run `oaica signin`", model, redactBaseURL(oaicaLaunchHost()), redactErr(rerr))
 		}
 
 		var statusErr api.StatusError
 		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
 			// Transport-level failure: no local daemon is running. Say what
 			// was tried instead of leaking a bare dial error.
-			return fmt.Errorf("%q is not served by %s and no local server answered at %s: %w", model, oaicaLaunchHost(), envconfig.Host(), err)
+			return fmt.Errorf("%q is not served by %s and no local server answered at %s: %w", model, redactBaseURL(oaicaLaunchHost()), redactBaseURL(envconfig.Host().String()), redactErr(err))
 		}
 	}
 

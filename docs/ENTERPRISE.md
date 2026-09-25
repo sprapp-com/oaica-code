@@ -80,7 +80,7 @@ the modes it actually finds so you can verify that on a given host.
 | `~/.oaica/remotes.json` | Your remotes: base URLs, and any inline `api_key` | **Possibly** |
 | `~/.oaica/config.json`, `plans.json`, `models.json`, `aliases.json` | Tiers, named plans, model manifest, aliases | No |
 | `~/.oaica/model_picks.json`, `picker_cache.json` | Picker frequency and cached inventory | No (no URLs or keys — the cached row is name/metadata only) |
-| `~/.oaica/local_servers.json` | Which `oaica serve` instances are running, and their ports | No |
+| `~/.oaica/local_servers.json` | Which `oaica serve` instances are running, their ports, and the `--api-key` each was started with | **Possibly** |
 | `~/.oaica/requests.log` | One line per launch request: model name, which backend served it (a label, or the endpoint URL with any credential redacted), message *sizes*, timing, status | No — sizes, not content |
 | `~/.oaica/cache/` | Cached catalog and probe answers | No |
 | `~/.oaica/update_check.json` | Last update check: when, and which version was newest | No |
@@ -114,8 +114,9 @@ argument list. Concretely, the client:
 - refuses to print `oaica doctor --report` at all if any secret value would
   appear in it, rather than printing a partially-redacted bundle. The scan
   covers every place a key can sit — the environment, `remotes.json`,
-  `auth.json`, and the `api_key`, `license_key` and `license.json` files — so
-  a value the report does not currently print is still checked against it;
+  `auth.json`, the `api_key`, `license_key` and `license.json` files, and the
+  `--api-key` values in `local_servers.json` — so a value the report does not
+  currently print is still checked against it;
 - promotes a bare `https://<token>@host/v1` remote into a normal bearer token
   and strips it from the URL, so the secret stops travelling in URLs, in
   command lines visible to `ps`, and in `net/http` error text.
@@ -127,14 +128,20 @@ applies to an `OAICA_HOST` that carries a credential: the token is promoted to
 the bearer and stripped from the URL, so it does not appear in error text, in
 `ps`, or in any message naming the host.
 
-One known exception, stated rather than implied: `oaica launch kimi` passes its
-generated configuration to Kimi's own CLI as a `--config <json>` argument, and
-that JSON contains the provider key — so for that one integration the key is in
-the child process's argument list, readable from `/proc/<pid>/cmdline` by any
-local user. Codex, Claude Code, opencode and the rest receive their credentials
-through the environment or a config file instead. If that matters on a shared
-host, don't launch Kimi there, or run it on a machine where you are the only
-user.
+`oaica launch kimi` hands the provider key to Kimi Code CLI through the
+`KIMI_MODEL_*` environment variables Moonshot documents for that purpose, so it
+stays out of the child's argument list. Codex, Claude Code, opencode and the
+rest receive their credentials the same way, through the environment or a
+config file.
+
+One known exception, stated rather than implied: if `kimi` on `PATH` is the
+**archived** Python `kimi-cli` — recognisable by `--config-file` in its `kimi
+--help` — it has no environment channel, and oaica falls back to its
+`--config <json>` argument, which contains the provider key. That key is then
+in the child process's argument list, readable from `/proc/<pid>/cmdline` by any
+local user. Install Kimi Code CLI instead (which is what `oaica launch kimi`
+offers, from `code.kimi.com/kimi-code/…`), or don't launch Kimi on a shared
+host.
 
 ## Installing, pinning, air-gapped
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -313,7 +314,85 @@ func TestKimiRun_RejectsConflictingArgsBeforeInstall(t *testing.T) {
 	}
 }
 
-func TestKimiRun_PassesInlineConfigAndExtraArgs(t *testing.T) {
+// The current CLI (Kimi Code CLI) is configured through the KIMI_MODEL_*
+// environment variables: the provider key must never reach the child's argv,
+// which any local user can read from /proc/<pid>/cmdline. The archived
+// kimi-cli has no such channel, so it still gets --config — but only after a
+// probe says that is what the binary is (2026-09-26 audit).
+func TestKimiRun_EnvConfiguredCLIKeepsKeyOutOfArgv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake binary")
+	}
+
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+	logPath := filepath.Join(tmpDir, "kimi-args.log")
+	envPath := filepath.Join(tmpDir, "kimi-env.log")
+	// --help answers as the current CLI (no --config-file); a real run logs
+	// its argv and environment.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "Usage: kimi [options]"
+  echo "  --session <id>   Resume a session"
+  exit 0
+fi
+for arg in "$@"; do
+  printf "%%s\n" "$arg" >> %q
+done
+env | grep "^KIMI_MODEL" | sort >> %q
+exit 0
+`, logPath, envPath)
+	if err := os.WriteFile(filepath.Join(tmpDir, "kimi"), []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake kimi: %v", err)
+	}
+	// The fake comes first so findKimiBinary picks it up, but the real PATH
+	// stays: the script itself needs env/grep/sort, which the fake's PATH
+	// would otherwise not contain (printf is a shell builtin, which is why
+	// the argv log worked and the env log did not).
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	t.Setenv("OLLAMA_HOST", srv.URL)
+
+	k := &Kimi{}
+	if err := k.Run("llama3.2", nil, []string{"--quiet", "--print"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	argv, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read args log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(argv)), "\n")
+	want := []string{"--quiet", "--print"}
+	if !slices.Equal(lines, want) {
+		t.Fatalf("child argv = %v, want %v", lines, want)
+	}
+	if strings.Contains(string(argv), "api_key") {
+		t.Fatalf("the provider config reached the child argv: %v", lines)
+	}
+
+	envLog, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("failed to read env log: %v", err)
+	}
+	env := string(envLog)
+	for _, want := range []string{
+		"KIMI_MODEL_NAME=llama3.2",
+		"KIMI_MODEL_API_KEY=ollama",
+		"KIMI_MODEL_PROVIDER_TYPE=openai",
+		"KIMI_MODEL_MAX_CONTEXT_SIZE=" + strconv.Itoa(kimiDefaultMaxContextSize),
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("child environment is missing %q:\n%s", want, env)
+		}
+	}
+}
+
+// A binary whose help advertises --config-file is the archived Python CLI,
+// which ignores KIMI_MODEL_* and only accepts the config as an argument.
+func TestKimiRun_LegacyCLIGetsInlineConfig(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses POSIX shell fake binary")
 	}
@@ -322,6 +401,11 @@ func TestKimiRun_PassesInlineConfigAndExtraArgs(t *testing.T) {
 	setTestHome(t, tmpDir)
 	logPath := filepath.Join(tmpDir, "kimi-args.log")
 	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "--help" ]; then
+  echo "  --config TEXT       Config TOML/JSON string to load"
+  echo "  --config-file FILE  Config TOML/JSON file to load"
+  exit 0
+fi
 for arg in "$@"; do
   printf "%%s\n" "$arg" >> %q
 done

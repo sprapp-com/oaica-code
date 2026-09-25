@@ -69,7 +69,7 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 		oaicaAuthorize(httpReq)
 		resp, err := (&http.Client{Timeout: 180 * time.Second}).Do(httpReq)
 		if err != nil {
-			lastErr = fmt.Errorf("couldn't reach %s: %w", oaicaHost(), err)
+			lastErr = launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 			if ctx.Err() != nil {
 				return "", lastErr
 			}

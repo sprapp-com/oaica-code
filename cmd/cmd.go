@@ -1955,7 +1955,7 @@ func checkServerHeartbeat(cmd *cobra.Command, _ []string) error {
 // this fork ships no daemon and `oaica serve` means something else entirely
 // (self-host a pulled GGUF). Fresh-user audit of 0.4.6, P0-1.
 func errNoLocalDaemon() error {
-	return fmt.Errorf("no local Ollama daemon at %s. oaica is a thin client: use `oaica run <model>` (hosted), `oaica pull <model>` + `oaica serve <model>` (self-host), or point OLLAMA_HOST at a running Ollama if you have one", envconfig.Host())
+	return fmt.Errorf("no local Ollama daemon at %s. oaica is a thin client: use `oaica run <model>` (hosted), `oaica pull <model>` + `oaica serve <model>` (self-host), or point OLLAMA_HOST at a running Ollama if you have one", launch.RedactBaseURL(envconfig.Host().String()))
 }
 
 func versionHandler(cmd *cobra.Command, _ []string) {

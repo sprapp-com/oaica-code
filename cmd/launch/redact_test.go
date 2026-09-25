@@ -161,3 +161,34 @@ type sentinelJoiner struct {
 
 func (e *sentinelJoiner) Error() string   { return e.msg }
 func (e *sentinelJoiner) Unwrap() []error { return e.errs }
+
+// http.NewRequest's own error quotes the URL back, so a base URL with
+// userinfo in it lands in the message before any request exists. The Do-error
+// path is wrapped where it happens; this one is not, which is why the
+// constructor is wrapped instead (2026-09-26 audit).
+func TestNewRedactedRequest_RedactsParseError(t *testing.T) {
+	cases := []struct{ name, url, secret string }{
+		{"space in host", "https://sk-live-AUDITSECRET@ho st/v1/models", "AUDITSECRET"},
+		{"control character", "https://sk-live-AUDITSECRET@host/\x7f/v1", "AUDITSECRET"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewRedactedRequest("GET", tc.url, nil)
+			if err == nil {
+				t.Fatalf("expected http.NewRequest to reject %q", tc.url)
+			}
+			if strings.Contains(err.Error(), tc.secret) {
+				t.Errorf("the credential reached the error text: %q", err.Error())
+			}
+		})
+	}
+
+	// And a URL that parses comes back as a usable request, unchanged.
+	req, err := NewRedactedRequest("GET", "https://user:pw@example.test/v1/models", nil)
+	if err != nil {
+		t.Fatalf("NewRedactedRequest: %v", err)
+	}
+	if got := req.URL.Host; got != "example.test" {
+		t.Errorf("host = %q, want example.test", got)
+	}
+}

@@ -216,11 +216,11 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 					}}, nil
 				}
 			}
-			tried = append(tried, fmt.Sprintf("not on %s", oaicaLaunchHost()))
+			tried = append(tried, fmt.Sprintf("not on %s", redactBaseURL(oaicaLaunchHost())))
 		} else if isOaicaRouterAuthErr(routerErr) {
-			tried = append(tried, fmt.Sprintf("%s rejected the API key — set OAICA_API_KEY or run `oaica signin`", oaicaLaunchHost()))
+			tried = append(tried, fmt.Sprintf("%s rejected the API key — set OAICA_API_KEY or run `oaica signin`", redactBaseURL(oaicaLaunchHost())))
 		} else {
-			tried = append(tried, fmt.Sprintf("%s unavailable (%v)", oaicaLaunchHost(), routerErr))
+			tried = append(tried, fmt.Sprintf("%s unavailable (%v)", redactBaseURL(oaicaLaunchHost()), redactErr(routerErr)))
 		}
 		if wantRouter {
 			return launchEndpoint{}, fmt.Errorf("model %q: %s", model, strings.Join(tried, "; "))
@@ -235,9 +235,9 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		}}, nil
 	}
 	if reachable {
-		tried = append(tried, fmt.Sprintf("not pulled on the local daemon at %s", envconfig.Host()))
+		tried = append(tried, fmt.Sprintf("not pulled on the local daemon at %s", redactBaseURL(envconfig.Host().String())))
 	} else {
-		tried = append(tried, fmt.Sprintf("no local daemon at %s", envconfig.Host()))
+		tried = append(tried, fmt.Sprintf("no local daemon at %s", redactBaseURL(envconfig.Host().String())))
 	}
 	if wantDaemon {
 		return launchEndpoint{}, fmt.Errorf("model %q: %s", model, strings.Join(tried, "; "))
@@ -1224,7 +1224,11 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		// same-backend case for two ORDINARY (non-native) endpoints, where
 		// an identical BaseURL really does mean "no larger leg exists."
 		if over.Source != sourceNativeAnthropic && over.BaseURL == plan.Primary.BaseURL {
-			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, over.BaseURL)
+			// redactBaseURL: resolveRemoteEndpoint deliberately keeps a
+			// Basic userinfo (user:password@) in the URL it returns, and
+			// this text goes out through cobra.CheckErr to stderr — a
+			// password printed for a routing mistake (2026-09-26 audit).
+			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, redactBaseURL(over.BaseURL))
 		}
 		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
 			return fmt.Errorf("--oversize: %w", err)
