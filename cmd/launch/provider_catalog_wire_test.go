@@ -25,42 +25,58 @@ func anthropicEndpointShaped(baseURL string) bool {
 	return strings.HasSuffix(b, "/anthropic") || strings.Contains(b, "/anthropic/")
 }
 
-// A base URL that names /anthropic must declare the anthropic wire. This is the
-// exact pairing that broke, and the default is openai — the dangerous direction.
-func TestCatalog_AnthropicEndpointsDeclareAnthropicWire(t *testing.T) {
-	checked := 0
+// No catalog row may point at a vendor's Anthropic-compatible path.
+//
+// oaica's translation proxy has exactly one upstream form, <base>/chat/
+// completions (anthropic_openai_proxy.go); the Anthropic passthrough exists
+// only for api.anthropic.com itself (proxyRoute.NativePassthrough, set from
+// sourceNativeAnthropic). A row on an /anthropic path therefore cannot be
+// driven by any launch: z.ai answered 404 {"detail":"Not Found"} to
+// /anthropic/v1/chat/completions and MiniMax 404 "404 page not found" —
+// surfacing as "502 upstream HTTP 404" in Claude Code. The plan rows were
+// repointed at each vendor's OpenAI-compatible path (zai-coding-plan →
+// /api/coding/paas/v4, the form models.dev declares; minimax-* →
+// api.minimax.io / api.minimax.cn). This test keeps the next such row out:
+// if an Anthropic-native remote is genuinely wanted, it needs a passthrough
+// route first, not a base_url.
+func TestCatalog_NoRowPointsAtAnAnthropicPath(t *testing.T) {
 	for _, e := range providerCatalog() {
 		if !anthropicEndpointShaped(e.BaseURL) {
 			continue
 		}
-		checked++
-		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Wire: e.Wire, ToolFormat: e.ToolFormat}
-		if got := r.Descriptor().Wire; got != "anthropic" {
-			t.Errorf("%s: base_url %q is an Anthropic-compatible endpoint but wire resolves to %q — the proxy would POST %s/chat/completions and the plan answers 404 (regression: 5426c932 lost this row's wire field)",
-				e.Name, e.BaseURL, got, r.openAIBase())
-		}
-	}
-	if checked == 0 {
-		t.Fatal("no anthropic-shaped endpoints in the catalog — this test verified nothing")
+		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
+		t.Errorf("%s: base_url %q is an Anthropic-shaped endpoint but the proxy only ever POSTs %s — repoint the row at the vendor's OpenAI-compatible path, or give it a passthrough route",
+			e.Name, e.BaseURL, r.openAIBase()+"/chat/completions")
 	}
 }
 
-// The converse guard: a row declaring the anthropic wire must build an upstream
-// that is an Anthropic messages URL, with no doubled version segment. Catches
-// both a base_url carrying "/v1" that openAIBase re-adds and a wrong wire.
-func TestCatalog_AnthropicWireBuildsMessagesURL(t *testing.T) {
+// The verified endpoint each plan row must reach. These are live-curl results,
+// not guesses: a "fix the URL" edit that looks plausible but was never tried
+// against the vendor is exactly what produced the 404s above.
+func TestCatalog_PlanRowsHitTheVerifiedEndpoint(t *testing.T) {
+	want := map[string]string{
+		"zai-coding-plan":        "https://api.z.ai/api/coding/paas/v4/chat/completions",
+		"zai":                    "https://api.z.ai/api/paas/v4/chat/completions",
+		"minimax-coding-plan":    "https://api.minimax.io/v1/chat/completions",
+		"minimax-cn-coding-plan": "https://api.minimax.cn/v1/chat/completions",
+	}
+	seen := 0
 	for _, e := range providerCatalog() {
-		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
-		if r.Descriptor().Wire != "anthropic" {
+		wantURL, ok := want[e.Name]
+		if !ok {
 			continue
 		}
-		upstream := r.openAIBase() + "/messages"
-		if strings.Contains(upstream, "/v1/v1") {
-			t.Errorf("%s: upstream %q repeats the version segment", e.Name, upstream)
+		seen++
+		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
+		if got := r.openAIBase() + "/chat/completions"; got != wantURL {
+			t.Errorf("%s: upstream %q, want the verified %q", e.Name, got, wantURL)
 		}
-		if !strings.HasSuffix(upstream, "/v1/messages") {
-			t.Errorf("%s: upstream %q is not an Anthropic messages endpoint", e.Name, upstream)
+		if r.Descriptor().Wire != "openai" {
+			t.Errorf("%s: wire = %q, want openai (these plans are driven through the OpenAI translation proxy)", e.Name, r.Descriptor().Wire)
 		}
+	}
+	if seen != len(want) {
+		t.Fatalf("checked %d of %d plan rows — a row was renamed or removed without updating this list", seen, len(want))
 	}
 }
 

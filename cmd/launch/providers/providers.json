@@ -63,7 +63,7 @@
       "glm-5v-turbo": {"context": 200000, "output": 131072}
     }
     },
-    {"name": "zai-coding-plan", "auth_via": "opencode", "base_url": "https://api.z.ai/api/anthropic", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "Z_AI_API_KEY", "plan_label": "Coding Plan (Z.AI — subscription)", "key_url": "https://z.ai/manage-apikey/apikey-list", "notes": "Flat-fee GLM Coding Plan on the Anthropic-compatible endpoint, so Claude Code drives it directly. Z.AI also serves the same models OpenAI-compatible at /api/coding/paas/v4 (models.dev uses that form); the anthropic path is the one that works as an ANTHROPIC_BASE_URL. Keys off Z_AI_API_KEY — the variable our fleet exports for this plan. The per-token row 'zai' points at the paas endpoint instead; a coding-plan key there yields 429 'no resource package', not a model error (verified 2026-09-25). This row MUST keep wire=anthropic: without it oaica posts /chat/completions at the anthropic path and the plan answers 404 {\"detail\":\"Not Found\"} (regressed in 5426c932, restored here).",
+    {"name": "zai-coding-plan", "auth_via": "opencode", "base_url": "https://api.z.ai/api/coding/paas", "version": "v4", "tool_format": "tool_calls", "api_key_env": "Z_AI_API_KEY", "plan_label": "Coding Plan (Z.AI — subscription)", "key_url": "https://z.ai/manage-apikey/apikey-list", "notes": "Flat-fee GLM Coding Plan. Reached on z.ai's OpenAI-compatible CODING path /api/coding/paas/v4 — the form models.dev declares for this plan — because oaica's proxy always POSTs <base>/chat/completions (verified live 2026-09-25 with a coding-plan key: coding/paas/v4 = 200, api/paas/v4 = 429 'no resource package' — that is the per-token row 'zai', not this one). Do NOT repoint this row at /api/z.ai/api/anthropic: that path answers 200 to Anthropic-shaped /v1/messages (with x-api-key) but 404 {\"detail\":\"Not Found\"} to /chat/completions, which is what this proxy sends — it was the cause of \"502 upstream HTTP 404\" in Claude Code until 74ac00b5/this change.",
      "models": {
       "glm-4.7": {"context": 204800, "output": 131072},
       "glm-5-turbo": {"context": 200000, "output": 131072},
@@ -85,7 +85,7 @@
       "MiniMax-M3": {"context": 1000000, "output": 512000}
     }
     },
-    {"name": "minimax-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.io/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax — subscription)", "key_url": "https://platform.minimax.io/user-center/basic-information/interface-key",
+    {"name": "minimax-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.io", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax — subscription)", "key_url": "https://platform.minimax.io/user-center/basic-information/interface-key", "notes": "MiniMax subscription plan on the OpenAI-compatible endpoint (same base as the per-token 'minimax' row — the plan changes billing, not the path). models.dev lists this provider under the Anthropic SDK (/anthropic/v1), but oaica's proxy only ever POSTs <base>/chat/completions, and /anthropic/v1/chat/completions answers 404 '404 page not found' (verified 2026-09-25) — so the anthropic path is unreachable here and must not be used.",
      "models": {
       "MiniMax-M2": {"context": 204800, "output": 131072},
       "MiniMax-M2.1": {"context": 204800, "output": 131072},
@@ -294,7 +294,7 @@
       "GLM-4.7": {"context": 204800, "output": 131072}
     }
     },
-    {"name": "minimax-cn-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.cn/anthropic/v1", "wire": "anthropic", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax China — subscription)", "key_url": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+    {"name": "minimax-cn-coding-plan", "auth_via": "opencode", "base_url": "https://api.minimax.cn", "tool_format": "tool_calls", "api_key_env": "MINIMAX_API_KEY", "plan_label": "Coding Plan (MiniMax China — subscription)", "key_url": "https://platform.minimaxi.com/user-center/basic-information/interface-key", "notes": "MiniMax China subscription plan, OpenAI-compatible base like the global row — see minimax-coding-plan's notes for why the /anthropic path is unusable here. Endpoint path verified 2026-09-25 (api.minimax.cn/v1/chat/completions answers an OpenAI-shaped 401 for a non-CN key, i.e. the route exists; api.minimaxi.com/v1 does too, same shape).",
      "models": {
       "MiniMax-M2": {"context": 204800, "output": 131072},
       "MiniMax-M2.1": {"context": 204800, "output": 131072},
