@@ -6,7 +6,7 @@
 # markers in install.sh; this test extracts that block and runs it under
 # plain `sh` (what `#!/bin/sh` and the CI harness use) with stub status/error/
 # warning/available functions. A small python http.server serves a fake
-# oaica.com/download directory and can truncate or corrupt the first response
+# release-asset directory and can truncate or corrupt the first response
 # for a path, which is the Cloudflare cache-fill failure this guards against.
 #
 #   bash scripts/tests/install_checksum_test.sh
@@ -54,6 +54,14 @@ if cmp -s "$INSTALL_SH" "$ROOT/site/install.sh"; then
 else
     fail "scripts/install.sh and site/install.sh differ (cp scripts/install.sh site/install.sh)"
 fi
+# Same trap on Windows: release.yaml publishes scripts/install.ps1 while
+# oaica.com serves site/install.ps1, so drift between them means the two
+# install paths behave differently.
+if cmp -s "$ROOT/scripts/install.ps1" "$ROOT/site/install.ps1"; then
+    ok "scripts/install.ps1 and site/install.ps1 are identical"
+else
+    fail "scripts/install.ps1 and site/install.ps1 differ (cp site/install.ps1 scripts/install.ps1)"
+fi
 
 ###########################################
 # 2. Extract the helper block
@@ -67,7 +75,6 @@ status() { echo ">>> $*" >&2; }
 error() { echo "ERROR: $*"; exit 1; }
 warning() { echo "WARNING: $*"; }
 available() { command -v "$1" >/dev/null; }
-VER_PARAM="${VER_PARAM:-}"
 SUDO=
 EOF
 
@@ -207,10 +214,22 @@ assert_eq "$rc" "0" "darwin zip: exit 0"
 assert_contains "$out" "Checksum OK: oaica-darwin-arm64.zip" "darwin zip: verified against SHA256SUMS"
 assert_contains "$out" "oaica-fake" "darwin zip: extracted binary runs"
 
-# ?version= query strings (OAICA_VERSION) are appended to both archive and SHA256SUMS URLs.
-rc=0; out=$(VER_PARAM='?version=9.9.9' run_sh "fetch_archive '$BASE' oaica-linux-amd64.tgz \"\$TEMP_DIR/a.tgz\"") || rc=$?
-assert_eq "$rc" "0" "OAICA_VERSION query string: exit 0"
-assert_contains "$out" "Checksum OK: oaica-linux-amd64.tgz" "OAICA_VERSION query string: still verified"
+# release_download_base: where the archives and SHA256SUMS are fetched from.
+# Default is the latest published GitHub release — not a hand-maintained copy
+# on oaica.com, which drifted and served an older artifact than the newest tag.
+rc=0; out=$(run_sh "release_download_base") || rc=$?
+assert_eq "$rc" "0" "release_download_base: exit 0"
+assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/latest/download" "release_download_base: default is the latest release"
+rc=0; out=$(run_sh "OAICA_VERSION=0.5.46 release_download_base") || rc=$?
+assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/download/oaica-v0.5.46" "release_download_base: OAICA_VERSION pins that tag"
+rc=0; out=$(run_sh "OAICA_VERSION=v0.5.46 release_download_base") || rc=$?
+assert_eq "$out" "https://github.com/sprapp-com/oaica-code/releases/download/oaica-v0.5.46" "release_download_base: a leading 'v' is not doubled"
+rc=0; out=$(run_sh "OAICA_DOWNLOAD_BASE=https://mirror.example.com/oaica/ release_download_base") || rc=$?
+assert_eq "$out" "https://mirror.example.com/oaica" "release_download_base: OAICA_DOWNLOAD_BASE overrides, trailing slash dropped"
+rc=0; out=$(run_sh "OAICA_VERSION=0.5.46 OAICA_DOWNLOAD_BASE=https://mirror.example.com/oaica release_download_base") || rc=$?
+assert_eq "$out" "https://mirror.example.com/oaica" "release_download_base: an air-gapped mirror wins over OAICA_VERSION"
+rc=0; out=$(run_sh "OAICA_RELEASE_REPO=acme/oaica-fork release_download_base") || rc=$?
+assert_eq "$out" "https://github.com/acme/oaica-fork/releases/latest/download" "release_download_base: OAICA_RELEASE_REPO swaps the repository"
 
 # Truncated body (HTTP 200, Content-Length says more): retried, then succeeds.
 rc=0; out=$(run_sh "fetch_archive '$BASE' short-once.tgz \"\$TEMP_DIR/s.tgz\" && cmp -s \"\$TEMP_DIR/s.tgz\" '$DL/short-once.tgz' && echo DOWNLOADED") || rc=$?

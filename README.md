@@ -11,16 +11,28 @@ curl -fsSL https://oaica.com/install.sh | bash    # macOS/Linux
 irm https://oaica.com/install.ps1 | iex           # Windows
 ```
 
-Prefer a manual download? Grab a tarball from
-[oaica.com/download](https://oaica.com/download/) or the
-[GitHub releases](https://github.com/sprapp-com/oaica-code/releases). The
+Both installers fetch the archive **and** its checksum from the GitHub release
+for the version being installed, so what you install is always the artifact CI
+built from that tag:
+
+```shell
+# pin an exact version
+OAICA_VERSION=0.5.46 curl -fsSL https://oaica.com/install.sh | bash
+# fetch from a mirror instead of GitHub (air-gapped hosts)
+OAICA_DOWNLOAD_BASE=https://mirror.internal/oaica curl -fsSL https://oaica.com/install.sh | bash
+```
+
+Prefer a manual download? Every archive is attached to the
+[GitHub releases](https://github.com/sprapp-com/oaica-code/releases) together
+with `SHA256SUMS`, `VERSION.txt`, and the install scripts themselves. The
 archive extracts to `bin/oaica`, so either extract into `~/.local`
 (`tar -C ~/.local -xzf oaica-*.tar.gz`) or move `bin/oaica` onto your `PATH`
 yourself (e.g. `/usr/local/bin`).
 
-**Current release:** see https://oaica.com/download/VERSION.txt for the live
-pointer (it is written by the release build, so it cannot go stale the way a
-number typed here does).
+**Current release:** see the [latest GitHub
+release](https://github.com/sprapp-com/oaica-code/releases/latest) — the tag and
+its assets are the release, so reading them cannot go stale the way a number
+typed into this file does.
 
 **API base URL:** `https://api.oaica.com` (`OAICA_HOST` defaults here;
 OpenAI-compatible).

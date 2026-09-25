@@ -39,24 +39,53 @@ case "$ARCH" in
     *) error "Unsupported architecture: $ARCH" ;;
 esac
 
-VER_PARAM="${OAICA_VERSION:+?version=$OAICA_VERSION}"
-
 ###########################################
 # Download + checksum helpers (macOS and Linux)
 ###########################################
-# Every archive is verified against https://oaica.com/download/SHA256SUMS
-# (written by scripts/build_oaica.sh) before it is extracted. Cloudflare Pages
-# once served an HTTP 200 with a truncated body (1.6 MB of 4.9 MB) during a
-# cache fill; that used to surface as a cryptic zstd/tar error. Now a short
-# body or a checksum mismatch is retried up to DOWNLOAD_ATTEMPTS times and
-# then fails with a clear message.
+# Archives and SHA256SUMS come from the GitHub release for the version being
+# installed — the artifacts CI built from that tag — not from a copy published
+# on oaica.com. That copy was maintained by hand and drifted: it was still
+# serving 0.5.45 while the newest release was 0.5.46, so a user asking for the
+# latest got something older with no indication. A release URL cannot drift
+# from its tag.
+#
+# Every archive is verified against that release's SHA256SUMS (written by
+# scripts/build_oaica.sh) before it is extracted. Cloudflare Pages once served
+# an HTTP 200 with a truncated body (1.6 MB of 4.9 MB) during a cache fill;
+# that used to surface as a cryptic zstd/tar error. Now a short body or a
+# checksum mismatch is retried up to DOWNLOAD_ATTEMPTS times and then fails
+# with a clear message.
 #
 # scripts/tests/install_checksum_test.sh extracts and exercises the block
 # between the begin/end markers; keep the markers and keep the block
 # self-contained (it may only depend on status/error/warning/available,
-# TEMP_DIR and VER_PARAM).
+# TEMP_DIR, and the OAICA_* environment variables).
 # --- download helpers (begin) ---
 DOWNLOAD_ATTEMPTS=3
+
+# release_download_base prints the base URL the archives and SHA256SUMS are
+# fetched from. Precedence:
+#
+#   OAICA_DOWNLOAD_BASE   overrides everything — a mirror, or an air-gapped
+#                         host serving the release assets.
+#   OAICA_VERSION         pins that version's release (tag oaica-v<version>);
+#                         a leading "v" is accepted.
+#   neither               the latest published release.
+#
+# OAICA_RELEASE_REPO overrides the repository (a fork, or an internal mirror of
+# the releases) and defaults to this one.
+release_download_base() {
+    if [ -n "${OAICA_DOWNLOAD_BASE:-}" ]; then
+        printf '%s' "${OAICA_DOWNLOAD_BASE%/}"
+        return 0
+    fi
+    repo="${OAICA_RELEASE_REPO:-sprapp-com/oaica-code}"
+    if [ -n "${OAICA_VERSION:-}" ]; then
+        printf 'https://github.com/%s/releases/download/oaica-v%s' "$repo" "${OAICA_VERSION#v}"
+        return 0
+    fi
+    printf 'https://github.com/%s/releases/latest/download' "$repo"
+}
 
 # Print the SHA-256 hex digest of "$1", or nothing when no tool is available.
 sha256_of() {
@@ -97,7 +126,7 @@ verify_archive() {
     fi
 
     if ! curl --fail --silent --show-error --location --retry 3 \
-            -o "$TEMP_DIR/SHA256SUMS" "${url_base}/SHA256SUMS${VER_PARAM}"; then
+            -o "$TEMP_DIR/SHA256SUMS" "${url_base}/SHA256SUMS"; then
         warning "Could not download SHA256SUMS; skipping checksum verification of $name"
         return 0
     fi
@@ -129,7 +158,7 @@ fetch_archive() {
         rm -f "$dest"
         rc=0
         curl --fail --show-error --location --progress-bar \
-            -o "$dest" "${url_base}/${name}${VER_PARAM}" || rc=$?
+            -o "$dest" "${url_base}/${name}" || rc=$?
         if [ "$rc" -eq 0 ] && [ ! -s "$dest" ]; then
             rc=18
         fi
@@ -145,13 +174,18 @@ fetch_archive() {
         esac
 
         if [ "$attempt" -ge "$DOWNLOAD_ATTEMPTS" ]; then
-            error "$reason for $name after $DOWNLOAD_ATTEMPTS attempts. The download from oaica.com is incomplete or corrupt; please re-run the installer."
+            error "$reason for $name after $DOWNLOAD_ATTEMPTS attempts. The download from $url_base is incomplete or corrupt; please re-run the installer."
         fi
         attempt=$((attempt + 1))
         status "$reason, retrying ($attempt/$DOWNLOAD_ATTEMPTS)"
     done
 }
 # --- download helpers (end) ---
+
+DOWNLOAD_BASE="$(release_download_base)"
+if [ -n "${OAICA_VERSION:-}" ]; then
+    status "Installing OAICA ${OAICA_VERSION#v} from $DOWNLOAD_BASE"
+fi
 
 ###########################################
 # Uninstall
@@ -212,7 +246,7 @@ if [ "$OS" = "Darwin" ]; then
     BINDIR="/usr/local/bin"
 
     status "Downloading OAICA for macOS ($DARWIN_ARCH)..."
-    fetch_archive "https://oaica.com/download" "$DARWIN_ARCHIVE" "$TEMP_DIR/oaica-darwin.zip"
+    fetch_archive "$DOWNLOAD_BASE" "$DARWIN_ARCHIVE" "$TEMP_DIR/oaica-darwin.zip"
 
     status "Installing OAICA to $BINDIR..."
     unzip -q "$TEMP_DIR/oaica-darwin.zip" -d "$TEMP_DIR"
@@ -271,7 +305,7 @@ download_and_extract() {
     local filename="$3"
 
     # Check if .tar.zst is available
-    if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst${VER_PARAM}" >/dev/null 2>&1; then
+    if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst" >/dev/null 2>&1; then
         # zst file exists - check if we have zstd tool
         if ! available zstd; then
             error "This version requires zstd for extraction. Please install zstd and try again:
@@ -304,7 +338,7 @@ fi
 status "Installing oaica to $OAICA_INSTALL_DIR"
 $SUDO install -o0 -g0 -m755 -d $BINDIR
 $SUDO install -o0 -g0 -m755 -d "$OAICA_INSTALL_DIR/lib/oaica"
-download_and_extract "https://oaica.com/download" "$OAICA_INSTALL_DIR" "oaica-linux-${ARCH}"
+download_and_extract "$DOWNLOAD_BASE" "$OAICA_INSTALL_DIR" "oaica-linux-${ARCH}"
 
 if [ "$OAICA_INSTALL_DIR/bin/oaica" != "$BINDIR/oaica" ] ; then
     status "Making oaica accessible in the PATH in $BINDIR"

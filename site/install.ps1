@@ -23,10 +23,15 @@
 
     Environment variables:
 
-        OAICA_VERSION       Target version (default: latest stable)
-        OAICA_INSTALL_DIR   Custom install directory
-        OAICA_UNINSTALL     Set to 1 to uninstall OAICA
-        OAICA_DEBUG         Enable verbose output
+        OAICA_VERSION         Target version (default: latest release)
+        OAICA_INSTALL_DIR     Custom install directory
+        OAICA_DOWNLOAD_BASE   Override where archives are fetched from (mirror
+                              or air-gapped host); OAICA_DOWNLOAD_URL is an
+                              accepted alias
+        OAICA_RELEASE_REPO    GitHub repo owning the releases
+                              (default: sprapp-com/oaica-code)
+        OAICA_UNINSTALL       Set to 1 to uninstall OAICA
+        OAICA_DEBUG           Enable verbose output
 
 .EXAMPLE
     irm https://oaica.com/install.ps1 | iex
@@ -54,8 +59,27 @@ $DebugInstall = [bool]$env:OAICA_DEBUG
 # Constants
 # --------------------------------------------------------------------------
 
-# OAICA_DOWNLOAD_URL for developer testing only
-$DownloadBaseURL = if ($env:OAICA_DOWNLOAD_URL) { $env:OAICA_DOWNLOAD_URL.TrimEnd('/') } else { "https://oaica.com/download" }
+# Archives and SHA256SUMS come from the GitHub release for the version being
+# installed — the artifacts CI built from that tag — not from a copy published
+# on oaica.com, which was maintained by hand and drifted. Precedence:
+#
+#   OAICA_DOWNLOAD_BASE   overrides everything (mirror, or air-gapped host
+#                         serving the release assets)
+#   OAICA_VERSION         pins that version's release (tag oaica-v<version>)
+#   neither               the latest published release
+#
+# OAICA_RELEASE_REPO overrides the repository. OAICA_DOWNLOAD_URL is accepted
+# as an alias of OAICA_DOWNLOAD_BASE for existing dev/test setups.
+$Repo = if ($env:OAICA_RELEASE_REPO) { $env:OAICA_RELEASE_REPO } else { "sprapp-com/oaica-code" }
+if ($env:OAICA_DOWNLOAD_BASE) {
+    $DownloadBaseURL = $env:OAICA_DOWNLOAD_BASE.TrimEnd('/')
+} elseif ($env:OAICA_DOWNLOAD_URL) {
+    $DownloadBaseURL = $env:OAICA_DOWNLOAD_URL.TrimEnd('/')
+} elseif ($Version) {
+    $DownloadBaseURL = "https://github.com/$Repo/releases/download/oaica-v$($Version.TrimStart('v'))"
+} else {
+    $DownloadBaseURL = "https://github.com/$Repo/releases/latest/download"
+}
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -160,6 +184,50 @@ function Invoke-Download {
     }
 }
 
+function Test-ArchiveChecksum {
+    # Verify archive $Path (published as $Name) against the SHA256SUMS asset in
+    # the same release. Mirrors scripts/install.sh: when verification is
+    # impossible (no SHA256SUMS, no entry, unreadable digest) it warns and
+    # passes; a mismatch is fatal, so a truncated or tampered download can
+    # never be installed silently.
+    param(
+        [string]$UrlBase,
+        [string]$Name,
+        [string]$Path
+    )
+
+    $sumsFile = Join-Path $env:TEMP "oaica-SHA256SUMS"
+    try {
+        Invoke-Download -Url "$UrlBase/SHA256SUMS" -OutFile $sumsFile
+    } catch {
+        Write-Warning "Could not download SHA256SUMS; skipping checksum verification of $Name"
+        return
+    }
+
+    $expected = $null
+    foreach ($line in Get-Content $sumsFile) {
+        $fields = $line -split '\s+', 2
+        if ($fields.Length -eq 2 -and $fields[1].TrimStart('*') -eq $Name) {
+            $expected = $fields[0].Trim()
+            break
+        }
+    }
+    if (-not $expected) {
+        Write-Warning "SHA256SUMS has no entry for $Name; skipping checksum verification"
+        return
+    }
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        Write-Warning "SHA256SUMS entry for $Name is unreadable; skipping checksum verification"
+        return
+    }
+
+    $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+    if ($actual -ne $expected.ToUpperInvariant()) {
+        throw "Checksum mismatch for ${Name}: expected $expected, got $actual. The download is incomplete or corrupt; re-run the installer."
+    }
+    Write-Host ">>> Checksum OK: $Name"
+}
+
 # --------------------------------------------------------------------------
 # Uninstall
 # --------------------------------------------------------------------------
@@ -202,10 +270,10 @@ function Invoke-Install {
     }
 
     if ($Version) {
-        $zipUrl = "$DownloadBaseURL/oaica-windows-amd64.zip?version=$Version"
-    } else {
-        $zipUrl = "$DownloadBaseURL/oaica-windows-amd64.zip"
+        Write-Host ">>> Installing OAICA $($Version.TrimStart('v'))"
     }
+    $zipName = "oaica-windows-amd64.zip"
+    $zipUrl = "$DownloadBaseURL/$zipName"
 
     Write-Step "Downloading OAICA"
     if (-not $DebugInstall) {
@@ -214,6 +282,7 @@ function Invoke-Install {
 
     $tempZip = Join-Path $env:TEMP "oaica-windows-amd64.zip"
     Invoke-Download -Url $zipUrl -OutFile $tempZip
+    Test-ArchiveChecksum -UrlBase $DownloadBaseURL -Name $zipName -Path $tempZip
 
     $oaicaDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "Programs\OAICA" }
 
