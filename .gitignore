@@ -30,3 +30,7 @@ tools/katlb/katlb-linux-amd64
 tools/gateway/gateway
 tools/meterhub/meterhub
 tools/gateway/oaica-gateway-linux-amd64
+
+# committed by accident, then rebuilt by CI and left dirty on every run
+tools/gatekeeper/gatekeeper
+tools/oaicalb/oaicalb
