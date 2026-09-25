@@ -59,39 +59,18 @@ type cloudModelLimit struct {
 	Output  int
 }
 
-// extraCloudModelLimits maps Ollama cloud alias base names to token limits for
-// aliases that are not already covered by ollamaCloudAliasCatalog.
-// TODO(parthsareen): grab context/output limits from model info instead of hardcoding
-var extraCloudModelLimits = map[string]cloudModelLimit{
-	"cogito-2.1:671b":     {Context: 163_840, Output: 65_536},
-	"deepseek-v3.1:671b":  {Context: 163_840, Output: 163_840},
-	"deepseek-v3.2":       {Context: 163_840, Output: 65_536},
-	"gemma4:31b":          {Context: 262_144, Output: 131_072},
-	"glm-4.6":             {Context: 202_752, Output: 131_072},
-	"glm-4.7":             {Context: 202_752, Output: 131_072},
-	"glm-5":               {Context: 202_752, Output: 131_072},
-	"glm-5.1":             {Context: 202_752, Output: 131_072},
-	"glm-5.2":             {Context: 202_752, Output: 131_072},
-	"glm-5.3-flash":       {Context: 202_752, Output: 131_072},
-	"gpt-oss:120b":        {Context: 131_072, Output: 131_072},
-	"gpt-oss:20b":         {Context: 131_072, Output: 131_072},
-	"kimi-k2:1t":          {Context: 262_144, Output: 262_144},
-	"kimi-k2.5":           {Context: 262_144, Output: 262_144},
-	"kimi-k2.6":           {Context: 262_144, Output: 262_144},
-	"kimi-k2-thinking":    {Context: 262_144, Output: 262_144},
-	"nemotron-3-nano:30b": {Context: 1_048_576, Output: 131_072},
-	"qwen3-coder:480b":    {Context: 262_144, Output: 65_536},
-	"qwen3-coder-next":    {Context: 262_144, Output: 32_768},
-	"qwen3-next:80b":      {Context: 262_144, Output: 32_768},
-	"qwen3.5":             {Context: 262_144, Output: 32_768},
-}
-
 // cloudModelLimits holds the Ollama cloud alias limits: context/output token
 // limits keyed by the base name of an Ollama ":cloud" alias. It is a lookup
 // table only — nothing here is a recommendation, and lookupCloudModelLimit
 // only consults it for names carrying an explicit cloud source tag, so OAICA
 // router / user-remote model ids never match it.
-var cloudModelLimits = mergeCloudModelLimits(cloudModelLimitsFromRecommendations(ollamaCloudAliasCatalog), extraCloudModelLimits)
+//
+// Sourced from cloud_limits_catalog.go's embedded default + `oaica model
+// cloud-limits sync` override (data, not a Go literal — correcting or
+// adding an alias's limits is a cloud_limits.json edit, never a recompile),
+// merged with ollamaCloudAliasCatalog's own entries (the picker's
+// recommendation copy, which also carries limits inline).
+var cloudModelLimits = mergeCloudModelLimits(cloudModelLimitsFromRecommendations(ollamaCloudAliasCatalog), cloudLimitsFromCatalog())
 
 var (
 	dynamicCloudModelLimitsMu sync.RWMutex
@@ -630,35 +609,20 @@ func modelItemFromInventory(name string, info modelInfo, item ModelItem) ModelIt
 	return item
 }
 
-// billingPlanLabel tags a picker row with how it's billed, when the model id
-// carries a known GLM/Z.AI naming pattern: distinguishes a shared aggregator
-// key's flat-rate "Coding Plan" (all of zen's traffic rides one subscription,
-// regardless of which model you pick) from a direct per-token Z.AI API key
-// (2026-09-02 — the user's own opencode picker shows this distinction native;
-// ours had none, so a GLM row here looked billing-agnostic when it isn't).
-// Bare "<remote>/glm-*" names are the zen/opencode-go aggregator; an explicit
-// "zai/glm-*" (a direct Z.AI remote, once one is configured in remotes.json)
-// is the API-key path instead.
+// billingPlanLabel tags a picker row with how it's billed, when the row's
+// provider has a plan_label in the provider catalog (provider_catalog.go —
+// e.g. "API Plan (Z.AI — per-token key)" for zai, "Coding Plan (Z.AI —
+// subscription)" for zai-coding-plan). Fully data-driven: adding a new
+// billed provider/plan is a providers.json edit, never a code change here
+// (2026-09-02 — the user's own opencode picker shows this distinction
+// native; ours had none, so a GLM row here looked billing-agnostic when it
+// isn't; 2026-09-17 — moved off a hardcoded per-vendor prefix switch).
 func billingPlanLabel(name string) string {
-	rest, ok := strings.CutPrefix(name, "opencode-go/")
-	if ok && strings.HasPrefix(rest, "glm-") {
-		return "Coding Plan (zen — shared subscription)"
+	provider, rest, ok := strings.Cut(name, "/")
+	if !ok {
+		return ""
 	}
-	if rest, ok := strings.CutPrefix(name, "zai/"); ok && strings.HasPrefix(rest, "glm-") {
-		return "API Plan (Z.AI — per-token key)"
-	}
-	// moonshot (Kimi) and minimax are built-in catalog providers
-	// (user_remotes.go's catalogProviders) — same per-token-key auth as
-	// zai above, just a different vendor. Labeled the same way so a
-	// "kimi-k3"/minimax row in the picker doesn't look billing-agnostic
-	// (2026-09-03, requested alongside the zai label already here).
-	if _, ok := strings.CutPrefix(name, "moonshot/"); ok {
-		return "API Plan (Moonshot/Kimi — per-token key)"
-	}
-	if _, ok := strings.CutPrefix(name, "minimax/"); ok {
-		return "API Plan (MiniMax — per-token key)"
-	}
-	return ""
+	return providerPlanLabel(provider, rest)
 }
 
 // isCloudModelName reports whether the model name has an explicit cloud source.

@@ -4,6 +4,20 @@ import (
 	"testing"
 )
 
+// findBuiltinRemote returns a pointer to the entry named name, or nil.
+// zai-coding-plan is always present in builtinRemotes() output (unlike
+// every env-gated builtin), so tests asserting "gated when env unset" for
+// a DIFFERENT builtin must look up by name rather than assume length/index.
+func findBuiltinRemote(t *testing.T, remotes []userRemote, name string) *userRemote {
+	t.Helper()
+	for i := range remotes {
+		if remotes[i].Name == name {
+			return &remotes[i]
+		}
+	}
+	return nil
+}
+
 func TestOpenAIBase(t *testing.T) {
 	tests := []struct {
 		name string
@@ -40,28 +54,38 @@ func TestOpenAIBase(t *testing.T) {
 	}
 }
 
-func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
-	t.Setenv(zaiEnvKey, "")
-	// Every builtin is env-gated; clear the others too or a key in the
-	// developer's shell makes builtinRemotes() non-nil here.
-	t.Setenv(openrouterEnvKey, "")
-	t.Setenv(ollamaCloudEnvKey, "")
+// clearAllCatalogKeys clears every provider catalog env var (data-driven —
+// covers new providers/plans automatically), so a test asserting an exact
+// builtinRemotes() shape isn't at the mercy of the developer's own shell.
+func clearAllCatalogKeys(t *testing.T) {
+	t.Helper()
+	for _, p := range providerCatalog() {
+		if p.APIKeyEnv == "" {
+			continue // e.g. opencode-go: reference-only catalog entry, no env var
+		}
+		t.Setenv(p.APIKeyEnv, "")
+	}
+}
 
-	if got := builtinRemotes(); got != nil {
-		t.Fatalf("builtinRemotes() = %v, want nil when %s unset", got, zaiEnvKey)
+func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
+	clearAllCatalogKeys(t)
+
+	// zai-coding-plan is a separate catalog entry with its own env var, so
+	// the gate-when-unset assertion here is scoped to "zai" specifically.
+	if got := findBuiltinRemote(t, builtinRemotes(), zaiName); got != nil {
+		t.Fatalf("builtinRemotes() contains %v, want no %q entry when %s unset", got, zaiName, zaiEnvKey)
 	}
 
 	t.Setenv(zaiEnvKey, "zai-secret")
-	got := builtinRemotes()
-	if len(got) != 1 {
-		t.Fatalf("builtinRemotes() len = %d, want 1", len(got))
+	z := findBuiltinRemote(t, builtinRemotes(), zaiName)
+	if z == nil {
+		t.Fatalf("builtinRemotes() missing %q after setting %s", zaiName, zaiEnvKey)
 	}
-	z := got[0]
 	if z.Name != zaiName {
 		t.Fatalf("builtin name = %q, want %q", z.Name, zaiName)
 	}
-	if z.BaseURL != zaiBaseURL {
-		t.Fatalf("builtin base_url = %q, want %q", z.BaseURL, zaiBaseURL)
+	if z.BaseURL != providerCatalogBaseURL(t, zaiName) {
+		t.Fatalf("builtin base_url = %q, want catalog value", z.BaseURL)
 	}
 	if z.APIKeyEnv != zaiEnvKey {
 		t.Fatalf("builtin api_key_env = %q, want %q", z.APIKeyEnv, zaiEnvKey)
@@ -77,20 +101,31 @@ func TestBuiltinRemotes_ZAIKeyGate(t *testing.T) {
 	}
 }
 
+// providerCatalogBaseURL looks up a provider's base_url from the live
+// catalog, so tests assert against the actual data source (providers.json)
+// instead of a second, potentially-drifting hardcoded copy of the URL.
+func providerCatalogBaseURL(t *testing.T, name string) string {
+	t.Helper()
+	for _, p := range providerCatalog() {
+		if p.Name == name {
+			return p.BaseURL
+		}
+	}
+	t.Fatalf("provider %q not found in catalog", name)
+	return ""
+}
+
 func TestBuiltinRemotes_OllamaCloudKeyGate(t *testing.T) {
-	t.Setenv(zaiEnvKey, "")
-	t.Setenv(openrouterEnvKey, "")
-	t.Setenv(ollamaCloudEnvKey, "")
-	if got := builtinRemotes(); got != nil {
-		t.Fatalf("builtinRemotes() = %v, want nil when %s unset", got, ollamaCloudEnvKey)
+	clearAllCatalogKeys(t)
+	if got := findBuiltinRemote(t, builtinRemotes(), ollamaCloudName); got != nil {
+		t.Fatalf("builtinRemotes() contains %v, want no %q entry when %s unset", got, ollamaCloudName, ollamaCloudEnvKey)
 	}
 
 	t.Setenv(ollamaCloudEnvKey, "ollama-secret")
-	got := builtinRemotes()
-	if len(got) != 1 {
-		t.Fatalf("builtinRemotes() len = %d, want 1", len(got))
+	o := findBuiltinRemote(t, builtinRemotes(), ollamaCloudName)
+	if o == nil {
+		t.Fatalf("builtinRemotes() missing %q after setting %s", ollamaCloudName, ollamaCloudEnvKey)
 	}
-	o := got[0]
 	if o.Name != ollamaCloudName {
 		t.Fatalf("builtin name = %q, want %q", o.Name, ollamaCloudName)
 	}

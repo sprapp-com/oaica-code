@@ -174,107 +174,20 @@ func userRemotesPath() string {
 	return filepath.Join(home, ".oaica", "remotes.json")
 }
 
-// Built-in z.ai provider. Exporting Z_AI_API_KEY (e.g. in ~/.bashrc) is enough
-// to make z.ai appear in the picker — no remotes.json edit. Uses the official
-// z.ai platform OpenAI-compatible endpoint under its "v4" API version, so GLM
-// models (e.g. glm-5.3) are discoverable and selectable.
-const (
-	zaiName    = "zai"
-	zaiBaseURL = "https://api.z.ai/api/paas"
-	zaiEnvKey  = "Z_AI_API_KEY"
-)
-
-// Built-in OpenRouter provider. Exporting OPENROUTER_API_KEY is enough to put
-// every OpenRouter model (~400) in the picker as "openrouter/<vendor>/<id>",
-// searchable with type-to-filter. Ids keep their "vendor/" prefix -- see
-// remoteDisplayID; OpenRouter rejects the stripped form as ambiguous.
-//
-// This replaces the per-model pattern ("openrouter-ox-alpha" pinned to one
-// id) that needed a remotes.json edit for every model tried.
-const (
-	openrouterName    = "openrouter"
-	openrouterBaseURL = "https://openrouter.ai/api"
-	openrouterEnvKey  = "OPENROUTER_API_KEY"
-)
-
-// Built-in Ollama Cloud provider (ollama.com's hosted models over its
-// OpenAI-compatible API, https://ollama.com/v1). Exporting OLLAMA_API_KEY is
-// enough to list every cloud model in the picker as "ollama-cloud/<id>" --
-// no local Ollama daemon and no `ollama signin` needed, unlike the
-// daemon-proxied ":cloud" aliases. Named "ollama-cloud", NOT "ollama": the
-// bare "ollama/" prefix already selects the LOCAL daemon in
-// resolveLaunchEndpoint (see hasSourcePrefix), and a remote of that name
-// would be unreachable behind it.
-const (
-	ollamaCloudName    = "ollama-cloud"
-	ollamaCloudBaseURL = "https://ollama.com"
-	ollamaCloudEnvKey  = "OLLAMA_API_KEY"
-)
-
-// catalogProviders is the built-in directory of first-party inference
-// providers (the "comprehensive" list — opencode builds its picker from
-// models.dev, whose catalog has no endpoint URLs; this table is the
-// canonical endpoints each provider's OpenAI- or Anthropic-compatible API
-// lives at). A provider appears in the picker only while its key is in the
-// environment — no key, nothing to route through, no row. A remotes.json
-// entry of the same name overrides (e.g. a proxy URL for openai).
-var catalogProviders = []userRemote{
-	{Name: "anthropic", BaseURL: "https://api.anthropic.com", Wire: "anthropic", APIKeyEnv: "ANTHROPIC_API_KEY"},
-	{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"},
-	{Name: "google", BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKeyEnv: "GEMINI_API_KEY"},
-	{Name: "groq", BaseURL: "https://api.groq.com/openai/v1", APIKeyEnv: "GROQ_API_KEY"},
-	{Name: "mistral", BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY"},
-	{Name: "deepseek", BaseURL: "https://api.deepseek.com", APIKeyEnv: "DEEPSEEK_API_KEY"},
-	{Name: "xai", BaseURL: "https://api.x.ai/v1", APIKeyEnv: "XAI_API_KEY"},
-	{Name: "together", BaseURL: "https://api.together.xyz/v1", APIKeyEnv: "TOGETHER_API_KEY"},
-	{Name: "fireworks", BaseURL: "https://api.fireworks.ai/inference/v1", APIKeyEnv: "FIREWORKS_API_KEY"},
-	{Name: "cerebras", BaseURL: "https://api.cerebras.ai/v1", APIKeyEnv: "CEREBRAS_API_KEY"},
-	{Name: "perplexity", BaseURL: "https://api.perplexity.ai", APIKeyEnv: "PERPLEXITY_API_KEY"},
-	{Name: "alibaba", BaseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", APIKeyEnv: "DASHSCOPE_API_KEY"},
-	{Name: "moonshot", BaseURL: "https://api.moonshot.ai/v1", APIKeyEnv: "MOONSHOT_API_KEY"},
-	{Name: "zhipu", BaseURL: "https://open.bigmodel.cn/api/paas/v4", APIKeyEnv: "ZHIPU_API_KEY"},
-	{Name: "minimax", BaseURL: "https://api.minimax.io/v1", APIKeyEnv: "MINIMAX_API_KEY"},
-}
-
-// builtinRemotes returns remotes that oaica knows about without config, active
-// only while their credential env var is set. A user-defined remote of the
-// same name in remotes.json wins (see loadUserRemotes).
+// builtinRemotes returns remotes that oaica knows about without config,
+// active only while their credential env var is set — no key, nothing to
+// route through, no row. Sourced entirely from providerCatalog()
+// (provider_catalog.go): the embedded default (cmd/launch/providers/
+// providers.json) plus whatever `oaica provider sync` has pulled down.
+// Adding a provider, adding a new billing plan for an existing one (e.g.
+// z.ai's Coding Plan alongside its pay-per-token API), relabeling, or
+// fixing an endpoint is a providers.json change — never a change here. A
+// user-defined remote of the same name in remotes.json still wins (see
+// loadUserRemotes).
 func builtinRemotes() []userRemote {
 	var out []userRemote
-	if os.Getenv(zaiEnvKey) != "" {
-		out = append(out, userRemote{
-			Name:      zaiName,
-			BaseURL:   zaiBaseURL,
-			APIKeyEnv: zaiEnvKey,
-			Version:   "v4",
-		})
-	}
-	if os.Getenv(openrouterEnvKey) != "" {
-		out = append(out, userRemote{
-			Name:       openrouterName,
-			BaseURL:    openrouterBaseURL,
-			APIKeyEnv:  openrouterEnvKey,
-			ToolFormat: "tool_calls",
-		})
-	}
-	if os.Getenv(ollamaCloudEnvKey) != "" {
-		out = append(out, userRemote{
-			Name:       ollamaCloudName,
-			BaseURL:    ollamaCloudBaseURL,
-			APIKeyEnv:  ollamaCloudEnvKey,
-			ToolFormat: "tool_calls",
-		})
-	}
-	// First-party catalog providers: active while their key is set, and
-	// only when the user hasn't defined their own remote of that name
-	// (loadUserRemotes dedupes by name, custom wins). Each contributes its
-	// full live /models list to the picker as "<provider>/<id>".
-	configured := map[string]bool{}
-	for _, r := range out {
-		configured[r.Name] = true
-	}
-	for _, p := range catalogProviders {
-		if configured[p.Name] || os.Getenv(p.APIKeyEnv) == "" {
+	for _, p := range providerCatalogAsUserRemotes() {
+		if os.Getenv(p.APIKeyEnv) == "" {
 			continue
 		}
 		out = append(out, p)
@@ -483,6 +396,11 @@ func (r userRemote) openAIBase() string {
 	return remoteBaseURL(r) + "/" + v
 }
 
+// remoteModelsFetchTimeout bounds one remote's contribution to the picker.
+// All remotes are queried concurrently, but the picker should still appear
+// promptly when a VPN/LAN or cloud endpoint has gone away.
+const remoteModelsFetchTimeout = 2 * time.Second
+
 // fetchRemoteModels lists one remote's models endpoint (e.g. /v1/models).
 // Short timeout: a sleeping box must not stall the picker.
 func fetchRemoteModels(r userRemote) ([]string, error) {
@@ -500,7 +418,7 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 			req.Header.Set("Authorization", "Bearer "+k)
 		}
 	}
-	resp, err := (&http.Client{Timeout: 6 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: remoteModelsFetchTimeout}).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -559,7 +477,7 @@ func remoteDisplayID(id string) string {
 // Package var so tests can replace the remote sweep: it is the single network
 // call behind both the picker inventory (modelInventory.load) and the bare-id
 // index (bareRemoteModelIndex), and every configured remote costs up to
-// fetchRemoteModels' 6s timeout when it is unreachable. The default is the
+// fetchRemoteModels' short timeout when it is unreachable. The default is the
 // live sweep.
 var userRemoteLaunchModels = userRemoteLaunchModelsLive
 
@@ -567,10 +485,10 @@ var userRemoteLaunchModels = userRemoteLaunchModelsLive
 // userRemoteLaunchModels.
 //
 // Remotes are fetched CONCURRENTLY, not one at a time: fetchRemoteModels has a
-// 6s timeout per remote, and a real config can easily list a dozen-plus boxes
+// short timeout per remote, and a real config can easily list a dozen-plus boxes
 // (LAN, external, cloud). Sequentially that's minutes in the worst case for
 // one sleeping/slow box to cost the whole picker; in parallel the wall-clock
-// cost is bounded by the single slowest remote, ~6s worst case. Results are
+// cost is bounded by the single slowest remote, ~2s worst case. Results are
 // reassembled in the original remotes.json order so the picker stays
 // deterministic across runs regardless of which goroutine finishes first.
 // remoteModelsCacheTTL is how long a remote's /models answer is trusted on

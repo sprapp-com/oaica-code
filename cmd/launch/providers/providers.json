@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "providers": [
+    {"name": "anthropic", "base_url": "https://api.anthropic.com", "wire": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"},
+    {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
+    {"name": "google", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "api_key_env": "GEMINI_API_KEY"},
+    {"name": "groq", "base_url": "https://api.groq.com/openai/v1", "api_key_env": "GROQ_API_KEY"},
+    {"name": "mistral", "base_url": "https://api.mistral.ai/v1", "api_key_env": "MISTRAL_API_KEY"},
+    {"name": "deepseek", "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY"},
+    {"name": "xai", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY"},
+    {"name": "together", "base_url": "https://api.together.xyz/v1", "api_key_env": "TOGETHER_API_KEY"},
+    {"name": "fireworks", "base_url": "https://api.fireworks.ai/inference/v1", "api_key_env": "FIREWORKS_API_KEY"},
+    {"name": "cerebras", "base_url": "https://api.cerebras.ai/v1", "api_key_env": "CEREBRAS_API_KEY"},
+    {"name": "perplexity", "base_url": "https://api.perplexity.ai", "api_key_env": "PERPLEXITY_API_KEY"},
+    {"name": "alibaba", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY"},
+    {"name": "moonshot", "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY", "plan_label": "API Plan (Moonshot/Kimi — per-token key)"},
+    {"name": "zhipu", "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key_env": "ZHIPU_API_KEY"},
+    {"name": "minimax", "base_url": "https://api.minimax.io/v1", "api_key_env": "MINIMAX_API_KEY", "plan_label": "API Plan (MiniMax — per-token key)"},
+    {"name": "zai", "base_url": "https://api.z.ai/api/paas", "version": "v4", "api_key_env": "Z_AI_API_KEY",
+     "plan_label": "API Plan (Z.AI — per-token key)", "notes": "Pay-per-token platform API."},
+    {"name": "zai-coding-plan", "base_url": "https://api.z.ai/api/anthropic", "wire": "anthropic", "api_key_env": "Z_AI_CODING_PLAN_API_KEY",
+     "plan_label": "Coding Plan (Z.AI — subscription)", "key_url": "https://z.ai/manage-apikey/apikey-list",
+     "notes": "Flat-fee GLM Coding Plan subscription, distinct key from 'zai' above. Same model catalog, different billing plan."},
+    {"name": "opencode-go", "base_url": "https://opencode.ai/zen/go", "plan_label": "Coding Plan (zen — shared subscription)", "plan_label_model_prefix": "glm-",
+     "notes": "Reference only — no api_key_env, so this never becomes a selectable builtin; this row exists purely so an opencode-go/glm-* row (from a user's own remotes.json, if they name their aggregator that) gets labeled. Non-GLM models routed through the same aggregator bill differently, hence the model-prefix scope."},
+    {"name": "openrouter", "base_url": "https://openrouter.ai/api", "tool_format": "tool_calls", "api_key_env": "OPENROUTER_API_KEY",
+     "notes": "~400 models, ids keep their vendor/ prefix."},
+    {"name": "ollama-cloud", "base_url": "https://ollama.com", "tool_format": "tool_calls", "api_key_env": "OLLAMA_API_KEY",
+     "notes": "ollama.com hosted models, no local daemon/signin needed."}
+  ]
+}

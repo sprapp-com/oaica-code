@@ -155,12 +155,12 @@ func TestFindUserRemoteForModel_OpenRouterVendorIDKeptWhole(t *testing.T) {
 // run against a clean environment (dev boxes often export a dozen keys).
 func clearCatalogKeys(t *testing.T) {
 	t.Helper()
-	for _, r := range catalogProviders {
-		t.Setenv(r.APIKeyEnv, "")
+	for _, p := range providerCatalog() {
+		if p.APIKeyEnv == "" {
+			continue
+		}
+		t.Setenv(p.APIKeyEnv, "")
 	}
-	t.Setenv(zaiEnvKey, "")
-	t.Setenv(openrouterEnvKey, "")
-	t.Setenv(ollamaCloudEnvKey, "")
 }
 
 func TestBuiltinRemotes_OpenRouterKeyGate(t *testing.T) {

@@ -69,11 +69,11 @@ func quantSubmatch(name string) string {
 
 // localScanReport is what ModelScan returns for the caller to print.
 type localScanReport struct {
-	Dirs     []string
-	Added    []string
-	Updated  []string // existing entry that gained a ModelPath
-	Ignored  []string // file already registered with that path
-	Invalid  []string // id: reason
+	Dirs    []string
+	Added   []string
+	Updated []string // existing entry that gained a ModelPath
+	Ignored []string // file already registered with that path
+	Invalid []string // id: reason
 }
 
 // ModelScan walks dirs (empty = localScanDirs) and upserts every .pqm /
