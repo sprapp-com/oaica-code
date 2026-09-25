@@ -32,11 +32,17 @@ the proxy maps them onto the leg the plan owns for that tier
 the primary, sonnet to the secondary, haiku to the haiku leg, whether those
 legs are native (`claude/haiku`) or an ordinary remote/router model
 (`zai-coding-plan/glm-4.5-air`). A leg literally named for a tier claims that
-family — but only on the SONNET slot (`--sonnet-model claude/opus`), the one
-slot whose env value the launcher controls; a leg on the opus or haiku slot
-may only claim its own slot's family, so `--haiku-model claude/opus` cannot
-take the opus family (the main plan-mode conversation) off the configured
-primary.
+family if the tier is opus/sonnet/haiku — with two limits. It must be a
+genuinely distinct SONNET leg (`--sonnet-model claude/opus`), the one slot
+whose env value the launcher controls, so a native primary's own tier name
+cannot claim a family through the copy of itself that fills the empty sonnet
+slot (`--model claude/haiku --haiku-model <remote>` leaves the haiku family to
+the remote leg); and `--haiku-model claude/opus` cannot take the opus family
+(the main plan-mode conversation) off the configured primary, because a leg on
+the opus or haiku slot only claims its own slot's family. A tier name outside
+those three slots (`--haiku-model claude/fable`) always claims, since no slot
+owns that family and the alternative is the primary's model, which cannot serve
+an Anthropic id at all.
 
 Every request carries the resolved model id. The launcher runs ONE local
 Anthropic→OpenAI translation proxy with a **routing table keyed by that id**,

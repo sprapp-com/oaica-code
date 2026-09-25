@@ -500,20 +500,21 @@ func buildTierPlan(model, sonnetModel, haikuModel string, forceTools bool) (tier
 //
 // An error naming neither leg or both cannot be attributed to one tier (and is
 // usually the primary's, which no saved tier can influence), so every saved
-// value is dropped: a stale key must never break every launch. A value the
-// user typed on this command line is never forgiven — savedSonnet/savedHaiku
-// say which tiers came from the file at all.
-func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (bool, bool) {
+// value is dropped — a stale key must never break every launch — and reported
+// as unattributed so the warning does not claim a value the error never named
+// came from the config file. A value the user typed on this command line is
+// never forgiven: savedSonnet/savedHaiku say which tiers came from the file.
+func savedTiersToDrop(err error, savedSonnet, savedHaiku bool) (dropSonnet, dropHaiku, attributed bool) {
 	if err == nil || (!savedSonnet && !savedHaiku) {
-		return false, false
+		return false, false, false
 	}
 	msg := err.Error()
 	namesSonnet := strings.Contains(msg, "--sonnet-model:")
 	namesHaiku := strings.Contains(msg, "--haiku-model:")
 	if namesSonnet != namesHaiku {
-		return savedSonnet && namesSonnet, savedHaiku && namesHaiku
+		return savedSonnet && namesSonnet, savedHaiku && namesHaiku, true
 	}
-	return savedSonnet, savedHaiku
+	return savedSonnet, savedHaiku, false
 }
 
 // resolveTierPlan builds the launch's tier plan, forgiving a stale saved tier.
@@ -534,15 +535,13 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 	// warnings) and an attempt may be discarded below, so buffer them: only
 	// the plan the launch keeps gets to print.
 	var buf strings.Builder
-	planNotices = &buf
-	plan, err := buildTierPlan(model, sonnetModel, haikuModel, forceTools)
-	planNotices = os.Stderr
+	plan, err := buildTierPlanBuffered(model, sonnetModel, haikuModel, forceTools, &buf)
 	if err == nil {
 		_, _ = io.WriteString(os.Stderr, buf.String())
 		return plan, sonnetModel, haikuModel, nil
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		dropSonnet, dropHaiku := savedTiersToDrop(err, savedSonnet, savedHaiku)
+		dropSonnet, dropHaiku, attributed := savedTiersToDrop(err, savedSonnet, savedHaiku)
 		if !dropSonnet && !dropHaiku {
 			return tierPlan{}, "", "", err
 		}
@@ -553,17 +552,31 @@ func resolveTierPlan(model, sonnetModel, haikuModel string, forceTools, savedSon
 		if dropHaiku {
 			haikuModel, savedHaiku, dropped = "", false, append(dropped, "haiku_model")
 		}
-		fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
+		if attributed {
+			fmt.Fprintf(os.Stderr, "config: %v — that value came from ~/.oaica/config.json, not this command line; ignoring %s for this launch. Repair it with `oaica config set sonnet-model|haiku-model <model>`, or clear the key with `-`\n", err, strings.Join(dropped, " + "))
+		} else {
+			fmt.Fprintf(os.Stderr, "config: %v — the saved tiers (%s) are the only inputs this launch did not take from its command line, so they are the only ones a past `oaica config set` could have invalidated; retrying without them. `oaica config show` lists them, `oaica config set sonnet-model|haiku-model -` clears one\n", err, strings.Join(dropped, " + "))
+		}
 		var retryBuf strings.Builder
-		planNotices = &retryBuf
-		plan, err = buildTierPlan(model, sonnetModel, haikuModel, forceTools)
-		planNotices = os.Stderr
+		plan, err = buildTierPlanBuffered(model, sonnetModel, haikuModel, forceTools, &retryBuf)
 		if err == nil {
 			_, _ = io.WriteString(os.Stderr, retryBuf.String())
 			return plan, sonnetModel, haikuModel, nil
 		}
 	}
 	return tierPlan{}, "", "", err
+}
+
+// buildTierPlanBuffered runs buildTierPlan with its user-facing notices
+// (price banner, tool-wire warning — planNotices) collected into buf instead of
+// printed, so a caller that may discard the attempt (resolveTierPlan) does not
+// print the same banner twice. The writer is restored on every path, panic
+// included.
+func buildTierPlanBuffered(model, sonnetModel, haikuModel string, forceTools bool, buf *strings.Builder) (tierPlan, error) {
+	prev := planNotices
+	planNotices = buf
+	defer func() { planNotices = prev }()
+	return buildTierPlan(model, sonnetModel, haikuModel, forceTools)
 }
 
 // standingTierModels applies the user's saved preferences
@@ -588,6 +601,20 @@ func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, b
 	return sonnetModel, haikuModel, sonnetSaved, haikuSaved
 }
 
+// isSlotFamily reports whether a family is one the positional pass can place:
+// Claude Code's own tier slots (opus, sonnet, haiku). No slot owns any other
+// family ("fable", "claude"), so nothing competes for one — a leg named for it
+// claims it from wherever it sits, which is the only way that family id can
+// reach the leg instead of Default (the primary's model, which cannot serve
+// an api.anthropic.com id at all).
+func isSlotFamily(family string) bool {
+	switch family {
+	case "opus", "sonnet", "haiku":
+		return true
+	}
+	return false
+}
+
 // tierFamilyRoutes maps Claude model families ("opus", "sonnet", "haiku",
 // "fable") to the plan leg that owns that TIER (see proxyRouteTable.FamilyLegs
 // for the whole story: opusplan resolves its opus/haiku slots internally, so
@@ -598,11 +625,12 @@ func standingTierModels(sonnetModel, haikuModel string) (string, string, bool, b
 //
 //  1. A leg whose NAME is a native tier claims that family. "--sonnet-model
 //     claude/opus" is the user naming a family for a tier, so it beats the
-//     positional default: the sonnet tier IS Claude's opus. That claim is
-//     confined to the SONNET slot (see the loop below): it is the only slot
-//     whose env value the launcher controls, so it is the only place a foreign
-//     family can arrive FROM a leg name. A leg on the opus or haiku slot may
-//     only claim its own slot's family.
+//     positional default: the sonnet tier IS Claude's opus. Two limits on that
+//     claim, both in the loop below: it is confined to a genuinely distinct
+//     SONNET leg (the one slot whose env value the launcher controls, so the
+//     only place a foreign family can arrive FROM a leg name), and it never
+//     applies to a family no slot owns ("fable", "claude") because nothing
+//     competes for those.
 //  2. Positional defaults fill the families nothing claimed: the opus slot is
 //     the plan's primary, sonnet the secondary, haiku the haiku leg.
 //
@@ -649,6 +677,14 @@ func tierFamilyRoutes(plan tierPlan) map[string]proxyRoute {
 		routes[family] = r
 	}
 	slotFamilies := []string{"opus", "sonnet", "haiku"}
+	// A slot-1 foreign claim only means anything when slot 1 is a leg of its
+	// own: without --sonnet-model the secondary is a COPY of the primary
+	// (buildTierPlan sets SecondaryName = model), so the exemption would let a
+	// native primary's tier name claim a family through its own copy —
+	// `--model claude/haiku --haiku-model zai/glm-4.5-air` claimed the haiku
+	// family for the primary at the sonnet slot and the configured remote leg
+	// was left serving nothing.
+	secondaryOwnLeg := plan.SecondaryName != "" && plan.SecondaryName != plan.PrimaryName
 	for i, leg := range legs {
 		// An empty tier ("claude/") is a picker typo, not a family: it would
 		// otherwise claim the "" key, which no client id ever produces.
@@ -656,20 +692,28 @@ func tierFamilyRoutes(plan tierPlan) map[string]proxyRoute {
 		if !ok || tier == "" {
 			continue
 		}
-		// A leg naming ANOTHER family may only do so on the sonnet slot. That
-		// slot is the one Claude Code lets us set (opusplan resolves its opus
-		// and haiku slots from its own catalog), so "claude/opus" there is a
-		// deliberate statement about the sonnet tier. Elsewhere the same name
-		// moves traffic the user never aimed at it: "--haiku-model claude/opus"
-		// would take the OPUS family — the main plan-mode conversation — off
-		// the configured primary and onto the Anthropic login, and a native
-		// primary named "claude/fable" would take the fable family away from
-		// the haiku leg the plan actually configured. Those legs keep their own
-		// slot's family and let pass 2 place the rest.
-		if i != 1 && tier != slotFamilies[i] {
+		// A family no slot can place is nobody's to lose (see isSlotFamily).
+		if !isSlotFamily(tier) {
+			claim(tier, leg)
 			continue
 		}
-		claim(tier, leg)
+		// For a SLOT family, a leg naming another family may only do so on a
+		// genuinely distinct sonnet leg. That slot is the one Claude Code lets
+		// us set (opusplan resolves its opus and haiku slots from its own
+		// catalog), so "claude/opus" there is a deliberate statement about the
+		// sonnet tier. Elsewhere the same name moves traffic the user never
+		// aimed at that leg: "--haiku-model claude/opus" would take the OPUS
+		// family — the main plan-mode conversation — off the configured primary
+		// and onto the Anthropic login, and the haiku leg the plan configured
+		// would serve nothing. Those legs keep their own slot's family and let
+		// pass 2 place the rest.
+		if i == 1 && secondaryOwnLeg {
+			claim(tier, leg)
+			continue
+		}
+		if tier == slotFamilies[i] {
+			claim(tier, leg)
+		}
 	}
 	for i, family := range []string{"opus", "sonnet", "haiku"} {
 		if _, claimed := routes[family]; claimed {

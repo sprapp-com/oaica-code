@@ -132,19 +132,23 @@ func TestSavedTiersToDrop(t *testing.T) {
 		err                     error
 		savedSonnet, savedHaiku bool
 		wantSonnet, wantHaiku   bool
+		wantAttributed          bool
 	}{
-		{"sonnet leg fails, both saved", sonnetErr, true, true, true, false},
-		{"haiku leg fails, both saved", haikuErr, true, true, false, true},
-		{"sonnet leg fails, only haiku saved", sonnetErr, false, true, false, false},
-		{"nothing saved", sonnetErr, false, false, false, false},
-		{"primary fails, both saved", primaryErr, true, true, true, true},
-		{"error names both legs", bothErr, true, true, true, true},
-		{"no error at all", nil, true, true, false, false},
+		{"sonnet leg fails, both saved", sonnetErr, true, true, true, false, true},
+		{"haiku leg fails, both saved", haikuErr, true, true, false, true, true},
+		{"sonnet leg fails, only haiku saved", sonnetErr, false, true, false, false, true},
+		{"nothing saved", sonnetErr, false, false, false, false, false},
+		// Unattributable: the warning must not claim the failing value came
+		// from config.json, but a stale key still may not break the launch.
+		{"primary fails, both saved", primaryErr, true, true, true, true, false},
+		{"error names both legs", bothErr, true, true, true, true, false},
+		{"no error at all", nil, true, true, false, false, false},
 	}
 	for _, c := range cases {
-		gotSonnet, gotHaiku := savedTiersToDrop(c.err, c.savedSonnet, c.savedHaiku)
-		if gotSonnet != c.wantSonnet || gotHaiku != c.wantHaiku {
-			t.Errorf("%s: savedTiersToDrop = %v/%v, want %v/%v", c.name, gotSonnet, gotHaiku, c.wantSonnet, c.wantHaiku)
+		gotSonnet, gotHaiku, gotAttributed := savedTiersToDrop(c.err, c.savedSonnet, c.savedHaiku)
+		if gotSonnet != c.wantSonnet || gotHaiku != c.wantHaiku || gotAttributed != c.wantAttributed {
+			t.Errorf("%s: savedTiersToDrop = %v/%v/%v, want %v/%v/%v",
+				c.name, gotSonnet, gotHaiku, gotAttributed, c.wantSonnet, c.wantHaiku, c.wantAttributed)
 		}
 	}
 }

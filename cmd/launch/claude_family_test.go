@@ -198,6 +198,45 @@ func TestTierFamilyRoutes_OnlyTheSonnetSlotClaimsAForeignFamily(t *testing.T) {
 	}
 }
 
+// Two shapes the slot rule must not break (round-4 audit):
+//
+//   - a NATIVE primary whose tier name is the slot the haiku leg belongs to
+//     ("--model claude/haiku --haiku-model <remote>"): without a distinct
+//     sonnet leg the secondary is a COPY of the primary, so a slot-1 exemption
+//     honoured the primary's haiku claim through that copy and the configured
+//     haiku leg served nothing;
+//   - a leg named for a family no slot owns ("--haiku-model claude/fable"):
+//     pass 2 can never place "fable", so claiming it steals nothing — refusing
+//     the claim sent the fable id to the primary, which cannot serve it.
+func TestTierFamilyRoutes_SlotRuleKeepsTheConfiguredLegReachable(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"http://box:8080/v1","api_key":"k","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"http://zai:8080/v1","api_key":"k2","tool_format":"tool_calls"}]}`)
+	stubBareIndex(t, map[string][]string{})
+	stubCloudFetch(t, nil, &oaicaRouterError{Status: 401})
+	stubDaemon(t)
+	stubNativeModelCatalog(t, map[string]string{"haiku": "claude-haiku-4-5-20251001", "fable": "claude-fable-5-1"})
+
+	plan, err := buildTierPlan("claude/haiku", "", "zai/glm-4.5-air", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, model := plan.Routes.resolve("claude-haiku-4-5-20251001")
+	if route.BaseURL != "http://zai:8080/v1" || model != "glm-4.5-air" {
+		t.Fatalf("haiku id resolved to %+v/%q, want the configured zai haiku leg (a native primary's own tier name must not claim the family through its sonnet-slot copy)", route, model)
+	}
+
+	plan, err = buildTierPlan("box/kat-awq", "", "claude/fable", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, _ = plan.Routes.resolve("claude-fable-5-1")
+	if !route.NativePassthrough {
+		t.Fatalf("fable id resolved to %+v, want the native fable leg that was named for it (no slot owns the fable family, so nothing is stolen)", route)
+	}
+}
+
 // An empty tier is a truncated picker string, not a family: it must not claim
 // the "" key, and it must not resolve to the first Anthropic catalog entry.
 func TestTierFamilyRoutes_EmptyTierClaimsNothing(t *testing.T) {
