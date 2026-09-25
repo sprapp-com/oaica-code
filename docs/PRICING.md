@@ -329,7 +329,166 @@ price since. Refreshed live:
 | **oaica (current)** | $0.05 | $0.12 | — |
 | DeepSeek V4 Flash 0731 | $0.03 | $0.10 | **they're cheaper, both legs** |
 | GLM-5.3-Flash | $0.075 (promo, expires 2026-09-09) | $0.25 (promo) | we're 1.5-2x cheaper |
-| MiniMax M3 | $0.30 ($0.23 via OpenRouter) | $1.20 ($0.96 via OpenRouter) | we're 4.6-6x cheaper |
+| MiniMax M3 (pay-as-you-go API) | $0.30 ($0.23 via OpenRouter) | $1.20 ($0.96 via OpenRouter) | we're 4.6-6x cheaper |
+
+**Correction (2026-09-07): the above MiniMax row is stale/misleading —
+it only compares against their pay-as-you-go API, not their actual
+subscription product.** MiniMax's "Token Plan" subscription (checked
+2026-09-07) sells at **~$0.0106-0.0129/M tokens blended** (Plus $22/mo
+for ~1.7B tokens, Max $55/mo for ~5.1B, Ultra $132/mo for ~12.5B) — this
+is **4-5x CHEAPER than our own $0.055/M infra cost basis**, not more
+expensive. We cannot win a price war against this: it's subsidized
+loss-leader pricing from a well-funded lab racing for coding-tool
+market share, not a sustainable unit-economics comparison. Do not use
+the PAYG-API row above to claim a price advantage over MiniMax's actual
+subscription offering — see [[openference-pricing-strategy]] for the
+non-price angles that actually apply against MiniMax specifically
+(data sovereignty, on-prem deployment, custom fine-tuning) instead of
+trying to compete on $/token.
+
+## Request-based subscription plan for OpenClaw — proposal, not yet
+## deployed (2026-09-07)
+
+Decision: switch from token-based caps (the Starter/Pro tiers above) to
+**request-based caps**, matching Openference's model (see below) rather
+than inventing our own metric — easier for users to compare plans
+across services, and doesn't require us to expose our internal
+token-cost structure.
+
+### Why request-based, using our own real numbers
+
+Real coding-agent traffic averages ~120K tokens/request (prefill-heavy,
+see the single-GPU section above). At our infra cost basis (~$0.055/M
+tokens blended), that's **~$0.0066/request** — our real marginal cost.
+
+**Breakeven on one GPU** ($1,014.70/mo fixed cost, ~103,000 requests/mo
+theoretical capacity at 100% utilization, 17M tok/hr ÷ 120K tok/req ×
+730hr): breakeven at ~34 subscribers/GPU averaging ≤~700 req/week each
+(~5% of a 13,000/week cap) — realistic given every metered-cap
+subscription business (Claude Pro, ChatGPT Plus, Openference itself)
+runs on real usage sitting far below the stated cap. At a more typical
+~100 subscribers/GPU (avg ~230 req/week, ~1.8% of cap): revenue
+$3,000/mo vs $1,014.70/mo cost = **~66% margin**, and this scales
+linearly with GPU count — margin % holds as we add capacity.
+
+**Why this beats a pure aggregator/reseller at the same game:**
+Openference resells upstream inference (their per-model cost multiplier
+system — e.g. GLM-5.2 at 2x baseline — implies they're passing through
+real upstream cost variance with markup on top). We own the GPU
+outright serving our own model — no reseller markup layer between us
+and the hardware, so our true marginal cost per request is lower for
+whatever our own model is doing.
+
+### Competitor reference: Openference (openference.com, checked 2026-09-07)
+
+OpenAI-compatible aggregator gateway (GLM, DeepSeek, Kimi, Qwen,
+MiniMax), request-based subscription, format translation
+(OpenAI/Anthropic/Codex), auto-failover, multi-tool integration
+(Cursor, Claude Code, Codex, Cline, OpenCode, Pi). Their published tiers
+(`docs.openference.com/billing/plans`):
+
+| Plan | Price/mo | 5h window | Weekly cap |
+|---|---|---|---|
+| Free | $0 | 25 req | 350 |
+| Lite | $15 | 400 req | 7,500 |
+| Pro | $30 | 800 req | 13,000 |
+| Pro+ | $45 | 1,200 req | 19,500 |
+| Max | $60 | 1,600 req | 26,000 |
+| Max+ | $120 | 3,200 req | 52,000 |
+
+### Our matching tiers (undercut price and/or raise caps, own model only)
+
+| Plan | Price/mo | 5h window | Weekly cap | vs. Openference |
+|---|---|---|---|---|
+| Free | $0 | 40 req | 500 | more generous — cheap acquisition, tiny marginal cost per free user |
+| Lite | $12 | 400 req | 7,500 | 20% cheaper, same cap |
+| Pro | $25 | 900 req | 14,500 | cheaper AND higher cap |
+| Pro+ | $40 | 1,300 req | 21,000 | cheaper AND higher cap |
+| Max | $55 | 1,700 req | 27,500 | cheaper AND higher cap |
+| Max+ | — | — | — | **not offered** — see below |
+
+**Deliberately not competing at Max+.** That tier is for power/frontier-
+coding users who need genuine top-tier model quality; our own model
+(oaica-35b-a3b-vision, measured 33.3% SWE-bench Pro — see
+`docs/KAT_VL_MODEL_EVAL.md`) is not competitive there regardless of
+price or cap generosity. Cheap-and-generous doesn't fix a capability
+gap. Route that segment to the OpenRouter passthrough (already wired,
+`cmd/launch/user_remotes.go`) as a paid upsell instead of trying to
+serve it from our own model.
+
+**Real risk to flag, not paper over:** the utilization assumption above
+(≤5-20% of cap) holds for human-paced usage but may not hold for
+scripted/automated agent workloads, which can run near-continuously.
+Openference already handles this by pricing dedicated "Auto Agent"
+plans separately at higher per-minute caps — we should do the same
+before launch: meter and price unattended/scripted usage differently
+from interactive sessions, not lump them into the same cap.
+
+**Status:** proposal only. Before deploying: (1) add automation-tier
+metering (see risk above), (2) verify `tools/meterhub` can enforce
+request-count caps, not just token-count caps — it currently only
+implements `checkWindowCap` for tokens (see the single-GPU section
+above), so this needs new plumbing, not just a rate-card change.
+
+## "Unlimited" tier, rate-limited by concurrency, not tokens/requests —
+## alternative proposal (2026-09-07)
+
+A third option instead of token caps or request caps: sell **"unlimited"
+usage**, enforced not by tracking volume at all but by capping **how many
+concurrent requests a subscriber can have in flight at once** — the same
+mechanism every "unlimited" AI subscription actually runs on under the
+hood (MiniMax's own Token Plan markets "estimated tokens/month" as the
+headline number, but the real enforcement is "3-4 / 4-5 / 6-7 concurrent
+agents" per tier — the token estimate is marketing dressing).
+
+**Why this fits our infra specifically:** both production replicas run
+`--max-num-seqs 18` (verified live, 2026-09-07, ports 30110 and 30111) —
+a hard admission-control cap on simultaneous in-flight sequences per
+GPU, already enforced at the vLLM level regardless of what we sell on
+top of it. Capping concurrency *per subscriber* on top of this existing
+limit means:
+
+- **No token-sum or request-count tracking needed at all** — just count
+  active in-flight requests per API key at the gateway, reject/queue
+  past N. Avoids the `tools/meterhub` request-cap plumbing gap noted
+  above entirely.
+- **Natural worst-case bound**: 18 total seqs per replica ÷ 2-3
+  concurrent slots per active subscriber ≈ 6-9 subscribers can be
+  *simultaneously maxed out* on one GPU before it saturates — but real
+  subscribers are rarely all active at once (same multiplexing
+  assumption every "unlimited" plan already relies on).
+- **Scales with fleet size** — add a replica, add ~6-9 more
+  simultaneously-maxable subscriber slots, same as the token/request
+  models above.
+
+**Proposed tiers** (concurrency-tier shape mirrors MiniMax's, price
+undercuts Openference's request tiers since there's no volume cap to
+protect against):
+
+| Tier | Price/mo | Concurrent requests | Notes |
+|---|---|---|---|
+| Solo | $10 | 1 | single agent/session at a time |
+| Team | $22 | 2-3 | mirrors MiniMax Plus's agent concurrency |
+| Studio | $40 | 4-5 | mirrors MiniMax Max's agent concurrency |
+
+**Required guardrail, not optional:** concurrency alone doesn't stop
+rapid-fire sequential abuse (open/close requests faster than a normal
+session would, to extract more total throughput than concurrency
+implies). Needs a secondary **requests-per-minute soft throttle** plus
+fair-use language in the terms — exactly how ChatGPT Plus/Claude Pro
+hedge their own "unlimited" framing. Don't market this as literally
+uncapped; market it as "no token/message counting, fair use applies."
+
+**Comparison to the token-cap and request-cap proposals above:** this is
+the lowest-engineering-effort option (no meterhub changes needed at
+all, just gateway-level concurrency tracking) and the cleanest
+marketing story ("unlimited," no cap math for users to think about),
+at the cost of a real abuse-vector risk (rapid sequential requests) that
+must be closed with a rate-per-minute throttle before launch. The
+token-cap and request-cap proposals give finer-grained cost control per
+subscriber; this one trades that for simplicity and marketing appeal.
+**Not yet decided which of the three ships — this doc records all three
+options, not a final choice.**
 
 **We already beat MiniMax and GLM on raw metered rate.** DeepSeek V4
 Flash is the one real competitor undercutting us on sticker price —

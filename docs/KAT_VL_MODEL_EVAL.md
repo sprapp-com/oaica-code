@@ -350,9 +350,34 @@ The server also crashed twice more, silently (no traceback, GPU memory
 just drops to 0 a few seconds after `#full token` climbs to ~129k across
 4 concurrent full-256k-context streams) at `MEM=0.90`/no concurrency cap —
 reproducible, not random. Mitigated by capping `MAXREQ=3` and dropping to
-`MEM=0.85` for the SWE-bench Pro eval run itself (root cause unconfirmed:
-`dmesg` is blocked in this container, consistent with the box's known
-cgroup-OOM-kills-look-silent pattern).
+`MEM=0.85` for the SWE-bench Pro eval run itself.
+
+**Root cause confirmed (2026-09-06, via disciplined diagnose-skill
+investigation, not guessed):** host-level cgroup RAM OOM-kill on this
+shared vast.ai container — NOT an Escha-W2/sglang application bug, NOT
+GPU VRAM exhaustion. sglang's own tracked KV/mamba pool was only ~24%
+full at time of death; cgroup `memory.events` showed `oom_kill: 15`
+cumulative. GPU VRAM and host RAM are separate budgets here — Escha-W2's
+weights are only ~10GB VRAM, so GPU headroom was never the constraint;
+the crash trigger scales with concurrency × context length on the
+HOST-RAM side (tokenizer/scheduler/buffer overhead), independent of how
+little VRAM the model itself uses. **Not fixable app-side.** `MAXREQ=3`
+is the confirmed-correct admission-control value for this container's
+actual RAM budget, not an arbitrary workaround. No watchdog/auto-restart
+exists yet for this service — standing gap.
+
+Two further real bugs hit and fixed during later BFCL v4 work on this
+same server (2026-09-06/07): (1) `bfcl_eval`'s `web_search.py` has a
+`while True` retry loop around a SerpAPI call with no timeout at all —
+hangs forever if outbound network to the search backend stalls; patched
+to fail fast when `SERPAPI_API_KEY` is unset. (2) Launching this server
+with an explicit `--dtype float16` override crashes at CUDA-graph-capture
+(and even in eager mode) with `RuntimeError: Expected
+conv_states_.scalar_type() == input_type to be true` inside
+`causal_conv1d_fwd` — the model's native config is `bfloat16` with
+`mamba_ssm_dtype: float32`, and forcing `float16` breaks the mamba
+conv-state kernel's internal dtype assumptions. **Fix: omit `--dtype`
+entirely**, let sglang use the model's native dtype.
 
 ### SWE-bench Pro results (same 48-instance subset, same custom scorer)
 
@@ -382,15 +407,16 @@ against 35B-A3B-MoE competition, though the two runs used different agent
 harnesses (mini-swe-agent here vs whatever each baseline used) so this is
 directional, not a controlled comparison.
 
-### TB2 — blocked, not attempted
+### TB2 — blocked, not attempted (decision: abandoned, not just blocked)
 
 The `harbor` CLI's session/API-key auth to the Harbor Hub registry is
 invalid on this box: `harbor dataset access terminal-bench/terminal-bench`
 returns `permission denied for function get_package_access`, and both
 `terminal-bench@2.1` and `terminal-bench@2.0` dataset tags resolve to
 empty regardless of which is requested — consistent with an expired/
-invalid credential, not a wrong tag. Needs a fresh `harbor login` (or
-API key) on this box before TB2 can run for any model, not just this one.
+invalid credential, not a wrong tag. **Decision (2026-09-06): do not pursue
+TB2 further for any model** — replaced with BFCL v4 (see below), a
+real independent PyPI package (`bfcl-eval`) with no Harbor dependency.
 
 ### Throughput/concurrency sweep (256k ctx, GPU2, MEM=0.85, no MAXREQ cap)
 
@@ -420,4 +446,50 @@ Cleanup: GPU7 and GPU2 were temporarily pulled from the production
 a100b); GPU2 has been restored (`fleetctl.sh add 2:30110`), GPU7 pending
 restoration once its last SWE-bench Pro straggler instance is confirmed
 stopped.
+
+### BFCL v4 results (2026-09-06/07, official `bfcl-eval` PyPI package,
+### full runs, all 17 non-agentic categories — no partial subsets)
+
+Served as `Qwen/Qwen3-8B-FC` (matches the registered `QwenFCHandler`'s
+expected qwen3_coder-style XML tool-call format; not an actual Qwen3-8B).
+`web_search_*` and `memory_*` categories excluded — no SERPAPI key
+configured, and `memory_*` is a separate axis not attempted this run.
+
+**Overall Accuracy: 38.45%**
+
+| Section | Acc | Detail |
+|---|---|---|
+| Non-Live AST | 78.46% | simple 74.83%, multiple 98%, parallel 69.5%, parallel_multiple 71.5% |
+| Live AST | 82.38% | simple 87.6%, multiple 82.05%, parallel 62.5%, parallel_multiple 54.17% |
+| Multi-Turn | 63.13% | base 73.5%, miss_func 66%, miss_param 49.5%, long_context 63.5% |
+| Relevance detection | 81.25% | correctly calls when it should |
+| Irrelevance detection | 34.26% | **weak spot** — over-calls tools when none apply (bare `irrelevance` category alone: 17.5%) |
+
+Pattern: strong on straightforward and multi-call tool execution (69-98%
+across non-live/live AST), genuinely weak on irrelevance detection and
+harder multi-turn edge cases (missing-param, live parallel-multiple) —
+consistent with 2-bit quantization concentrating its precision loss on
+ambiguous/negative cases rather than core tool-call capability.
+
+**Comparison vs production `oaica-35b-a3b-vision`:** a local proxy
+harness (`eval_bfcl_http.py`, non-live AST categories only — no official
+`bfcl_eval` run and no live/multi-turn/relevance axes exist for this
+model yet) scored production oaica-35b-a3b-vision at **87.43%** overall
+on the overlapping categories (simple 92.75%, multiple 91.5%, parallel
+88.5%, parallel_multiple 84%, irrelevance 80.4%) — clearly ahead of
+Escha-W2 on every shared category, including irrelevance (80.4% vs
+17.5%). A separate "0906" candidate checkpoint (not production) scored
+much lower, 67.2%/66.7%, weak on parallel_multiple (~46-48%) — a
+regression candidate, not promoted. **Caveat: this is a directional
+comparison on overlapping non-live categories only**, not an
+apples-to-apples full-suite comparison — that would need a fresh
+official `bfcl_eval` run on oaica-35b-a3b-vision covering
+live/multi-turn/relevance, which hasn't been done.
+
+**Bottom line (on the overlapping non-live categories only):** Escha-W2's
+2-bit quant trails the production w4a16 model there, on top of being
+harder to operate safely (proprietary fork, no admission control, needs
+`MAXREQ` cap, no watchdog). Its only edge is VRAM footprint (~10GB vs
+~17-18GB) — not obviously worth the accuracy tradeoff on what's measured
+so far, unless VRAM is the binding constraint.
 
