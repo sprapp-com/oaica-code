@@ -292,6 +292,22 @@ func (h *Hermes) Configure(model string) error {
 		return err
 	}
 
+	// The model inventory is read before the lock: it is a host round-trip, and
+	// nothing about it belongs to the config file's critical section.
+	models := h.listModels(model)
+
+	// ~/.hermes/config.yaml belongs to Hermes, and oaica rewrites the whole
+	// document from a snapshot of it (unknown keys are carried through, not
+	// merged into the file). Two oaica commands whose writes overlap would each
+	// publish a snapshot taken before the other's, so the read-modify-write runs
+	// under the store's lock, keyed under ~/.oaica/locks as every foreign store
+	// in this package is (2026-09-26 audit, twelfth round).
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		return writeHermesConfig(configPath, model, models)
+	})
+}
+
+func writeHermesConfig(configPath, model string, models []string) error {
 	cfg := map[string]any{}
 	if data, err := os.ReadFile(configPath); err == nil {
 		if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -305,7 +321,6 @@ func (h *Hermes) Configure(model string) error {
 	if modelSection == nil {
 		modelSection = make(map[string]any)
 	}
-	models := h.listModels(model)
 	applyHermesManagedProviders(cfg, hermesBaseURLFor(model), hermesModelIDFor(model), models)
 
 	// launch writes the minimum provider/default-model settings needed to

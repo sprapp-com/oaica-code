@@ -90,6 +90,13 @@ func TestAgentConfigStoreWriterChildHelper(t *testing.T) {
 	os.Setenv("OAICA_HOST", "http://127.0.0.1:1")
 	os.Setenv("OAICA_REMOTES_FILE", filepath.Join(home, "no-remotes.json"))
 	os.Setenv("OAICA_AUTH_FILE", filepath.Join(home, "no-auth.json"))
+	// Two integrations resolve their store directory from these before HOME
+	// falls back, and the child inherits the parent's environment: an ambient
+	// value would point a writer at a real install rather than at this test's
+	// scratch home.
+	os.Setenv("HERMES_HOME", "")
+	os.Setenv("PI_CONFIG_DIR", "")
+	os.Setenv("PI_CODING_AGENT_DIR", "")
 
 	waitForAgentStoreRelease(t, release)
 	if err := runAgentStoreWriter(kind, id); err != nil {
