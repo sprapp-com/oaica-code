@@ -10,6 +10,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ModelAddOptions is the parsed form of `oaica model add`'s flags.
@@ -116,12 +117,38 @@ func WriteModelList(w io.Writer) error {
 			ctx = strconv.Itoa(e.ContextWindow)
 		}
 		notes := e.Notes
-		if len(notes) > 60 {
-			notes = notes[:57] + "..."
+		// Rune-counted, not byte-counted: notes[:57] cut a multi-byte rune in
+		// half whenever the cut landed inside one, so every `model list` row
+		// whose note ended in one shipped invalid UTF-8 to the pipe consumer or
+		// log shipper on the other end (2026-09-26 audit, tenth round).
+		if r := []rune(notes); len(r) > 60 {
+			notes = string(r[:57]) + "..."
 		}
-		fmt.Fprintf(w, "%-24s %-13s %-10s %-12s %s\n", e.ID, e.Engine, orDash(e.Quant), ctx, notes)
+		fmt.Fprintf(w, "%-24s %-13s %-10s %-12s %s\n",
+			manifestCell(e.ID), manifestCell(string(e.Engine)), manifestCell(orDash(e.Quant)), ctx, manifestCell(notes))
 	}
 	return nil
+}
+
+// manifestCell renders one manifest field as a single line of listing output:
+// a name carrying a control character in Go-quoted form, and any byte sequence
+// that is not valid UTF-8 sanitised first, so the value cannot forge a row, a
+// field line, or a corrupt byte stream.
+//
+// The same rule printableName (remote_cli.go) applies to a remote name, plus
+// the invalid-UTF-8 case: models.json is hand-editable and is merged from the
+// synced catalog, so an id or note reaches the printer without ever passing
+// through `model add`'s validation, and a byte cut taken here (the notes
+// truncation) can produce invalid UTF-8 from a value that was fine on disk
+// (2026-09-26 audit, tenth round).
+func manifestCell(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "�")
+	}
+	if strings.ContainsFunc(s, isControlRune) {
+		return strconv.Quote(s)
+	}
+	return s
 }
 
 // WriteModelShow prints one entry's full detail to w.
@@ -130,20 +157,24 @@ func WriteModelShow(w io.Writer, id string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "id:               %s\n", e.ID)
-	fmt.Fprintf(w, "engine:           %s\n", e.Engine)
-	fmt.Fprintf(w, "arch:             %s\n", orDash(e.Arch))
-	fmt.Fprintf(w, "quant:            %s\n", orDash(e.Quant))
+	fmt.Fprintf(w, "id:               %s\n", manifestCell(e.ID))
+	fmt.Fprintf(w, "engine:           %s\n", manifestCell(string(e.Engine)))
+	fmt.Fprintf(w, "arch:             %s\n", manifestCell(orDash(e.Arch)))
+	fmt.Fprintf(w, "quant:            %s\n", manifestCell(orDash(e.Quant)))
 	fmt.Fprintf(w, "context_window:   %s\n", intOrDash(e.ContextWindow))
 	fmt.Fprintf(w, "max_output_tokens:%s\n", intOrDash(e.DefaultMaxOutputTokens))
 	fmt.Fprintf(w, "gpu_mem_gb:       %s\n", floatOrDash(e.GPUMemGB))
 	fmt.Fprintf(w, "ram_gb:           %s\n", floatOrDash(e.RAMGB))
-	fmt.Fprintf(w, "model_path:       %s\n", orDash(e.ModelPath))
+	fmt.Fprintf(w, "model_path:       %s\n", manifestCell(orDash(e.ModelPath)))
 	if len(e.LaunchFlags) > 0 {
-		fmt.Fprintf(w, "launch_flags:     %s\n", strings.Join(e.LaunchFlags, " "))
+		flags := make([]string, 0, len(e.LaunchFlags))
+		for _, f := range e.LaunchFlags {
+			flags = append(flags, manifestCell(f))
+		}
+		fmt.Fprintf(w, "launch_flags:     %s\n", strings.Join(flags, " "))
 	}
 	if e.Notes != "" {
-		fmt.Fprintf(w, "notes:            %s\n", e.Notes)
+		fmt.Fprintf(w, "notes:            %s\n", manifestCell(e.Notes))
 	}
 	return nil
 }
