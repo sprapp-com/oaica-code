@@ -198,7 +198,13 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 			}
 		}
 
-		req, err := http.NewRequest(r.Method, backend+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
+		// The caller's context, not a detached one: a client that disconnects
+		// mid-request must release the backend with it, or a backend that
+		// accepted and then said nothing holds this handler and both sockets
+		// until oaica exits. proxyUpstreamClient bounds connection setup only —
+		// never the response, since a slow local model may legitimately stream
+		// past any fixed timeout.
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, backend+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -206,7 +212,7 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 		req.Header = r.Header.Clone()
 		req.ContentLength = int64(len(body))
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := proxyUpstreamClient.Do(req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return

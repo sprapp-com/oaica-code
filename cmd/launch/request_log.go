@@ -166,7 +166,13 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 			return
 		}
 
-		req, err := http.NewRequest(r.Method, targetBaseURL+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
+		// The caller's context, not a detached one: when Claude Code gives up on
+		// a request (or the user Ctrl-Cs) this handler has to give up on the
+		// upstream with it, or both sockets stay open until the process exits.
+		// proxyUpstreamClient bounds connection setup only — never the response,
+		// because a local model may legitimately stream for longer than any
+		// fixed timeout.
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetBaseURL+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
 		if err != nil {
 			// redactErr: a target that carries the key as URL userinfo (an
 			// OAICA_HOST like https://sk-...@api.oaica.com, the same shape
@@ -178,7 +184,7 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 		req.Header = r.Header.Clone()
 		req.ContentLength = int64(len(body))
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := proxyUpstreamClient.Do(req)
 		if err != nil {
 			// A transport error quotes the request URL verbatim.
 			http.Error(w, redactErr(err).Error(), http.StatusBadGateway)
