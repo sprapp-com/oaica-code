@@ -106,13 +106,12 @@ func saveAuthStore(f authStoreFile, path string) error {
 	if f.Providers == nil {
 		f.Providers = map[string]authCredential{}
 	}
-	b, err := json.MarshalIndent(f, "", "  ")
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	b, err := storeDocumentMergeValue(f, path)
 	if err != nil {
 		return err
 	}
-	// Members the struct does not model survive the rewrite — see
-	// store_document.go.
-	b = storeDocumentMerge(b, path)
 	b = append(b, '\n')
 	if err := writeAtomic(path, b); err != nil {
 		return err

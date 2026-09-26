@@ -200,38 +200,82 @@ func TestASavedModelKeepsMembersTheStructDoesNotModel(t *testing.T) {
 	}
 }
 
-// The rule the recursion is built on, stated directly: a member of the document
-// is a collection and its keys belong to the caller — so a key that is gone is a
-// deletion, whether its values are entries (providers) or plain strings
-// (aliases, which is how `alias rm` broke when the rule was guessed from
-// shape). A member of a collection is an entry, and an unknown member of an
-// entry is re-attached.
-func TestStoreDocumentMergeTellsCollectionsFromEntries(t *testing.T) {
+// The rule the recursion is built on, stated directly. What may be re-attached
+// is decided by the caller's TYPE:
+//
+//   - a member the type declares, absent from the marshalled value, is the
+//     caller clearing it — never re-attached;
+//   - a member the type does not declare is somebody else's — re-attached;
+//   - a key of a map, or an entry of a list, is chosen by the caller — absent
+//     or a different length is a deletion, never re-attached.
+//
+// The distinction cannot be read off the JSON: `{"providers": {...}}` and an
+// entry object are the same bytes. Guessing from shape is what made
+// `oaica alias rm` report success and leave the alias in the file.
+func TestStoreDocumentMergeFollowsTheTypeNotTheShape(t *testing.T) {
+	type entry struct {
+		Type string `json:"type"`
+		Key  string `json:"key,omitempty"`
+	}
+	type withProviders struct {
+		Version   int              `json:"version"`
+		Providers map[string]entry `json:"providers"`
+	}
+	type withAliases struct {
+		Version int               `json:"version"`
+		Aliases map[string]string `json:"aliases"`
+	}
+
 	dir := t.TempDir()
 
 	collection := filepath.Join(dir, "collection.json")
-	if err := os.WriteFile(collection, []byte(`{"providers":{"a":{"type":"api_key","extra":1},"b":{"type":"api_key"}}}`), 0o600); err != nil {
+	if err := os.WriteFile(collection, []byte(`{"version":1,"providers":{"a":{"type":"api_key","extra":1},"b":{"type":"api_key"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := string(storeDocumentMerge([]byte(`{"providers":{"a":{"type":"api_key"},"version":1}}`), collection))
+	merged, err := storeDocumentMergeValue(withProviders{Version: 1, Providers: map[string]entry{"a": {Type: "api_key"}}}, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(merged)
 	if strings.Contains(got, `"b"`) {
-		t.Errorf("an entry removed from a collection came back:\n%s", got)
+		t.Errorf("an entry removed from a map came back:\n%s", got)
 	}
 	if !strings.Contains(got, `"extra"`) {
-		t.Errorf("an unmodelled member of an entry that is still there was dropped:\n%s", got)
-	}
-	if !strings.Contains(got, `"version"`) {
-		t.Errorf("an unmodelled top-level member was dropped:\n%s", got)
+		t.Errorf("an undeclared member of an entry that is still there was dropped:\n%s", got)
 	}
 
-	// A map of names to scalars is a collection too, and a name the caller
-	// removed must stay removed.
-	aliases := filepath.Join(dir, "aliases.json")
-	if err := os.WriteFile(aliases, []byte(`{"aliases":{"kat":"kat-awq","zai":"glm-5.3"},"version":1}`), 0o600); err != nil {
+	// A member the type declares, cleared by the caller, stays cleared — the
+	// config.json case: omitempty drops it and it must not come back.
+	cleared := filepath.Join(dir, "cleared.json")
+	if err := os.WriteFile(cleared, []byte(`{"version":1,"providers":{"a":{"type":"api_key","key":"sk-1","extra":1}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got = string(storeDocumentMerge([]byte(`{"aliases":{"kat":"kat-awq"},"version":1}`), aliases))
+	merged, err = storeDocumentMergeValue(withProviders{Version: 1, Providers: map[string]entry{"a": {Type: "api_key"}}}, cleared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = string(merged)
+	if strings.Contains(got, "sk-1") {
+		t.Errorf("a member the caller cleared came back:\n%s", got)
+	}
+	if !strings.Contains(got, `"extra"`) {
+		t.Errorf("an undeclared member of the same entry was dropped instead of re-attached:\n%s", got)
+	}
+
+	// A map of names to plain strings is keyed by the caller too.
+	aliases := filepath.Join(dir, "aliases.json")
+	if err := os.WriteFile(aliases, []byte(`{"version":1,"schema_note":"newer client","aliases":{"kat":"kat-awq","zai":"glm-5.3"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	merged, err = storeDocumentMergeValue(withAliases{Version: 1, Aliases: map[string]string{"kat": "kat-awq"}}, aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = string(merged)
 	if strings.Contains(got, `"glm-5.3"`) {
 		t.Errorf("an alias the caller removed came back:\n%s", got)
+	}
+	if !strings.Contains(got, `"schema_note"`) {
+		t.Errorf("a top-level member the type does not declare was dropped:\n%s", got)
 	}
 }

@@ -75,13 +75,12 @@ func saveUserRemotesFile(f userRemotesFile, path string) error {
 			return err
 		}
 	}
-	b, err := json.MarshalIndent(f, "", "  ")
+	// Members this struct does not model (`schema_note`, a hand-added label) are
+	// re-attached rather than deleted by the rewrite — see store_document.go.
+	b, err := storeDocumentMergeValue(f, path)
 	if err != nil {
 		return err
 	}
-	// Members this struct does not model (`schema_note`, a hand-added label) are
-	// re-attached rather than deleted by the rewrite — see store_document.go.
-	b = storeDocumentMerge(b, path)
 	// 0o600: this file may hold plaintext bearer tokens (--api-key).
 	// Through the atomic writer, NOT os.WriteFile (2026-09-26 audit): an
 	// in-place O_TRUNC write makes the truncation window visible to every

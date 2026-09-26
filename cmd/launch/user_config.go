@@ -89,26 +89,46 @@ func UserConfigSetHaikuModel(model string) error {
 // userConfigSet applies one change and writes the file atomically, leaving
 // every other key untouched — the two setters above differ only in which
 // field they assign.
+//
+// Load → mutate → save under the store's cross-process lock, the same shape as
+// the other stores in this package (2026-09-26 audit). Without the lock two
+// writers — the launch wizard and `oaica config set`, or two setters in a
+// provisioning script — each read the same snapshot and the later rename
+// published only its own field: eight concurrent writers left one tier set and
+// the other silently reverted to unset, which is the difference between
+// background work on the cheap leg and on the primary one.
 func userConfigSet(mutate func(*UserConfig)) error {
-	c, err := UserConfigLoad()
-	if err != nil {
-		return err
-	}
-	mutate(&c)
 	path, err := userConfigPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
-	}
-	// Unique temp + rename: config.json is written by the wizard and by
-	// `oaica config set`, read by every launch (2026-09-26 audit).
-	return fileutil.WriteFileAtomic(path, b, 0o600)
+	return fileutil.WithFileLock(path, func() error {
+		c, err := UserConfigLoad()
+		if err != nil {
+			return err
+		}
+		snapshot := storeDocumentSnapshot(c)
+		mutate(&c)
+		if !storeDocumentChanged(snapshot, c) {
+			// Nothing to say, and a rewrite with nothing to say is how the
+			// unmodelled members of a document get lost — see store_document.go.
+			// It also keeps `config set <tier> <value it already has>` from
+			// touching the file at all.
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		// Members this struct does not model (`schema_note`, a key a newer
+		// oaica wrote) are re-attached rather than deleted by the rewrite.
+		b, err := storeDocumentMergeValue(c, path)
+		if err != nil {
+			return err
+		}
+		// Unique temp + rename: config.json is written by the wizard and by
+		// `oaica config set`, read by every launch (2026-09-26 audit).
+		return fileutil.WriteFileAtomic(path, b, 0o600)
+	})
 }
 
 // UserConfigSonnetModel returns the standing sonnet tier ("" when unset) —

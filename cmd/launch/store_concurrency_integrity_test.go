@@ -35,6 +35,9 @@ var storeEnvVar = map[string]string{
 	"plan":     "OAICA_PLANS_FILE",
 	"manifest": "OAICA_MODELS_FILE",
 	"alias":    "OAICA_ALIASES_FILE",
+	// config.json resolves through the home directory, not a variable of its
+	// own (user_config.go), so HOME is what a child installs.
+	"config": "HOME",
 }
 
 // TestStoreWriterChildHelper is not a test of its own: the parent re-executes
@@ -59,7 +62,13 @@ func TestStoreWriterChildHelper(t *testing.T) {
 	if !ok {
 		t.Fatalf("unknown kind %q", kind)
 	}
-	os.Setenv(env, store)
+	if kind == "config" {
+		// store is the file; the variable is the home directory it resolves
+		// under (<home>/.oaica/config.json).
+		os.Setenv(env, filepath.Dir(filepath.Dir(store)))
+	} else {
+		os.Setenv(env, store)
+	}
 
 	var err error
 	switch kind {
@@ -73,6 +82,14 @@ func TestStoreWriterChildHelper(t *testing.T) {
 		_, err = ModelAdd(ModelAddOptions{ID: id, Engine: "vllm", ModelPath: "/m/" + id})
 	case "alias":
 		err = ModelAliasSet(id, "target-"+id)
+	case "config":
+		// id is "sonnet-N" or "haiku-N": the point is that two processes write
+		// two different keys into one document.
+		if strings.HasPrefix(id, "sonnet") {
+			err = UserConfigSetSonnetModel(id)
+		} else {
+			err = UserConfigSetHaikuModel(id)
+		}
 	}
 	if err != nil {
 		t.Fatalf("%s %s: %v", kind, id, err)
@@ -84,7 +101,7 @@ func storePathFor(t *testing.T, home, kind string) string {
 	t.Helper()
 	name, ok := map[string]string{
 		"auth": "auth.json", "remote": "remotes.json", "plan": "plans.json",
-		"manifest": "models.json", "alias": "aliases.json",
+		"manifest": "models.json", "alias": "aliases.json", "config": "config.json",
 	}[kind]
 	if !ok {
 		t.Fatalf("unknown store kind %q", kind)

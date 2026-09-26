@@ -85,13 +85,12 @@ func (a *modelAliases) save() error {
 	if a.Version == 0 {
 		a.Version = modelAliasesVersion
 	}
-	data, err := json.MarshalIndent(a, "", "  ")
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	data, err := storeDocumentMergeValue(a, path)
 	if err != nil {
 		return err
 	}
-	// Members the struct does not model survive the rewrite — see
-	// store_document.go.
-	data = storeDocumentMerge(data, path)
 	// Unique temp + rename (2026-09-26 audit): the aliases file is read by
 	// every launch and written by `oaica alias set`.
 	return fileutil.WriteFileAtomic(path, data, 0o600)

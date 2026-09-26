@@ -128,13 +128,12 @@ func (p *tierPlanProfiles) save() error {
 	if p.Version == 0 {
 		p.Version = tierPlanProfilesVersion
 	}
-	data, err := json.MarshalIndent(p, "", "  ")
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	data, err := storeDocumentMergeValue(p, path)
 	if err != nil {
 		return err
 	}
-	// Members the struct does not model survive the rewrite — see
-	// store_document.go.
-	data = storeDocumentMerge(data, path)
 	// A unique temp + rename: two `oaica` processes both write plans.json
 	// (a launch wizard saving a plan while `oaica plan set` runs), and a
 	// fixed "<path>.tmp" let one publish the other's half-written buffer

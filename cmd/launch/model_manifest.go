@@ -191,11 +191,11 @@ func (m *modelManifest) save() error {
 	if m.Version == 0 {
 		m.Version = modelManifestVersion
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
+	data, err := storeDocumentMergeValue(m, path)
 	if err != nil {
 		return err
 	}
-	return fileutil.WriteFileAtomic(path, storeDocumentMerge(data, path), 0o600)
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // updateModelManifest is the ONLY writer path for models.json: it holds the
