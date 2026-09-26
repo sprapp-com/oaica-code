@@ -149,7 +149,13 @@ func (c *Cline) Edit(models []LaunchModel) error {
 	//
 	// Both documents are also read before either is written: a malformed second
 	// one must be an error the user sees before oaica has already rewritten the
-	// first (pi's Edit, same reason).
+	// first (pi's Edit, same reason). The SAME rule applies to a document that
+	// parses but is not ours to repoint: the legacy endpoint check runs here, in
+	// the read phase, and not only inside the legacy writer — that writer runs
+	// second, so a launch refused for a foreign globalState.json had already
+	// published (or created) providers.json by the time it refused, leaving the
+	// pair split across two selections, which is the one thing these two files
+	// are never allowed to be (2026-09-27 audit, round 26).
 	return fileutil.WithFileLock(foreignStoreLockBase(providersPath), func() error {
 		return fileutil.WithFileLock(foreignStoreLockBase(legacyPath), func() error {
 			providersConfig, err := readClineConfig(providersPath)
@@ -158,6 +164,9 @@ func (c *Cline) Edit(models []LaunchModel) error {
 			}
 			legacyConfig, err := readClineConfig(legacyPath)
 			if err != nil {
+				return err
+			}
+			if err := clineRefuseForeignLegacyEndpoint(legacyConfig); err != nil {
 				return err
 			}
 			if err := writeClineProvidersConfig(providersPath, providersConfig, models[0]); err != nil {
@@ -262,6 +271,34 @@ func clineEndpointWasOurs(recorded string) bool {
 		}
 	}
 	return false
+}
+
+// clineRefuseForeignLegacyEndpoint refuses a legacy globalState.json whose
+// Ollama endpoint oaica did not write.
+//
+// The document holds that endpoint three ways — ollamaBaseUrl plus each mode's
+// own copy — and Cline keeps ONE Ollama endpoint for both modes, so a write
+// repoints all of them together. A user whose Cline is set to their own server
+// (a LAN box, ollama.com with a key) lost its endpoint and its model id here,
+// in a document the providers guard never looks at (2026-09-27 audit, round
+// 25). Redacted: the value is file-derived and may carry a credential in its
+// userinfo or query.
+//
+// Called from BOTH the read phase of Cline.Edit and the top of
+// writeClineLegacyGlobalState: the writers publish providers.json first, so a
+// check that lived only in the legacy writer refused the launch after the
+// first half of the pair was already on disk (2026-09-27 audit, round 26).
+func clineRefuseForeignLegacyEndpoint(config map[string]any) error {
+	for _, key := range []string{"actModeOllamaBaseUrl", "planModeOllamaBaseUrl", "ollamaBaseUrl"} {
+		recorded, _ := config[key].(string)
+		if strings.TrimSpace(recorded) == "" {
+			continue
+		}
+		if !clineEndpointWasOurs(recorded) {
+			return fmt.Errorf("Cline's legacy settings (%s) name an endpoint oaica did not write (%s), so it is yours: Cline keeps one Ollama endpoint for both modes, and pointing it at the local daemon would rewrite its base URL and model id. Remove or rename that endpoint in Cline's own settings, or launch a different integration", key, redactBaseURL(recorded))
+		}
+	}
+	return nil
 }
 
 // clineLegacyBaseURLFor is the server root the legacy global state records for
@@ -375,21 +412,12 @@ func writeClineLegacyGlobalState(configPath string, config map[string]any, model
 	}
 
 	// Before anything is mutated: the same refusal writeClineProvidersConfig
-	// makes, for the same reason. This document holds the ollama endpoint the
-	// same way the providers entry does — ollamaBaseUrl plus each mode's own
-	// copy — and the write below repoints all of them at the daemon. A user
-	// whose Cline is set to their own server lost its endpoint and its model id
-	// here, in a document the providers guard never looks at (2026-09-27 audit,
-	// round 25). Redacted: the value is file-derived and may carry a credential
-	// in its userinfo or query.
-	for _, key := range []string{"actModeOllamaBaseUrl", "planModeOllamaBaseUrl", "ollamaBaseUrl"} {
-		recorded, _ := config[key].(string)
-		if strings.TrimSpace(recorded) == "" {
-			continue
-		}
-		if !clineEndpointWasOurs(recorded) {
-			return fmt.Errorf("Cline's legacy settings (%s) name an endpoint oaica did not write (%s), so it is yours: Cline keeps one Ollama endpoint for both modes, and pointing it at the local daemon would rewrite its base URL and model id. Remove or rename that endpoint in Cline's own settings, or launch a different integration", key, redactBaseURL(recorded))
-		}
+	// makes, for the same reason. It ALSO runs a frame up, in Cline.Edit's read
+	// phase, because this writer is the second of the pair: a launch refused
+	// here would already have published providers.json. Same helper, so the two
+	// call sites cannot drift (2026-09-27 audit, round 26).
+	if err := clineRefuseForeignLegacyEndpoint(config); err != nil {
+		return err
 	}
 
 	// The same two branches the providers.json write above takes: for a

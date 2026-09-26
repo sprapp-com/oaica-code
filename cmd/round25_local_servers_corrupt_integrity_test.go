@@ -63,23 +63,13 @@ func TestRegisterRefusesToReplaceAnUnreadableRegistry(t *testing.T) {
 	}
 }
 
-// TestUnregisterLeavesAnUnreadableRegistryAlone is the teardown half: dropping
-// an entry cannot match anything in a document that cannot be parsed, and the
-// rewrite from that empty answer would do the same damage.
-func TestUnregisterLeavesAnUnreadableRegistryAlone(t *testing.T) {
-	const corrupt = `{"model":"kat"`
-	path := seedLocalServers(t, corrupt)
-
-	oaicaUnregisterLocalServer("kat")
-
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != corrupt {
-		t.Errorf("unregister rewrote an unreadable registry:\n got: %s\nwant: %s", got, corrupt)
-	}
-}
+// The teardown half needs no test of its own (2026-09-27 audit, round 26): the
+// rewrite in oaicaDropLocalServers is gated on `dropped`, so a document that
+// cannot be parsed — in which nothing can match — never reaches the write at
+// all. A test over a corrupt registry passes whether or not the strict read is
+// there, which is what made the earlier one vacuous and why it was removed
+// rather than kept as decoration. The rule it would have pinned is pinned by
+// construction, in the code, where the gate is.
 
 // Control: the two states that are NOT "unreadable" keep working — an absent
 // registry is an empty one (the first `oaica serve` on a box creates it), and a

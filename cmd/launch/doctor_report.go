@@ -119,7 +119,12 @@ func reportSecrets() []reportSecret {
 		// `oaica serve --api-key K` records K in local_servers.json, so that
 		// file is a fourth credential store — one the report used to describe
 		// as non-sensitive and never scan for (2026-09-26 audit).
-		for _, k := range localServerKeys(home) {
+		//
+		// A read error is not swallowed here: the report warns about it below
+		// (buildDoctorReport), so an unscannable registry shrinks the value
+		// list VISIBLY rather than silently (2026-09-27 audit).
+		keys, _ := localServerKeys(home)
+		for _, k := range keys {
 			add("an `oaica serve --api-key` value in ~/.oaica/local_servers.json", k)
 		}
 	}
@@ -132,24 +137,33 @@ func reportSecrets() []reportSecret {
 // localServerKeys returns every api_key recorded in
 // ~/.oaica/local_servers.json, the file `oaica serve` writes so `oaica launch`
 // can find a running local server. Only ever called to feed the leak scan,
-// which compares values and never prints them; a malformed or absent file
-// yields no keys, which is why the caller does not treat an error as fatal.
-func localServerKeys(home string) []string {
-	b, err := os.ReadFile(filepath.Join(home, ".oaica", "local_servers.json"))
+// which compares values and never prints them.
+//
+// An absent file and an unreadable one are different answers (2026-09-27
+// audit). The first means there is nothing to scan; the second means the file
+// may hold a credential the scan cannot see, and returning nil for both made
+// the leak check silently smaller — the one state it must never be wrong
+// about. The error is returned so the caller can say so out loud.
+func localServerKeys(home string) ([]string, error) {
+	path := filepath.Join(home, ".oaica", "local_servers.json")
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	var entries []struct {
 		APIKey string `json:"api_key"`
 	}
-	if json.Unmarshal(b, &entries) != nil {
-		return nil
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	keys := make([]string, 0, len(entries))
 	for _, e := range entries {
 		keys = append(keys, e.APIKey)
 	}
-	return keys
+	return keys, nil
 }
 
 // readSecretFile returns a file's trimmed contents, or "" for any error —
@@ -254,6 +268,16 @@ func buildDoctorReport() (string, bool) {
 		// (2026-09-26 audit).
 		describeFile(&b, filepath.Join(home, ".oaica", "config.json"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "local_servers.json"), true)
+		// A registry that exists but cannot be parsed is the case the line
+		// above cannot distinguish from a healthy one (it prints "present"),
+		// and it is the case that matters: `oaica serve --api-key K` records K
+		// in that file, so a scan that cannot read it does not know a key it
+		// must not print. The warning names the path and the failure; the error
+		// text carries no file CONTENT, so it cannot itself leak a key
+		// (2026-09-27 audit).
+		if _, err := localServerKeys(home); err != nil {
+			fmt.Fprintf(&b, "  WARNING: %v — an `oaica serve --api-key` value in that file cannot be read, so this report's leak check does NOT cover it\n", err)
+		}
 		// sensitive=true so the directory's own bits print (see describeFile):
 		// the cache holds the picker's fetched rows, not credentials, but a
 		// world-writable cache dir is still a layout fact the 0700/0600 check

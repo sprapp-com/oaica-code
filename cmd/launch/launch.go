@@ -216,6 +216,31 @@ func sameModelSelection(a, b []string) bool {
 	return true
 }
 
+// selectionIsDeclaredBy reports whether declared holds every name in wanted,
+// in any order, under sameModelSelection's per-name rule. It is the drift
+// question for a store that keeps more than the current selection — "does what
+// the editor says it holds include everything this launch would write" — where
+// equality would call a store that still declares the whole selection
+// unchanged only by accident of position (2026-09-27 audit, round 26).
+func selectionIsDeclaredBy(declared, wanted []string) bool {
+	if len(wanted) == 0 {
+		return false
+	}
+	for _, want := range wanted {
+		found := false
+		for _, have := range declared {
+			if modelNamesAreTheSame(have, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // modelNamesAreTheSame is sameModelSelection's per-name rule: equal strings, or
 // two names that resolve to one endpoint under one upstream model.
 func modelNamesAreTheSame(a, b string) bool {
@@ -1087,6 +1112,38 @@ func integrationConsumesTierFlags(name string) bool {
 	return ok
 }
 
+// liveEditorDeclaration is launchEditorIntegration's drift term: does what the
+// editor says it holds already include this selection?
+//
+// Two readings of one question. The first compares in the picker's vocabulary,
+// which is what the integrations that translate their store's id back to a
+// picker name (cline, pi, droid) answer with, and keeps the exact-order,
+// same-length semantics it always had. The second compares in the STORE's
+// vocabulary — the ids the writers embed (launchModelWriteID) — because for a
+// row whose picker name is a display label there is no way back from the stored
+// id to the label by name alone: the ollama-cloud catalogue row is picked as
+// "ollama/gpt-oss" and served as "gpt-oss:cloud", so the store holds an id no
+// picker name equals, the first reading answered false on every run, and each
+// launch re-resolved the inventory and rewrote a config that had not changed
+// (2026-09-27 audit, round 26).
+//
+// The second reading asks whether the store declares EVERY id the selection is
+// written as; extra rows are not drift. That is the shape of a store that keeps
+// history beside the current selection (opencode's recent list, and any store
+// an older launch left entries in), where position-by-position equality called
+// a store that still declares the whole selection "changed".
+func (c *launcherClient) liveEditorDeclaration(ctx context.Context, editor Editor, models []string) bool {
+	declared := editor.Models()
+	if sameModelSelection(declared, models) {
+		return true
+	}
+	if len(models) == 0 {
+		return false
+	}
+	inventory, _ := c.modelInventory().Load(ctx)
+	return selectionIsDeclaredBy(declared, storeIDsForSelection(inventory, models))
+}
+
 func (c *launcherClient) launchEditorIntegration(ctx context.Context, name string, runner Runner, editor Editor, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {
 	models, needsConfigure := c.resolveEditorLaunchModels(ctx, saved, req)
 
@@ -1126,7 +1183,7 @@ func (c *launcherClient) launchEditorIntegration(ctx context.Context, name strin
 	models = stored
 
 	var launchModels []LaunchModel
-	liveConfigMatches := sameModelSelection(editor.Models(), models)
+	liveConfigMatches := c.liveEditorDeclaration(ctx, editor, models)
 	if needsConfigure || req.ModelOverride != "" || !savedMatchesModels(saved, models) || !liveConfigMatches {
 		launchModels = c.modelInventory().Resolve(ctx, models)
 		if err := prepareEditorIntegration(name, editor, launchModels); err != nil {

@@ -955,6 +955,45 @@ func launchModelNames(models []LaunchModel) []string {
 	return names
 }
 
+// launchModelWriteIDs is launchModelNames' counterpart in the vocabulary the
+// integrations' stores hold: the id each row is written AS (launchModelWriteID
+// — the backend id when the row's Name is a display label). The two spellings
+// are not interchangeable, and a comparison that reads one against the other
+// answers "different" for a row that did not change (2026-09-27 audit, round
+// 26).
+func launchModelWriteIDs(models []LaunchModel) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if id := launchModelWriteID(model); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// storeIDsForSelection is launchModelWriteIDs for a selection of NAMES — the
+// form a launch carries and saves. Each name is looked up in the inventory the
+// picker was built from, so the ollama-cloud catalogue row named "ollama/
+// gpt-oss" answers with the id its store holds ("gpt-oss:cloud"); a name with
+// no row keeps the id a child CLI would be handed (childModelIDFor), which is
+// what a store writes for a model it resolves directly. The order and the
+// length of names are preserved, so the result is comparable position by
+// position.
+func storeIDsForSelection(inventory []LaunchModel, names []string) []string {
+	ids := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if row, ok := findLaunchModel(inventory, name); ok {
+			ids = append(ids, launchModelWriteID(row))
+			continue
+		}
+		ids = append(ids, childModelIDFor(name))
+	}
+	return ids
+}
+
 func launchModelsFromNames(names []string) []LaunchModel {
 	models := make([]LaunchModel, 0, len(names))
 	for _, name := range names {

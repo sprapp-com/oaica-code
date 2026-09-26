@@ -343,8 +343,50 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 	})
 }
 
+// Models reports the models opencode's own state says a block oaica writes
+// declares — the daemon block or a configured user remote (see
+// opencodeProviderFor: those are the two partitions OpenCode.Edit writes).
+// Entries naming any other provider are the history of the user's other
+// opencode clients and are not this integration's to report.
+//
+// It answered nil, which is the one answer the launcher's drift term can never
+// match (sameModelSelection fails on length), so every opencode launch
+// re-resolved the inventory and rewrote a state file that had not changed —
+// the failure every other integration's Models() was fixed for (2026-09-27
+// audit, round 26).
+//
+// The ids are reported AS STORED, not translated to picker names: the stored
+// id is what the writers embed (launchModelWriteID for a daemon row, the
+// remote's own upstream id for a remote row), and the launcher compares its
+// saved selection in that same vocabulary.
 func (o *OpenCode) Models() []string {
-	return nil
+	return opencodeStateModelIDs(opencodeIsOurProviderBlock)
+}
+
+// opencodeIsOurProviderBlock reports whether a provider id in opencode's state
+// is one this integration writes: a daemon block (any spelling
+// opencodeDaemonProviderID can produce) or a configured user remote's name —
+// the block buildInlineConfig gives that remote's models.
+func opencodeIsOurProviderBlock(pid string) bool {
+	if opencodeIsDaemonProviderID(pid) {
+		return true
+	}
+	if pid == "" {
+		return false
+	}
+	// A remote's block id is the remote's name (opencodeProviderFor →
+	// resolveRemoteEndpoint), so the name is looked up as a remote, not as a
+	// "<remote>/<model>" picker name.
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if r.Name == pid {
+			return true
+		}
+	}
+	return false
 }
 
 // opencodeModelID is the model id opencode expects for a picker model: the
@@ -522,6 +564,15 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 
 // readModelJSONModels reads ollama model IDs from the opencode model.json state file
 func readModelJSONModels() []string {
+	// Any id the daemon block has used (see opencodeDaemonProviderID).
+	return opencodeStateModelIDs(opencodeIsDaemonProviderID)
+}
+
+// opencodeStateModelIDs returns the model id of every entry in opencode's model
+// state whose provider block pred accepts, in the order the state lists them —
+// the one scan both readers of this file share, so the ids Edit writes and the
+// ids a reader reports cannot drift apart.
+func opencodeStateModelIDs(pred func(string) bool) []string {
 	statePath, err := openCodeStatePath()
 	if err != nil {
 		return nil
@@ -541,8 +592,7 @@ func readModelJSONModels() []string {
 		if !ok {
 			continue
 		}
-		// Any id the daemon block has used (see opencodeDaemonProviderID).
-		if pid, _ := e["providerID"].(string); !opencodeIsDaemonProviderID(pid) {
+		if pid, _ := e["providerID"].(string); !pred(pid) {
 			continue
 		}
 		if id, ok := e["modelID"].(string); ok && id != "" {

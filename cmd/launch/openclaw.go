@@ -806,7 +806,7 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 	// immediately rather than being shadowed by a cached modelOverride. Its own
 	// file, so its own lock — taken after this one is released, to keep a single
 	// lock order (config, then session state) between any two oaica commands.
-	clearSessionModelOverride(models[0].Name)
+	clearSessionModelOverride(openclawPrimaryModel(models[0]))
 	return nil
 }
 
@@ -943,7 +943,7 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 	if modelConfig == nil {
 		modelConfig = make(map[string]any)
 	}
-	modelConfig["primary"] = "ollama/" + models[0].Name
+	modelConfig["primary"] = openclawPrimaryModel(models[0])
 	defaults["model"] = modelConfig
 	agents["defaults"] = defaults
 	config["agents"] = agents
@@ -1238,6 +1238,17 @@ func configOnDisk(data []byte) map[string]any {
 // openclawEditConfig), so the entry's "id" and that key have to be one value
 // (2026-09-27 audit, round 25).
 func openclawModelID(model LaunchModel) string { return launchModelWriteID(model) }
+
+// openclawPrimaryModel is the string OpenClaw's agents.defaults.model.primary
+// holds for a row: the provider's own namespace, then the id the provider
+// DECLARES it as. It is one function because the two places that need it — the
+// config writer and the session-override clear — read from the same session
+// state, whose "model" field holds this exact spelling (see the
+// "ollama/old-model" fixtures in openclaw_test.go). Writing the entry as the
+// Upstream id while pointing primary at the picker label would name a model its
+// own provider list no longer declares: "ollama/gpt-oss" for an entry declared
+// "gpt-oss:cloud" (2026-09-27 audit, round 26).
+func openclawPrimaryModel(model LaunchModel) string { return "ollama/" + openclawModelID(model) }
 
 // openclawModelConfig builds an OpenClaw model config entry with capability detection.
 // The second return value indicates whether the model is a cloud (remote) model.
