@@ -2540,22 +2540,24 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 		req.Header.Set("X-Session-Id", sessionID)
 	}
 
-	// Long timeout, not proxyPassThrough's 30s: this carries real
-	// completions, which can run minutes on a large request (same
-	// reasoning as tier_routing.go's API_TIMEOUT_MS for the OAICA-routed
-	// path — a chat completion is not a quick metadata call).
+	// proxyUpstreamClient, not a client with its own response deadline: this
+	// carries real completions, which legitimately run for minutes, and a
+	// fixed deadline here is a wall-clock cut at a time that belongs to no
+	// one. It is not the child's clock (the child's API_TIMEOUT_MS starts when
+	// the child sends, this one when the proxy receives, and a retry loop or a
+	// raised limit puts a healthy turn past it), and it is not needed to cover
+	// the child giving up: a child that gives up CANCELS the request, which
+	// feedPassthroughRouteHealth already reads as clientGone and excludes from
+	// the leg's health entirely. What a deadline here did produce was a
+	// truncated body after a 200 — indistinguishable, to that same health
+	// feed, from a leg that cannot finish a turn, so three long healthy turns
+	// opened the circuit and moved the session off a working backend
+	// (2026-09-26 audit).
 	//
-	// This is the same 10 minutes tier_routing.go exports to the child as
-	// API_TIMEOUT_MS=600000, and equal on purpose. The child's timer starts
-	// first, so when a turn really does run that long the child aborts on its
-	// own clock and retries on its own terms; this client only ever fires in
-	// the gap between the child giving up and its request being torn down,
-	// where its 502 is the truthful answer to a request nobody is waiting for
-	// any more. Neither timeout can abort the other's retry loop mid-turn,
-	// which is what a mismatch (say 30s here against 10 minutes there) would
-	// do — the child would retry a leg this side had already killed.
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Do(req)
+	// Setup stays bounded: this client's transport has a 10s dial and a 90s
+	// idle timeout, so an unreachable upstream still fails promptly rather
+	// than hanging until the child's own timer.
+	resp, err := proxyUpstreamClient.Do(req)
 	if err != nil {
 		logTransportFailure(http.StatusBadGateway)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
