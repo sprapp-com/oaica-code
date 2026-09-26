@@ -238,7 +238,7 @@ func TestTheInteractiveTurnHonoursVerbose(t *testing.T) {
 	captureStdout(t, func() {
 		errOut = captureStderr(t, func() {
 			var err error
-			after, _, err = oaicaTurn("kat-awq", nil, "hi", true)
+			after, _, err = oaicaTurn("kat-awq", nil, "hi", "", true)
 			if err != nil {
 				t.Fatalf("oaicaTurn: %v", err)
 			}
@@ -255,8 +255,10 @@ func TestTheInteractiveTurnHonoursVerbose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String(), oaicaVerboseRequested(cmd))") {
-		t.Errorf("generateInteractive no longer passes the verbose state into oaicaTurn — `oaica run --verbose` would report timings in one-shot mode and stay silent in the REPL, which is the same flag promising two different things")
+	// The same line carries the `/set system` message: both are per-turn state
+	// the REPL re-reads, and both were fields oaicaTurn never received.
+	if !strings.Contains(string(src), "oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String(), opts.System, oaicaVerboseRequested(cmd))") {
+		t.Errorf("generateInteractive no longer passes the session's verbose state and system message into oaicaTurn — `oaica run --verbose` would report timings in one-shot mode and stay silent in the REPL, and a `/set system` message would be dropped without a word (see interactive_oaica_set_integrity_test.go)")
 	}
 }
 

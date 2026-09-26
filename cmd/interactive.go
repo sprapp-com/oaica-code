@@ -275,55 +275,23 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					}
 					fmt.Println("Set 'quiet' mode.")
 				case "think":
-					thinkValue := api.ThinkValue{Value: true}
-					var maybeLevel string
-					if len(args) > 2 {
-						maybeLevel = args[2]
-					}
-					if maybeLevel != "" {
-						// TODO(drifkin): validate the level, could be model dependent
-						// though... It will also be validated on the server once a call is
-						// made.
-						thinkValue.Value = maybeLevel
-					}
-					opts.Think = &thinkValue
-					if client, err := api.ClientFromEnvironment(); err == nil {
-						ensureThinkingSupport(cmd.Context(), client, opts.Model)
-					}
-					if maybeLevel != "" {
-						fmt.Printf("Set 'think' mode to '%s'.\n", maybeLevel)
-					} else {
-						fmt.Println("Set 'think' mode.")
-					}
+					oaicaSettingNotSent("think", "Thinking is off for every request this fork sends — oaicaChatComplete pins enable_thinking=false, and any reasoning a backend returns anyway is stripped before you see it.")
 				case "nothink":
-					opts.Think = &api.ThinkValue{Value: false}
-					if client, err := api.ClientFromEnvironment(); err == nil {
-						ensureThinkingSupport(cmd.Context(), client, opts.Model)
-					}
-					fmt.Println("Set 'nothink' mode.")
+					oaicaSettingNotSent("nothink", "Thinking is already off for every request this fork sends.")
 				case "format":
 					if len(args) < 3 || args[2] != "json" {
 						fmt.Println("Invalid or missing format. For 'json' mode use '/set format json'")
-					} else {
-						opts.Format = args[2]
-						fmt.Printf("Set format to '%s' mode.\n", args[2])
+						break
 					}
+					oaicaSettingNotSent("format json", "The router's JSON mode is not wired up.")
 				case "noformat":
-					opts.Format = ""
-					fmt.Println("Disabled format.")
+					oaicaSettingNotSent("noformat", "Nothing is in format mode to begin with.")
 				case "parameter":
 					if len(args) < 4 {
 						usageParameters()
 						continue
 					}
-					params := args[3:]
-					fp, err := api.FormatParams(map[string][]string{args[2]: params})
-					if err != nil {
-						fmt.Printf("Couldn't set parameter: %q\n", err)
-						continue
-					}
-					fmt.Printf("Set parameter '%s' to '%s'\n", args[2], strings.Join(params, ", "))
-					opts.Options[args[2]] = fp[args[2]]
+					oaicaSettingNotSent("parameter", "Ollama generation parameters (num_ctx, temperature, …) are not sent to the router.")
 				case "system":
 					if len(args) < 3 {
 						usageSet()
@@ -621,7 +589,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		if sb.Len() > 0 && multiline == MultilineNone && oaicaActiveModel != "" {
 			// OAICA thin-client path: bypass Ollama's native chat() entirely,
 			// speak OpenAI-shaped /v1/chat/completions to api.oaica.com.
-			newHistory, reply, err := oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String(), oaicaVerboseRequested(cmd))
+			newHistory, reply, err := oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String(), opts.System, oaicaVerboseRequested(cmd))
 			oaicaHistory = newHistory
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
@@ -682,6 +650,18 @@ func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChat
 	return nil
 }
 
+// oaicaSettingNotSent answers a `/set` option the router is never sent with.
+//
+// generateInteractive's OAICA gate takes every turn, so the native branch that
+// reads opts.Think, opts.Format and opts.Options is unreachable here: setting
+// them changed nothing a turn could observe and printed a success anyway — the
+// same inert promise /load and /save made (2026-09-26 audit). Saying so is the
+// honest version. The option names stay accepted, because a session scripted
+// against them must keep running; only the answer changes.
+func oaicaSettingNotSent(name, why string) {
+	fmt.Printf("Not set: '%s' is not sent in this session — every turn is served by the OAICA API, which takes the model and the conversation. %s\n", name, why)
+}
+
 // oaicaSwitchActiveModel points an OAICA session at name, clears the
 // conversation that belonged to the previous model, and reports whether it
 // switched. /model and /load both go through here, because in this fork they
@@ -726,13 +706,34 @@ func oaicaSwitchActiveModel(name string, activeModel *string, history *[]oaicaCh
 // verbose is the `/set verbose` state, re-read per turn so toggling it
 // mid-session takes effect on the next reply. The timings go to stderr — see
 // oaicaChatTimed for why they are not on stdout like the native path's.
-func oaicaTurn(model string, history []oaicaChatMessage, prompt string, verbose bool) ([]oaicaChatMessage, string, error) {
+//
+// system is the `/set system` message, sent ahead of the conversation on every
+// turn. It is a per-turn argument rather than a member of the history because
+// the two have different lifetimes: /clear resets the conversation and must
+// leave the system message standing, and a history that carried it would
+// re-send it once per turn's copy of itself. Before this, `/set system` wrote
+// opts.System, which only the unreachable native branch reads, so the message
+// the user typed was dropped in silence (2026-09-26 audit).
+func oaicaTurn(model string, history []oaicaChatMessage, prompt, system string, verbose bool) ([]oaicaChatMessage, string, error) {
 	next := append(history, oaicaChatMessage{Role: "user", Content: prompt})
-	reply, err := oaicaChatTimed(os.Stderr, verbose, model, next)
+	reply, err := oaicaChatTimed(os.Stderr, verbose, model, oaicaWithSystem(system, next))
 	if err != nil {
 		return history, "", err
 	}
 	return append(next, oaicaChatMessage{Role: "assistant", Content: reply}), reply, nil
+}
+
+// oaicaWithSystem returns msgs with the session's system message at the head,
+// where the router reads it. An empty (or whitespace-only) message is omitted
+// rather than sent empty — an empty system turn is a request the user did not
+// ask for.
+func oaicaWithSystem(system string, msgs []oaicaChatMessage) []oaicaChatMessage {
+	if strings.TrimSpace(system) == "" {
+		return msgs
+	}
+	out := make([]oaicaChatMessage, 0, len(msgs)+1)
+	out = append(out, oaicaChatMessage{Role: "system", Content: system})
+	return append(out, msgs...)
 }
 
 // oaicaVerboseRequested reports whether --verbose (or `/set verbose`, which

@@ -37,7 +37,7 @@ func TestAFailedOaicaTurnIsNotKeptInTheHistory(t *testing.T) {
 	})
 
 	before := []oaicaChatMessage{{Role: "user", Content: "first"}, {Role: "assistant", Content: "answer"}}
-	after, reply, err := oaicaTurn("kat", before, "a prompt that fails", false)
+	after, reply, err := oaicaTurn("kat", before, "a prompt that fails", "", false)
 	if err == nil {
 		t.Fatal("premise: the stub failed the turn")
 	}
@@ -56,7 +56,7 @@ func TestASuccessfulOaicaTurnIsAddedToTheHistory(t *testing.T) {
 		return "the answer", nil
 	})
 
-	after, reply, err := oaicaTurn("kat", nil, "a prompt", false)
+	after, reply, err := oaicaTurn("kat", nil, "a prompt", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
