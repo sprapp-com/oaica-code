@@ -1381,20 +1381,49 @@ func (g *gateway) logUpstreamError(info *errCaptureInfo, status int, code, msg s
 }
 
 type usage struct {
-	PromptTokens        int `json:"prompt_tokens"`
-	CompletionTokens    int `json:"completion_tokens"`
-	PromptTokensDetails *struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	// PromptCacheHitTokens is the sibling spelling some builds emit instead of
+	// the details object (DeepSeek's). Declared so cachedTokens can fall back
+	// to it rather than billing a stated hit at the fresh rate.
+	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails  *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
 }
 
-// cachedTokens is nil-safe: PromptTokensDetails is only present once an
-// upstream actually populates it (see ledgerEntry.CachedTokens's doc).
+// cachedTokens is the prefix-cache hit count, and it is the ledger's copy of
+// the function cmd/launch's client proxy already carries — the same three
+// protections, for the same three failures (2026-09-27 audit, round 23):
+//
+//   - nil-safe: PromptTokensDetails is only present once an upstream actually
+//     populates it (see ledgerEntry.CachedTokens's doc);
+//   - the fallback is on the VALUE, not the pointer: a build that always emits
+//     the details object, populated only when it has a hit, reports an uncached
+//     prompt while its own sibling field states the hit — and here the number
+//     is billed, so those tokens would pay the fresh rate;
+//   - clamped at zero below and at the prompt size above: the cost math
+//     subtracts this from the prompt, so a malformed negative count INFLATES
+//     the fresh tokens (prompt - (-5000) = prompt + 5000), and the ledger row
+//     would record a negative hit.
 func (u usage) cachedTokens() int {
-	if u.PromptTokensDetails == nil {
+	c := 0
+	if u.PromptTokensDetails != nil {
+		c = u.PromptTokensDetails.CachedTokens
+	}
+	if c == 0 {
+		c = u.PromptCacheHitTokens
+	}
+	if c < 0 {
 		return 0
 	}
-	return u.PromptTokensDetails.CachedTokens
+	if c > u.PromptTokens {
+		if u.PromptTokens < 0 {
+			return 0
+		}
+		return u.PromptTokens
+	}
+	return c
 }
 
 // usageRecorder wraps the ResponseWriter to (a) forward bytes immediately

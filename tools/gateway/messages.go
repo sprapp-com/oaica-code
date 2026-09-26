@@ -387,9 +387,16 @@ type anthropicBridge struct {
 }
 
 type bridgeSSE struct {
-	tail      bytes.Buffer
-	stopMsg   string
+	tail bytes.Buffer
+	// stopMsg is the upstream's finish_reason, mapped to Anthropic's
+	// stop_reason for the closing message_delta.
+	stopMsg string
+	// inTok is the upstream's prompt_tokens and cacheTok the cached part of
+	// it: the closing message_delta reports inTok-cacheTok as input_tokens and
+	// cacheTok as cache_read_input_tokens, because Anthropic's input_tokens is
+	// the UNCACHED prompt (2026-09-27 audit, round 23).
 	inTok     int
+	cacheTok  int
 	outTok    int
 	finished  bool
 	startSent bool
@@ -513,7 +520,17 @@ func (b *anthropicBridge) finalize() {
 	if len(respBlocks) == 0 {
 		respBlocks = append(respBlocks, map[string]any{"type": "text", "text": ""})
 	}
-	in, out := resp.Usage.PromptTokens, resp.Usage.CompletionTokens
+	// Anthropic's contract — the one this bridge translates INTO — is that
+	// input_tokens is the UNCACHED prompt and cache_read_input_tokens the
+	// prefix the upstream served from its cache; the two partition the prompt
+	// and sum to what the upstream counted. Emitting the whole prompt as fresh
+	// input read a 95% cache hit as a 0% hit, and any consumer that treats
+	// input_tokens as fresh input over-counted by the cached amount. The client
+	// proxy has split the same body this way since 2026-09-26 (see
+	// anthropic_openai_proxy.go, and anthropic/anthropic.go for the contract);
+	// this side never emitted the field at all (2026-09-27 audit, round 23).
+	cached := resp.Usage.cachedTokens()
+	in, out := resp.Usage.PromptTokens-cached, resp.Usage.CompletionTokens
 	json.NewEncoder(b.ResponseWriter).Encode(map[string]any{
 		"id":            respID(resp.ID),
 		"type":          "message",
@@ -522,7 +539,11 @@ func (b *anthropicBridge) finalize() {
 		"content":       respBlocks,
 		"stop_reason":   stopReasonOpenAIToAnthropic(resp.Choices[0].FinishReason),
 		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": in, "output_tokens": out},
+		"usage": map[string]any{
+			"input_tokens":            in,
+			"cache_read_input_tokens": cached,
+			"output_tokens":           out,
+		},
 	})
 }
 
@@ -586,6 +607,14 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			Usage *struct {
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
+				// The same two spellings the ledger's usage type carries; the
+				// cached part is reported to the client as
+				// cache_read_input_tokens rather than folded into input_tokens
+				// (2026-09-27 audit, round 23).
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+				PromptTokensDetails  *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 		}
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
@@ -594,6 +623,11 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 		if chunk.Usage != nil {
 			b.sse.inTok = chunk.Usage.PromptTokens
 			b.sse.outTok = chunk.Usage.CompletionTokens
+			b.sse.cacheTok = usage{
+				PromptTokens:         chunk.Usage.PromptTokens,
+				PromptCacheHitTokens: chunk.Usage.PromptCacheHitTokens,
+				PromptTokensDetails:  chunk.Usage.PromptTokensDetails,
+			}.cachedTokens()
 		}
 		for _, ch := range chunk.Choices {
 			if r := firstNonEmpty(ch.Delta.Reasoning, ch.Delta.ReasoningContent); r != "" {
@@ -664,10 +698,18 @@ func (b *anthropicBridge) finishStream() {
 	for _, block := range b.toolBlocks {
 		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": block})
 	}
+	// input_tokens excludes what the upstream served from its prefix cache,
+	// which is reported separately: the two partition prompt_tokens and sum to
+	// it, so a client that adds them sees the real prompt and one that bills
+	// input_tokens bills only the uncached part (2026-09-27 audit, round 23).
 	b.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReasonOpenAIToAnthropic(b.sse.stopMsg), "stop_sequence": nil},
-		"usage": map[string]any{"input_tokens": b.sse.inTok, "output_tokens": b.sse.outTok},
+		"usage": map[string]any{
+			"input_tokens":            b.sse.inTok - b.sse.cacheTok,
+			"cache_read_input_tokens": b.sse.cacheTok,
+			"output_tokens":           b.sse.outTok,
+		},
 	})
 	b.emit("message_stop", map[string]any{"type": "message_stop"})
 }
