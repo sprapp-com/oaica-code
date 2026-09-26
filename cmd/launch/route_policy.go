@@ -701,20 +701,34 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (
 // BaseURL every other route's breaker state is keyed on.
 const nativeOversizeBreakerKey = "native-anthropic-oversize"
 
-// startRouteHealthPoll probes every distinct fallback base URL every
-// pollInterval until ctx is cancelled, recording the outcome so breakers
-// both OPEN proactively and RECOVER without waiting for a real request to
-// prove the leg is back. GET /models: every OpenAI-compatible backend we
-// route to (vLLM, Ollama, gateways, aggregators) serves it, and unlike a
-// TCP dial it exercises the full HTTP path including any LB in front.
+// startRouteHealthPoll probes every distinct fallback leg every pollInterval
+// until ctx is cancelled, recording the outcome so breakers both OPEN
+// proactively and RECOVER without waiting for a real request to prove the leg
+// is back. GET /models: every OpenAI-compatible backend we route to (vLLM,
+// Ollama, gateways, aggregators) serves it, and unlike a TCP dial it exercises
+// the full HTTP path including any LB in front.
+//
+// The probe carries the leg's OWN credential, and only a status that actually
+// proves the completion path works counts (2026-09-26 audit, tenth round,
+// auditor B — HIGH). Both halves were wrong before:
+//
+//   - Unauthenticated, a key-protected leg answered 401/403 to a probe that
+//     never sent its key — and any status below 500 was read as recovery.
+//     recordOK zeroes BOTH openUntil and fails, so an OPEN breaker was closed
+//     one poll later and a leg failing real requests more slowly than the poll
+//     interval never accumulated breakerFailsToOpen at all: the circuit never
+//     opened, the documented failover never happened, and every 30s window
+//     bounced the session back onto the dead leg.
+//   - For the same reason a 429 from a shedding leg read healthy forever.
+//
+// So: 2xx is the only evidence of recovery; 401/403 is evidence of NOTHING
+// (the leg answered, but this probe's authorization says nothing about the
+// completion path) and is left as no signal — it must not erase a real failure
+// count; every other answer, and a transport error, is a leg failure.
 func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval time.Duration) {
 	seen := map[string]bool{}
-	var urls []string
-	legs := append([]proxyRoute{t.Default}, t.Fallbacks...)
-	if t.Oversize.BaseURL != "" {
-		legs = append(legs, t.Oversize)
-	}
-	for _, r := range legs {
+	var legs []proxyRoute
+	for _, r := range append(append([]proxyRoute{t.Default}, t.Fallbacks...), t.Oversize) {
 		// An anthropic-wire remote leg is NOT probed: GET <base>/models is an
 		// OpenAI-shaped probe, and a vendor that serves /messages there need
 		// not serve /models at all (the plan rows' base carries an /anthropic
@@ -728,20 +742,26 @@ func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval 
 		}
 		if r.BaseURL != "" && !seen[r.BaseURL] {
 			seen[r.BaseURL] = true
-			urls = append(urls, r.BaseURL)
+			legs = append(legs, r)
 		}
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	tick := time.NewTicker(pollInterval)
 	defer tick.Stop()
 	probe := func() {
-		for _, u := range urls {
+		for _, leg := range legs {
+			u := leg.BaseURL
 			// ctx-bound request: shutdown cancels an in-flight probe instead
 			// of letting shutdown lag behind it (up to the 5s client timeout
 			// per URL under the old channel-only signal).
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(u, "/")+"/models", nil)
 			if err != nil {
 				continue
+			}
+			// The same credential the leg's own requests carry (KeyEnv
+			// re-read per probe, exactly as resolveKey does per request).
+			if key := leg.resolveKey(); key != "" {
+				req.Header.Set("Authorization", "Bearer "+key)
 			}
 			resp, err := client.Do(req)
 			if err != nil {
@@ -753,9 +773,15 @@ func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval 
 			}
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			switch {
+			case resp.StatusCode >= 200 && resp.StatusCode < 300:
 				t.breakers.recordOK(u)
-			} else {
+			case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+				// Alive but unauthorized for THIS probe: not evidence the
+				// completion path works, and not evidence it is broken.
+				// Recording nothing is the point — recordOK here is what
+				// kept an OPEN breaker from ever staying open.
+			default:
 				t.breakers.recordFail(u)
 			}
 		}
