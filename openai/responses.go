@@ -780,7 +780,11 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 				Arguments: tc.Function.Arguments,
 			})
 		}
-	} else {
+	}
+	// The text of a turn that also called a tool is part of the answer, not an
+	// alternative to it (2026-09-27 audit, round 18). A turn with no tool calls
+	// still gets its message item, as it always did.
+	if len(chatResponse.Message.ToolCalls) == 0 || chatResponse.Message.Content != "" {
 		output = append(output, ResponsesOutputItem{
 			ID:     itemID,
 			Type:   "message",
@@ -903,7 +907,6 @@ type ResponsesStreamConverter struct {
 	// item "done" events) reports the index the item was announced under, which
 	// is no longer outputIndex once the counter has moved past it.
 	messageItemIndex int
-	toolCallsSent    bool
 	accumulatedText  string
 	sequenceNumber   int
 
@@ -960,15 +963,18 @@ func (c *ResponsesStreamConverter) Process(r api.ChatResponse) []ResponsesStream
 		events = append(events, c.processThinking(r.Message.Thinking)...)
 	}
 
+	// Handle text content. It is emitted whatever the tool calls are doing: a
+	// model that narrates before it acts ("Let me look at the file." then the
+	// call) produces both, they are both items of the response, and refusing
+	// the content whenever the chunk carried a call dropped the model's answer
+	// with no error (2026-09-27 audit, round 18).
+	if r.Message.Content != "" {
+		events = append(events, c.processTextContent(r.Message.Content)...)
+	}
+
 	// Handle tool calls
 	if hasToolCalls {
 		events = append(events, c.processToolCalls(r.Message.ToolCalls)...)
-		c.toolCallsSent = true
-	}
-
-	// Handle text content (only if no tool calls)
-	if !hasToolCalls && !c.toolCallsSent && r.Message.Content != "" {
-		events = append(events, c.processTextContent(r.Message.Content)...)
 	}
 
 	// Done - emit closing events
@@ -1308,13 +1314,10 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 		})
 	}
 
-	// Add tool calls if present
-	if len(c.toolCallItems) > 0 {
-		for _, item := range c.toolCallItems {
-			output = append(output, item)
-		}
-	} else if c.contentStarted {
-		// Add message item if we had text content
+	// Add the message item if text was relayed, then the tool calls: a turn can
+	// hold both, and the client was sent deltas for the message whether or not
+	// a call followed (2026-09-27 audit, round 18).
+	if c.contentStarted {
 		output = append(output, map[string]any{
 			"id":     c.itemID,
 			"type":   "message",
@@ -1329,6 +1332,11 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 		})
 	}
 
+	// Add tool calls if present
+	for _, item := range c.toolCallItems {
+		output = append(output, item)
+	}
+
 	return output
 }
 
@@ -1339,7 +1347,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 	events = append(events, c.finishReasoning()...)
 
 	// Emit text completion events if we had text content
-	if !c.toolCallsSent && c.contentStarted {
+	if c.contentStarted {
 		// response.output_text.done
 		events = append(events, c.newEvent("response.output_text.done", map[string]any{
 			"item_id":       c.itemID,
