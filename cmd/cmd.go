@@ -681,7 +681,11 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		if !ok {
 			fmt.Printf("Unknown model '%s'. Available models:\n", args[0])
 			for _, n := range names {
-				fmt.Printf("  %s\n", n)
+				// Quoted: the list is the ROUTER's, and it is printed right
+				// after an error, the moment a user is most likely to copy a
+				// name verbatim — a newline in one forged extra entries
+				// (2026-09-26 audit, fifteenth round).
+				fmt.Printf("  %s\n", launch.PrintableCell(n))
 			}
 			// Returning an error (not nil) so the shell sees exit 1 — a
 			// typo'd model used to look like success. Audit 0.4.6, P0-4/P1-2.

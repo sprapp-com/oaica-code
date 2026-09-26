@@ -94,7 +94,11 @@ func WriteRefreshedModelSources(w io.Writer, r RefreshedModelSources) {
 		}
 		fmt.Fprintf(w, "%s (%d):\n", title, len(names))
 		for _, n := range names {
-			fmt.Fprintf(w, "  %s\n", n)
+			// Names come from a user remote's /models answer or the router
+			// catalog; a newline in one forged extra rows and made the count
+			// in this section's header disagree with what is visible
+			// (2026-09-26 audit, fifteenth round).
+			fmt.Fprintf(w, "  %s\n", PrintableCell(n))
 		}
 	}
 	printSection("Local", r.Local)

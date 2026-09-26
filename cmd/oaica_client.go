@@ -109,6 +109,16 @@ func oaicaDiagnosisBody(body []byte) string {
 	return oaicaDiagnosis(truncateForError(body))
 }
 
+// oaicaPrintableCells renders each of a router-supplied list's entries for a
+// one-line report, through the same rule the rest of the CLI uses
+// (launch.PrintableCell): an ordinary entry as-is, one carrying a control
+// character in Go-quoted form. The one-shot dispatcher builds its model and
+// LoRA lists from the ROUTER's answer, and a newline in a model id or
+// description forged extra rows under a header the user already trusts — the
+// same forgery round 13 fixed in the interactive twin
+// (2026-09-26 audit, fifteenth round).
+func oaicaPrintableCells(names []string) []string { return launch.PrintableCells(names) }
+
 // oaicaAuthHint is appended to every router auth failure so the fix arrives
 // with the diagnosis instead of leaving a fresh user with a bare "missing or
 // invalid API key" from the gateway (audit 0.4.6, P1-3). One hint line, max.
@@ -740,7 +750,7 @@ func oaicaAuthLogout(name string) error {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	return nil
 }
@@ -892,9 +902,9 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			}
 			out := "Available models:"
 			for _, m := range entries {
-				out += fmt.Sprintf("\n  %-28s %s", m.ID, starString(m.Stars))
+				out += fmt.Sprintf("\n  %-28s %s", launch.PrintableCell(m.ID), starString(m.Stars))
 				if m.Description != "" {
-					out += fmt.Sprintf("\n  %-28s %s", "", m.Description)
+					out += fmt.Sprintf("\n  %-28s %s", "", launch.PrintableCell(m.Description))
 				}
 			}
 			return out, true, nil
@@ -905,7 +915,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			return "", true, err
 		}
 		if !ok {
-			return fmt.Sprintf("Unknown model '%s'. Available models:\n  %s", requested, strings.Join(names, "\n  ")), true, nil
+			return fmt.Sprintf("Unknown model '%s'. Available models:\n  %s", requested, strings.Join(oaicaPrintableCells(names), "\n  ")), true, nil
 		}
 		*activeModel = requested
 		return fmt.Sprintf("Switched to model '%s'", *activeModel), true, nil
@@ -941,7 +951,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 					for i, l := range loras {
 						names[i] = l.Name
 					}
-					return fmt.Sprintf("Unknown LoRA '%s'. Configured: %s", name, strings.Join(names, ", ")), true, nil
+					return fmt.Sprintf("Unknown LoRA '%s'. Configured: %s", name, strings.Join(oaicaPrintableCells(names), ", ")), true, nil
 				}
 				entries = append(entries, oaicaLoraRequestEntry{ID: found.ID, Scale: 1})
 				models[found.Model] = true
@@ -969,7 +979,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			}
 			out := "Configured LoRA adapters:"
 			for _, l := range loras {
-				out += fmt.Sprintf("\n  %s  (model: %s, slot: %d)", l.Name, l.Model, l.ID)
+				out += fmt.Sprintf("\n  %s  (model: %s, slot: %d)", launch.PrintableCell(l.Name), launch.PrintableCell(l.Model), l.ID)
 			}
 			return out, true, nil
 		case "add":

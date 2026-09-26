@@ -633,7 +633,10 @@ func oaicaShowInfo(model string) error {
 		if e.ID == model || strings.HasPrefix(model, e.ID+"+") {
 			fmt.Printf("model:  %s\n", model)
 			if e.Description != "" {
-				fmt.Printf("best for: %s\n", e.Description)
+				// Free text the ROUTER controls; a newline in it emitted
+				// arbitrary lines inside this panel (2026-09-26 audit,
+				// fifteenth round).
+				fmt.Printf("best for: %s\n", launch.PrintableCell(e.Description))
 			}
 			if e.Stars > 0 {
 				fmt.Printf("rating: %s\n", starString(e.Stars))
@@ -683,7 +686,7 @@ func oaicaSwitchActiveModel(name string, activeModel *string, history *[]oaicaCh
 	if !ok {
 		fmt.Printf("Unknown model '%s'. Available models:\n", name)
 		for _, n := range names {
-			fmt.Printf("  %s\n", n)
+			fmt.Printf("  %s\n", launch.PrintableCell(n))
 		}
 		return false, nil
 	}

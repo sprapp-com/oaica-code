@@ -277,7 +277,11 @@ func buildDoctorReport() (string, bool) {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		fmt.Fprintf(&b, "  auth.json          %d provider(s): %s\n", len(names), strings.Join(names, ", "))
+		// auth.json is hand-editable, and this report is the artifact users
+		// paste into bug reports: a provider name carrying a newline forged
+		// extra rows in it and made the count disagree with the list
+		// (2026-09-26 audit, fifteenth round).
+		fmt.Fprintf(&b, "  auth.json          %d provider(s): %s\n", len(names), strings.Join(PrintableCells(names), ", "))
 	} else {
 		fmt.Fprintf(&b, "  auth.json          no stored providers\n")
 	}

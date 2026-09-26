@@ -203,6 +203,18 @@ func WriteUsageStatsJSON(w, warn io.Writer, rows []UsageStatsRow, unreadable int
 // packages cannot drift apart on what "safe to print" means.
 func PrintableCell(s string) string { return manifestCell(s) }
 
+// PrintableCells applies PrintableCell to every entry of a supplied list, for
+// the listings that print one value per line (or join them into one line): the
+// rule has to reach each ENTRY, not the joined string, or the separator would
+// be quoted along with it (2026-09-26 audit, fifteenth round).
+func PrintableCells(values []string) []string {
+	out := make([]string, len(values))
+	for i, v := range values {
+		out[i] = PrintableCell(v)
+	}
+	return out
+}
+
 // WriteUsageStatsTable writes the human table `oaica usage` prints. It lives
 // here, beside the reader, rather than in the command's RunE, because the model
 // and backend cells are printed rows of a report nothing else re-checks: the
