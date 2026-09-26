@@ -245,10 +245,15 @@ func TestRequireLicenseLive_OfflinePastGraceBlocks(t *testing.T) {
 	}
 }
 
+// A key below redactMinLen is reported by its LENGTH, not by its characters:
+// eight of a nine-character key is the key. See
+// license_redact_integrity_test.go for why the old flat "first four and last
+// four" rule was a disclosure and not a redaction.
 func TestRedactLicenseKey(t *testing.T) {
 	cases := map[string]string{
 		"":                     "****",
-		"short":                "****",
+		"short":                "****(5 chars)",
+		"OAICA-ABCD-EFGH-123":  "****(19 chars)",
 		"OAICA-ABCD-EFGH-1234": "OAIC…1234",
 	}
 	for in, want := range cases {

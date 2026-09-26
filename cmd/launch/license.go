@@ -463,12 +463,26 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// redactMinLen is the shortest key that can afford a fingerprint. The
+// "first four and last four" shape is a fixed eight characters, so on
+// anything much shorter it stops being a fingerprint and becomes the secret:
+// a nine-character key came back as eight of its nine characters, printed
+// into an error message that ends up in a log, a screenshot or a support
+// ticket. Real keys (Lemon Squeezy's are 36-character UUIDs) are far above
+// this; a short one is a mis-paste, and for a mis-paste the length alone is
+// what the user needs.
+const redactMinLen = 20
+
 // redactLicenseKey shows enough of a key for the user to recognize it in
 // an error message without echoing the whole secret back to a terminal
-// that might be recorded/shared.
+// that might be recorded/shared. A key too short to carry a fingerprint is
+// shown as its length and nothing else.
 func redactLicenseKey(key string) string {
-	if len(key) <= 8 {
+	if key == "" {
 		return "****"
+	}
+	if len(key) < redactMinLen {
+		return fmt.Sprintf("****(%d chars)", len(key))
 	}
 	return key[:4] + "…" + key[len(key)-4:]
 }
