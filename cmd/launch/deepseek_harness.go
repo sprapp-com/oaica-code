@@ -190,19 +190,16 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 	if err != nil {
 		return err
 	}
-	settings, err := readDeepSeekHarnessYAMLDocument(settingsPath)
-	if err != nil {
-		return fmt.Errorf("parse deepseek harness launch settings: %w", err)
-	}
-	if err := applyDeepSeekHarnessSettings(settings, primary, models, shouldManageOllamaWebSearch()); err != nil {
-		return err
-	}
-
-	settingsData, err := yaml.Marshal(settings)
-	if err != nil {
-		return err
-	}
-	if err := writeDeepSeekHarnessFile(settingsPath, settingsData); err != nil {
+	// ~/.ollama/launch/dsh/settings.yaml is oaica's own store, so the lock goes
+	// beside it, as the other oaica-owned stores do. It is read as a YAML
+	// document, edited in place and published whole: two `oaica launch deepseek`
+	// commands overlapping would each publish a snapshot taken before the
+	// other's settings landed, and the launch that renamed last would silently
+	// decide the file (2026-09-26 audit, twelfth round). The read happens inside
+	// the lock, or the lock would order only the publishes.
+	if err := fileutil.WithFileLock(settingsPath, func() error {
+		return writeDeepSeekHarnessSettings(settingsPath, primary, models)
+	}); err != nil {
 		return err
 	}
 
@@ -222,6 +219,26 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 		return err
 	}
 	return writeDeepSeekHarnessFile(patchPath, patchData)
+}
+
+// writeDeepSeekHarnessSettings is the load → mutate → publish half of
+// ConfigureWithModels, run under the settings store's lock. The patch file the
+// caller writes next is a fresh document marshalled from a literal, with no
+// read-back of anything, so it needs no lock.
+func writeDeepSeekHarnessSettings(settingsPath, primary string, models []LaunchModel) error {
+	settings, err := readDeepSeekHarnessYAMLDocument(settingsPath)
+	if err != nil {
+		return fmt.Errorf("parse deepseek harness launch settings: %w", err)
+	}
+	if err := applyDeepSeekHarnessSettings(settings, primary, models, shouldManageOllamaWebSearch()); err != nil {
+		return err
+	}
+
+	settingsData, err := yaml.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	return writeDeepSeekHarnessFile(settingsPath, settingsData)
 }
 
 func readDeepSeekHarnessYAML(path string) (map[string]any, error) {
