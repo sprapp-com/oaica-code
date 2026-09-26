@@ -2277,11 +2277,12 @@ func NewCLI() *cobra.Command {
 	// serve-anthropic-proxy — hidden test harness for the Anthropic↔OpenAI
 	// translation proxy used by `oaica launch claude --model <remote>/<model>`.
 	// Resolves a remote from ~/.oaica/remotes.json, runs the proxy on the
-	// given port (default: auto-pick free), and prints the chosen port to
-	// stdout. Smoke-test standalone against a real remote without launching
-	// Claude Code: `oaica serve-anthropic-proxy --remote deepseek --model
-	// deepseek-v4-flash --port 8799`, then curl
-	// http://127.0.0.1:8799/v1/messages.
+	// given port (default: auto-pick free), and prints the chosen port and the
+	// client token to stdout. Smoke-test standalone against a real remote
+	// without launching Claude Code: `oaica serve-anthropic-proxy --remote
+	// deepseek --model deepseek-v4-flash --port 8799`, then curl
+	// http://127.0.0.1:8799/v1/messages with the printed token as
+	// `x-api-key` (or `Authorization: Bearer`).
 	serveAnthropicProxyCmd := &cobra.Command{
 		Use:    "serve-anthropic-proxy",
 		Short:  "Run a local Anthropic↔OpenAI translation proxy for a user-defined remote (test harness)",

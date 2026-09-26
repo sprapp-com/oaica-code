@@ -571,14 +571,22 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 	if err != nil {
 		return "", fmt.Errorf("generate proxy client token: %w", err)
 	}
-	return token, RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
+	return token, RunAnthropicOpenAIProxyRoutes(ln, singleRemoteRouteTable(remote, upstreamModel, token))
+}
+
+// singleRemoteRouteTable is the one-leg route table shared by the three
+// single-remote entry points (RunAnthropicOpenAIProxy,
+// StartAnthropicOpenAIProxy, ServeAnthropicProxyForRemote): one user-defined
+// remote, translated unless its wire is native Anthropic.
+func singleRemoteRouteTable(remote userRemote, upstreamModel, token string) proxyRouteTable {
+	return proxyRouteTable{
 		ClientToken: token,
 		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
 			// An anthropic-wire remote is forwarded untranslated to its own
 			// /messages (see routeFor's doc for why); a single-leg launch of
 			// one takes exactly the same path as a tier-planned one.
 			NativePassthrough: remote.Descriptor().Wire == "anthropic"},
-	})
+	}
 }
 
 // StartAnthropicOpenAIProxy is the async form of RunAnthropicOpenAIProxy for
@@ -591,14 +599,7 @@ func StartAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel
 		return "", fmt.Errorf("generate proxy client token: %w", err)
 	}
 	go func() {
-		_ = RunAnthropicOpenAIProxyRoutes(ln, proxyRouteTable{
-			ClientToken: token,
-			Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
-				// An anthropic-wire remote is forwarded untranslated to its own
-				// /messages (see routeFor's doc for why); a single-leg launch of
-				// one takes exactly the same path as a tier-planned one.
-				NativePassthrough: remote.Descriptor().Wire == "anthropic"},
-		})
+		_ = RunAnthropicOpenAIProxyRoutes(ln, singleRemoteRouteTable(remote, upstreamModel, token))
 	}()
 	return token, nil
 }
@@ -789,8 +790,10 @@ type proxyRouteTable struct {
 	// and user on the box; without this, anyone local could spend the
 	// launcher's real upstream keys. Claude.Run generates one per launch
 	// and hands it to Claude Code as ANTHROPIC_AUTH_TOKEN, so the real keys
-	// never enter the child environment. Empty = no check (the standalone
-	// serve-anthropic-proxy subcommand and older callers).
+	// never enter the child environment. Empty = no check, which today means
+	// only a test that builds a proxyRouteTable by hand: all three shipped
+	// single-remote entry points generate one (the standalone
+	// serve-anthropic-proxy subcommand included, which is why it PRINTS it).
 	ClientToken string
 	// SessionID, when set, is sent upstream as X-Session-Id on every
 	// request this proxy forwards. It exists for load balancers that offer
@@ -2915,9 +2918,24 @@ func findUserRemoteByName(name string) (userRemote, bool) {
 	return userRemote{}, false
 }
 
+// listenProxyForRemote is net.Listen, as a package var so a test can hold on to
+// the listener it hands out — the serve loop below only returns when that
+// listener closes, and the test needs a way to close it.
+var listenProxyForRemote = net.Listen
+
 // ServeAnthropicProxyForRemote is the entry point used by the hidden CLI
-// subcommand. It resolves the remote, binds a listener (on port, or a free
-// one if port<=0), prints the chosen port to stdout, then blocks serving.
+// subcommand. It resolves the remote, binds a listener (on port, or a free one
+// if port<=0), prints the chosen port AND the client token to stdout, then
+// blocks serving.
+//
+// Both go to stdout before the serve loop starts, and the token's line says
+// what it is: the loop blocks until the process is killed, so anything printed
+// after it never reached a human at all. That included the token, which made
+// the documented smoke test unusable — `curl http://127.0.0.1:8799/v1/messages`
+// gets 401, and the token it needs was the one thing the command never showed
+// (2026-09-26 audit). There is no other way to learn it: the proxy listens on
+// loopback, which is shared with every other process on the box, so it accepts
+// nothing but this token (2026-09-01 security audit H1).
 func ServeAnthropicProxyForRemote(remoteName, upstreamModel string, port int) error {
 	remote, ok := findUserRemoteByName(remoteName)
 	if !ok {
@@ -2927,16 +2945,15 @@ func ServeAnthropicProxyForRemote(remoteName, upstreamModel string, port int) er
 		return fmt.Errorf("--model is required (the bare upstream model id, e.g. deepseek-v4-flash)")
 	}
 	addr := "127.0.0.1:" + strconv.Itoa(port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := listenProxyForRemote("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
-	chosen := ln.Addr().(*net.TCPAddr).Port
-	fmt.Println(strconv.Itoa(chosen))
-	token, rerr := RunAnthropicOpenAIProxy(ln, remote, upstreamModel)
-	if rerr != nil {
-		return rerr
+	token, err := newProxyClientToken()
+	if err != nil {
+		return fmt.Errorf("generate proxy client token: %w", err)
 	}
-	fmt.Println(token)
-	return nil
+	fmt.Println(strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+	fmt.Println("client token: " + token)
+	return RunAnthropicOpenAIProxyRoutes(ln, singleRemoteRouteTable(remote, upstreamModel, token))
 }
