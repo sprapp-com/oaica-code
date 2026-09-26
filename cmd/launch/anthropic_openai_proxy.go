@@ -28,6 +28,8 @@ package launch
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -2238,9 +2240,31 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 // caller is the only one that knows it (2026-09-26 audit).
 func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response, secret string) {
 	const maxRelayedBody = 16 << 20
+	// The body has to be TEXT before any of this means anything. Redaction is
+	// a string operation, and a compressed body is not the text the client
+	// will read: a key inside it is not a substring of anything, the
+	// Content-Encoding header was copied back verbatim, and the client — which
+	// decodes exactly the encoding it asked for — read the working credential
+	// in clear text (2026-09-26 audit, ninth round). Two sources of that
+	// encoding are closed here: the callers no longer forward the CLIENT's
+	// accept-encoding, and a body that arrives encoded anyway (a vendor that
+	// compresses unconditionally) is decoded before redaction. An encoding this
+	// process cannot read is refused outright rather than relayed — passing it
+	// through would be vouching for bytes no rule here has seen.
+	src := resp.Body
+	if enc := contentEncodingOf(resp); enc != "" && !resp.Uncompressed {
+		decoded, ok := decodeContentEncoding(src, enc)
+		if !ok {
+			writeAnthropicError(w, http.StatusBadGateway,
+				fmt.Sprintf("upstream answered with a Content-Encoding this proxy cannot decode (%s), so its body cannot be relayed", enc))
+			return
+		}
+		defer decoded.Close()
+		src = decoded
+	}
 	// One byte past the cap is what distinguishes "exactly the limit" from
 	// "there was more".
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRelayedBody+1))
+	body, err := io.ReadAll(io.LimitReader(src, maxRelayedBody+1))
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream response: "+redactErr(err).Error())
 		return
@@ -2253,7 +2277,10 @@ func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response, secret st
 	redact := func(s string) string { return redactSecret(redactCredentials(s), secret) }
 	body = []byte(redact(string(body)))
 	for k, vs := range resp.Header {
-		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Transfer-Encoding") {
+		// Content-Encoding is dropped with the length: what is written below is
+		// one plaintext body of a known size, whatever arrived.
+		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Transfer-Encoding") ||
+			strings.EqualFold(k, "Content-Encoding") {
 			continue
 		}
 		for _, v := range vs {
@@ -2263,6 +2290,33 @@ func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response, secret st
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
+}
+
+// contentEncodingOf returns the response's Content-Encoding, lowercased and
+// trimmed, or "" when it carries none (or only "identity").
+func contentEncodingOf(resp *http.Response) string {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if enc == "" || enc == "identity" {
+		return ""
+	}
+	return enc
+}
+
+// decodeContentEncoding wraps body in a decoder for the named Content-Encoding,
+// and reports false for an encoding this process cannot read (br, zstd, ...) or
+// a stream that does not decode as that encoding at all.
+func decodeContentEncoding(body io.Reader, encoding string) (io.ReadCloser, bool) {
+	switch encoding {
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(body)
+		if err != nil {
+			return nil, false
+		}
+		return zr, true
+	case "deflate":
+		return flate.NewReader(body), true
+	}
+	return nil, false
 }
 
 // nativeAnthropicUpstream is api.anthropic.com's own /v1/messages endpoint
@@ -2300,7 +2354,16 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 		return
 	}
 	for k, vs := range r.Header {
-		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") {
+		// accept-encoding is dropped for the same reason the credential is:
+		// this relay redacts the upstream's text before the client sees it, and
+		// a vendor that compresses (because WE asked on the client's behalf)
+		// answers in bytes no string rule can sanitize — while the client, which
+		// decodes exactly the encoding it asked for, reads the credential the
+		// redaction was supposed to remove (2026-09-26 audit, ninth round).
+		// Leaving it unset lets the transport negotiate and transparently
+		// decode, so what reaches relayUpstreamResponse is plaintext.
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") ||
+			strings.EqualFold(k, "accept-encoding") {
 			continue
 		}
 		for _, v := range vs {
@@ -2757,7 +2820,14 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	// these two header names is replaced, never merged, so a stale or
 	// wrong client-side auth header can never leak through.
 	for k, vs := range r.Header {
-		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") {
+		// accept-encoding goes the way of the credential: this leg redacts the
+		// upstream's failure text with the literal key it injected
+		// (relayUpstreamResponse), which is only possible on a body it can read,
+		// and forwarding the client's preference invited a vendor to gzip the
+		// one body that has to be sanitized (2026-09-26 audit, ninth round).
+		// Unset, the transport negotiates and decodes for us.
+		if strings.EqualFold(k, "authorization") || strings.EqualFold(k, "x-api-key") ||
+			strings.EqualFold(k, "accept-encoding") {
 			continue
 		}
 		for _, v := range vs {
