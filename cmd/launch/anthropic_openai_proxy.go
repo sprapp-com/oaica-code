@@ -2476,14 +2476,29 @@ func fetchNativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("catalog returned HTTP %d", resp.StatusCode)
 	}
+	// Bounded: this body is somebody else's answer, read into this process's
+	// memory in full before it is parsed, and an unbounded read of it is the
+	// peak memory of a long-lived proxy that resolves aliases in the
+	// background. The real catalog is tens of KB; the cap is the same 64 MiB
+	// every other buffered-and-parsed body in this package uses (2026-09-26
+	// audit).
+	body, err := httpbody.ReadCapped(resp.Body, nativeModelCatalogMaxBytes, "the native model catalog")
+	if err != nil {
+		return nil, err
+	}
 	var catalog struct {
 		Data []nativeCatalogEntry `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+	if err := json.Unmarshal(body, &catalog); err != nil {
 		return nil, err
 	}
 	return catalog.Data, nil
 }
+
+// nativeModelCatalogMaxBytes is the cap fetchNativeModelCatalog buffers before
+// parsing (see the call site). A package var only so a test can lower it to a
+// few bytes rather than allocate 64 MiB to prove the cap is enforced.
+var nativeModelCatalogMaxBytes = httpbody.DefaultMax
 
 // rewriteAnthropicRequestModel returns body with its top-level "model"
 // field replaced by newModel, preserving every other field and their
