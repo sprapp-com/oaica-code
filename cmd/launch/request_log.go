@@ -155,12 +155,45 @@ func extractLastAndTotalMessageLen(body []byte) (lastLen, totalLen int) {
 // POST. Used by claude.go so `oaica launch claude` always routes through
 // this, whether the real destination is the cloud router or a local
 // `oaica serve` instance.
+// localLoggingProxyMaxBytes is the cap this proxy reads a request body under,
+// the same 64 MiB every other buffered request body in this package uses. A
+// package var, not the constant, only so a test can lower it to a few hundred
+// bytes rather than push 64 MiB through the loopback to prove the refusal is
+// recorded.
+var localLoggingProxyMaxBytes = httpbody.DefaultMax
+
 func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 	setRequestLogProxyPort(ln)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		body, err := httpbody.ReadCapped(r.Body, httpbody.DefaultMax, "the request body")
+
+		// The row is created FIRST, before anything can refuse this request.
+		// It used to be created behind the body read, so the refusals that
+		// happen before that point returned with no row at all: a body over the
+		// cap (413) is unambiguously a turn attempt, and `oaica usage` reported
+		// ERR 0 for a session whose every turn was refused here — the same
+		// reading the transport-failure and truncated-turn fixes were made for
+		// (2026-09-26 audit, ninth round). The body-derived fields (model,
+		// sizes, signals) are filled in below, once there is a body.
+		var entry *requestLogEntry
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") {
+			e := requestLogEntry{
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Path:      r.URL.Path,
+				Backend:   redactBaseURL(targetBaseURL),
+			}
+			entry = &e
+			defer func() {
+				entry.DurationMs = time.Since(start).Milliseconds()
+				appendRequestLog(*entry)
+			}()
+		}
+
+		body, err := httpbody.ReadCapped(r.Body, localLoggingProxyMaxBytes, "the request body")
 		if err != nil {
+			if entry != nil {
+				entry.StatusCode = http.StatusRequestEntityTooLarge
+			}
 			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -173,6 +206,9 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 		// fixed timeout.
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, targetBaseURL+r.URL.Path+"?"+r.URL.RawQuery, bytes.NewReader(body))
 		if err != nil {
+			if entry != nil {
+				entry.StatusCode = http.StatusBadGateway
+			}
 			// redactErr: a target that carries the key as URL userinfo (an
 			// OAICA_HOST like https://sk-...@api.oaica.com, the same shape
 			// remotes.json leaked) appears in net/http's own error text —
@@ -183,34 +219,22 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 		req.Header = r.Header.Clone()
 		req.ContentLength = int64(len(body))
 
-		// The row is built BEFORE the upstream call and written from a defer,
-		// like the Anthropic proxy's rows: it used to be created behind the
-		// request, so a transport failure (refused connection, DNS, TLS,
-		// timeout) returned early and left no evidence at all — `oaica usage`
-		// reported ERR 0 for a session whose every turn failed (2026-09-26
-		// audit).
-		var entry *requestLogEntry
-		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") && len(body) > 0 {
+		// The row exists from the top of the handler (see there) and is written
+		// from its defer, so a transport failure (refused connection, DNS, TLS,
+		// timeout) still leaves evidence — `oaica usage` reported ERR 0 for a
+		// session whose every turn failed (2026-09-26 audit). All that is left
+		// here is the part that needs a body.
+		if entry != nil {
 			var modelField struct {
 				Model string `json:"model"`
 			}
 			json.Unmarshal(body, &modelField)
 			lastLen, totalLen := extractLastAndTotalMessageLen(body)
-			e := requestLogEntry{
-				Timestamp:        time.Now().UTC().Format(time.RFC3339),
-				Model:            modelField.Model,
-				Path:             r.URL.Path,
-				Backend:          redactBaseURL(targetBaseURL),
-				LastMessageLen:   lastLen,
-				TotalMessagesLen: totalLen,
-				HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
-				WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
-			}
-			entry = &e
-			defer func() {
-				entry.DurationMs = time.Since(start).Milliseconds()
-				appendRequestLog(*entry)
-			}()
+			entry.Model = modelField.Model
+			entry.LastMessageLen = lastLen
+			entry.TotalMessagesLen = totalLen
+			entry.HardSignalMatch = requestLogHardSignalRE.MatchString(string(body))
+			entry.WouldBeHardByLen = lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3
 		}
 
 		resp, err := proxyUpstreamClient.Do(req)
