@@ -118,6 +118,13 @@ func ensureQwenInstalled() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if qwenGOOS != "windows" && len(args) > 0 {
+		// The unix plan runs the verified download's temp file itself
+		// (qwenInstallerCommand's single argument), so this is the only place
+		// it can be removed — kimi's installer does the same. On Windows the
+		// plan copies it into %TEMP% and runs that copy instead.
+		defer os.Remove(args[0])
+	}
 
 	fmt.Fprintf(os.Stderr, "\nInstalling Qwen Code...\n")
 	shimDir, cleanup, err := qwenInstallShimDir()
@@ -206,7 +213,55 @@ func checkQwenInstallerDependencies() error {
 	return nil
 }
 
+// qwenInstallScriptURL / qwenInstallBatURL are the upstream installer scripts.
+// Package vars so a test can point them at a local server and drive
+// installer_dl.go's real checksum gate; production points them at the vendor.
+var (
+	qwenInstallScriptURL = "https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh"
+	qwenInstallBatURL    = "https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat"
+)
+
+// qwenInstallerScript downloads this platform's installer through
+// installer_dl.go's verified download — the same gate every other installer in
+// this package uses (audit L3) — and returns the temp file it wrote. The bytes
+// are hashed and a SHA-256 pin (built-in, or OAICA_INSTALL_SHA256_<URL>) is
+// enforced before anything is allowed to run them.
+func qwenInstallerScript(goos string) (string, error) {
+	switch goos {
+	case "windows":
+		return fetchInstallerScriptFn(qwenInstallBatURL)
+	case "darwin", "linux":
+		return fetchInstallerScriptFn(qwenInstallScriptURL)
+	default:
+		return "", fmt.Errorf("unsupported platform for qwen install: %s", goos)
+	}
+}
+
+// qwenInstallerCommand is the command that runs the installer for a platform.
+// On darwin/linux that is bash plus exactly one argument: the verified file.
+// It used to be
+//
+//	bash -c "set -o pipefail; curl -fsSL <url> | sed ... | bash"
+//
+// which piped a remote script straight into a shell with no integrity check at
+// all — a compromised CDN, a DNS hijack or a MITM on the user's network
+// executed attacker code with the user's privileges, and a download that died
+// mid-way could splice into a syntactically valid partial script. The fetch now
+// goes through qwenInstallerScript, so the exact bytes that were hashed are the
+// bytes that run (2026-09-26 audit, tenth round).
+//
+// The sed stage that used to strip the script's trailing block (up to and
+// including its final `exec qwen`) is gone with it: the shim qwen that
+// qwenInstallShimDir puts first on PATH is what keeps that last exec from
+// launching the app, which is how the Windows path already worked. On Windows
+// the verified file is copied to a .bat name before it runs — the download is
+// shared code and writes a .sh, and `& $installer` needs cmd to recognise the
+// extension.
 func qwenInstallerCommand(goos string) (string, []string, error) {
+	path, err := qwenInstallerScript(goos)
+	if err != nil {
+		return "", nil, err
+	}
 	switch goos {
 	case "windows":
 		return "powershell", []string{
@@ -214,16 +269,19 @@ func qwenInstallerCommand(goos string) (string, []string, error) {
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"$installer = Join-Path $env:TEMP 'install-qwen.bat'; Invoke-WebRequest -UseBasicParsing -Uri 'https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.bat' -OutFile $installer; $content = Get-Content -Raw -Path $installer; $content = $content -replace '(?m)^\\s*call qwen\\s*$', 'REM call qwen'; Set-Content -Path $installer -Value $content -Encoding ASCII; & $installer",
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-qwen.bat'; Copy-Item -LiteralPath $verified -Destination $installer -Force; $content = Get-Content -Raw -Path $installer; $content = $content -replace '(?m)^\\s*call qwen\\s*$', 'REM call qwen'; Set-Content -Path $installer -Value $content -Encoding ASCII; & $installer",
 		}, nil
 	case "darwin", "linux":
-		return "bash", []string{
-			"-c",
-			"set -o pipefail; curl -fsSL https://qwen-code-assets.oss-cn-hangzhou.aliyuncs.com/installation/install-qwen.sh | sed '/log_info \"Starting Qwen Code...\"/,/exec qwen/d' | bash",
-		}, nil
+		return "bash", []string{path}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported platform for qwen install: %s", goos)
 	}
+}
+
+// psQuote renders s as a PowerShell single-quoted literal; a quote inside is
+// doubled, which is PowerShell's own escape.
+func psQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func (q *Qwen) Run(model string, _ []LaunchModel, args []string) error {

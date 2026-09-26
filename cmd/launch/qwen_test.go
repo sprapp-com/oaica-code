@@ -492,6 +492,20 @@ func TestEnsureQwenInstalled(t *testing.T) {
 		t.Cleanup(func() { DefaultConfirmPrompt = oldConfirm })
 	}
 
+	// withVerifiedDownload stubs installer_dl.go's download for a subtest and
+	// returns the file it hands back. These subtests must never reach the
+	// network: before finding #18 was fixed the install argv fetched the
+	// script itself, so there was no seam to stub; now the install runs the
+	// verified file and nothing else.
+	withVerifiedDownload := func(t *testing.T, name string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) { return path, nil }
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+		return path
+	}
+
 	t.Run("already installed", func(t *testing.T) {
 		setQwenTestHome(t, t.TempDir())
 		tmpDir := t.TempDir()
@@ -564,9 +578,12 @@ func TestEnsureQwenInstalled(t *testing.T) {
 
 		installLog := filepath.Join(tmpDir, "bash.log")
 		qwenPath := filepath.Join(homeDir, ".npm-global", "bin", "qwen")
+		verified := withVerifiedDownload(t, "install-qwen.sh")
+		// The verified file is the argv: fake bash creates the binary when it
+		// was handed one (the path), which is what the real installer does.
 		bashScript := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
-if [ "$1" = "-c" ]; then
+if [ -n "$1" ]; then
   /bin/mkdir -p %q
   /bin/cat > %q <<'EOS'
 #!/bin/sh
@@ -596,11 +613,14 @@ exit 0
 		if err != nil {
 			t.Fatalf("failed to read install log: %v", err)
 		}
-		if !strings.Contains(string(logData), "install-qwen.sh") {
-			t.Fatalf("expected install-qwen.sh command in log, got:\n%s", string(logData))
+		if !strings.Contains(string(logData), filepath.Base(verified)) {
+			t.Fatalf("expected the verified installer file in the log, got:\n%s", string(logData))
 		}
-		if !strings.Contains(string(logData), "exec qwen/d") {
-			t.Fatalf("expected command to remove installer auto-start block, got:\n%s", string(logData))
+		// The installer auto-start block (`exec qwen`) is no longer stripped
+		// with sed: the shim qwen first on PATH is what makes that exec a
+		// no-op. Nothing else may be piped in — the log is the whole argv.
+		if strings.Contains(string(logData), "curl") || strings.Contains(string(logData), "|") {
+			t.Fatalf("installer argv still fetches or pipes the script:\n%s", string(logData))
 		}
 	})
 
@@ -620,6 +640,7 @@ exit 0
 
 		installLog := filepath.Join(tmpDir, "powershell.log")
 		qwenPath := filepath.Join(appData, "npm", "qwen.cmd")
+		verified := withVerifiedDownload(t, "install-qwen.bat")
 		powershellScript := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
 /bin/mkdir -p %q
@@ -656,6 +677,15 @@ exit 0
 		if !strings.Contains(string(logData), "REM call qwen") {
 			t.Fatalf("expected command to replace installer auto-start call, got:\n%s", string(logData))
 		}
+		// The .bat PowerShell runs is copied out of the verified download, not
+		// fetched by PowerShell itself (Invoke-WebRequest -OutFile was the
+		// download installer_dl.go never saw).
+		if !strings.Contains(string(logData), filepath.Base(verified)) {
+			t.Fatalf("expected the verified installer file in the log, got:\n%s", string(logData))
+		}
+		if strings.Contains(string(logData), "Invoke-WebRequest") {
+			t.Fatalf("PowerShell still downloads the installer itself:\n%s", string(logData))
+		}
 	})
 
 	t.Run("install command fails", func(t *testing.T) {
@@ -668,6 +698,7 @@ exit 0
 		t.Setenv("PATH", tmpDir)
 		qwenGOOS = "linux"
 		writeFakeBinary(t, tmpDir, "curl")
+		withVerifiedDownload(t, "install-qwen.sh")
 		if err := os.WriteFile(filepath.Join(tmpDir, "bash"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatalf("failed to write fake bash: %v", err)
 		}
@@ -808,31 +839,45 @@ func TestQwenInstallerEnvPrependsShimPath(t *testing.T) {
 	}
 }
 
+// TestQwenInstallerCommand pins each platform's install argv. It pinned a
+// `curl | sed | bash` pipeline on darwin/linux and an Invoke-WebRequest
+// download on Windows until the tenth audit round: neither went through
+// installer_dl.go, so the script that ran was never hashed (finding #18). The
+// argv now runs the file the verified download handed back, and that file is
+// the only thing that runs.
 func TestQwenInstallerCommand(t *testing.T) {
 	tests := []struct {
-		name      string
-		goos      string
-		wantBin   string
-		wantParts []string
-		wantErr   bool
+		name       string
+		goos       string
+		wantBin    string
+		wantParts  []string
+		wantAbsent []string
+		wantErr    bool
 	}{
 		{
 			name:      "linux",
 			goos:      "linux",
 			wantBin:   "bash",
-			wantParts: []string{"-c", "install-qwen.sh", "sed", "exec qwen/d"},
+			wantParts: []string{qwenTestVerifiedPath},
+			// No shell pipeline and no fetcher of its own: everything runs
+			// from the verified file.
+			wantAbsent: []string{"|", "curl", "sed", "-c"},
 		},
 		{
-			name:      "darwin",
-			goos:      "darwin",
-			wantBin:   "bash",
-			wantParts: []string{"-c", "install-qwen.sh", "sed", "exec qwen/d"},
+			name:       "darwin",
+			goos:       "darwin",
+			wantBin:    "bash",
+			wantParts:  []string{qwenTestVerifiedPath},
+			wantAbsent: []string{"|", "curl", "sed", "-c"},
 		},
 		{
 			name:      "windows",
 			goos:      "windows",
 			wantBin:   "powershell",
-			wantParts: []string{"-Command", "-UseBasicParsing", "-OutFile", "Get-Content -Raw", "install-qwen.bat", "REM call qwen"},
+			wantParts: []string{"-Command", "Copy-Item", qwenTestVerifiedPath, "Get-Content -Raw", "REM call qwen"},
+			// PowerShell no longer downloads the script itself — a download it
+			// made was one installer_dl.go never saw.
+			wantAbsent: []string{"Invoke-WebRequest", "-OutFile"},
 		},
 		{
 			name:    "unsupported",
@@ -843,6 +888,12 @@ func TestQwenInstallerCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			oldFetch := fetchInstallerScriptFn
+			fetchInstallerScriptFn = func(string) (string, error) {
+				return qwenTestVerifiedPath, nil
+			}
+			t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+
 			bin, args, err := qwenInstallerCommand(tt.goos)
 			if tt.wantErr {
 				if err == nil {
@@ -860,6 +911,11 @@ func TestQwenInstallerCommand(t *testing.T) {
 			for _, part := range tt.wantParts {
 				if !strings.Contains(joined, part) {
 					t.Fatalf("args %q missing %q", joined, part)
+				}
+			}
+			for _, part := range tt.wantAbsent {
+				if strings.Contains(joined, part) {
+					t.Fatalf("args %q still contains %q — the installer must not fetch or re-pipe the script itself", joined, part)
 				}
 			}
 		})
