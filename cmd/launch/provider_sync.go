@@ -74,6 +74,7 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 			return ProviderSyncReport{URL: display}, err
 		}
 		saveCatalogETag(cachePath+".etag", display, newEtag)
+		saveCatalogCacheSource(cachePath, display)
 	}
 
 	return ProviderSyncReport{URL: display, Count: len(f.Providers), FromCache: fromCache}, nil
@@ -101,7 +102,10 @@ func fetchProviderCatalogBody(url, etag string) (body []byte, newEtag string, fr
 	}
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		if cachePath, perr := providerCatalogCachePath(); perr == nil {
+		// Offline: the cached copy is only usable when it is known to have come
+		// from THIS url — see catalogCacheSourcePath.
+		if cachePath, perr := providerCatalogCachePath(); perr == nil &&
+			catalogCacheSourceMatches(cachePath, display, defaultProviderSyncURL) {
 			if b, rerr := os.ReadFile(cachePath); rerr == nil {
 				return b, etag, true, nil
 			}

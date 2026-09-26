@@ -85,6 +85,12 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		if err := os.WriteFile(cache, []byte(`{"version":1,"providers":[{"name":"mirror","base_url":"https://mirror.example.com"}]}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		// The offline fallback serves the cache only for the URL it came from
+		// (catalogCacheSourcePath), so the seed has to name its source too.
+		// The redacted form is what the sync writes.
+		if err := os.WriteFile(catalogCacheSourcePath(cache), []byte(redactBaseURL("https://"+key+"@127.0.0.1:1/providers.json")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 
 		rep, err := ProviderSync("https://" + key + "@127.0.0.1:1/providers.json")
 		if err != nil {
@@ -111,6 +117,9 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		// because it discarded the parse error (2026-09-26 audit, third round
 		// made the sync refuse an unreadable body, which is what exposed it).
 		if err := os.WriteFile(cache, []byte(`{"version":1,"limits":{"x":{"context":1,"output":1}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(catalogCacheSourcePath(cache), []byte(redactBaseURL("https://"+key+"@127.0.0.1:1/cloud_limits.json")+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 

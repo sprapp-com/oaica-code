@@ -62,6 +62,42 @@ func loadCatalogETag(path, url, legacyDefaultURL string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// catalogCacheSourcePath is where the URL a cached catalogue BODY came from is
+// recorded, beside the body itself.
+//
+// The validator file above cannot serve as that record: it is deliberately
+// REMOVED when a response carries no ETag, while the cached body stays. Without
+// a record of its own, the offline fallback read whatever body happened to be
+// in the single fixed cache path regardless of the URL asked for, so syncing
+// once from a private mirror and then from the default catalogue while offline
+// reported a successful sync of the DEFAULT catalogue with the MIRROR's
+// contents and its count (2026-09-26 audit, tenth round — the transport-error
+// sibling of the third-round 304 fix).
+func catalogCacheSourcePath(cachePath string) string { return cachePath + ".url" }
+
+// saveCatalogCacheSource records url as the source of the cached body at
+// cachePath. url is the REDACTED form, for the same reason the validator
+// binding uses it.
+func saveCatalogCacheSource(cachePath, url string) {
+	_ = fileutil.WriteFileAtomic(catalogCacheSourcePath(cachePath), []byte(url+"\n"), 0o600)
+}
+
+// catalogCacheSourceMatches reports whether the cached body is known to have
+// come from url.
+//
+// A cache written before the source was recorded has no record at all; only
+// the package's own default catalogue may claim one, because guessing otherwise
+// would re-open the hole this closes. (A mirror user's first sync after
+// upgrading refuses the stale cache and says to sync while online, which is the
+// honest answer.)
+func catalogCacheSourceMatches(cachePath, url, legacyDefaultURL string) bool {
+	b, err := os.ReadFile(catalogCacheSourcePath(cachePath))
+	if err != nil {
+		return url == redactBaseURL(legacyDefaultURL)
+	}
+	return strings.TrimSpace(string(b)) == url
+}
+
 // saveCatalogETag records the validator for url, or REMOVES the file when the
 // response carried none — keeping a validator for a body that has since been
 // replaced is the second failure above.

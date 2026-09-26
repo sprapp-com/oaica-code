@@ -72,6 +72,7 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 			return CloudLimitsSyncReport{URL: display}, err
 		}
 		saveCatalogETag(cachePath+".etag", display, newEtag)
+		saveCatalogCacheSource(cachePath, display)
 	}
 
 	return CloudLimitsSyncReport{URL: display, Count: len(f.Limits), FromCache: fromCache}, nil
@@ -99,8 +100,12 @@ func fetchCloudLimitsBody(url, etag, cachePath string) (body []byte, newEtag str
 	}
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		if b, rerr := os.ReadFile(cachePath); rerr == nil {
-			return b, etag, true, nil
+		// Offline: only a cache known to have come from THIS url is usable —
+		// see catalogCacheSourcePath (2026-09-26 audit, tenth round).
+		if catalogCacheSourceMatches(cachePath, display, defaultCloudLimitsSyncURL) {
+			if b, rerr := os.ReadFile(cachePath); rerr == nil {
+				return b, etag, true, nil
+			}
 		}
 		return nil, "", false, fmt.Errorf("couldn't reach %s: %w", display, redactErr(err))
 	}
