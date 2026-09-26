@@ -1917,6 +1917,23 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		writeAnthropicError(w, http.StatusBadGateway, "decode upstream response: "+redactErr(err).Error())
 		return false
 	}
+	if len(oaiResp.Choices) == 0 {
+		// A 200 that carries no completion is not a finished turn. Accepting
+		// it meant the client was told the model answered nothing
+		// (stop_reason end_turn, zero content blocks), was billed a prompt
+		// that never existed, and the leg recorded a healthy 200 forever —
+		// for the shapes a misconfigured or intercepted upstream actually
+		// returns: `{"detail":"Not Found"}`, a bare `{}`, a health payload,
+		// or an empty choices array. upstreamErrorMessage above recognises
+		// only a top-level error OBJECT, and openAIResponseToChatResponse
+		// has no else for an empty array. The streaming path already refuses
+		// this same body with 502, and the server-side sibling refuses it
+		// too ("upstream returned no completion choices",
+		// tools/gateway/messages.go) — the verdict must not depend on
+		// `stream: true` (2026-09-26 audit, thirteenth round).
+		writeAnthropicError(w, http.StatusBadGateway, "upstream returned no completion choices")
+		return false
+	}
 	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
 		onUsage(oaiResp.Usage.PromptTokens)
 	}
