@@ -19,7 +19,6 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/internal/modelref"
 	"github.com/ollama/ollama/readline"
-	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 )
 
@@ -36,9 +35,8 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "Available Commands:")
 		fmt.Fprintln(os.Stderr, "  /set            Set session variables")
 		fmt.Fprintln(os.Stderr, "  /show           Show model information")
-		fmt.Fprintln(os.Stderr, "  /load <model>   Load a session or model")
+		fmt.Fprintln(os.Stderr, "  /load <model>   Switch the active model (same as /model)")
 		fmt.Fprintln(os.Stderr, "  /model <name>   Switch active model (OAICA API — see /model list)")
-		fmt.Fprintln(os.Stderr, "  /save <model>   Save your current session")
 		fmt.Fprintln(os.Stderr, "  /clear          Clear session context")
 		fmt.Fprintln(os.Stderr, "  /bye            Exit")
 		fmt.Fprintln(os.Stderr, "  /?, /help       Help for a command")
@@ -135,7 +133,6 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 
 	var sb strings.Builder
 	var multiline MultilineState
-	var thinkExplicitlySet bool = opts.Think != nil
 	// oaicaActiveModel: when set (via /model, or pre-seeded from `oaica run
 	// <model>`'s opts.Model), subsequent user turns route through the OAICA
 	// OpenAI-compatible router (oaica_client.go) instead of Ollama's native
@@ -221,43 +218,16 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				fmt.Println("Usage:\n  /load <modelname>")
 				continue
 			}
-			origOpts := opts.Copy()
-
-			client, err := api.ClientFromEnvironment()
-			if err != nil {
-				fmt.Println("error: couldn't connect to ollama server")
-				return err
-			}
-
-			opts.Model = args[1]
-			oaicaHistory = resetConversation(&opts, oaicaHistory)
-			opts.LoadedMessages = nil
-			fmt.Printf("Loading model '%s'\n", opts.Model)
-			info, err := client.Show(cmd.Context(), &api.ShowRequest{Model: opts.Model})
-			if err != nil {
-				if strings.Contains(err.Error(), "not found") {
-					fmt.Printf("Couldn't find model '%s'\n", opts.Model)
-					opts = origOpts.Copy()
-					continue
-				}
-				return err
-			}
-			applyShowResponseToRunOptions(&opts, info)
-			opts.Think, err = inferThinkingOption(&info.Capabilities, &opts, thinkExplicitlySet)
-			if err != nil {
-				return err
-			}
-			if err := loadOrUnloadModel(cmd, &opts); err != nil {
-				if strings.Contains(err.Error(), "not found") {
-					fmt.Printf("Couldn't find model '%s'\n", opts.Model)
-					opts = origOpts.Copy()
-					continue
-				}
-				if strings.Contains(err.Error(), "does not support thinking") {
-					fmt.Printf("error: %v\n", err)
-					continue
-				}
-				return err
+			// Same act as /model <name> in this fork —
+			// see oaicaSwitchActiveModel. The daemon path this used to take
+			// (client.Show → applyShowResponseToRunOptions →
+			// loadOrUnloadModel) changed opts.Model, which the OAICA gate below
+			// never reads, so the session kept answering from the model that
+			// was already active and every failure that was not "not found"
+			// ended the session with "error: couldn't connect to ollama
+			// server" (2026-09-26 audit).
+			if _, err := oaicaSwitchActiveModel(args[1], &oaicaActiveModel, &oaicaHistory); err != nil {
+				fmt.Printf("error: %v\n", err)
 			}
 			continue
 		case isSlashCommand(line, "/save"):
@@ -266,24 +236,15 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				fmt.Println("Usage:\n  /save <modelname>")
 				continue
 			}
-
-			client, err := api.ClientFromEnvironment()
-			if err != nil {
-				fmt.Println("error: couldn't connect to ollama server")
-				return err
-			}
-
-			req := NewCreateRequest(args[1], opts)
-			fn := func(resp api.ProgressResponse) error { return nil }
-			err = client.Create(cmd.Context(), req, fn)
-			if err != nil {
-				if strings.Contains(err.Error(), errtypes.InvalidModelNameErrMsg) {
-					fmt.Printf("error: The model name '%s' is invalid\n", args[1])
-					continue
-				}
-				return err
-			}
-			fmt.Printf("Created new model '%s'\n", args[1])
+			// Refused, not attempted. /save built a LOCAL Ollama model from the
+			// session's run options (NewCreateRequest → client.Create), and a
+			// session here is served by the OAICA API: the model it created
+			// was real but had nothing to do with the turns it claimed to
+			// save, and reaching a daemon that need not be running both cost a
+			// round trip and ended the session on failure (2026-09-26 audit).
+			// Saying so, and staying in the session, is the honest version of
+			// the promise the help used to make.
+			fmt.Println("save: unavailable — this session is served by the OAICA API, so there is no local model to write. Use `oaica model add` outside the session to register one.")
 			continue
 		case isSlashCommand(line, "/clear"):
 			oaicaHistory = resetConversation(&opts, oaicaHistory)
@@ -326,7 +287,6 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 						thinkValue.Value = maybeLevel
 					}
 					opts.Think = &thinkValue
-					thinkExplicitlySet = true
 					if client, err := api.ClientFromEnvironment(); err == nil {
 						ensureThinkingSupport(cmd.Context(), client, opts.Model)
 					}
@@ -337,7 +297,6 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					}
 				case "nothink":
 					opts.Think = &api.ThinkValue{Value: false}
-					thinkExplicitlySet = true
 					if client, err := api.ClientFromEnvironment(); err == nil {
 						ensureThinkingSupport(cmd.Context(), client, opts.Model)
 					}
@@ -515,22 +474,9 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				}
 				continue
 			}
-			requested := args[1]
-			ok, names, err := oaicaModelExists(requested)
-			if err != nil {
+			if _, err := oaicaSwitchActiveModel(args[1], &oaicaActiveModel, &oaicaHistory); err != nil {
 				fmt.Printf("error: %v\n", err)
-				continue
 			}
-			if !ok {
-				fmt.Printf("Unknown model '%s'. Available models:\n", requested)
-				for _, n := range names {
-					fmt.Printf("  %s\n", n)
-				}
-				continue
-			}
-			oaicaActiveModel = requested
-			oaicaHistory = nil
-			fmt.Printf("Switched to model '%s'\n", oaicaActiveModel)
 			continue
 		case isSlashCommand(line, "/lora"):
 			args := strings.Fields(line)
@@ -734,6 +680,38 @@ func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChat
 		opts.Messages = append(opts.Messages, api.Message{Role: "system", Content: opts.System})
 	}
 	return nil
+}
+
+// oaicaSwitchActiveModel points an OAICA session at name, clears the
+// conversation that belonged to the previous model, and reports whether it
+// switched. /model and /load both go through here, because in this fork they
+// are the same act: every turn is served by the OAICA API (the oaicaActiveModel
+// gate in generateInteractive), so there is no daemon-side "load" to do.
+// /load's own daemon work — client.Show, loadOrUnloadModel — put a model into a
+// process this session never talks to while the turns kept going to the model
+// already active, and printed a success about nothing the user could observe
+// (2026-09-26 audit).
+//
+// An unknown name is not an error: the session stays where it was and the user
+// is shown what exists. Returning an error here for a typo is what made /load
+// end the session, and it is the shape this function exists to not have.
+// Only an unreachable router is an error.
+func oaicaSwitchActiveModel(name string, activeModel *string, history *[]oaicaChatMessage) (bool, error) {
+	ok, names, err := oaicaModelExists(name)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		fmt.Printf("Unknown model '%s'. Available models:\n", name)
+		for _, n := range names {
+			fmt.Printf("  %s\n", n)
+		}
+		return false, nil
+	}
+	*activeModel = name
+	*history = nil
+	fmt.Printf("Switched to model '%s'\n", name)
+	return true, nil
 }
 
 // oaicaTurn appends the user's turn, asks the OAICA router for a reply, and
