@@ -78,3 +78,49 @@ func TestDaemonBackedCommandsStillDocumentOLLAMA_HOST(t *testing.T) {
 		}
 	}
 }
+
+// TestNoFlagUsageNamesASingleDashFlagThisCLIDoesNotHave is the thirteenth
+// round's addition (2026-09-26): `oaica serve --help` described --ncmoe as
+// "overriding -cmoe", and no -cmoe flag exists in this CLI — the string is an
+// argument this command passes on llama-server's command line. A user reading
+// that line looks for a flag that is not there (or concludes --ncmoe is the
+// negation of something they can also pass).
+//
+// The rule pinned here: a single-dash long name in a usage string is either a
+// flag this command parses (pflag accepts one character that way, nothing
+// longer) or it is named as another program's, with that program in the same
+// sentence. --no-cmoe, the flag that really does turn the default off, is
+// named too.
+func TestNoFlagUsageNamesASingleDashFlagThisCLIDoesNotHave(t *testing.T) {
+	root := NewCLI()
+	serve, _, err := root.Find([]string{"serve"})
+	if err != nil {
+		t.Fatalf("premise: no serve command: %v", err)
+	}
+	ncmoe := serve.Flags().Lookup("ncmoe")
+	if ncmoe == nil {
+		t.Fatal("premise: serve --ncmoe no longer exists; this test pins the help text of that flag")
+	}
+	// Every "-xyz" token (single dash, three or more characters) in the usage
+	// is a name this CLI cannot parse: a pflag shorthand is exactly one char.
+	for _, tok := range strings.Fields(ncmoe.Usage) {
+		name := strings.TrimLeft(tok, "(")
+		if !strings.HasPrefix(name, "-") || strings.HasPrefix(name, "--") {
+			continue
+		}
+		body := strings.TrimLeft(name, "-")
+		body = strings.TrimRight(body, ").,;:")
+		if len(body) < 3 {
+			continue
+		}
+		if !strings.Contains(ncmoe.Usage, "llama-server") {
+			t.Errorf("serve --ncmoe usage %q names %q, and no flag of that name exists in this CLI (a pflag shorthand is one character) — the text has to say whose argument it is, or the user looks for a flag that is not there", ncmoe.Usage, name)
+		}
+	}
+	if !strings.Contains(ncmoe.Usage, "--no-cmoe") {
+		t.Errorf("serve --ncmoe usage %q does not name --no-cmoe, the flag that actually disables the default it overrides", ncmoe.Usage)
+	}
+	if serve.Flags().Lookup("no-cmoe") == nil {
+		t.Error("premise: serve --no-cmoe no longer exists, and this help text names it")
+	}
+}
