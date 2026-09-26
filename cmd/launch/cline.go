@@ -331,7 +331,8 @@ func (c *Cline) Models() []string {
 	if modelID == "" {
 		return nil
 	}
-	return []string{modelID}
+	baseURL, _ := config["actModeOllamaBaseUrl"].(string)
+	return []string{clinePickerNameFor(modelID, baseURL)}
 }
 
 func clineProviderModel(home string) string {
@@ -346,5 +347,47 @@ func clineProviderModel(home string) string {
 	provider, _ := providers[clineLaunchProvider].(map[string]any)
 	settings, _ := provider["settings"].(map[string]any)
 	model, _ := settings["model"].(string)
-	return model
+	baseURL, _ := settings["baseUrl"].(string)
+	return clinePickerNameFor(model, baseURL)
+}
+
+// clinePickerNameFor is the inverse of clineModelIDFor: the picker name a
+// stored entry was written for.
+//
+// Both of Cline's stores keep the remote's endpoint beside the id — the
+// provider settings as the remote's base URL, the legacy state as its root —
+// and they store, for a user-remote model, the bare upstream id. Answering
+// with that id names a model the launcher never saved (it saves the picker
+// name), so liveConfigMatches (slices.Equal(editor.Models(), models),
+// launch.go) was false on every run and each launch rewrote the config it had
+// just read (2026-09-26 audit, thirteenth round — the same fix pi, droid and
+// hermes carry). Either recorded form matches, because the two stores record
+// the endpoint differently.
+func clinePickerNameFor(modelID, recordedBase string) string {
+	if modelID == "" || recordedBase == "" {
+		return modelID
+	}
+	want := strings.TrimRight(recordedBase, "/")
+	if want == strings.TrimRight(clineProviderBaseURL(), "/") || want == strings.TrimRight(clineOllamaRootURL(), "/") {
+		// The daemon's own endpoint: an entry here is a picker name already.
+		return modelID
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		// The rule findUserRemoteForModel uses: a corrupt store must not take
+		// the built-in providers with it.
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") != want && strings.TrimRight(remoteBaseURL(r), "/") != want {
+			continue
+		}
+		// Only a name that resolves back to the same model is that model's
+		// picker name; anything else is left as it was found.
+		candidate := r.Name + "/" + modelID
+		if ep, ok := resolveRemoteEndpoint(candidate); ok && ep.UpstreamModel == modelID {
+			return candidate
+		}
+	}
+	return modelID
 }
