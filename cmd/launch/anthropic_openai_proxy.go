@@ -238,19 +238,28 @@ func (u *openAIUsage) cachedTokens() int {
 	return c
 }
 
-// statesACount reports whether the usage object actually STATES a token
-// count. The presence of the object is not a statement: a build that always
-// emits it, populated only when it has something to say, sends
-// {"prompt_tokens":0,"completion_tokens":0} — an empty statement, not a
-// measurement of zero. Gating the no-usage fallbacks on the pointer read that
-// as fact, so the client was told input_tokens=0 for a turn whose prompt was
-// real: a session that never appears to grow, so auto-compaction never fires,
-// until the request hits the context wall — the 2026-08-30 failure reached
-// through a different door (2026-09-26 audit, twelfth round). Callers fall
-// back per FIELD on the value; this is the "did it state anything at all"
-// form for the non-streaming path, which has a single fallback to place.
-func (u *openAIUsage) statesACount() bool {
-	return u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0)
+// statedPromptTokens / statedCompletionTokens report whether the usage object
+// actually STATES that particular count. The presence of the object is not a
+// statement about its fields: a build that always emits it, populated only when
+// it has something to say, sends {"prompt_tokens":0,"completion_tokens":0} — an
+// empty statement, not a measurement of zero — and a partially populated object
+// states one count and says nothing about the other. Gating a fallback on the
+// OBJECT (or on an OR of its two fields) therefore suppressed it for a field
+// the upstream never spoke about, and the client was told input_tokens=0 for a
+// turn whose prompt was real: a session that never appears to grow, so
+// auto-compaction never fires, until the request hits the context wall — the
+// 2026-08-30 failure reached through a different door (2026-09-26 audit,
+// twelfth and thirteenth rounds).
+//
+// "Stated" is deliberately not "non-zero": a fully-cached turn reports
+// prompt_tokens>0 with every one of them cached, so its uncached count is
+// legitimately 0 and must not be replaced by an estimate.
+func (u *openAIUsage) statedPromptTokens() bool {
+	return u != nil && u.PromptTokens > 0
+}
+
+func (u *openAIUsage) statedCompletionTokens() bool {
+	return u != nil && u.CompletionTokens > 0
 }
 
 // openAIStreamChunk is one SSE data: payload from a streaming response.
@@ -1938,11 +1947,19 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		onUsage(oaiResp.Usage.PromptTokens)
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
-	if !oaiResp.Usage.statesACount() && estInputTokens > 0 {
-		// No usage object to report. An estimate is the only honest number
-		// available, and it keeps the client's context accounting moving —
-		// see the note at the streaming call site (2026-09-26 audit).
+	// Per FIELD, not per object: an object that states one count says nothing
+	// about the other, and gating on the object suppressed the fallback for
+	// the field the upstream never spoke about — the "session never appears to
+	// grow" failure, reached through a partial statement (2026-09-26 audit,
+	// thirteenth round).
+	if !oaiResp.Usage.statedPromptTokens() && estInputTokens > 0 {
+		// An estimate is the only honest number available for a prompt the
+		// upstream did not count, and it keeps the client's context
+		// accounting moving — see the note at the streaming call site.
 		chatResp.Metrics.PromptEvalCount = estInputTokens
+	}
+	if !oaiResp.Usage.statedCompletionTokens() && oaiResp.Choices[0].Message.Content != "" {
+		chatResp.Metrics.EvalCount = len(oaiResp.Choices[0].Message.Content)/4 + 1
 	}
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
 	anthResp.Usage.CacheReadInputTokens = oaiResp.Usage.cachedTokens()
@@ -2245,14 +2262,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	}
 	cached := 0
 	// Each field is taken only when the upstream STATED it. A usage chunk
-	// that states nothing (see statesACount) otherwise suppressed both
+	// that states nothing (see statedPromptTokens) otherwise suppressed both
 	// fallbacks at once by being present, which is strictly worse than the
 	// no-usage-chunk shape the fallbacks were added for (2026-09-26 audit,
 	// twelfth round). "Stated" is not "non-zero": a fully-cached turn reports
 	// prompt_tokens>0 with every one of them cached, so its uncached count is
 	// legitimately 0 and must not be replaced by the estimate.
-	statedPrompt := finalUsage != nil && finalUsage.PromptTokens > 0
-	statedCompletion := finalUsage != nil && finalUsage.CompletionTokens > 0
+	statedPrompt := finalUsage.statedPromptTokens()
+	statedCompletion := finalUsage.statedCompletionTokens()
 	if finalUsage != nil {
 		cached = finalUsage.cachedTokens()
 	}
