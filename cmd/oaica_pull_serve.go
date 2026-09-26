@@ -184,30 +184,38 @@ func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	if err != nil {
 		return err
 	}
-	entries := oaicaReadLocalServers(path)
-	filtered := entries[:0]
-	for _, e := range entries {
-		if e.Model != model {
-			filtered = append(filtered, e)
+	// The lock covers the whole load-mutate-save, not just the write: its
+	// writers are separate `oaica serve` processes registering themselves at
+	// startup, and an atomic rename only stops a READER from seeing half a
+	// file — two servers starting at once both read the same snapshot and the
+	// one that renames last wins with the other's entry gone, while both
+	// report a clean start (2026-09-26 audit).
+	return fileutil.WithFileLock(path, func() error {
+		entries := oaicaReadLocalServers(path)
+		filtered := entries[:0]
+		for _, e := range entries {
+			if e.Model != model {
+				filtered = append(filtered, e)
+			}
 		}
-	}
-	filtered = append(filtered, oaicaLocalServerEntry{
-		Model:     model,
-		Origin:    origin,
-		PID:       os.Getpid(),
-		StartedAt: time.Now().UTC().Format(time.RFC3339),
-		APIKey:    apiKey,
+		filtered = append(filtered, oaicaLocalServerEntry{
+			Model:     model,
+			Origin:    origin,
+			PID:       os.Getpid(),
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+			APIKey:    apiKey,
+		})
+		b, err := json.MarshalIndent(filtered, "", "  ")
+		if err != nil {
+			return err
+		}
+		// Atomic, not os.WriteFile (2026-09-26 audit): every `oaica serve`
+		// registers itself here and every `oaica serve --stop` unregisters, so
+		// two servers starting at once wrote through one live path. The file
+		// carries each server's --api-key, and it is read by a DIFFERENT command
+		// (`oaica pull` / the picker) than the one that writes it.
+		return fileutil.WriteFileAtomic(path, b, 0o600)
 	})
-	b, err := json.MarshalIndent(filtered, "", "  ")
-	if err != nil {
-		return err
-	}
-	// Atomic, not os.WriteFile (2026-09-26 audit): every `oaica serve`
-	// registers itself here and every `oaica serve --stop` unregisters, so
-	// two servers starting at once wrote through one live path. The file
-	// carries each server's --api-key, and it is read by a DIFFERENT command
-	// (`oaica pull` / the picker) than the one that writes it.
-	return fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // oaicaUnregisterLocalServerAt removes exactly the entry THIS process
@@ -238,32 +246,38 @@ func oaicaUnregisterLocalServer(model string) {
 // selects — the first only, when first is true. Nothing is written when
 // nothing matched, so a teardown whose entry was already replaced (or never
 // registered) cannot disturb the live servers' entries.
+//
+// Under the same lock as the registration path: this is the same
+// load-mutate-save over the same file, and a teardown racing a startup would
+// otherwise drop the OTHER server's entry (2026-09-26 audit).
 func oaicaDropLocalServers(match func(oaicaLocalServerEntry) bool, first bool) {
 	path, err := oaicaLocalServersPath()
 	if err != nil {
 		return
 	}
-	entries := oaicaReadLocalServers(path)
-	filtered := entries[:0]
-	dropped := false
-	for _, e := range entries {
-		if match(e) && (!first || !dropped) {
-			dropped = true
-			continue
+	_ = fileutil.WithFileLock(path, func() error {
+		entries := oaicaReadLocalServers(path)
+		filtered := entries[:0]
+		dropped := false
+		for _, e := range entries {
+			if match(e) && (!first || !dropped) {
+				dropped = true
+				continue
+			}
+			filtered = append(filtered, e)
 		}
-		filtered = append(filtered, e)
-	}
-	if !dropped {
-		return
-	}
-	b, err := json.MarshalIndent(filtered, "", "  ")
-	if err != nil {
-		return
-	}
-	// Best-effort (this is a teardown path), but still atomic: a partial
-	// write here would strand the OTHER running servers' entries
-	// (2026-09-26 audit).
-	_ = fileutil.WriteFileAtomic(path, b, 0o600)
+		if !dropped {
+			return nil
+		}
+		b, err := json.MarshalIndent(filtered, "", "  ")
+		if err != nil {
+			return err
+		}
+		// Best-effort (this is a teardown path), but still atomic: a partial
+		// write here would strand the OTHER running servers' entries
+		// (2026-09-26 audit).
+		return fileutil.WriteFileAtomic(path, b, 0o600)
+	})
 }
 
 func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
