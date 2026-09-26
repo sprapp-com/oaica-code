@@ -121,3 +121,94 @@ func TestVSCodeSettingsKeepNumbersOaicaDoesNotModel(t *testing.T) {
 		t.Errorf("the rewritten settings.json is not valid JSON: %v", err)
 	}
 }
+
+// muse, qwen and droid had the same defect: each reads a document the user or
+// another program owns, adds its own keys, and writes the whole thing back —
+// and each decoded it through float64 (muse via fileutil.ReadJSON, qwen's
+// readConfig and droid's Edit via json.Unmarshal). The numbers oaica does not
+// model are on that trip too.
+
+// Muse's file is the one that is also a live document: muse persists its own
+// settings into the config root launch hands it (muse.go:243), so whatever
+// muse recorded there — including the stamps it writes as integers — is what
+// the next launch reads back and re-encodes. "Preserve" therefore has to mean
+// byte-for-byte for every number, not just for the keys oaica owns.
+func TestAMuseSettingsKeepsNumbersOaicaDoesNotModel(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	path, err := museSettingsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := []byte(`{"schema_version": 1, "museSessionStamp": ` + unrepresentableInt + `, "windowScale": ` + integralFloat + `}`)
+	if err := os.WriteFile(path, seed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeMuseSettings([]LaunchModel{{Name: "gpt-oss:20b"}}); err != nil {
+		t.Fatalf("writeMuseSettings: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(seed, after) {
+		t.Fatal("the settings file was not rewritten, so the round-trip this test is about never happened")
+	}
+	assertNumbersSurviveUntouched(t, seed, after, "muse settings")
+}
+
+func TestAQwenConfigKeepsNumbersOaicaDoesNotModel(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	setQwenTestHome(t, home)
+
+	configDir := filepath.Join(home, ".qwen")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := []byte(`{"model":{"name":"gemma4"}, "sessionStamp": ` + unrepresentableInt + `, "windowScale": ` + integralFloat + `}`)
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), seed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (&Qwen{}).Configure("gemma4"); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	after, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumbersSurviveUntouched(t, seed, after, "qwen settings")
+}
+
+func TestADroidSettingsKeepsNumbersOaicaDoesNotModel(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	settingsDir := filepath.Join(home, ".factory")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := []byte(`{"factorySessionStamp": ` + unrepresentableInt + `, "windowScale": ` + integralFloat + `}`)
+	if err := os.WriteFile(filepath.Join(settingsDir, "settings.json"), seed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (&Droid{}).Edit(testLaunchModels("model-a")); err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+
+	after, err := os.ReadFile(filepath.Join(settingsDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumbersSurviveUntouched(t, seed, after, "droid settings")
+}

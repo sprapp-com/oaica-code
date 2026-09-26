@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -90,7 +91,14 @@ func (d *Droid) Edit(models []LaunchModel) error {
 	settingsMap := make(map[string]any)
 	var settings droidSettings
 	if data, err := os.ReadFile(settingsPath); err == nil {
-		if err := json.Unmarshal(data, &settingsMap); err != nil {
+		// UseNumber: the map is written back whole below, and the fields it
+		// carries that oaica does not model are the user's own. Decoding into
+		// map[string]any makes every number in it a float64, so an integer
+		// above 2^53 comes back as a different number and 1.0 comes back as 1
+		// (2026-09-26 audit, tenth round).
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&settingsMap); err != nil {
 			return fmt.Errorf("failed to parse settings file: %w, at: %s", err, settingsPath)
 		}
 		json.Unmarshal(data, &settings) // ignore error, zero values are fine

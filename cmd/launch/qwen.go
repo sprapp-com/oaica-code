@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -602,7 +603,15 @@ func (q *Qwen) readConfig() (map[string]any, error) {
 	}
 
 	cfg := map[string]any{}
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	// UseNumber: Configure writes this document back whole, and it is the
+	// user's file — qwen keeps its own keys in it. Decoding into
+	// map[string]any makes every number in it a float64, so an integer above
+	// 2^53 comes back as a different number and 1.0 comes back as 1 — a config
+	// changed by a launch that only meant to add a provider entry
+	// (2026-09-26 audit, tenth round).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse qwen config: %w", err)
 	}
 

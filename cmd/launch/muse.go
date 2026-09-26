@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -257,7 +258,7 @@ func museUserSettingsPath() (string, error) {
 // through would rewrite it and discard whatever muse persisted there.
 func museBaseSettings() (map[string]any, error) {
 	if path, err := museSettingsPath(); err == nil {
-		settings, err := fileutil.ReadJSON(path)
+		settings, err := museReadSettings(path)
 		switch {
 		case err == nil && settings != nil:
 			return settings, nil
@@ -266,11 +267,36 @@ func museBaseSettings() (map[string]any, error) {
 		}
 	}
 	if path, err := museUserSettingsPath(); err == nil {
-		if settings, err := fileutil.ReadJSON(path); err == nil && settings != nil {
+		if settings, err := museReadSettings(path); err == nil && settings != nil {
 			return settings, nil
 		}
 	}
 	return map[string]any{}, nil
+}
+
+// museReadSettings reads a settings document without letting its numbers
+// through float64.
+//
+// writeMuseSettingsFile rewrites the whole document, and this file is also a
+// LIVE document: muse persists its own settings into the config root launch
+// hands it, so the values in it are not all oaica's and a number oaica does not
+// model is still one muse wrote. Decoding into map[string]any makes every one
+// of them a float64, and a float64 is not the number that was in the file —
+// 2^53+1 comes back as 2^53, 1.0 comes back as 1 — so the next program to read
+// it sees a different value. Same rule as cline, vscode, claude-desktop, pi and
+// opencode apply to their own documents (2026-09-26 audit, tenth round).
+func museReadSettings(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var settings map[string]any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&settings); err != nil {
+		return nil, err
+	}
+	return settings, nil
 }
 
 // writeMuseSettings regenerates the settings file launch owns, replacing only
