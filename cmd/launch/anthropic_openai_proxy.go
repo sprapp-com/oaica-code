@@ -2194,6 +2194,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		flusher.Flush()
 	}
 
+	// streamedText counts the characters actually sent to the client, so the
+	// done event can report a usable output count even when the upstream
+	// sent no usage (see the tally below). Declared here because flushToolCalls
+	// adds to it the argument bytes of the calls it emits.
+	streamedText := 0
+
 	// truncation is closed over rather than passed in: it is decided by the
 	// finish_reason the stream carried, and it changes what a fragment means.
 	flushToolCalls := func(truncated bool) {
@@ -2246,6 +2252,13 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				Function: api.ToolCallFunction{Name: a.name, Arguments: args},
 			})
 		}
+		// Counted HERE, on the calls about to be emitted, not where the
+		// fragments accumulated: a truncated unparseable fragment is dropped
+		// above and reaches the client as no tool_use block at all, so counting
+		// it billed output_tokens for a turn that relayed nothing runnable
+		// (2026-09-27 audit, round 24). Same measure as the non-stream and
+		// adopt paths, so the two agree (round 23).
+		streamedText += toolCallArgumentsSize(tcs)
 		toolAccums = map[int]*toolAccum{}
 		if len(tcs) == 0 {
 			// Every accumulated call was a truncated fragment. Emitting an
@@ -2264,10 +2277,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
-	// streamedText counts the characters actually sent to the client, so the
-	// done event can report a usable output count even when the upstream
-	// sent no usage (see the tally below).
-	streamedText := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -2411,12 +2420,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				}
 				if tc.Function.Arguments != "" {
 					acc.args.WriteString(tc.Function.Arguments)
-					// The argument JSON reaches the client inside the tool_use
-					// block and the upstream bills it as output, so the output
-					// estimate counts it beside the answer and the thinking; a
-					// tool-only turn otherwise reported output_tokens: 0 for
-					// the turn that did the work (2026-09-27 audit, round 23).
-					streamedText += len(tc.Function.Arguments)
 				}
 			}
 

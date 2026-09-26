@@ -822,6 +822,29 @@ func fallbackLaunchModel(name string) LaunchModel {
 }
 
 func findLaunchModel(models []LaunchModel, name string) (LaunchModel, bool) {
+	if model, ok := findLaunchModelExact(models, name); ok {
+		return model, true
+	}
+	// A user alias is transparent, and the row that serves its target is the
+	// row that serves the alias. Without this hop every caller saw a name no
+	// row carries: the writers fell back to the picker spelling (round 23),
+	// and the REFUSALS — which ask this function whether the row is one the
+	// local daemon serves — found nothing and returned nil, so an alias
+	// pointing at another endpoint bypassed the guard that exists to refuse
+	// exactly that. The ChatGPT app was written the remote's model id beside
+	// the daemon's base URL (2026-09-27 audit, round 24, both auditors).
+	if target, ok := resolveModelAlias(name); ok {
+		target = strings.TrimSpace(target)
+		if target != name {
+			return findLaunchModelExact(models, target)
+		}
+	}
+	return LaunchModel{}, false
+}
+
+// findLaunchModelExact is findLaunchModel without the alias hop: the row whose
+// own name is this one.
+func findLaunchModelExact(models []LaunchModel, name string) (LaunchModel, bool) {
 	for _, model := range models {
 		if launchModelMatches(model.Name, name) {
 			resolved := cloneLaunchModel(model)
@@ -841,6 +864,43 @@ func findLaunchModel(models []LaunchModel, name string) (LaunchModel, bool) {
 		}
 	}
 	return LaunchModel{}, false
+}
+
+// displayBareName folds the display-only spellings of the LOCAL daemon's ids
+// into the bare id: "ollama/<id>" (the picker's display prefix) and
+// "daemon/<id>" (resolveLaunchEndpoint's daemon pin) both name the daemon's
+// "<id>", and the writers store the bare id, so a launch spelled with the
+// prefix read back as drift and reconfigured the integration on every run
+// (2026-09-27 audit, round 24).
+//
+// Two exclusions hold the line findLaunchModel drew in round 21:
+//
+//   - a user remote literally named "ollama" (or "daemon") owns that namespace
+//     — its namespace IS its identity, and resolveRemoteEndpoint answers for
+//     it, so the name is returned untouched;
+//   - router/ and oaica/ are NOT folded: they pin the router, which is a
+//     different endpoint than the daemon, and this comparison has no way to
+//     name that difference. Left unfolded, such a pair reads as drift and the
+//     integration reconfigures — noisy but never silently pointed elsewhere.
+func displayBareName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	rest, ok := "", false
+	for _, p := range []string{ollamaPickerPrefix, "daemon/"} {
+		if r, cut := strings.CutPrefix(name, p); cut {
+			rest, ok = r, true
+			break
+		}
+	}
+	if !ok || rest == "" {
+		return name
+	}
+	if _, isRemote := resolveRemoteEndpoint(name); isRemote {
+		return name
+	}
+	return rest
 }
 
 func launchModelMatches(candidate, name string) bool {
@@ -926,10 +986,48 @@ func launchModelEndpointKey(model LaunchModel) string {
 	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
 		return "remote:" + strings.TrimRight(ep.BaseURL, "/")
 	}
+	// The ROUTER's own namespace, keyed as its own endpoint rather than the
+	// daemon's. A router SKU is not a model the local daemon has — posting its
+	// id to the daemon does not resolve there — but nothing in the name says so
+	// to this function, which keyed it "daemon" and therefore told the
+	// single-endpoint writers (the ChatGPT app, the DeepSeek Harness, muse)
+	// that it was a row they could write: each names one base URL, the daemon's,
+	// so the router's own id went into the store beside the daemon's endpoint
+	// and the launch reported success for a model the endpoint does not serve
+	// (2026-09-27 audit, round 24, both auditors). Placed after the remote arm
+	// for the same reason resolveLaunchEndpoint places its own prefix handling
+	// there: a user remote named "oaica" owns its namespace.
+	if routerPinnedName(model.Name) {
+		return "router"
+	}
 	if isCloudModelName(model.Name) {
 		return "daemon"
 	}
 	return "daemon"
+}
+
+// routerPinnedName reports whether a name pins the OAICA router: the explicit
+// source prefixes resolveLaunchEndpoint's router arm understands ("router/",
+// "oaica/"), or the router's own bare "oaica-<sku>" ids.
+//
+// The bare form is how the router's SKUs reach every list that carries them —
+// the picker's "OAICA Models" rows and the wizard's recommended section keep
+// them unprefixed (tier_wizard's tierItemName leaves "oaica-*" as-is, and its
+// pinned section selects exactly this prefix as "actual router SKUs"), so the
+// name is the only thing there is to go on. A user remote is consulted first
+// and wins: its namespace is its own, and `oaica/kat` naming a remote called
+// "oaica" is that remote's model.
+func routerPinnedName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if _, ok := resolveRemoteEndpoint(name); ok {
+		return false
+	}
+	return strings.HasPrefix(name, "router/") ||
+		strings.HasPrefix(name, "oaica/") ||
+		strings.HasPrefix(name, "oaica-")
 }
 
 // daemonRoutedModel reports whether a picker row is one the LOCAL DAEMON
@@ -952,6 +1050,9 @@ func daemonRoutedModel(model LaunchModel) bool {
 func nonDaemonRowReason(model LaunchModel) string {
 	if model.LiveSource == liveSourceLocal {
 		return "the model is served by `oaica serve` at its own origin, and its \"<model>:local\" name posted to the local daemon does not resolve there"
+	}
+	if routerPinnedName(model.Name) {
+		return "the model is served by the OAICA router at its own origin with your OAICA credential, and the local daemon does not have it at all"
 	}
 	return "the model is reached at its own origin, and its namespaced name posted to the local daemon does not resolve there"
 }

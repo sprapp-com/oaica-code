@@ -222,6 +222,10 @@ func modelNamesAreTheSame(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
+	a, b = displayBareName(a), displayBareName(b)
+	if a == "" || b == "" {
+		return false
+	}
 	if a == b {
 		return true
 	}
@@ -229,13 +233,35 @@ func modelNamesAreTheSame(a, b string) bool {
 	// --target ollama/glm-5.3-flash:cloud` makes them the same model. A writer
 	// that stores the id the endpoint serves reads back the TARGET while the
 	// launcher saved the alias, so the pair compared as drift and every launch
-	// configured the integration again (2026-09-27 audit, round 23). Only a
-	// name that IS an alias is compared this way: childModelIDFor is not
-	// applied to both sides, so two unrelated names keep their own identities.
-	if target, ok := resolveModelAlias(a); ok && childModelIDFor(target) == childModelIDFor(b) {
+	// configured the integration again (2026-09-27 audit, round 23).
+	//
+	// The target is compared as a TARGET, not re-entered as a name: the alias
+	// table is not guaranteed acyclic (ModelAliasSet rejects "/" in a name but
+	// not a self- or two-step cycle), so a recursive call could not terminate.
+	// Round 23 compared childModelIDFor alone here, which drops the endpoint —
+	// so an alias pointing at box1's `kat-awq` matched box2's `kat-awq` and the
+	// drift term kept box2's URL and key (2026-09-27 audit, round 24).
+	if target, ok := resolveModelAlias(a); ok && sameResolvedModel(target, b) {
 		return true
 	}
-	if target, ok := resolveModelAlias(b); ok && childModelIDFor(target) == childModelIDFor(a) {
+	if target, ok := resolveModelAlias(b); ok && sameResolvedModel(target, a) {
+		return true
+	}
+	return sameResolvedModel(a, b)
+}
+
+// sameResolvedModel compares two names already known not to be aliases: the
+// same string, or two names one endpoint serves under one upstream model.
+// Display prefixes are folded first (displayBareName), so a writer that stored
+// the daemon id still agrees with the picker's spelling of it.
+func sameResolvedModel(a, b string) bool {
+	if a = displayBareName(a); a == "" {
+		return false
+	}
+	if b = displayBareName(b); b == "" {
+		return false
+	}
+	if a == b {
 		return true
 	}
 	ae, aok := resolveRemoteEndpoint(a)

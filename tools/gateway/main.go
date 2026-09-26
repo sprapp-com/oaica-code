@@ -1411,8 +1411,15 @@ func (u usage) cachedTokens() int {
 	if u.PromptTokensDetails != nil {
 		c = u.PromptTokensDetails.CachedTokens
 	}
-	if c == 0 {
-		c = u.PromptCacheHitTokens
+	// A malformed details value (<=0) must not suppress a sibling that does
+	// state the hit: the clamp used to run AFTER this fallback, so a negative
+	// details count short-circuited the sibling and then clamped to zero,
+	// billing the whole prompt at the fresh rate — the outcome the fallback
+	// exists to prevent (2026-09-27 audit, round 24).
+	if c <= 0 {
+		if sibling := u.PromptCacheHitTokens; sibling > 0 {
+			c = sibling
+		}
 	}
 	if c < 0 {
 		return 0
@@ -1424,6 +1431,33 @@ func (u usage) cachedTokens() int {
 		return u.PromptTokens
 	}
 	return c
+}
+
+// merge folds a later chunk's usage into this one field by field. SSE usage
+// objects are not guaranteed to be cumulative: a build may narrate the running
+// counts per chunk and state only the fields it has just measured, so the
+// whole-struct replace this used to be billed whichever chunk arrived last —
+// a closing chunk that omits the cache fields turned a stated hit into zero on
+// the ledger row, i.e. the prompt paid the fresh rate (2026-09-27 audit,
+// round 24). A value the chunk does state wins, including one that replaces an
+// earlier larger value; only silence preserves what an earlier chunk stated.
+func (u *usage) merge(next usage) {
+	if next.PromptTokens != 0 {
+		u.PromptTokens = next.PromptTokens
+	}
+	if next.CompletionTokens != 0 {
+		u.CompletionTokens = next.CompletionTokens
+	}
+	if next.PromptCacheHitTokens != 0 {
+		u.PromptCacheHitTokens = next.PromptCacheHitTokens
+	}
+	if next.PromptTokensDetails != nil {
+		if u.PromptTokensDetails == nil {
+			u.PromptTokensDetails = next.PromptTokensDetails
+		} else if next.PromptTokensDetails.CachedTokens != 0 {
+			u.PromptTokensDetails.CachedTokens = next.PromptTokensDetails.CachedTokens
+		}
+	}
 }
 
 // usageRecorder wraps the ResponseWriter to (a) forward bytes immediately
@@ -1492,7 +1526,7 @@ func (u *usageRecorder) scanSSE(p []byte) {
 			Usage *usage `json:"usage"`
 		}
 		if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
-			u.usage = *chunk.Usage
+			u.usage.merge(*chunk.Usage)
 			u.seen = true
 		}
 	}

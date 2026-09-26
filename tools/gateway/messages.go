@@ -376,6 +376,7 @@ type anthropicBridge struct {
 
 	status      int
 	wroteHeader bool
+	committed   bool // success status written to the client (see commit)
 	errStatus   int
 	errBody     bytes.Buffer
 
@@ -406,6 +407,14 @@ func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthr
 	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[int]int{}}
 }
 
+// WriteHeader records the upstream's status; it does not commit one to the
+// client. Committing here was the round-24 defect: a 200 upstream whose body
+// cannot be translated — no choices, or not JSON — is answered by finalize()
+// with a 502, and an already-committed 200 turned that into a superfluous
+// WriteHeader that net/http discards, so the client read a FAILED turn as a
+// successful one (and the ledger recorded 200 for it). The success status is
+// written by commit(), which the stream path calls when it has its first event
+// to send and the non-stream path calls once its translation succeeded.
 func (b *anthropicBridge) WriteHeader(code int) {
 	if b.wroteHeader {
 		return
@@ -418,10 +427,19 @@ func (b *anthropicBridge) WriteHeader(code int) {
 		b.errStatus = code
 		return
 	}
-	b.ResponseWriter.WriteHeader(code)
+}
+
+// commit writes the success status exactly once. Callers must have set any
+// Content-Type they want first: WriteHeader flushes the header block.
+func (b *anthropicBridge) commit() {
+	if b.committed {
+		return
+	}
+	b.committed = true
 	if b.stream {
 		b.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 	}
+	b.ResponseWriter.WriteHeader(http.StatusOK)
 }
 
 func (b *anthropicBridge) Write(p []byte) (int, error) {
@@ -446,12 +464,12 @@ func (b *anthropicBridge) Write(p []byte) (int, error) {
 func (b *anthropicBridge) bufCapOK() bool { return b.sse.tail.Len() < 8<<20 }
 
 // Flush satisfies http.Flusher (ReverseProxy asserts it to stream).
-// Suppressed while an error response is pending: an upstream Flush would
-// make the underlying writer implicitly WriteHeader(200) (httptest and
-// net/http both do this), locking the status at 200 before finalize() can
-// write the real one — the translated 401 then shipped as 200.
+// Suppressed until commit: an upstream Flush would make the underlying writer
+// implicitly WriteHeader(200) (httptest and net/http both do this), locking
+// the status at 200 before finalize() can write the real one — the translated
+// 401, or the 502 for an untranslatable 200, then shipped as 200.
 func (b *anthropicBridge) Flush() {
-	if b.errStatus >= 400 {
+	if !b.committed {
 		return
 	}
 	if f, ok := b.ResponseWriter.(http.Flusher); ok {
@@ -463,6 +481,18 @@ func (b *anthropicBridge) Flush() {
 // (non-stream + error paths — the stream path already wrote incrementally).
 func (b *anthropicBridge) finalize() {
 	if b.stream && b.errStatus == 0 {
+		if !b.sse.startSent {
+			// The upstream ended without a single event. finishStream's own
+			// contract ("the client must always get a well-formed end") cannot
+			// be met by an empty body, and a client reading the stream waits
+			// for message_stop — so answer the way the non-stream path answers
+			// an empty completion: 502, which tells the client to retry instead
+			// of waiting (2026-09-27 audit, round 24). Nothing has been
+			// committed yet, so the status is still ours to choose.
+			log.Printf("oaica-gateway: /v1/messages upstream 200 with an empty stream")
+			writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned an empty stream")
+			return
+		}
 		b.finishStream()
 		return
 	}
@@ -531,6 +561,8 @@ func (b *anthropicBridge) finalize() {
 	// this side never emitted the field at all (2026-09-27 audit, round 23).
 	cached := resp.Usage.cachedTokens()
 	in, out := resp.Usage.PromptTokens-cached, resp.Usage.CompletionTokens
+	b.ResponseWriter.Header().Set("Content-Type", "application/json")
+	b.commit()
 	json.NewEncoder(b.ResponseWriter).Encode(map[string]any{
 		"id":            respID(resp.ID),
 		"type":          "message",
@@ -621,13 +653,25 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			continue
 		}
 		if chunk.Usage != nil {
-			b.sse.inTok = chunk.Usage.PromptTokens
-			b.sse.outTok = chunk.Usage.CompletionTokens
-			b.sse.cacheTok = usage{
+			// Per-field, not wholesale: an upstream that narrates usage per
+			// chunk may state only what it has just measured, and the closing
+			// chunk's silence about the cache is not a statement that the hit
+			// was zero — replacing the whole usage lost a stated hit on both
+			// the client's message_delta and the ledger row (2026-09-27 audit,
+			// round 24).
+			if chunk.Usage.PromptTokens != 0 {
+				b.sse.inTok = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens != 0 {
+				b.sse.outTok = chunk.Usage.CompletionTokens
+			}
+			if c := (usage{
 				PromptTokens:         chunk.Usage.PromptTokens,
 				PromptCacheHitTokens: chunk.Usage.PromptCacheHitTokens,
 				PromptTokensDetails:  chunk.Usage.PromptTokensDetails,
-			}.cachedTokens()
+			}).cachedTokens(); c != 0 {
+				b.sse.cacheTok = c
+			}
 		}
 		for _, ch := range chunk.Choices {
 			if r := firstNonEmpty(ch.Delta.Reasoning, ch.Delta.ReasoningContent); r != "" {
@@ -715,6 +759,7 @@ func (b *anthropicBridge) finishStream() {
 }
 
 func (b *anthropicBridge) emit(event string, data any) {
+	b.commit() // first event: the stream is a success, and it is now streamable
 	payload, _ := json.Marshal(data)
 	fmt.Fprintf(b.ResponseWriter, "event: %s\ndata: %s\n\n", event, payload)
 	b.Flush()
