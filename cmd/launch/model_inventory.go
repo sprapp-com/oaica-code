@@ -826,8 +826,17 @@ func findLaunchModel(models []LaunchModel, name string) (LaunchModel, bool) {
 		if launchModelMatches(model.Name, name) {
 			resolved := cloneLaunchModel(model)
 			// The daemon (and every downstream caller) knows the bare id;
-			// "ollama/<name>" is picker display only.
-			resolved.Name = strings.TrimPrefix(resolved.Name, ollamaPickerPrefix)
+			// "ollama/<name>" is picker display only — for a DAEMON row. A user
+			// remote literally named "ollama" produces the same shape, and its
+			// namespace IS its identity: stripping it left a name no remote
+			// lookup could claim (nothing contains "/" any more), so the row
+			// fell through to "the daemon" and a store that dials the daemon was
+			// written with a model only the remote serves. Same rule as
+			// stripOllamaPickerNames and launchNameForPickerName
+			// (2026-09-27 audit, round 21).
+			if _, _, isRemote := findUserRemoteForModel(resolved.Name); !isRemote {
+				resolved.Name = strings.TrimPrefix(resolved.Name, ollamaPickerPrefix)
+			}
 			return resolved, true
 		}
 	}
@@ -896,6 +905,17 @@ func launchModelEndpointKey(model LaunchModel) string {
 	if model.LiveSource == liveSourceLocal {
 		return "serve:" + model.Name
 	}
+	// The ROW's daemon-side identity, before the name: an ollama-cloud
+	// catalogue row is named bare by the time it reaches a writer
+	// (findLaunchModel strips the "ollama/" picker prefix) while the daemon
+	// knows it as "<id>:cloud" (LaunchModel.Upstream). Resolving that bare name
+	// let an unrelated remote serving the same bare id claim a row the daemon
+	// serves — the ids collide by design, the shipped catalogues and ollama.com
+	// use the same names — and the refusals then rejected the cloud model with a
+	// reason that was false for it (2026-09-27 audit, round 21).
+	if isCloudModelName(model.Upstream) || (model.Upstream == "" && isCloudModelName(model.Name)) {
+		return "daemon"
+	}
 	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
 		return "remote:" + strings.TrimRight(ep.BaseURL, "/")
 	}
@@ -924,6 +944,33 @@ func nonDaemonRowReason(model LaunchModel) string {
 		return "the model is served by `oaica serve` at its own origin, and its \"<model>:local\" name posted to the local daemon does not resolve there"
 	}
 	return "the model is reached at its own origin, and its namespaced name posted to the local daemon does not resolve there"
+}
+
+// rejectServedModels refuses an `oaica serve` row for an integration launch.
+//
+// A "<model>:local" row is a model THIS MACHINE serves from its own process, on
+// its own origin, behind its own credential. It is not a model the local daemon
+// has (posting the tagged name to the daemon does not resolve there) and not a
+// user remote either. Every integration writer resolves a row as
+// "user remote, else the daemon" (resolveRemoteEndpoint), and the daemon is the
+// fallback for every family it does not know — so such a row was written as a
+// DAEMON endpoint under the row's "<model>:local" id, the launch reported
+// success, and the first inference 404'd. Refusing says so instead, and names
+// the path that does work: the model on its own, which routes it through its
+// own origin (resolveLaunchEndpoint's local-serve arm). Teaching the writers
+// the local-serve shape is the follow-up; it is one endpoint more per foreign
+// config format, and a silent wrong endpoint is the worse failure.
+//
+// The row also became reachable only in round 20, when hasLocalModel stopped
+// skipping the local-serve family — before that the picker reopened on it.
+func rejectServedModels(integration string, models []LaunchModel) error {
+	for _, model := range models {
+		if model.LiveSource != liveSourceLocal {
+			continue
+		}
+		return fmt.Errorf("%s cannot be pointed at %q: the model is served by `oaica serve` on its own origin with its own credential, and %s's configuration names the local daemon for every row it writes — the daemon does not serve this model. Launch it on its own (`oaica launch --model %s`) to route it through its own origin, or add it to %s's own settings", integration, model.Name, integration, model.Name, integration)
+	}
+	return nil
 }
 
 // singleEndpointModels keeps the rows a store that names ONE endpoint can
