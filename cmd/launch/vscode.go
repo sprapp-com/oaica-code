@@ -427,11 +427,18 @@ func (v *VSCode) ShowInModelPicker(models []string) error {
 		}
 	}
 
-	// Read existing preferences
+	// Read existing preferences. A stored `null` decodes into a nil map (and
+	// the error is not one — a nil map is a successful decode of null), which
+	// the writes below would then panic on: "assignment to entry in nil map",
+	// killing the launch (2026-09-27 audit, round 21). Same class as the
+	// document-null readers decodeJSONObject covers; this value is not a
+	// document, so the guard is inline.
 	prefs := make(map[string]bool)
 	var prefsJSON string
 	if err := db.QueryRow("SELECT value FROM ItemTable WHERE key = 'chatModelPickerPreferences'").Scan(&prefsJSON); err == nil {
-		_ = json.Unmarshal([]byte(prefsJSON), &prefs)
+		if err := json.Unmarshal([]byte(prefsJSON), &prefs); err != nil || prefs == nil {
+			prefs = make(map[string]bool)
+		}
 	}
 
 	// Build name→ID map from VS Code's cached model list.
