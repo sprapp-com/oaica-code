@@ -1108,7 +1108,19 @@ func configureOllamaWebSearchLocked(configPath string) {
 	if ollamaEntry == nil {
 		ollamaEntry = make(map[string]any)
 	}
-	ollamaEntry["enabled"] = true
+	// "enabled" is written only where it is missing, or where an earlier launch
+	// left the stale plugin shape behind and this is the repair. The entry is a
+	// plugin OpenClaw itself knows, and a value already there is one the user
+	// set: re-enabling it on every launch silently undid the choice
+	// (2026-09-27 audit, round 21, F12).
+	// "enabled" is written only where it is missing, or where an earlier launch
+	// left the stale plugin shape behind and this is the repair. The entry is a
+	// plugin OpenClaw itself knows, and a value already there is one the user
+	// set: re-enabling it on every launch silently undid the choice
+	// (2026-09-27 audit, round 21, F12).
+	if _, exists := ollamaEntry["enabled"]; !exists || stalePluginConfigured {
+		ollamaEntry["enabled"] = true
+	}
 	entries["ollama"] = ollamaEntry
 	plugins["entries"] = entries
 
@@ -1150,7 +1162,19 @@ func configureOllamaWebSearchLocked(configPath string) {
 	if stalePluginConfigured {
 		fetch["enabled"] = true
 	}
-	search["enabled"] = true
+	// As above: a "search" tool the user turned off stays off. What this
+	// integration owns is the PROVIDER behind it, not whether search runs at
+	// all — and a launch that flips the switch back on every time makes the
+	// user's setting unchangeable (2026-09-27 audit, round 21, F12).
+	// As above: a "search" tool the user turned off stays off. What this
+	// integration owns is the PROVIDER behind it, not whether search runs at
+	// all — and a launch that flips the switch back on every time makes the
+	// user's setting unchangeable (2026-09-27 audit, round 21, F12).
+	if stalePluginConfigured {
+		search["enabled"] = true
+	} else if _, exists := search["enabled"]; !exists {
+		search["enabled"] = true
+	}
 	web["search"] = search
 	if len(fetch) > 0 {
 		web["fetch"] = fetch
