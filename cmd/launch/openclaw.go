@@ -28,12 +28,20 @@ type Openclaw struct{}
 
 func (c *Openclaw) String() string { return "OpenClaw" }
 
+// openclawRemoteRefusal is the one refusal message for a user remote. Run
+// refuses the primary this way and Edit refuses any member of the selection
+// this way, so the two cannot drift into telling the user different things
+// about the same limitation.
+func openclawRemoteRefusal(model, remote string) error {
+	return fmt.Errorf("OpenClaw does not yet support user remotes (%q → %q); it relies on the Ollama native API, which is not served for user remotes. Use an OpenAI-compatible integration instead: opencode, codex, hermes, cline, droid, or kimi.", model, remote)
+}
+
 func (c *Openclaw) Run(model string, _ []LaunchModel, args []string) error {
 	// OpenClaw drives the Ollama native API (/api/chat) through the daemon,
 	// which the thin-client fork does not serve for user remotes — refuse early
 	// with a clear message instead of a confusing daemon 404.
 	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return fmt.Errorf("OpenClaw does not yet support user remotes (%q → %q); it relies on the Ollama native API, which is not served for user remotes. Use an OpenAI-compatible integration instead: opencode, codex, hermes, cline, droid, or kimi.", model, ep.Name)
+		return openclawRemoteRefusal(model, ep.Name)
 	}
 
 	bin, err := ensureOpenclawInstalled()
@@ -748,6 +756,21 @@ func (c *Openclaw) Paths() []string {
 func (c *Openclaw) Edit(models []LaunchModel) error {
 	if len(models) == 0 {
 		return nil
+	}
+
+	// Run refuses a user remote, but Edit runs first and used to write the
+	// whole config regardless: openclawEditConfig replaced
+	// models.providers.ollama.models with the selection and set
+	// agents.defaults.model.primary to the picker name, then Run refused and
+	// no launch happened — leaving OpenClaw configured for a model the daemon
+	// cannot serve, its primary pointing at a namespaced name that resolves
+	// nowhere. The refusal belongs where the user can still act on it, before
+	// the file is touched (2026-09-26 audit, round 16; same shape as
+	// museRejectRemoteModels).
+	for _, m := range models {
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			return openclawRemoteRefusal(m.Name, ep.Name)
+		}
 	}
 
 	home, err := os.UserHomeDir()

@@ -610,9 +610,55 @@ func readPiJSONDocument(path string) (map[string]any, error) {
 	return doc, nil
 }
 
+// piRejectMixedEndpoints refuses a selection Pi cannot express, before any of
+// it is written.
+//
+// Pi's models.json gives oaica one provider slot and every model this package
+// registers in it is served from that slot's single baseUrl with its single
+// apiKey (piProviderBaseURL/piProviderKey). A selection that spans endpoints
+// therefore declared the other endpoint's model under a URL that does not
+// serve it and a credential that is not its own: a local model registered in a
+// provider pointed at a third-party API, or a second remote's model declared
+// under the first remote's URL and key — the launch then fails at the far end
+// with a model-not-found the user cannot act on (2026-09-26 audit, round 16).
+//
+// Refusing is the answer the round-10 repoint and muse's settings both take,
+// and the reason it is refusal rather than a second provider block is that the
+// rest of this file reads ONE slot: Pi.Models() and piPickerNameFor answer
+// from providers["ollama"] and its baseUrl, so a block oaica added beside it
+// would be invisible to the picker — the model would look absent from the live
+// config and be re-registered on every launch.
+func piRejectMixedEndpoints(models []LaunchModel) error {
+	sawDaemon := false
+	remoteName, remoteModel := "", ""
+	for _, m := range models {
+		ep, ok := resolveRemoteEndpoint(m.Name)
+		if !ok {
+			sawDaemon = true
+			continue
+		}
+		switch {
+		case remoteName == "":
+			remoteName, remoteModel = ep.Name, m.Name
+		case ep.Name != remoteName:
+			return fmt.Errorf("pi cannot launch the remote models %q and %q in one selection: Pi serves every oaica-registered model from a single provider endpoint and credential, so one of them would be declared under the other's endpoint and fail with model-not-found. Launch them in separate `oaica launch pi` runs", remoteModel, m.Name)
+		}
+	}
+	if sawDaemon && remoteName != "" {
+		return fmt.Errorf("pi cannot launch the remote model %q and a local model in one selection: Pi serves every oaica-registered model from a single provider endpoint and credential, so the local model would be declared under %s's endpoint and fail with model-not-found. Launch them in separate `oaica launch pi` runs", remoteModel, remoteName)
+	}
+	return nil
+}
+
 func (p *Pi) Edit(models []LaunchModel) error {
 	if len(models) == 0 {
 		return nil
+	}
+
+	// The selection as a whole has to be expressible in Pi's one provider slot
+	// before any of it is written (piRejectMixedEndpoints).
+	if err := piRejectMixedEndpoints(models); err != nil {
+		return err
 	}
 
 	// Pi's primary model is configured via Edit, not passed to Run, so the

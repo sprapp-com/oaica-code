@@ -123,7 +123,10 @@ func ensureQwenInstalled() (string, error) {
 		// The unix plan runs the verified download's temp file itself
 		// (qwenInstallerCommand's single argument), so this is the only place
 		// it can be removed — kimi's installer does the same. On Windows the
-		// plan copies it into %TEMP% and runs that copy instead.
+		// plan copies it into %TEMP% and runs that copy instead, and that arm
+		// removes both the copy and the verified file itself (a child
+		// PowerShell's `finally` is the only place that survives an installer
+		// that fails part way).
 		defer os.Remove(args[0])
 	}
 
@@ -270,7 +273,24 @@ func qwenInstallerCommand(goos string) (string, []string, error) {
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-qwen.bat'; Copy-Item -LiteralPath $verified -Destination $installer -Force; $content = Get-Content -Raw -Path $installer; $content = $content -replace '(?m)^\\s*call qwen\\s*$', 'REM call qwen'; Set-Content -Path $installer -Value $content -Encoding ASCII; & $installer",
+			// The copy is what makes this arm unlike the unix one: cmd has to
+			// recognise the extension, and the verified download always writes
+			// a .sh. Two things about how that copy is made matter.
+			//
+			// The name is random, not the fixed "install-qwen.bat": %TEMP% is
+			// shared, so a fixed name is a path another local process can
+			// predict and pre-create, and Copy-Item -Force onto an existing
+			// reparse point writes through it — the bytes that then run from
+			// `& $installer` need not be the bytes installer_dl.go verified.
+			//
+			// And both files are removed in a finally, so they go even when the
+			// installer fails or throws, and so does $verified — the caller's
+			// removal is unix-only (it is args[0] there, and this arm does not
+			// hand back the file it runs), and the copy must not be the one file
+			// of this pair that outlives the install. Left behind, the verified
+			// script and the copy it was rewritten into accumulated in the
+			// user's %TEMP% on every attempt (2026-09-26 audit, round 16).
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP ('install-qwen-' + [System.IO.Path]::GetRandomFileName() + '.bat'); try { Copy-Item -LiteralPath $verified -Destination $installer -Force; $content = Get-Content -Raw -Path $installer; $content = $content -replace '(?m)^\\s*call qwen\\s*$', 'REM call qwen'; Set-Content -Path $installer -Value $content -Encoding ASCII; & $installer } finally { Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue }",
 		}, nil
 	case "darwin", "linux":
 		return "bash", []string{path}, nil
