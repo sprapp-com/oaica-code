@@ -1159,14 +1159,30 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// POST /v1/messages on the same leg stayed open: denied catalogue, then
 		// served completions (2026-09-26 audit, third round).
 		if table.Default.NativePassthrough {
-			if upstream, headerName, headerValue, ok := table.Default.anthropicRemoteModelsTarget(); ok {
-				// Anthropic-wire REMOTE (a plan row): a user-remote leg, so it
-				// is gated exactly as its /v1/messages is. Its own /v1/models,
-				// authenticated the way the vendor expects (x-api-key). A 404
-				// here is harmless — context_window_remote.go falls back to the
+			// The discriminator is the same one /v1/messages uses: an
+			// anthropic-WIRE remote has a base URL, and a truly native claude/*
+			// leg is the only kind with none (routeFor marks both
+			// NativePassthrough — see the flag's doc).
+			if table.Default.Wire == "anthropic" && table.Default.BaseURL != "" {
+				// Anthropic-wire REMOTE (a plan row: zai-coding-plan and
+				// friends): a user-remote leg, so it is gated exactly as its
+				// /v1/messages is, and it answers with its OWN list. When its
+				// target cannot be resolved — a row whose key is not set —
+				// this used to fall through to nativeAnthropicModelsPassthrough
+				// and answer a vendor's leg out of api.anthropic.com, under the
+				// user's own Anthropic credential and past the gate, where
+				// /v1/messages for the same row says "no credential for <model>
+				// — run `oaica auth login`". A 404 from the row's own endpoint
+				// is harmless: context_window_remote.go falls back to the
 				// catalog's declared window.
 				if allowed, reason := checkEntitlement(r, table.Default.Label, ""); !allowed {
 					writeAnthropicError(w, http.StatusForbidden, reason)
+					return
+				}
+				upstream, headerName, headerValue, ok := table.Default.anthropicRemoteModelsTarget()
+				if !ok {
+					writeAnthropicError(w, http.StatusUnauthorized,
+						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", table.Default.UpstreamModel, strings.TrimPrefix(table.Default.Label, "remote:")))
 					return
 				}
 				anthropicModelsPassthrough(w, r, upstream, headerName, headerValue)
