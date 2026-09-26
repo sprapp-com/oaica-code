@@ -121,3 +121,39 @@ func TestTwoDistinctCallsWithoutIDsGetDistinctIDs(t *testing.T) {
 		t.Errorf("two distinct parallel calls got the SAME id %q: the client cannot route their tool_results apart\n%s", a, raw)
 	}
 }
+
+// Two IDENTICAL id-less calls must not leave the client with two tool_use
+// blocks sharing one id: that shape is a protocol violation (Anthropic never
+// emits it), and the tool_result round-trip becomes ambiguous — one
+// tool_result satisfies both blocks, and the follow-up request carries two
+// OpenAI tool messages with the same tool_call_id.
+//
+// The streaming path already answers this exact body with ONE block: its
+// accumulator keys on name+arguments (`anthropic.go`, toolCallsSent), so the
+// duplicate is skipped. Both paths translate the same upstream body, so they
+// must agree; the duplicate-id shape is the half that cannot be right
+// (2026-09-26 audit, fourteenth round).
+func TestTwoIdenticalCallsWithoutIDsDoNotShareOneID(t *testing.T) {
+	up := jsonUpstream(t, `{"id":"x","model":"kat-awq","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","function":{"name":"Bash","arguments":"{}"}},{"type":"function","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`)
+	defer up.Close()
+	proxy := startCalibProxy(t, up.URL, "sess-tool-id-identical")
+
+	resp, err := http.Post(proxy+"/v1/messages", "application/json", strings.NewReader(string(calibMessagesBody(t, 32, 64, false))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	blocks := toolCallBlocks(t, raw)
+	if len(blocks) != 1 {
+		t.Errorf("got %d tool_use block(s) for two identical id-less calls, want 1 — the streaming path emits one for this same body, and two blocks sharing one synthesized id is a protocol violation\n%s", len(blocks), raw)
+	}
+	if len(blocks) > 1 {
+		a, _ := blocks[0]["id"].(string)
+		b, _ := blocks[1]["id"].(string)
+		if a == b {
+			t.Errorf("both tool_use blocks carry id %q; a tool_result for it satisfies both\n%s", a, raw)
+		}
+	}
+}
