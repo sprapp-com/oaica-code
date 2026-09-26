@@ -487,6 +487,24 @@ func (t proxyRouteTable) escalationTarget(base proxyRoute) (proxyRoute, bool) {
 // the healthy set changes) meaningfully expensive.
 const weightedRingVpointsPerUnit = 1000
 
+// maxShardWeight bounds one leg's `--shard model:weight`. The weight is a
+// relative share, so any ratio a user actually wants is expressible at small
+// numbers (3:1, 100:1); a value in the millions buys no reachable split but
+// costs Weight*weightedRingVpointsPerUnit ring points PER REQUEST, all of them
+// allocated and sorted before the pick. `--shard box/big:1000000` was ~149 GiB
+// of ring per request (2026-09-26 audit, tenth round). Out-of-range weights are
+// skipped like every other malformed value this flag accepts (a non-numeric
+// weight, a weight <= 0), so the flag never silently pretends to have applied a
+// split it did not.
+const maxShardWeight = 10000
+
+// maxRingPoints bounds the whole ring regardless of the weights, so the memory
+// a single request can allocate does not depend on a number in a flag. A ring
+// larger than this has its points apportioned proportionally, keeping ratios
+// close (each candidate keeps at least one point) without the arithmetic above
+// being able to reach the allocator at all.
+const maxRingPoints = 20000
+
 // weightedRingPoint is one virtual node on a weightedPick hash ring.
 type weightedRingPoint struct {
 	route proxyRoute
@@ -501,6 +519,46 @@ type weightedRingPoint struct {
 // RouteWeighted's doc), but the split ACROSS sessions follows the weights.
 // Returns false when fewer than 2 distinct base URLs qualify — nothing to
 // weight, caller falls through to ordinary failover.
+// weightedRing builds the hash ring for weightedPick. Each route gets
+// Weight*weightedRingVpointsPerUnit points when the total fits maxRingPoints;
+// otherwise the budget is apportioned by weight (at least one point per route),
+// so the size of the ring — and the work one request does to build and sort it —
+// is bounded by maxRingPoints no matter what weights reached here.
+//
+// It is rebuilt per request, not cached: the candidate set is "the weighted
+// legs whose breaker is currently closed, pinned-policy-permitting", and the
+// cost of asking is a map lookup per leg, while a cache would have to key on
+// that whole set and invalidate on every breaker transition. What makes that
+// affordable is the bound, not reuse.
+func weightedRing(candidates []proxyRoute) []weightedRingPoint {
+	points := make([]int, len(candidates))
+	totalWeight := int64(0)
+	for i, r := range candidates {
+		totalWeight += int64(r.Weight)
+		points[i] = r.Weight * weightedRingVpointsPerUnit
+	}
+	if int64(maxRingPoints) < totalWeight*weightedRingVpointsPerUnit {
+		for i, r := range candidates {
+			n := int(int64(r.Weight) * maxRingPoints / totalWeight)
+			if n < 1 {
+				n = 1
+			}
+			points[i] = n
+		}
+	}
+
+	var ring []weightedRingPoint
+	for i, r := range candidates {
+		for n := 0; n < points[i]; n++ {
+			h := fnv.New32a()
+			h.Write([]byte(r.BaseURL + "#" + strconv.Itoa(n)))
+			ring = append(ring, weightedRingPoint{route: r, hash: h.Sum32()})
+		}
+	}
+	sort.Slice(ring, func(i, j int) bool { return ring[i].hash < ring[j].hash })
+	return ring
+}
+
 func (t proxyRouteTable) weightedPick(base proxyRoute) (proxyRoute, bool) {
 	var candidates []proxyRoute
 	seen := map[string]bool{}
@@ -526,15 +584,7 @@ func (t proxyRouteTable) weightedPick(base proxyRoute) (proxyRoute, bool) {
 		return proxyRoute{}, false
 	}
 
-	var ring []weightedRingPoint
-	for _, r := range candidates {
-		for i := 0; i < r.Weight*weightedRingVpointsPerUnit; i++ {
-			h := fnv.New32a()
-			h.Write([]byte(r.BaseURL + "#" + strconv.Itoa(i)))
-			ring = append(ring, weightedRingPoint{route: r, hash: h.Sum32()})
-		}
-	}
-	sort.Slice(ring, func(i, j int) bool { return ring[i].hash < ring[j].hash })
+	ring := weightedRing(candidates)
 
 	kh := fnv.New32a()
 	kh.Write([]byte(t.SessionID))
@@ -920,7 +970,7 @@ func extractShardFlags(args []string) (map[string]int, []string) {
 		// SILENT no-op, so padding would look like the weight was ignored.
 		model = strings.TrimSpace(model)
 		weight, err := strconv.Atoi(strings.TrimSpace(weightStr))
-		if err != nil || weight <= 0 {
+		if err != nil || weight <= 0 || weight > maxShardWeight {
 			continue
 		}
 		if shards == nil {
