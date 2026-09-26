@@ -121,8 +121,21 @@ func looksLikeCredentialParam(raw string) bool {
 		}
 	}
 	joined := strings.ToLower(strings.Join(words, ""))
-	for _, suffix := range credentialParamSuffixes {
-		if strings.HasSuffix(joined, suffix) {
+	// One trailing qualifier names a FIELD ON a credential, not a credential:
+	// "key id", "password hash", "token value", "secret name". Stripping it
+	// before the core test is what makes "keyid", "passwordhash" and
+	// "secretvalue" reduce to the word they are built from.
+	for _, q := range credentialParamQualifiers {
+		if len(joined) > len(q) && strings.HasSuffix(joined, q) {
+			joined = strings.TrimSuffix(joined, q)
+			break
+		}
+	}
+	for _, core := range credentialParamCores {
+		// Suffix as well as prefix: the qualifier may sit on either side
+		// ("keyid" and "apikeyid" strip to "key"/"apikey"; "secretkey",
+		// "clientcreds" and "accesstoken" carry the core at the end).
+		if strings.HasSuffix(joined, core) || strings.HasPrefix(joined, core) {
 			return true
 		}
 	}
@@ -138,13 +151,36 @@ var credentialParamWords = map[string]bool{
 	"credential": true, "credentials": true, "creds": true,
 	"sig": true, "signature": true, "session": true, "cookie": true,
 	"license": true, "licence": true, "sas": true, "jwt": true,
+	"pass": true, "phrase": true, "passphrase": true,
 }
 
-// credentialParamSuffixes covers compounds written with no separator at all.
-var credentialParamSuffixes = []string{
-	"apikey", "apikeys", "token", "tokens", "secret", "secrets",
-	"password", "passwd", "pwd", "authkey", "auth", "sig", "signature",
-	"credential", "credentials", "bearer", "session", "cookie", "license", "sas", "jwt",
+// credentialParamCores is the credential vocabulary as STEMS, for a parameter
+// name written with no separator at all — the case credentialParamWords cannot
+// cover because there is no word boundary to match against. A stem is tested at
+// either end of the joined name ("secretkey", "clientcreds", "accesstoken" end
+// with one; "publickey" is the same word from the other side).
+//
+// This list replaced a fixed set of whole compounds ("apikey", "authkey", …)
+// that only recognised the spellings someone had happened to write down.
+// `?secretkey=sk-live-…` is the word "secret" glued to the word "key", exactly
+// like the "apikey" the fixed list knew — and it was printed verbatim by the
+// redactor and skipped by the leak scan, so the doctor reported a clean
+// deployment while the key travelled in the clear (2026-09-26 audit, seventh
+// round).
+var credentialParamCores = []string{
+	"key", "keys", "token", "tokens", "secret", "secrets",
+	"password", "passwd", "pwd", "pass", "phrase", "passphrase",
+	"auth", "authkey", "bearer", "cred", "creds",
+	"credential", "credentials", "sig", "signature",
+	"session", "cookie", "license", "licence", "sas", "jwt",
+}
+
+// credentialParamQualifiers name a FIELD ON a credential rather than a
+// credential. One is stripped from the end of the joined name before the core
+// test, so "keyid", "apikeyid", "passwordhash" and "secretvalue" all reduce to
+// the credential word they are built from.
+var credentialParamQualifiers = []string{
+	"id", "ids", "hash", "value", "val", "name", "index", "number",
 }
 
 // splitParamWords splits a parameter name into its words: on every separator

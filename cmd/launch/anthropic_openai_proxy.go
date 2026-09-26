@@ -1818,6 +1818,19 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 			continue
 		}
+		// A frame that PARSES can still be that same error object: it
+		// unmarshals cleanly into a chunk with no error field and no choices,
+		// so the recognition above never saw it — the loop body did nothing
+		// and the client was told only "stream ended before the response was
+		// complete", with the upstream's actual reason discarded (2026-09-26
+		// audit, seventh round). The cheap substring guard keeps the probe off
+		// the ordinary delta frames an answer is made of.
+		if strings.Contains(payload, `"error"`) {
+			if m := upstreamErrorMessage(payload); m != "" {
+				upstreamErr = m
+				continue
+			}
+		}
 
 		for _, choice := range chunk.Choices {
 			d := choice.Delta
@@ -2026,13 +2039,43 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 		return
 	}
 	defer resp.Body.Close()
+	relayUpstreamResponse(w, resp)
+}
+
+// relayUpstreamResponse copies an upstream GET /v1/models response back to the
+// client with every text surface run through redactCredentials.
+//
+// It used to be a verbatim io.Copy of the body plus every header, which made
+// these two passthroughs the only upstream-facing paths in this proxy that
+// could hand a credential to the launched client — and the upstream here is
+// deliberately NOT api.anthropic.com: it is a plan row's own base, or a user's
+// mirror, reached with the key in the base URL. A mirror whose error page
+// quotes the request URL, or that echoes the route in a diagnostic header,
+// therefore put the key on the client's terminal, which is the exact surface
+// the message paths redact (2026-09-26 audit, seventh round).
+//
+// The response is bounded and its length recomputed: redaction can change the
+// byte count, and a relayed Content-Length that no longer matches the body
+// truncates or hangs the client. The transfer encoding is dropped for the same
+// reason — this writes one fixed-length body.
+func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "read upstream response: "+redactErr(err).Error())
+		return
+	}
+	body = []byte(redactCredentials(string(body)))
 	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Transfer-Encoding") {
+			continue
+		}
 		for _, v := range vs {
-			w.Header().Add(k, v)
+			w.Header().Add(k, redactCredentials(v))
 		}
 	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = w.Write(body)
 }
 
 // nativeAnthropicUpstream is api.anthropic.com's own /v1/messages endpoint
@@ -2084,13 +2127,7 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 		return
 	}
 	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	relayUpstreamResponse(w, resp)
 }
 
 // nativeModelAliasCache memoizes resolveNativeModelAlias's real-model-id

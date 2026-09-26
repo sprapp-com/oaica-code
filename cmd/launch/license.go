@@ -128,6 +128,32 @@ type licenseFile struct {
 	ValidatedAt time.Time `json:"validated_at"`
 }
 
+// licenseRecordAge returns how long ago a validation stamp was, and whether
+// that stamp is usable as evidence at all.
+//
+// A stamp in the FUTURE is not usable: `time.Since` returns a negative
+// duration, and BOTH freshness tests in this file are `age < window`, so a
+// negative age satisfied the revalidate TTL and the offline grace alike. The
+// consequence was a permanent offline bypass with no purchase anywhere in it —
+// writing `{"validated_at":"2126-01-01T00:00:00Z"}` into ~/.oaica/license.json
+// (or into the OAICA_LICENSE_KEY anchor, which is the same record shape and the
+// same comparison) made any string pass the gate forever, with no network call
+// and no activation. A zero stamp is equally unusable: it certifies no
+// validation happened, which is exactly what the grace window must not be
+// anchored to. The file is one a user, a restore, or a skewed clock can write,
+// so "the clock says this was validated recently" is only meaningful when the
+// clock and the record agree — 2026-09-26 audit, seventh round.
+func licenseRecordAge(validatedAt, now time.Time) (time.Duration, bool) {
+	if validatedAt.IsZero() {
+		return 0, false
+	}
+	age := now.Sub(validatedAt)
+	if age < 0 {
+		return 0, false
+	}
+	return age, true
+}
+
 func licenseFilePath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -301,8 +327,8 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 		return nil // dev/test key — never revalidates over the network
 	}
 
-	age := time.Since(f.ValidatedAt)
-	if age < licenseRevalidateTTL {
+	age, ageOK := licenseRecordAge(f.ValidatedAt, time.Now())
+	if ageOK && age < licenseRevalidateTTL {
 		return nil // cached, still fresh — no network call on the common path
 	}
 
@@ -322,7 +348,7 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 	// Network/server error, not an explicit invalid answer: fall back to
 	// the offline grace window rather than punishing a paying user for a
 	// bad connection. Past the grace window this is a hard block.
-	if age < licenseOfflineGrace {
+	if ageOK && age < licenseOfflineGrace {
 		fmt.Fprintf(os.Stderr, "warning: could not reach the license server (%v) — running on a cached license, %s remaining before this must reconnect\n",
 			verr, (licenseOfflineGrace - age).Round(time.Hour))
 		return nil
@@ -349,7 +375,14 @@ func requireLicenseFromEnv(key string) error {
 
 	sum := sha256Hex(key)
 	anchor, _ := loadEnvLicenseAnchor()
-	if anchor != nil && anchor.KeySHA256 == sum && time.Since(anchor.ValidatedAt) < licenseRevalidateTTL {
+	// Same freshness rule as the stored path, and for the same reason: this
+	// anchor is the same record shape under the same comparison, so a future
+	// validated_at here was a bypass too (see licenseRecordAge).
+	anchorAge, anchorOK := time.Duration(0), false
+	if anchor != nil && anchor.KeySHA256 == sum {
+		anchorAge, anchorOK = licenseRecordAge(anchor.ValidatedAt, time.Now())
+	}
+	if anchorOK && anchorAge < licenseRevalidateTTL {
 		return nil // validated recently — no network call, same as a stored key
 	}
 
@@ -370,9 +403,9 @@ func requireLicenseFromEnv(key string) error {
 	// an env key with no such anchor would otherwise work forever without
 	// ever contacting the licence server, which is not "the same as a stored
 	// key", it is a different licence mode (2026-09-26 audit).
-	if anchor != nil && anchor.KeySHA256 == sum && time.Since(anchor.ValidatedAt) < licenseOfflineGrace {
+	if anchorOK && anchorAge < licenseOfflineGrace {
 		fmt.Fprintf(os.Stderr, "warning: could not reach the license server (%v) — running on the OAICA_LICENSE_KEY activation cached %s ago, %s remaining before this must reconnect\n",
-			verr, time.Since(anchor.ValidatedAt).Round(time.Hour), (licenseOfflineGrace - time.Since(anchor.ValidatedAt)).Round(time.Hour))
+			verr, anchorAge.Round(time.Hour), (licenseOfflineGrace - anchorAge).Round(time.Hour))
 		return nil
 	}
 	return fmt.Errorf(

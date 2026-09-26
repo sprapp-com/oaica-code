@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,5 +132,39 @@ func TestPublishedDevKeyIsNotInANonTestSourceFile(t *testing.T) {
 		if bytes.Contains(b, []byte(devTestKey)) {
 			t.Errorf("%s contains the published dev/test key: it is compiled into the default build, and `oaica activate %s` then hands out a perpetual licence offline — keep it in license_devkey_dev.go behind `-tags devtest`", name, devTestKey)
 		}
+	}
+}
+
+// TestTheEnterpriseDocDoesNotClaimTheDevKeyShipsInEveryBuild
+//
+// docs/ENTERPRISE.md's egress table is the document an enterprise reader uses
+// to decide whether the binary can phone home or be unlocked without a
+// purchase, and it said the published key "is compiled into the binary" — true
+// before the tag, false after, and a threat model built on a stale sentence is
+// worse than no sentence. The claim must still name the tag that gates it.
+func TestTheEnterpriseDocDoesNotClaimTheDevKeyShipsInEveryBuild(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "ENTERPRISE.md"))
+	if err != nil {
+		t.Skipf("docs/ENTERPRISE.md not readable from here: %v", err)
+	}
+	text := string(doc)
+	if !strings.Contains(text, devTestKey) {
+		return // the doc no longer mentions the key at all — nothing to be wrong about
+	}
+	idx := strings.Index(text, devTestKey)
+	// The sentence carrying the claim: back up to the start of its table row.
+	start := strings.LastIndex(text[:idx], "\n|")
+	if start < 0 {
+		start = 0
+	}
+	paragraph := text[start:]
+	if end := strings.Index(paragraph, "\n|"); end > 0 {
+		paragraph = paragraph[:end]
+	}
+	if !strings.Contains(paragraph, "devtest") {
+		t.Errorf("docs/ENTERPRISE.md documents %q without naming the `devtest` build tag that registers it:\n%s\n— the shipped binary does not honour this key, and a threat model built on the opposite claim is worse than none", devTestKey, paragraph)
+	}
+	if strings.Contains(paragraph, "is compiled into the binary") {
+		t.Errorf("docs/ENTERPRISE.md still says %q is compiled into the binary:\n%s\n— it is registered only by license_devkey_dev.go behind `-tags devtest`, so that sentence is false for every released artifact", devTestKey, paragraph)
 	}
 }

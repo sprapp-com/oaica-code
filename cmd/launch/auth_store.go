@@ -182,14 +182,20 @@ func maskKey(key string) string {
 	if key == "" {
 		return "(none)"
 	}
-	if len(key) <= 8 {
-		return strings.Repeat("*", len(key))
+	// Counted and sliced in RUNES, not bytes: a multibyte key sliced by byte
+	// printed invalid UTF-8 (half a character at each end) and was masked by
+	// halves, because nine two-byte runes are eighteen bytes and len/5 showed
+	// four characters where the rule allows one (2026-09-26 audit, seventh
+	// round).
+	r := []rune(key)
+	if len(r) <= 8 {
+		return strings.Repeat("*", len(r))
 	}
-	n := len(key) / 5
+	n := len(r) / 5
 	if n > 4 {
 		n = 4
 	}
-	return key[:n] + strings.Repeat("*", 8) + key[len(key)-n:]
+	return string(r[:n]) + strings.Repeat("*", 8) + string(r[len(r)-n:])
 }
 
 func sortedAuthProviders(f authStoreFile) []string {

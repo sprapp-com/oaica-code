@@ -19,7 +19,30 @@ package launch
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+// TestMaskKeyIsRuneSafe: the scale of the mask is a rune count, so it must be
+// applied in runes. Slicing by byte cut a multibyte character in half — the
+// printed hint was invalid UTF-8 and showed a partial character, which is both
+// a garbled report line and a disclosure the ratio did not intend. It also
+// miscounted: nine two-byte runes are eighteen bytes, so `len(key)/5` showed
+// four characters at each end where the rule says one.
+func TestMaskKeyIsRuneSafe(t *testing.T) {
+	for _, n := range []int{9, 10, 17, 20, 30} {
+		key := strings.Repeat("é", n)
+		got := maskKey(key)
+
+		if !utf8.ValidString(got) {
+			t.Errorf("maskKey(%d × \"é\") = %q — the mask is not valid UTF-8: the slice cut a two-byte character in half", n, got)
+			continue
+		}
+		visible := utf8.RuneCountInString(strings.ReplaceAll(got, "*", ""))
+		if visible*2 > n {
+			t.Errorf("maskKey(%d × \"é\") = %q discloses %d runes of %d — the ratio was computed in bytes, so a multibyte key is masked by halves", n, got, visible, n)
+		}
+	}
+}
 
 // TestMaskKeyNeverDisclosesMostOfTheKey sweeps every length from 1 to 64 and
 // checks that what a reader can recover is never more than half the key.
