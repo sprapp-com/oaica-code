@@ -76,7 +76,7 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 	// Refused BEFORE any write, including the restore snapshot below: a
 	// half-applied configuration is worse than the refusal, because the user's
 	// working ChatGPT setup is already gone by the time the failure surfaces.
-	if err := codexAppRejectRemoteModels(primary, models); err != nil {
+	if err := codexAppRejectNonDaemonModels(primary, models); err != nil {
 		return err
 	}
 
@@ -247,22 +247,28 @@ func codexAppCatalogContainsModel(model string) bool {
 // already answered the key prompt, and the catalog file it also wrote advertises
 // that model as available.
 //
+// What is refused is a PRIMARY routed to an endpoint other than the local
+// daemon (daemonRoutedModel), which is the same thing singleEndpointModels keys
+// on: an ollama-cloud row carries Remote too, and the daemon serves and proxies
+// it, so refusing it told the user to launch a daemon-backed model when that is
+// exactly what they had selected (2026-09-27 audit, round 20).
+//
 // Refusing here keeps the failure at the point the user can act on it. Same
-// shape and same answer as museRejectRemoteModels; lift this when the app's
+// shape and same answer as museRejectNonDaemonModels; lift this when the app's
 // credential field is verifiable.
-func codexAppRejectRemoteModels(primary string, models []LaunchModel) error {
+func codexAppRejectNonDaemonModels(primary string, models []LaunchModel) error {
 	// Only the PRIMARY is a refusal. `models` is the picker menu, not the
 	// selection (see singleEndpointModels): a remote row the user never picked
 	// used to refuse the launch of a local model outright.
 	model, ok := findLaunchModel(models, primary)
-	if !ok || !model.Remote {
+	if !ok || daemonRoutedModel(model) {
 		return nil
 	}
 	name := strings.TrimSpace(model.Name)
 	if name == "" {
 		return nil
 	}
-	return fmt.Errorf("the ChatGPT app cannot be pointed at the remote model %q: its config names a single provider endpoint and has no credential field oaica can write — oaica hands a remote's key to a launched child process as OPENAI_API_KEY, and the app is started by you, not by oaica. Add the remote to the app's own settings, or launch a daemon-backed model", name)
+	return fmt.Errorf("the ChatGPT app cannot be pointed at %q: its config names a single provider endpoint — the local daemon — and has no credential field oaica can write (oaica hands a remote's key to a launched child process as OPENAI_API_KEY, and the app is started by you, not by oaica). %s. Add the model to the app's own settings, or launch one the daemon serves", name, nonDaemonRowReason(model))
 }
 
 func writeCodexAppConfig(configPath, model, modelCatalogPath string) error {

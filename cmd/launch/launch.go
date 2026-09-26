@@ -1891,7 +1891,18 @@ func hasLocalModel(inventory []LaunchModel, name string) bool {
 		return true
 	}
 	for _, model := range inventory {
-		if model.Remote {
+		// Remote is the flag the picker sets both for a row reached at its own
+		// origin and for a row the daemon serves: an ollama-cloud row carries
+		// it too, and so does the local-serve family. Skipping all of them
+		// made `oaica launch … --model <model>:local` answer "unusable" for a
+		// model already running on this box — the picker reopened, and on a
+		// headless `--yes` run the launch died with "model selection requires
+		// an interactive terminal". A `oaica serve` row is a live server on
+		// this machine, so it is matched by name like any other row here; a
+		// user remote, which has no row in this inventory's namespace, is
+		// resolved above and its row is still skipped (2026-09-27 audit,
+		// round 20).
+		if model.Remote && model.LiveSource != liveSourceLocal {
 			continue
 		}
 		// launchModelMatches covers tag suffixes AND the ollama/ picker

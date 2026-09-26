@@ -185,7 +185,7 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 	if selected, ok := findLaunchModel(models, primary); ok {
 		primary = selected.Name
 	}
-	if err := deepSeekHarnessRejectRemoteModels(primary, models); err != nil {
+	if err := deepSeekHarnessRejectNonDaemonModels(primary, models); err != nil {
 		return err
 	}
 
@@ -224,7 +224,7 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 	return writeDeepSeekHarnessFile(patchPath, patchData)
 }
 
-// deepSeekHarnessRejectRemoteModels refuses a selection the harness settings
+// deepSeekHarnessRejectNonDaemonModels refuses a selection the harness settings
 // cannot route to.
 //
 // Every other integration that CAN translate a user-remote row does it with two
@@ -238,23 +238,30 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 // after the launch has already validated a key, and the settings advertise the
 // model as available.
 //
+// What is refused is a PRIMARY routed to an endpoint other than the local
+// daemon (daemonRoutedModel), which is the same thing singleEndpointModels
+// keys on: an ollama-cloud row carries Remote too, and the daemon serves and
+// proxies it, so refusing it told the user to launch a daemon-backed model
+// when that is exactly what they had selected (2026-09-27 audit, round 20).
+//
 // Refusing here keeps the failure at the point the user can act on it. Same
-// shape and same answer as museRejectRemoteModels and codexAppRejectRemoteModels;
-// lift this when the harness store grows a per-provider credential.
-func deepSeekHarnessRejectRemoteModels(primary string, models []LaunchModel) error {
+// shape and same answer as museRejectNonDaemonModels and
+// codexAppRejectNonDaemonModels; lift this when the harness store grows a
+// per-provider credential.
+func deepSeekHarnessRejectNonDaemonModels(primary string, models []LaunchModel) error {
 	// Only the PRIMARY is a refusal: it is what the settings name as the default
 	// model and put in the web-search block. `models` is the picker MENU, not the
 	// selection (see singleEndpointModels), and a remote row in it the user never
 	// picked used to refuse the launch of a local model outright.
 	model, ok := findLaunchModel(models, primary)
-	if !ok || !model.Remote {
+	if !ok || daemonRoutedModel(model) {
 		return nil
 	}
 	name := strings.TrimSpace(model.Name)
 	if name == "" {
 		return nil
 	}
-	return fmt.Errorf("the DeepSeek Harness cannot be pointed at the remote model %q: its settings carry a single endpoint and a single credential for every model row, both naming the local daemon, which does not resolve namespaced remotes. Add the remote to the harness's own settings, or launch a daemon-backed model", name)
+	return fmt.Errorf("the DeepSeek Harness cannot be pointed at %q: its settings carry a single endpoint and a single credential for every model row, both naming the local daemon — %s. Add the model to the harness's own settings, or launch one the daemon serves", name, nonDaemonRowReason(model))
 }
 
 // writeDeepSeekHarnessSettings is the load → mutate → publish half of

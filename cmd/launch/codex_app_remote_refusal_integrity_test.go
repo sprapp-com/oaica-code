@@ -27,6 +27,15 @@ func TestCodexAppRefusesARemoteModel(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:9999")
+	// The remote has to exist for the refusal to be about a remote at all: the
+	// predicate is the endpoint the row routes to, so a row that resolves
+	// nowhere is an ordinary name the daemon would be asked for
+	// (2026-09-27 audit, round 20).
+	withTempRemotesFile(t)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"https://box.example/v1","api_key":"sk-box-SECRET","tool_format":"tool_calls"}]}`)
+	if _, ok := resolveRemoteEndpoint("box/big-model"); !ok {
+		t.Fatal("premise: the box/big-model row does not resolve, so the refusal below would not be about a user remote")
+	}
 
 	remote := LaunchModel{Name: "box/big-model", Remote: true, Upstream: "big-model"}
 	models := append([]LaunchModel{remote}, launchModelsFromNames([]string{"llama3.2"})...)

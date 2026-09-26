@@ -309,7 +309,7 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	if len(models) == 0 {
 		return nil
 	}
-	if err := museRejectRemoteModels(models); err != nil {
+	if err := museRejectNonDaemonModels(models); err != nil {
 		return err
 	}
 
@@ -330,7 +330,7 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	})
 }
 
-// museRejectRemoteModels refuses a selection muse's settings cannot express.
+// museRejectNonDaemonModels refuses a selection muse's settings cannot express.
 //
 // Every other integration in this package translates a user-remote row to the
 // remote's own endpoint and model id. Muse cannot: endpoint_transport is ONE
@@ -345,12 +345,18 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 //
 // Refusing here keeps the failure at the point the user can act on it. Lift
 // this when muse's credential field is verifiable.
-func museRejectRemoteModels(models []LaunchModel) error {
+//
+// The rows refused are the ones routed to an endpoint other than the local
+// daemon (daemonRoutedModel): an ollama-cloud row carries Remote too, and the
+// daemon serves and proxies it, so refusing it told the user to launch a
+// daemon-backed model when that is exactly what they had selected (2026-09-27
+// audit, round 20).
+func museRejectNonDaemonModels(models []LaunchModel) error {
 	for _, model := range models {
-		if !model.Remote {
+		if daemonRoutedModel(model) {
 			continue
 		}
-		return fmt.Errorf("muse cannot be pointed at the remote model %q: muse's settings carry a single endpoint for every catalog row, and it has no credential field oaica can write. Add the remote to muse directly, or launch a daemon-backed model", model.Name)
+		return fmt.Errorf("muse cannot be pointed at %q: muse's settings carry a single endpoint for every catalog row — the local daemon — and it has no credential field oaica can write. %s. Add the model to muse directly, or launch one the daemon serves", model.Name, nonDaemonRowReason(model))
 	}
 	return nil
 }

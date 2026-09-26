@@ -902,6 +902,30 @@ func launchModelEndpointKey(model LaunchModel) string {
 	return "daemon"
 }
 
+// daemonRoutedModel reports whether a picker row is one the LOCAL DAEMON
+// serves — a local model, or an ollama-cloud model the daemon proxies.
+//
+// This is the predicate the single-endpoint stores need, not LaunchModel.Remote:
+// the stores that name one endpoint and one credential (the DeepSeek Harness,
+// the ChatGPT app, muse) all name that daemon, so the rows they cannot express
+// are the ones routed elsewhere. Remote is a superset — it is set for a cloud
+// row the daemon serves just as much as for a user remote at its own origin —
+// and keying a refusal on it rejected a cloud model with a message telling the
+// user to "launch a daemon-backed model", which is what they had done
+// (2026-09-27 audit, round 20).
+func daemonRoutedModel(model LaunchModel) bool {
+	return launchModelEndpointKey(model) == "daemon"
+}
+
+// nonDaemonRowReason names, for those refusals, why the row cannot be written:
+// where it is actually reached, and what the store would do with it instead.
+func nonDaemonRowReason(model LaunchModel) string {
+	if model.LiveSource == liveSourceLocal {
+		return "the model is served by `oaica serve` at its own origin, and its \"<model>:local\" name posted to the local daemon does not resolve there"
+	}
+	return "the model is reached at its own origin, and its namespaced name posted to the local daemon does not resolve there"
+}
+
 // singleEndpointModels keeps the rows a store that names ONE endpoint can
 // serve: the ones routed to the same endpoint as the primary, which is the row
 // that decides that store's base URL, wire and credential.
