@@ -3,6 +3,8 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -411,10 +413,22 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 // credential the launch had no use for, which is the same rule as the daemon
 // branch: a launch that needs no credential must not destroy one
 // (2026-09-27 audit, round 19).
+//
+// The exception is that remote reached on ANOTHER host (2026-09-27 audit,
+// round 20). This variable is not only stored: it is the envKey of the provider
+// written into the same document, whose baseUrl is that remote's host. A value
+// left there is the bearer qwen attaches to that host the next time it is run
+// without oaica, so keeping the user's ollama.com key means handing it to an
+// endpoint that never asked for it. Loopback cannot disclose anything, which is
+// why the round-19 rule still holds there and the destruction it prevents is
+// still worth preventing.
 func applyQwenOllamaKey(envCfg map[string]any, model string) {
 	key := qwenKeyFor(model)
 	if _, isRemote := resolveRemoteEndpoint(model); isRemote {
 		if strings.TrimSpace(key) == "" {
+			if !qwenEndpointIsLoopback(model) {
+				envCfg[qwenOllamaEnvKey] = ""
+			}
 			return
 		}
 		envCfg[qwenOllamaEnvKey] = key
@@ -424,6 +438,26 @@ func applyQwenOllamaKey(envCfg map[string]any, model string) {
 		return
 	}
 	envCfg[qwenOllamaEnvKey] = key
+}
+
+// qwenEndpointIsLoopback reports whether the remote a model resolves to is
+// reached on this machine — where a value left in OLLAMA_API_KEY cannot leave
+// the box. An endpoint that does not parse as a URL is not loopback.
+func qwenEndpointIsLoopback(model string) bool {
+	ep, ok := resolveRemoteEndpoint(model)
+	if !ok {
+		return false
+	}
+	u, err := url.Parse(ep.BaseURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func qwenMap(value any) map[string]any {

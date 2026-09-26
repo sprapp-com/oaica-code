@@ -70,6 +70,66 @@ func TestAKeylessRemoteQwenLaunchDoesNotBlankTheUsersKey(t *testing.T) {
 	}
 }
 
+// The same keyless remote reached on ANOTHER host is a different case, and the
+// opposite answer (2026-09-27 audit, round 20). OLLAMA_API_KEY is not only a
+// stored value: it is the envKey of the provider oaica is writing in this very
+// same document, and that provider's baseUrl is the remote's host. A value left
+// there is the bearer qwen attaches to that host the next time it is run without
+// oaica — so preserving the user's ollama.com key means handing it to an
+// endpoint that never asked for it. A loopback endpoint cannot disclose
+// anything; a remote host can.
+func TestAKeylessRemoteOnAnotherHostDoesNotKeepTheUsersKey(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	setQwenTestHome(t, home)
+	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"https://vllm.example/v1","api_key_env":"VLLM_KEY_UNSET","tool_format":"tool_calls"}]}`)
+	t.Setenv("VLLM_KEY_UNSET", "")
+
+	ep, ok := resolveRemoteEndpoint("box/big-model")
+	if !ok {
+		t.Fatal("premise: the box/big-model row does not resolve, so the launch would not take the remote branch")
+	}
+	if ep.Token != "" {
+		t.Fatalf("premise: the remote resolved a token (%q), so this is not the keyless case", ep.Token)
+	}
+
+	configDir := filepath.Join(home, ".qwen")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const real = "sk-ollama-cloud-REAL-KEY-1234567890"
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"),
+		[]byte(`{"env":{"OLLAMA_API_KEY":"`+real+`"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (&Qwen{}).Configure("box/big-model"); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	cfg := qwenConfig(t, home)
+	envCfg, _ := cfg["env"].(map[string]any)
+	if envCfg[qwenOllamaEnvKey] == real {
+		t.Errorf("the user's ollama.com key was left in %s while the provider written beside it points at %q with that same envKey: qwen presents it as that host's bearer on the next run",
+			qwenOllamaEnvKey, "https://vllm.example/v1")
+	}
+
+	// Control: the provider really is the remote's, so the assertion above is
+	// about the endpoint that would receive the key.
+	providers, _ := cfg["modelProviders"].(map[string]any)
+	openai, _ := providers["openai"].([]any)
+	if len(openai) == 0 {
+		t.Fatalf("no openai provider was written:\n%v", cfg)
+	}
+	first, _ := openai[0].(map[string]any)
+	if got := toStr(first["baseUrl"]); got != "https://vllm.example/v1" {
+		t.Fatalf("provider baseUrl = %q, want the keyless remote", got)
+	}
+	if got := toStr(first["envKey"]); got != qwenOllamaEnvKey {
+		t.Fatalf("premise changed: the provider reads its credential from %q, not %s, so the value above is not the one sent", got, qwenOllamaEnvKey)
+	}
+}
+
 // The control for the other direction: a remote that DOES have a token still
 // has to have it written, or the launch goes out with the wrong credential.
 func TestARemoteQwenLaunchStillWritesItsToken(t *testing.T) {
