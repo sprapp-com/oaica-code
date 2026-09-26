@@ -2751,7 +2751,12 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				if err != nil {
 					return err
 				}
-				fmt.Printf("%-20s -> %s\n", n, target)
+				// launch.PrintableCell: the name and the target are both
+				// file-held values, and ModelAliasSet rejects only empty and "/"
+				// — a stored name carrying a newline printed a fabricated second
+				// row here, naming a model the file never held (2026-09-26
+				// audit, eleventh round).
+				fmt.Printf("%-20s -> %s\n", launch.PrintableCell(n), launch.PrintableCell(target))
 			}
 			return nil
 		},
@@ -2782,7 +2787,9 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			if err != nil {
 				return err
 			}
-			fmt.Printf("%s -> %s\n", args[0], target)
+			// The argument reached this line only because it IS a stored key,
+			// so it is store data here exactly as it is in `alias list`.
+			fmt.Printf("%s -> %s\n", launch.PrintableCell(args[0]), launch.PrintableCell(target))
 			return nil
 		},
 	}
@@ -2793,11 +2800,15 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 	// by cmd/launch/tier_plan_profiles.go's extractPlanFlag inside
 	// `oaica launch claude --plan NAME`, upstream of buildTierPlan, so it's
 	// a pure convenience over --model/--sonnet-model — no new routing path.
+	// orDashStr renders an optional store field: the fallback is a CONSTANT
+	// ("(same)", "-", …) that nothing on disk can influence, so it is printed
+	// as-is; the value itself is file-held data and goes through the same
+	// quoting rule as the rest of the row (2026-09-26 audit, eleventh round).
 	orDashStr := func(s, fallback string) string {
 		if s == "" {
 			return fallback
 		}
-		return s
+		return launch.PrintableCell(s)
 	}
 	planCmd := &cobra.Command{
 		Use:   "plan",
@@ -2820,18 +2831,18 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			}); err != nil {
 				return err
 			}
-			fmt.Printf("plan %q: opus -> %s", args[0], model)
+			fmt.Printf("plan %q: opus -> %s", args[0], launch.PrintableCell(model))
 			if sonnetModel != "" {
-				fmt.Printf(", sonnet/subagents -> %s", sonnetModel)
+				fmt.Printf(", sonnet/subagents -> %s", launch.PrintableCell(sonnetModel))
 			}
 			if haikuModel != "" {
-				fmt.Printf(", haiku -> %s", haikuModel)
+				fmt.Printf(", haiku -> %s", launch.PrintableCell(haikuModel))
 			}
 			if oversizeModel != "" {
-				fmt.Printf(", oversize -> %s", oversizeModel)
+				fmt.Printf(", oversize -> %s", launch.PrintableCell(oversizeModel))
 			}
 			if policy != "" {
-				fmt.Printf(", policy %s", policy)
+				fmt.Printf(", policy %s", launch.PrintableCell(policy))
 			}
 			fmt.Println()
 			return nil
@@ -2868,7 +2879,13 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				haiku := orDashStr(prof.HaikuModel, "(same)")
 				oversize := orDashStr(prof.OversizeModel, "-")
 				policy := orDashStr(prof.RoutePolicy, "-")
-				fmt.Printf("%-20s %-20s %-20s %-20s %-20s %-16s %s\n", n, prof.Model, sonnet, haiku, oversize, policy, prof.Description)
+				// Every cell that comes from plans.json is quoted: PlanSet
+				// bounds the NAME to 64 bytes and leaves the description
+				// unbounded, and plans.json is hand-editable, so a stored
+				// description carrying a newline forged a row in the listing a
+				// user reads to see what their plans actually do (2026-09-26
+				// audit, eleventh round).
+				fmt.Printf("%-20s %-20s %-20s %-20s %-20s %-16s %s\n", launch.PrintableCell(n), launch.PrintableCell(prof.Model), sonnet, haiku, oversize, policy, launch.PrintableCell(prof.Description))
 			}
 			return nil
 		},
@@ -2882,8 +2899,11 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			if err != nil {
 				return err
 			}
-			fmt.Printf("name:         %s\n", args[0])
-			fmt.Printf("model:        %s\n", prof.Model)
+			// The argument is a stored plan name (PlanGet found it), and the
+			// model is a stored id — both are file data, printed with the same
+			// quoting rule as `plan list` (2026-09-26 audit, eleventh round).
+			fmt.Printf("name:         %s\n", launch.PrintableCell(args[0]))
+			fmt.Printf("model:        %s\n", launch.PrintableCell(prof.Model))
 			fmt.Printf("sonnet_model: %s\n", orDashStr(prof.SonnetModel, "(same as model)"))
 			fmt.Printf("haiku_model:  %s\n", orDashStr(prof.HaikuModel, "(same as model)"))
 			fmt.Printf("oversize_model: %s\n", orDashStr(prof.OversizeModel, "-"))
@@ -2948,7 +2968,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				if value == "" {
 					fmt.Println("sonnet_model cleared")
 				} else {
-					fmt.Printf("sonnet_model = %s (every `oaica launch claude` without --sonnet-model/--plan now uses this)\n", value)
+					fmt.Printf("sonnet_model = %s (every `oaica launch claude` without --sonnet-model/--plan now uses this)\n", launch.PrintableCell(value))
 				}
 				return nil
 			case "haiku-model", "haiku_model":
@@ -2958,7 +2978,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				if value == "" {
 					fmt.Println("haiku_model cleared")
 				} else {
-					fmt.Printf("haiku_model = %s (Claude Code's background work — titles, topic detection — now runs there instead of on the primary)\n", value)
+					fmt.Printf("haiku_model = %s (Claude Code's background work — titles, topic detection — now runs there instead of on the primary)\n", launch.PrintableCell(value))
 				}
 				return nil
 			default:
@@ -3128,9 +3148,15 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				if e.HasAuth {
 					authState = "auth-configured"
 				}
-				line := fmt.Sprintf("  %-28s %-45s %s", e.Name, oaicaPrintedOrigin(e.Origin), authState)
+				// The registry is remote data this machine never validated —
+				// the same class as a value read from a local store, and
+				// launch's own rows quote it (printableName). A registered
+				// name carrying a newline printed a fabricated provider row
+				// complete with an origin and an auth state (2026-09-26 audit,
+				// eleventh round).
+				line := fmt.Sprintf("  %-28s %-45s %s", launch.PrintableCell(e.Name), oaicaPrintedOrigin(e.Origin), authState)
 				if e.UpstreamModel != "" {
-					line += fmt.Sprintf("  (upstream model: %s)", e.UpstreamModel)
+					line += fmt.Sprintf("  (upstream model: %s)", launch.PrintableCell(e.UpstreamModel))
 				}
 				fmt.Println(line)
 			}

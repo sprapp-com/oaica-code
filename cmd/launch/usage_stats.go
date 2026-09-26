@@ -167,6 +167,21 @@ func WriteUsageStatsJSON(w, warn io.Writer, rows []UsageStatsRow, unreadable int
 	return nil
 }
 
+// PrintableCell renders one store-held value for a listing row: an ordinary
+// value as-is, one carrying a control character in Go-quoted form, and any
+// byte sequence that is not valid UTF-8 sanitised first. It is the exported
+// form of manifestCell (model_manifest_cli.go), i.e. the same rule
+// printableName (remote_cli.go) applies to a remote name.
+//
+// Exported because package cmd prints the same kind of value in its own
+// listings — alias names and targets, plan names/models/descriptions, config
+// model ids, and the router registry's name/upstream model — and had no such
+// call at all: `oaica model alias list` printed a stored name carrying a
+// newline as a fabricated extra row naming a model the file never held
+// (2026-09-26 audit, eleventh round). The rule lives in ONE place so the two
+// packages cannot drift apart on what "safe to print" means.
+func PrintableCell(s string) string { return manifestCell(s) }
+
 // WriteUsageStatsTable writes the human table `oaica usage` prints. It lives
 // here, beside the reader, rather than in the command's RunE, because the model
 // and backend cells are printed rows of a report nothing else re-checks: the
