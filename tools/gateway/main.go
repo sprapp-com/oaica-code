@@ -1460,6 +1460,18 @@ func (u *usage) merge(next usage) {
 	}
 }
 
+// ledgerStatusWriter lets a writer that TRANSLATES the upstream's answer state
+// the status the client will see, which is not always the status the upstream
+// sent: the /v1/messages bridge answers an untranslatable 200 with 502, and it
+// decides that in finalize(), which messagesHandler calls AFTER
+// completionHandler has already written the ledger row. Without this the row
+// recorded the upstream's 200 for a turn the client read as a failure — the one
+// record kept of what happened, claiming a success that never was
+// (2026-09-27 audit, round 25).
+type ledgerStatusWriter interface {
+	LedgerStatus(upstream int) int
+}
+
 // usageRecorder wraps the ResponseWriter to (a) forward bytes immediately
 // (streaming must not be buffered) and (b) scan them for the usage object.
 // For non-streaming responses the whole body is one JSON document; for SSE
@@ -1949,6 +1961,14 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string, overage bool) ledgerEntry {
 	cached := rec.usage.cachedTokens()
 	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, rec.usage.PromptTokens, cached, rec.usage.CompletionTokens)
+	// The status the CLIENT will read, when the writer knows better than the
+	// upstream's own header: the /v1/messages bridge answers an untranslatable
+	// 200 with 502 and that decision is made after this row is built (see
+	// ledgerStatusWriter).
+	status := rec.status
+	if reporter, ok := rec.ResponseWriter.(ledgerStatusWriter); ok {
+		status = reporter.LedgerStatus(status)
+	}
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,
@@ -1957,7 +1977,7 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		UpstreamModel:    m.upstreamID(),
 		Path:             path,
 		Stream:           stream,
-		Status:           rec.status,
+		Status:           status,
 		PromptTokens:     rec.usage.PromptTokens,
 		CompletionTokens: rec.usage.CompletionTokens,
 		CachedTokens:     cached,

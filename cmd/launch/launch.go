@@ -222,32 +222,37 @@ func modelNamesAreTheSame(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	a, b = displayBareName(a), displayBareName(b)
-	if a == "" || b == "" {
-		return false
-	}
-	if a == b {
-		return true
-	}
-	// An alias and its target are one selection — `oaica model alias glm
-	// --target ollama/glm-5.3-flash:cloud` makes them the same model. A writer
-	// that stores the id the endpoint serves reads back the TARGET while the
-	// launcher saved the alias, so the pair compared as drift and every launch
-	// configured the integration again (2026-09-27 audit, round 23).
+	// Each side's alias is resolved exactly ONCE, and BEFORE any spelling is
+	// compared — that order is the rule. Resolving after the comparison let the
+	// fold claim two endpoints were one: an alias `kat` pointing at box's
+	// `kat-awq` and the daemon's own `kat` fold to the same spelling, so
+	// modelNamesAreTheSame said they were the same selection, the drift term read
+	// the daemon-naming store as current, and the launch proceeded against the
+	// box with the daemon's name in the config (2026-09-27 audit, round 25).
 	//
-	// The target is compared as a TARGET, not re-entered as a name: the alias
-	// table is not guaranteed acyclic (ModelAliasSet rejects "/" in a name but
-	// not a self- or two-step cycle), so a recursive call could not terminate.
-	// Round 23 compared childModelIDFor alone here, which drops the endpoint —
-	// so an alias pointing at box1's `kat-awq` matched box2's `kat-awq` and the
-	// drift term kept box2's URL and key (2026-09-27 audit, round 24).
-	if target, ok := resolveModelAlias(a); ok && sameResolvedModel(target, b) {
-		return true
+	// Resolving once per side — never recursively — is what an alias hop may do:
+	// the alias table is not guaranteed acyclic (ModelAliasSet rejects "/" in a
+	// name but not a self- or two-step cycle). Round 23 compared childModelIDFor
+	// on both sides, which dropped the endpoint entirely, so an alias pointing at
+	// box1's `kat-awq` matched box2's `kat-awq` and the drift term kept box2's
+	// URL and key (2026-09-27 audit, round 24). Round 24's alias clause then ran
+	// after the early equality, which is the hole this closes.
+	return sameResolvedModel(aliasTargetOnce(a), aliasTargetOnce(b))
+}
+
+// aliasTargetOnce resolves one alias hop, returning the name unchanged when
+// there is no alias, when the target is empty, or when the name is its own
+// target — a self-alias must not be "resolved" into a different string, or two
+// identical spellings would stop comparing equal.
+func aliasTargetOnce(name string) string {
+	target, ok := resolveModelAlias(name)
+	if !ok {
+		return name
 	}
-	if target, ok := resolveModelAlias(b); ok && sameResolvedModel(target, a) {
-		return true
+	if target = strings.TrimSpace(target); target == "" || target == name {
+		return name
 	}
-	return sameResolvedModel(a, b)
+	return target
 }
 
 // sameResolvedModel compares two names already known not to be aliases: the

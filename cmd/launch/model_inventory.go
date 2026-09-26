@@ -822,24 +822,37 @@ func fallbackLaunchModel(name string) LaunchModel {
 }
 
 func findLaunchModel(models []LaunchModel, name string) (LaunchModel, bool) {
-	if model, ok := findLaunchModelExact(models, name); ok {
-		return model, true
-	}
-	// A user alias is transparent, and the row that serves its target is the
-	// row that serves the alias. Without this hop every caller saw a name no
-	// row carries: the writers fell back to the picker spelling (round 23),
-	// and the REFUSALS — which ask this function whether the row is one the
-	// local daemon serves — found nothing and returned nil, so an alias
-	// pointing at another endpoint bypassed the guard that exists to refuse
-	// exactly that. The ChatGPT app was written the remote's model id beside
-	// the daemon's base URL (2026-09-27 audit, round 24, both auditors).
+	// The alias hop runs FIRST, and that order is the fix. A row that merely
+	// shares the alias's own spelling is not what the alias means: the daemon
+	// serving a model called `gemma3` does not make a user's alias `gemma3`
+	// (pointing at box's `gemma3-ft`) that model. Matched exactly first, the
+	// collision won — the REFUSALS were handed the daemon row and permitted the
+	// launch — while the WRITE path resolved the alias (childModelIDFor), so the
+	// store got the box's model id beside the daemon's base URL and wire shape:
+	// exactly the mixed identity the hop exists to stop, one name collision away
+	// (2026-09-27 audit, round 25). model_alias.go states the rule this now
+	// follows: "an alias always wins if defined ... not a different thing that
+	// happens to share the bare id".
+	//
+	// A user alias is transparent, and the row that serves its target is the row
+	// that serves the alias. Without this hop every caller saw a name no row
+	// carries: the writers fell back to the picker spelling (round 23), and the
+	// REFUSALS — which ask this function whether the row is one the local daemon
+	// serves — found nothing and returned nil, so an alias pointing at another
+	// endpoint bypassed the guard that exists to refuse exactly that. The ChatGPT
+	// app was written the remote's model id beside the daemon's base URL
+	// (2026-09-27 audit, round 24, both auditors).
 	if target, ok := resolveModelAlias(name); ok {
 		target = strings.TrimSpace(target)
-		if target != name {
-			return findLaunchModelExact(models, target)
+		if target != "" && target != name {
+			if model, ok := findLaunchModelExact(models, target); ok {
+				return model, true
+			}
+			// The alias's target is not in the inventory. Fall through to the
+			// alias's own spelling: it is the only row this launch has.
 		}
 	}
-	return LaunchModel{}, false
+	return findLaunchModelExact(models, name)
 }
 
 // findLaunchModelExact is findLaunchModel without the alias hop: the row whose
@@ -997,13 +1010,32 @@ func launchModelEndpointKey(model LaunchModel) string {
 	// (2026-09-27 audit, round 24, both auditors). Placed after the remote arm
 	// for the same reason resolveLaunchEndpoint places its own prefix handling
 	// there: a user remote named "oaica" owns its namespace.
-	if routerPinnedName(model.Name) {
+	if routerPinnedRow(model) {
 		return "router"
 	}
 	if isCloudModelName(model.Name) {
 		return "daemon"
 	}
 	return "daemon"
+}
+
+// routerPinnedRow is routerPinnedName asked of a ROW rather than a name, and a
+// row's provenance outranks its spelling.
+//
+// LiveSource is the writer that produced the row: liveSourceDaemon means the
+// local daemon's own /api/tags listed this model. The daemon listing `oaica-…`
+// IS the daemon having it, so the name-shaped pin cannot apply — a user who
+// pulled a model literally named `oaica-small-7b` had it refused as a router
+// SKU, with a message saying the local daemon does not have it at all, while
+// resolveLaunchEndpoint resolves that very name to the daemon and the first
+// inference would have worked. The pin stays exactly where the name is the only
+// evidence — the router's own catalogue rows, which no writer labels
+// (2026-09-27 audit, round 25).
+func routerPinnedRow(model LaunchModel) bool {
+	if model.LiveSource == liveSourceDaemon {
+		return false
+	}
+	return routerPinnedName(model.Name)
 }
 
 // routerPinnedName reports whether a name pins the OAICA router: the explicit
@@ -1051,7 +1083,7 @@ func nonDaemonRowReason(model LaunchModel) string {
 	if model.LiveSource == liveSourceLocal {
 		return "the model is served by `oaica serve` at its own origin, and its \"<model>:local\" name posted to the local daemon does not resolve there"
 	}
-	if routerPinnedName(model.Name) {
+	if routerPinnedRow(model) {
 		return "the model is served by the OAICA router at its own origin with your OAICA credential, and the local daemon does not have it at all"
 	}
 	return "the model is reached at its own origin, and its namespaced name posted to the local daemon does not resolve there"

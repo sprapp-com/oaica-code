@@ -477,25 +477,60 @@ func (b *anthropicBridge) Flush() {
 	}
 }
 
+// noAnswer reports the failure the bridge must answer when the upstream said
+// 200 but sent nothing the client can use: the status (502) and the sentence
+// the client is told. It returns (0, "") when the body does carry an answer, or
+// when the upstream itself failed — that status is surfaced verbatim by
+// finalize(), and it is not this predicate's business.
+//
+// One predicate with two callers, deliberately. finalize() answers the CLIENT
+// with it; LedgerStatus reports it to the LEDGER, and the ledger row is written
+// EARLIER — completionHandler writes it before messagesHandler calls finalize.
+// The row therefore recorded the upstream's 200 for a turn the client read as a
+// failure (2026-09-27 audit, round 25). Mirrored conditions in the two callers
+// would drift apart; a shared one cannot.
+func (b *anthropicBridge) noAnswer() (int, string) {
+	if b.errStatus >= 400 {
+		return 0, ""
+	}
+	if b.stream {
+		if b.sse.startSent {
+			return 0, ""
+		}
+		// The upstream ended without a single event. finishStream's own contract
+		// ("the client must always get a well-formed end") cannot be met by an
+		// empty body, and a client reading the stream waits for message_stop —
+		// so answer the way the non-stream path answers an empty completion: 502,
+		// which tells the client to retry instead of waiting (round 24). Nothing
+		// has been committed yet, so the status is still ours to choose.
+		return http.StatusBadGateway, "upstream returned an empty stream"
+	}
+	var resp openAICompletion
+	if err := json.Unmarshal(b.sse.tail.Bytes(), &resp); err != nil {
+		return http.StatusBadGateway, "unparseable upstream response"
+	}
+	if len(resp.Choices) == 0 {
+		// Upstream 200 with no choices (some backends do this on refusal or
+		// empty completion) — an empty message beats a panic.
+		return http.StatusBadGateway, "upstream returned no completion choices"
+	}
+	return 0, ""
+}
+
+// LedgerStatus is the status the ledger should record for this turn, asked
+// before the row is built because the bridge — not the upstream — decides the
+// outcome the client sees. It is satisfied by the writer the gateway hands to
+// completionHandler (see ledgerStatusWriter).
+func (b *anthropicBridge) LedgerStatus(upstream int) int {
+	if status, _ := b.noAnswer(); status != 0 {
+		return status
+	}
+	return upstream
+}
+
 // finalize runs after completionHandler returns: emits the translated body
 // (non-stream + error paths — the stream path already wrote incrementally).
 func (b *anthropicBridge) finalize() {
-	if b.stream && b.errStatus == 0 {
-		if !b.sse.startSent {
-			// The upstream ended without a single event. finishStream's own
-			// contract ("the client must always get a well-formed end") cannot
-			// be met by an empty body, and a client reading the stream waits
-			// for message_stop — so answer the way the non-stream path answers
-			// an empty completion: 502, which tells the client to retry instead
-			// of waiting (2026-09-27 audit, round 24). Nothing has been
-			// committed yet, so the status is still ours to choose.
-			log.Printf("oaica-gateway: /v1/messages upstream 200 with an empty stream")
-			writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned an empty stream")
-			return
-		}
-		b.finishStream()
-		return
-	}
 	if b.errStatus >= 400 {
 		// Surface the upstream error verbatim inside the Anthropic envelope:
 		// its "message" is what actually explains the failure.
@@ -509,6 +544,15 @@ func (b *anthropicBridge) finalize() {
 		writeAnthropicErr(b.ResponseWriter, b.errStatus, "api_error", redactCredentialURLs(strings.TrimSpace(b.errBody.String())))
 		return
 	}
+	if status, msg := b.noAnswer(); status != 0 {
+		log.Printf("oaica-gateway: /v1/messages upstream 200 answered %d: %s", status, msg)
+		writeAnthropicErr(b.ResponseWriter, status, "api_error", msg)
+		return
+	}
+	if b.stream {
+		b.finishStream()
+		return
+	}
 	// Non-stream success: translate the buffered OpenAI completion.
 	var resp openAICompletion
 	if err := json.Unmarshal(b.sse.tail.Bytes(), &resp); err != nil {
@@ -516,9 +560,6 @@ func (b *anthropicBridge) finalize() {
 		return
 	}
 	if len(resp.Choices) == 0 {
-		// Upstream 200 with no choices (some backends do this on refusal or
-		// empty completion) — an empty message beats a panic.
-		log.Printf("oaica-gateway: /v1/messages upstream 200 with no choices")
 		writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned no completion choices")
 		return
 	}

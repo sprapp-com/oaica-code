@@ -99,7 +99,16 @@ func TestStreamedOutputEstimateCountsOnlyTheEmittedCall(t *testing.T) {
 	if !strings.Contains(body, `"tool_use"`) {
 		t.Fatalf("premise: the parseable call did not reach the client:\n%s", body)
 	}
-	if got := usageInt(deltaUsage(t, body), "output_tokens"); got <= 0 {
+	// The estimate is chars/4 + 1, so the bound below is the emitted call's own
+	// arguments and nothing else. It has to be a bound, not just "> 0": the
+	// defect this control sits beside counted the DROPPED fragment too, and both
+	// readings are positive — so a bare "> 0" would have passed with the fix
+	// reverted and pinned nothing (2026-09-27 audit, round 25, F5).
+	emitted := len(`{"path":"/tmp/x.txt"}`)
+	got := usageInt(deltaUsage(t, body), "output_tokens")
+	if got <= 0 {
 		t.Errorf("output_tokens = %d for a turn that relayed an executable tool_use block: moving the count to the emitted calls must not stop counting them", got)
+	} else if limit := emitted/4 + 1; got > limit {
+		t.Errorf("output_tokens = %d for a turn whose only emitted call has %d bytes of arguments (at most %d by the chars/4+1 estimate): the truncated fragment that never reached the client is being counted as output again", got, emitted, limit)
 	}
 }

@@ -62,6 +62,15 @@ func TestAUserRemoteNamedOaicaKeepsItsNamespace(t *testing.T) {
 	writeRemotes(t, `{"remotes":[{"name":"oaica","base_url":"https://oaica.example/v1","api_key":"sk-o"}]}`)
 
 	row := LaunchModel{Name: "oaica/kat-awq"}
+	// Asked of the NAME alone this pins the router — that is what the prefix
+	// means — so this asserts the remote guard INSIDE routerPinnedName rather
+	// than the arm order in launchModelEndpointKey: without the guard the key
+	// would still come out "remote:…" (the remote arm runs first) while this
+	// predicate answered true, and the refusal message would claim the router
+	// for the remote's own model.
+	if routerPinnedName(row.Name) {
+		t.Error("a user remote named \"oaica\" had its model pinned to the router: its namespace is its own")
+	}
 	if daemonRoutedModel(row) {
 		t.Error("a user remote named \"oaica\" was keyed to the local daemon: its base URL and key would be dropped as a no-op")
 	}
