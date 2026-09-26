@@ -320,9 +320,7 @@ func TestOversizeSwap_CrossesOverToNativeWhenOaicaLegOverflows(t *testing.T) {
 func TestOversizeSwap_ResolvesBareAliasAgainstRealCatalog(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-alias-test")
-	nativeModelAliasCache.Lock()
-	nativeModelAliasCache.m = nil
-	nativeModelAliasCache.Unlock()
+	resetNativeModelCatalog()
 
 	oaicaUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

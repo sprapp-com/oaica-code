@@ -36,24 +36,50 @@ func noRemotes(t *testing.T) {
 	stubBareIndex(t, map[string][]string{})
 }
 
-// stubNativeModelCatalog seeds resolveNativeModelAlias's cache with a
-// tier→wire-id mapping, so a test that reaches a native leg never makes a
-// live api.anthropic.com call — which it otherwise would, whenever the
-// machine running the tests has an Anthropic credential (an OAuth session in
+// resetNativeModelCatalog empties the cached catalog so the next resolution
+// fetches fresh — for tests that point nativeAnthropicModelsUpstream at their
+// own server and need it consulted.
+func resetNativeModelCatalog() {
+	nativeModelCatalogCache.Lock()
+	nativeModelCatalogCache.entries = nil
+	nativeModelCatalogCache.err = nil
+	nativeModelCatalogCache.expiresAt = time.Time{}
+	nativeModelCatalogCache.Unlock()
+}
+
+// stubNativeModelCatalog seeds the cached catalog from a tier→wire-id
+// mapping, so a test that reaches a native leg never makes a live
+// api.anthropic.com call — which it otherwise would, whenever the machine
+// running the tests has an Anthropic credential (an OAuth session in
 // ~/.claude/.credentials.json is enough), making the test's expected values
-// depend on Anthropic's current catalog.
+// depend on Anthropic's current catalog. The display names are the shape the
+// resolver matches on: "Claude <Tier>" as a case-insensitive prefix.
 func stubNativeModelCatalog(t *testing.T, byTier map[string]string) {
 	t.Helper()
-	nativeModelAliasCache.Lock()
-	nativeModelAliasCache.m = map[string]nativeAliasCacheEntry{}
-	for tier, id := range byTier {
-		nativeModelAliasCache.m[tier] = nativeAliasCacheEntry{resolved: id, expiresAt: time.Now().Add(time.Hour)}
+	seed := func() {
+		nativeModelCatalogCache.Lock()
+		nativeModelCatalogCache.entries = nil
+		nativeModelCatalogCache.err = nil
+		nativeModelCatalogCache.expiresAt = time.Now().Add(time.Hour)
+		for tier, id := range byTier {
+			display := "Claude "
+			if tier != "" { // a test seeds the empty tier deliberately (claude/)
+				display += strings.ToUpper(tier[:1]) + tier[1:]
+			}
+			nativeModelCatalogCache.entries = append(nativeModelCatalogCache.entries, nativeCatalogEntry{
+				ID:          id,
+				DisplayName: display,
+			})
+		}
+		nativeModelCatalogCache.Unlock()
 	}
-	nativeModelAliasCache.Unlock()
+	seed()
 	t.Cleanup(func() {
-		nativeModelAliasCache.Lock()
-		nativeModelAliasCache.m = nil
-		nativeModelAliasCache.Unlock()
+		nativeModelCatalogCache.Lock()
+		nativeModelCatalogCache.entries = nil
+		nativeModelCatalogCache.err = nil
+		nativeModelCatalogCache.expiresAt = time.Time{}
+		nativeModelCatalogCache.Unlock()
 	})
 }
 
@@ -570,14 +596,8 @@ func TestClaudeCodeModelAlias(t *testing.T) {
 // Claude Code then fails the same visible way it did before, instead of the
 // launch silently running a different model.
 func TestClaudeCodeModelAlias_UnresolvableFallsBackToTier(t *testing.T) {
-	nativeModelAliasCache.Lock()
-	nativeModelAliasCache.m = nil
-	nativeModelAliasCache.Unlock()
-	t.Cleanup(func() {
-		nativeModelAliasCache.Lock()
-		nativeModelAliasCache.m = nil
-		nativeModelAliasCache.Unlock()
-	})
+	resetNativeModelCatalog()
+	t.Cleanup(resetNativeModelCatalog)
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

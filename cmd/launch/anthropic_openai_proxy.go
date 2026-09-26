@@ -2215,21 +2215,46 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 	relayUpstreamResponse(w, resp)
 }
 
-// nativeModelAliasCache memoizes resolveNativeModelAlias's real-model-id
-// lookups. A short TTL, not "forever": Anthropic's catalog is the source of
-// truth for which id "fable"/"opus"/etc currently means, and that mapping
-// can change (a new point release) without this process restarting.
-var nativeModelAliasCache struct {
+// nativeModelCatalogCache memoizes the CATALOG, not one resolved alias per
+// entry. A short TTL, not "forever": Anthropic's catalog is the source of
+// truth for which id "fable"/"opus"/etc currently means, and that mapping can
+// change (a new point release) without this process restarting.
+//
+// Keyed by catalog rather than by alias because one launch asks about several
+// tiers at once (opus for the primary slot, sonnet for --sonnet-model, haiku
+// for opusplan, a fourth for the oversize leg), and each of those was its own
+// cache key and therefore its own GET of the same list. On a network that
+// drops packets instead of refusing them, that is the full timeout paid once
+// per tier — around half a minute of a CLI that has printed nothing — before
+// the child process has even started. There is one catalog; fetching it once
+// makes the tiers lookups in data already in hand.
+var nativeModelCatalogCache struct {
 	sync.Mutex
-	m map[string]nativeAliasCacheEntry
-}
-
-type nativeAliasCacheEntry struct {
-	resolved  string
+	entries   []nativeCatalogEntry
+	err       error
 	expiresAt time.Time
 }
 
-const nativeModelAliasCacheTTL = 10 * time.Minute
+// nativeCatalogEntry is one catalog row: the id that goes on the wire and the
+// display name the alias is matched against.
+type nativeCatalogEntry struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+const (
+	// nativeModelCatalogTTL is how long a good catalog is reused.
+	nativeModelCatalogTTL = 10 * time.Minute
+	// nativeModelCatalogFailureTTL is how long a FAILED fetch is remembered, so
+	// the rest of this launch (and the next one, briefly) reads the failure
+	// instead of paying the timeout again. Short, because a blip must not cost
+	// native tiers for ten minutes.
+	nativeModelCatalogFailureTTL = 30 * time.Second
+)
+
+// nativeModelCatalogTimeout bounds the catalog GET. A package var, not a
+// constant, so tests can shrink it.
+var nativeModelCatalogTimeout = 10 * time.Second
 
 // resolveNativeModelAlias turns a Claude Code CLI alias ("fable", "opus",
 // "sonnet", "haiku" — what nativeClaudeModelTier extracts from "claude/fable"
@@ -2260,64 +2285,72 @@ const nativeModelAliasCacheTTL = 10 * time.Minute
 // the same "not found" Anthropic already gives for an unknown id, no worse
 // than not attempting this at all.
 func resolveNativeModelAlias(model string) string {
-	nativeModelAliasCache.Lock()
-	if e, ok := nativeModelAliasCache.m[model]; ok && time.Now().Before(e.expiresAt) {
-		nativeModelAliasCache.Unlock()
-		return e.resolved
-	}
-	nativeModelAliasCache.Unlock()
-
-	resolved := resolveNativeModelAliasUncached(model)
-
-	nativeModelAliasCache.Lock()
-	if nativeModelAliasCache.m == nil {
-		nativeModelAliasCache.m = map[string]nativeAliasCacheEntry{}
-	}
-	nativeModelAliasCache.m[model] = nativeAliasCacheEntry{resolved: resolved, expiresAt: time.Now().Add(nativeModelAliasCacheTTL)}
-	nativeModelAliasCache.Unlock()
-	return resolved
-}
-
-func resolveNativeModelAliasUncached(model string) string {
-	auth, ok := resolveNativeAnthropicAuth()
-	if !ok {
+	entries, err := nativeModelCatalog()
+	if err != nil {
 		return model
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	want := "claude " + strings.ToLower(model)
+	for _, m := range entries {
+		if strings.HasPrefix(strings.ToLower(m.DisplayName), want) {
+			return m.ID
+		}
+	}
+	return model
+}
+
+// nativeModelCatalog returns Anthropic's catalog, fetching it at most once per
+// TTL — and at most once across concurrent callers, since the fetch happens
+// with the lock held. That is deliberate: the lock is only ever taken on the
+// native-tier resolution path (launch setup, and the oversize-to-native
+// crossover), where the alternative is several identical requests to the same
+// endpoint, and holding it makes "one catalog" true under concurrency too.
+func nativeModelCatalog() ([]nativeCatalogEntry, error) {
+	nativeModelCatalogCache.Lock()
+	defer nativeModelCatalogCache.Unlock()
+	if time.Now().Before(nativeModelCatalogCache.expiresAt) {
+		return nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+	}
+	entries, err := fetchNativeModelCatalog()
+	ttl := nativeModelCatalogTTL
+	if err != nil {
+		ttl = nativeModelCatalogFailureTTL
+	}
+	nativeModelCatalogCache.entries, nativeModelCatalogCache.err = entries, err
+	nativeModelCatalogCache.expiresAt = time.Now().Add(ttl)
+	return entries, err
+}
+
+func fetchNativeModelCatalog() ([]nativeCatalogEntry, error) {
+	auth, ok := resolveNativeAnthropicAuth()
+	if !ok {
+		return nil, errors.New("no Anthropic credential")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), nativeModelCatalogTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nativeAnthropicModelsUpstream, nil)
 	if err != nil {
-		return model
+		return nil, err
 	}
 	// applyNativeAnthropicAuth, not a bare Set: an OAuth bearer needs the
 	// anthropic-beta header too (see its doc) and this GET has no client
 	// request whose headers could supply it.
 	applyNativeAnthropicAuth(req, auth)
 	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: nativeModelCatalogTimeout}).Do(req)
 	if err != nil {
-		return model
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return model
+		return nil, fmt.Errorf("catalog returned HTTP %d", resp.StatusCode)
 	}
 	var catalog struct {
-		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-		} `json:"data"`
+		Data []nativeCatalogEntry `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
-		return model
+		return nil, err
 	}
-	want := "claude " + strings.ToLower(model)
-	for _, m := range catalog.Data {
-		if strings.HasPrefix(strings.ToLower(m.DisplayName), want) {
-			return m.ID
-		}
-	}
-	return model
+	return catalog.Data, nil
 }
 
 // rewriteAnthropicRequestModel returns body with its top-level "model"

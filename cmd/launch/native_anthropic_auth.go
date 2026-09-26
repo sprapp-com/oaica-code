@@ -65,7 +65,7 @@ func resolveNativeAnthropicAuth() (nativeAnthropicAuth, bool) {
 // Code sends it on every request it makes, so the passthrough routes inherit
 // it by forwarding the client's headers verbatim (anthropicModelsPassthrough)
 // and never need this constant. A request oaica builds on its OWN behalf has
-// no client to copy headers from; resolveNativeModelAliasUncached's /v1/models
+// no client to copy headers from; resolveNativeModelAlias's /v1/models
 // GET is the one such request, and without this header an OAuth-only user's
 // lookup 401s — which is what made the native alias resolution silently
 // no-op for exactly the users the native picker rows exist for.
