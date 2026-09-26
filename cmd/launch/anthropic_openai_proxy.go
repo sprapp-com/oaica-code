@@ -1097,10 +1097,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 	baseURL := table.Default.BaseURL
 
 	// Breaker/escalation state: created unconditionally. The messages
-	// handler records breaker/escalation signals on EVERY upstream result
-	// (nil-safe no-ops today, but a stale/future caller path that derefs
+	// handler records a breaker signal on every upstream result, and an
+	// escalation signal on every result that belongs to the leg selectRoute
+	// chose (the oversize crossover's does not — crossoverEscalationLeg).
+	// Nil-safe no-ops today, but a stale/future caller path that derefs
 	// without the nil guard would nil-panic on a plain single-leg launch —
-	// these are two empty structs; creating them always costs nothing).
+	// these are two empty structs; creating them always costs nothing.
 	if table.breakers == nil {
 		table.breakers = &routeBreakers{}
 	}
@@ -1286,7 +1288,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					return
 				}
 				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID)
-				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
+				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false), route.BaseURL,
 					status, relayed, r.Context().Err() != nil)
 				return
 			}
@@ -1296,7 +1298,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// that refused locally reports passthroughNotAttempted, which the
 			// feed handles on its own.
 			status, relayed, _ := nativeAnthropicPassthrough(w, r, body, table.SessionID)
-			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
+			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false), route.BaseURL,
 				status, relayed, r.Context().Err() != nil)
 			return
 		}
@@ -1320,6 +1322,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// With a routing table (tier_routing.go) the id also selects WHICH
 		// upstream: primary and --sonnet-model can be different backends.
 		route, reqModel, _ := table.selectRoute(anthReq.Model)
+		// The leg the `auto` escalation may hear about — the one selectRoute
+		// just chose and noted. It stops being that leg if an oversize
+		// crossover serves this request somewhere else (see
+		// crossoverEscalationLeg), and every record below goes through it
+		// rather than route.BaseURL for exactly that reason.
+		escalationLeg := route.BaseURL
 		// Always answer with the leg that will actually serve this request:
 		// our gateway logs it as routed_to for spend attribution, and it
 		// makes a silent --sonnet-model/fallback swap diagnosable from the
@@ -1469,15 +1477,20 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 							}
 							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID)
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-								status, relayed, r.Context().Err() != nil)
+								crossoverEscalationLeg(route.BaseURL, over.BaseURL), status, relayed, r.Context().Err() != nil)
 							return
 						}
 						status, relayed, _ := nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID)
 						feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-							status, relayed, r.Context().Err() != nil)
+							crossoverEscalationLeg(route.BaseURL, over.BaseURL), status, relayed, r.Context().Err() != nil)
 						return
 					}
 					route = over
+					// The crossover serves a leg on another host, so this
+					// request's result is not evidence about the leg
+					// selectRoute chose. The breaker below/above still records
+					// against `over` itself; escalation is dropped, explicitly.
+					escalationLeg = crossoverEscalationLeg(escalationLeg, over.BaseURL)
 					oaiReq.Model = route.UpstreamModel
 					w.Header().Set("X-Oaica-Route", route.Label)
 					// Same reason as the passthrough crossover above: the
@@ -1568,9 +1581,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			if r.Context().Err() == nil {
 				// Same signal feeds the `auto` policy's per-session escalation
 				// (route_policy.go): consecutive failures escalate the session to
-				// the stronger secondary leg.
+				// the stronger secondary leg. Only when the leg that failed is
+				// the one selectRoute chose — escalationLeg is "" after an
+				// oversize crossover onto another host, which is a signal the
+				// escalation state does not track.
 				table.breakers.recordFail(route.BaseURL)
-				table.escalations.recordFail(table.SessionID, route.BaseURL)
+				if escalationLeg != "" {
+					table.escalations.recordFail(table.SessionID, escalationLeg)
+				}
 			}
 			// The attempt is logged even though it never reached a backend:
 			// a leg that refuses connections is the case an ERR column exists
@@ -1601,7 +1619,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// (2026-09-26 audit). It is decided below, on what reached the client.
 		if resp.StatusCode >= 500 {
 			table.breakers.recordFail(route.BaseURL)
-			table.escalations.recordFail(table.SessionID, route.BaseURL)
+			if escalationLeg != "" {
+				table.escalations.recordFail(table.SessionID, escalationLeg)
+			}
 		}
 
 		rec := &statusCapturingWriter{ResponseWriter: w}
@@ -1696,10 +1716,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			case r.Context().Err() != nil:
 			case delivered:
 				table.breakers.recordOK(route.BaseURL)
-				table.escalations.recordOK(table.SessionID, route.BaseURL)
+				if escalationLeg != "" {
+					table.escalations.recordOK(table.SessionID, escalationLeg)
+				}
 			default:
 				table.breakers.recordFail(route.BaseURL)
-				table.escalations.recordFail(table.SessionID, route.BaseURL)
+				if escalationLeg != "" {
+					table.escalations.recordFail(table.SessionID, escalationLeg)
+				}
 			}
 		}
 	})
@@ -2525,7 +2549,25 @@ func passthroughBreakerKey(route proxyRoute, oversize bool) string {
 // not clear an existing failure streak either — and the same holds for a body
 // left incomplete, which is what our own cancellation produces (2026-09-26
 // audit).
-func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int, relayed, clientGone bool) {
+//
+// escalationLeg is the leg the `auto` policy's per-session escalation may hear
+// about, and it is a parameter rather than route.BaseURL because the two
+// differ on the oversize crossover (see crossoverEscalationLeg). An empty one
+// feeds the breaker only.
+func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey, escalationLeg string, status int, relayed, clientGone bool) {
+	// Skipped outright for an untracked leg rather than handed to recordFail as
+	// "": a native leg's BaseURL IS "", so an empty key would match a session
+	// whose noted leg is one and record against it.
+	escalateFail := func() {
+		if escalationLeg != "" {
+			table.escalations.recordFail(sessionID, escalationLeg)
+		}
+	}
+	escalateOK := func() {
+		if escalationLeg != "" {
+			table.escalations.recordOK(sessionID, escalationLeg)
+		}
+	}
 	switch {
 	case status == passthroughNotAttempted:
 		// This side answered without contacting the leg — no credential to
@@ -2539,7 +2581,7 @@ func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, session
 		// The client left before the leg answered. Says nothing about the leg.
 	case status == 0 || status >= 500:
 		table.breakers.recordFail(breakerKey)
-		table.escalations.recordFail(sessionID, route.BaseURL)
+		escalateFail()
 	case status >= 300:
 		// 4xx / 429: the leg answering at all — not a health signal.
 	case clientGone:
@@ -2547,11 +2589,37 @@ func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, session
 		// not the leg's doing.
 	case relayed:
 		table.breakers.recordOK(breakerKey)
-		table.escalations.recordOK(sessionID, route.BaseURL)
+		escalateOK()
 	default:
 		table.breakers.recordFail(breakerKey)
-		table.escalations.recordFail(sessionID, route.BaseURL)
+		escalateFail()
 	}
+}
+
+// crossoverEscalationLeg returns the leg an oversize crossover may feed the
+// `auto` policy's escalation with — "" when it may not feed it at all, which
+// is every crossover onto another host.
+//
+// The escalation state tracks exactly ONE leg per session: the one selectRoute
+// chose (routeEscalations.noteLeg), and recordFail/recordOK ignore every other
+// leg. oversizeSwap only ever returns an Oversize leg on a DIFFERENT base URL
+// (its own doc), so a crossover's result can never be about that leg — the
+// record used to be written anyway, four lines of code reading as a signal
+// while the per-leg guard dropped it (2026-09-26 audit).
+//
+// Leaving it dropped, rather than promoting the crossover to an escalation
+// signal, is deliberate: escalation moves the session OFF the leg selectRoute
+// chose, and a request that did not fit the primary's window says nothing about
+// that leg's health — escalating would move the session's ordinary traffic for
+// autoEscalateHoldFor because of a size mismatch. Repeated crossover failures
+// are handled by the crossover leg's OWN breaker, which oversizeSwap consults
+// before swapping, so the next such request fails visibly with "prompt is too
+// long" instead of silently landing on a dead leg.
+func crossoverEscalationLeg(selectedBaseURL, servedBaseURL string) string {
+	if servedBaseURL == selectedBaseURL {
+		return servedBaseURL
+	}
+	return ""
 }
 
 // passthroughNotAttempted is the status a passthrough wrapper returns when the

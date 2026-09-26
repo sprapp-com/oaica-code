@@ -91,7 +91,7 @@ func TestANeverAttemptedPassthroughRecordsNoHealthSignal(t *testing.T) {
 	key := passthroughBreakerKey(neverAttempted, false)
 
 	for i := 0; i < 5; i++ {
-		feedPassthroughRouteHealth(table, neverAttempted, "sess-cred", key, passthroughNotAttempted, false, false)
+		feedPassthroughRouteHealth(table, neverAttempted, "sess-cred", key, neverAttempted.BaseURL, passthroughNotAttempted, false, false)
 	}
 	if table.breakers.open(key) {
 		t.Error("a leg that was never contacted opened its circuit — five locally-refused requests (no credential to send) mark a working backend dead")
@@ -99,7 +99,7 @@ func TestANeverAttemptedPassthroughRecordsNoHealthSignal(t *testing.T) {
 
 	// Control: the same feed with a real transport failure still fails it.
 	for i := 0; i < breakerFailsToOpen; i++ {
-		feedPassthroughRouteHealth(table, neverAttempted, "sess-cred", key, 0, false, false)
+		feedPassthroughRouteHealth(table, neverAttempted, "sess-cred", key, neverAttempted.BaseURL, 0, false, false)
 	}
 	if !table.breakers.open(key) {
 		t.Errorf("a leg that really did not answer %d times was NOT failed — the fix for the credential case must not swallow the transport case", breakerFailsToOpen)

@@ -175,7 +175,7 @@ func TestDeadNativeOversizeLegIsNotChosenForCrossover(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		feedPassthroughRouteHealth(table, table.Oversize, "sess-1",
-			passthroughBreakerKey(table.Oversize, true), 0, false, false) // transport failures
+			passthroughBreakerKey(table.Oversize, true), table.Oversize.BaseURL, 0, false, false) // transport failures
 	}
 	if _, ok := table.oversizeSwap(primary, 50_000, 0); ok {
 		t.Error("a native oversize leg with 3 consecutive transport failures was still chosen for the crossover — oversizeSwap checks nativeOversizeBreakerKey, so the feed has to write that same key")
@@ -187,7 +187,7 @@ func TestPassthrough4xxDoesNotOpenTheBreaker(t *testing.T) {
 	table := proxyRouteTable{breakers: &routeBreakers{}, escalations: &routeEscalations{}}
 	route := proxyRoute{BaseURL: "https://zai.example/v1", Label: "zai"}
 	for i := 0; i < 5; i++ {
-		feedPassthroughRouteHealth(table, route, "sess-1", passthroughBreakerKey(route, false), http.StatusTooManyRequests, false, false)
+		feedPassthroughRouteHealth(table, route, "sess-1", passthroughBreakerKey(route, false), route.BaseURL, http.StatusTooManyRequests, false, false)
 	}
 	if table.breakers.open(route.BaseURL) {
 		t.Error("429s opened a passthrough leg's breaker — shedding is the leg working, not failing")

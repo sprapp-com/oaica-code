@@ -295,10 +295,15 @@ var autoEscalateHoldFor = 10 * time.Minute
 // zero or past, means "not escalated").
 // routeEscalation is the state for one SessionID: consecutive failures of
 // its currently chosen leg, and the instant escalation expires (stale, i.e.
-// zero or past, means "not escalated"). The signal is PER-LEG: results from
-// the leg the session is actually being served on count; a success on some
-// other leg must not clear the primary's failure streak, and a failure on
-// a fallback must not feed the escalation counter toward it.
+// zero or past, means "not escalated"). The signal is PER-LEG: only results
+// from the leg selectRoute CHOSE count — a success on some other leg must not
+// clear the primary's failure streak, and a failure on a fallback must not
+// feed the escalation counter toward it.
+//
+// One leg, not "whichever leg served the request": the oversize crossover
+// serves a leg on another host by construction (oversizeSwap), and its caller
+// therefore feeds the breaker only — see crossoverEscalationLeg for why that
+// result is deliberately not an escalation signal (2026-09-26 audit).
 type routeEscalation struct {
 	mu             sync.Mutex
 	leg            string
