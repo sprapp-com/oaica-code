@@ -75,10 +75,15 @@ func resolveNativeAnthropicAuth() (nativeAnthropicAuth, bool) {
 // resolution silently no-op for exactly the users the native picker rows exist
 // for) and every turn of theirs 401s.
 //
-// anthropicPassthrough and applyNativeAnthropicAuth are where it is applied;
-// both merge it into what the client sent rather than replacing it, because the
-// client's own beta values carry prompt caching and dropping one would be a
-// silent downgrade of a request the fix was not about.
+// Every site that injects such a credential applies it, and there are three of
+// them: anthropicPassthrough (the /v1/messages POST passthrough),
+// anthropicModelsPassthrough (the GET /v1/models relay — it did this bare until
+// the thirteenth round of the 2026-09-26 audit, and an OAuth-only machine's
+// model list 401'd for it), and applyNativeAnthropicAuth, which the two
+// requests oaica builds on its own behalf go through. All of them merge it into
+// what the client sent rather than replacing it, because the client's own beta
+// values carry prompt caching and dropping one would be a silent downgrade of a
+// request the fix was not about.
 const oauthBetaHeaderValue = "oauth-2025-04-20"
 
 // applyNativeAnthropicAuth puts auth on req the way the corresponding live

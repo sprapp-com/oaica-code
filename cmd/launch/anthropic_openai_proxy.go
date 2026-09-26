@@ -2538,7 +2538,13 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set(headerName, headerValue)
+	// The credential goes on through the same rule every other injection site
+	// uses (applyNativeAnthropicAuth): an OAuth bearer is accompanied by the
+	// beta that announces it, merged into whatever the client sent, while a
+	// vendor key sent as x-api-key needs none and gets none. This relay set
+	// the header bare, so an OAuth-only machine's model list 401'd and Claude
+	// Code fell back to its built-in one (2026-09-26 audit, thirteenth round).
+	applyNativeAnthropicAuth(req, nativeAnthropicAuth{Header: headerName, Value: headerValue})
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
