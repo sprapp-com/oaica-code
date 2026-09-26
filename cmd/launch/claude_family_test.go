@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -352,7 +353,7 @@ func TestResolveNativeModelAlias_SendsOAuthBetaHeader(t *testing.T) {
 	// OAuth-only box: no ANTHROPIC_API_KEY, a token in the credentials file.
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	resetNativeModelCatalog()
-	if got := resolveNativeModelAlias("sonnet"); got != "claude-sonnet-5" {
+	if got := resolveNativeModelAlias(context.Background(), "sonnet"); got != "claude-sonnet-5" {
 		t.Fatalf("resolveNativeModelAlias(sonnet) = %q, want the catalog id", got)
 	}
 	if gotAuth != "Bearer oauth-token-abc" {
@@ -367,7 +368,7 @@ func TestResolveNativeModelAlias_SendsOAuthBetaHeader(t *testing.T) {
 	gotBeta = ""
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 	resetNativeModelCatalog()
-	if got := resolveNativeModelAlias("sonnet"); got != "claude-sonnet-5" {
+	if got := resolveNativeModelAlias(context.Background(), "sonnet"); got != "claude-sonnet-5" {
 		t.Fatalf("API-key lookup = %q, want the catalog id", got)
 	}
 	if gotBeta != "" {

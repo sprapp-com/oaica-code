@@ -901,9 +901,14 @@ func tierFamilyRoutes(plan tierPlan) map[string]proxyRoute {
 // resolving it would match the first Anthropic catalog entry, silently
 // pinning the slot to the flagship model. Left alone, so the caller's own
 // value is used and the mistake stays visible.
+// The resolution is a network call (the catalog GET), so it is bounded by its
+// own timeout. Launch setup has no request whose cancellation could cut it
+// short — the child process has not started yet — so it passes a context that
+// only the timeout can end; callers reached from a live request pass that
+// request's context, so a client that goes away stops the wait.
 func claudeCodeModelAlias(model string) string {
 	if tier, ok := nativeClaudeModelTier(model); ok && tier != "" {
-		return resolveNativeModelAlias(tier)
+		return resolveNativeModelAlias(context.Background(), tier)
 	}
 	return model
 }

@@ -19,6 +19,7 @@ package launch
 // a match in data already in hand.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -102,7 +103,7 @@ func TestAHungCatalogCostsOneTimeoutNotOnePerTier(t *testing.T) {
 
 	start := time.Now()
 	for _, tier := range []string{"opus", "sonnet", "haiku"} {
-		if got := resolveNativeModelAlias(tier); got != tier {
+		if got := resolveNativeModelAlias(context.Background(), tier); got != tier {
 			t.Fatalf("a hung catalog resolved %q to %q, want the bare tier unchanged", tier, got)
 		}
 	}

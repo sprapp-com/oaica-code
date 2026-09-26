@@ -1442,7 +1442,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// without.
 						realModel := over.UpstreamModel
 						if over.BaseURL == "" {
-							realModel = resolveNativeModelAlias(over.UpstreamModel)
+							realModel = resolveNativeModelAlias(r.Context(), over.UpstreamModel)
 						}
 						nativeBody, rerr := rewriteAnthropicRequestModel(body, realModel)
 						if rerr != nil {
@@ -2265,11 +2265,16 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 // per tier — around half a minute of a CLI that has printed nothing — before
 // the child process has even started. There is one catalog; fetching it once
 // makes the tiers lookups in data already in hand.
+// inflight is the single-flight handle: non-nil while a fetch is running, and
+// closed when it finishes. Callers that arrive during a fetch wait on it
+// instead of on the mutex, so a stalled catalog costs them their own context,
+// not the lock (2026-09-26 audit).
 var nativeModelCatalogCache struct {
 	sync.Mutex
 	entries   []nativeCatalogEntry
 	err       error
 	expiresAt time.Time
+	inflight  chan struct{}
 }
 
 // nativeCatalogEntry is one catalog row: the id that goes on the wire and the
@@ -2321,8 +2326,13 @@ var nativeModelCatalogTimeout = 10 * time.Second
 // unchanged — the caller's own request still goes out, worst case with
 // the same "not found" Anthropic already gives for an unknown id, no worse
 // than not attempting this at all.
-func resolveNativeModelAlias(model string) string {
-	entries, err := nativeModelCatalog()
+//
+// ctx bounds the catalog fetch this may do: it is the CALLER's context, so a
+// request handler passes r.Context() and a client that hangs up stops the wait
+// (2026-09-26 audit). Callers with no request to cancel pass
+// context.Background(), leaving the fetch's own timeout as the only bound.
+func resolveNativeModelAlias(ctx context.Context, model string) string {
+	entries, err := nativeModelCatalog(ctx)
 	if err != nil {
 		return model
 	}
@@ -2336,33 +2346,66 @@ func resolveNativeModelAlias(model string) string {
 }
 
 // nativeModelCatalog returns Anthropic's catalog, fetching it at most once per
-// TTL — and at most once across concurrent callers, since the fetch happens
-// with the lock held. That is deliberate: the lock is only ever taken on the
-// native-tier resolution path (launch setup, and the oversize-to-native
-// crossover), where the alternative is several identical requests to the same
-// endpoint, and holding it makes "one catalog" true under concurrency too.
-func nativeModelCatalog() ([]nativeCatalogEntry, error) {
+// TTL — and at most once across concurrent callers: the first caller to find
+// the cache stale fetches and the rest wait on that fetch's completion rather
+// than starting their own.
+//
+// The mutex is NOT held across the network. It guards the cache fields and the
+// single-flight handle, and is released before the request goes out. Holding it
+// for the whole fetch (2026-09-26 audit) made every waiter's wait a
+// sync.Mutex.Lock — not context-aware — so the request path that reaches this
+// (resolveNativeModelAlias on the oversize crossover, from a live /v1/messages
+// handler) could not be cancelled: a client that hung up left its goroutine
+// parked on the lock until the fetch's own 10s timeout expired, and every
+// concurrent request queued behind it. The fetch now runs on the caller's
+// context, so a caller that goes away stops waiting.
+func nativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) {
 	nativeModelCatalogCache.Lock()
-	defer nativeModelCatalogCache.Unlock()
 	if time.Now().Before(nativeModelCatalogCache.expiresAt) {
-		return nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+		entries, err := nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+		nativeModelCatalogCache.Unlock()
+		return entries, err
 	}
-	entries, err := fetchNativeModelCatalog()
+	// A fetch is already running: wait for it, or for this caller to give up.
+	// Reading the result after it closes is safe because the fetch publishes
+	// the entries and the expiry BEFORE closing the channel.
+	if wait := nativeModelCatalogCache.inflight; wait != nil {
+		nativeModelCatalogCache.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		nativeModelCatalogCache.Lock()
+		entries, err := nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+		nativeModelCatalogCache.Unlock()
+		return entries, err
+	}
+	done := make(chan struct{})
+	nativeModelCatalogCache.inflight = done
+	nativeModelCatalogCache.Unlock()
+
+	entries, err := fetchNativeModelCatalog(ctx)
+
+	nativeModelCatalogCache.Lock()
 	ttl := nativeModelCatalogTTL
 	if err != nil {
 		ttl = nativeModelCatalogFailureTTL
 	}
 	nativeModelCatalogCache.entries, nativeModelCatalogCache.err = entries, err
 	nativeModelCatalogCache.expiresAt = time.Now().Add(ttl)
+	nativeModelCatalogCache.inflight = nil
+	nativeModelCatalogCache.Unlock()
+	close(done)
 	return entries, err
 }
 
-func fetchNativeModelCatalog() ([]nativeCatalogEntry, error) {
+func fetchNativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) {
 	auth, ok := resolveNativeAnthropicAuth()
 	if !ok {
 		return nil, errors.New("no Anthropic credential")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), nativeModelCatalogTimeout)
+	ctx, cancel := context.WithTimeout(ctx, nativeModelCatalogTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nativeAnthropicModelsUpstream, nil)
 	if err != nil {
