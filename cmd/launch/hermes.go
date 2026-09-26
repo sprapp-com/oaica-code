@@ -346,7 +346,45 @@ func (h *Hermes) CurrentModel() string {
 	if yaml.Unmarshal(data, &cfg) != nil {
 		return ""
 	}
-	return hermesManagedCurrentModel(cfg, hermesBaseURL())
+	return hermesManagedCurrentModel(cfg)
+}
+
+// hermesConfiguredRemoteForBase returns the configured remote a Hermes endpoint
+// belongs to, if any. Reads the remote store only — no network — so it is safe
+// on every picker-state read.
+func hermesConfiguredRemoteForBase(baseURL string) (userRemote, bool) {
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, false
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == strings.TrimRight(baseURL, "/") {
+			return r, true
+		}
+	}
+	return userRemote{}, false
+}
+
+// hermesRemotePickerName maps a remote endpoint plus the upstream id written in
+// the config back to the picker name the launch used ("box/big-model"). The
+// config stores the bare upstream id, which the launcher cannot match against
+// what it saved, so CurrentModel translates it back. Returns "" when no
+// configured remote serves that endpoint under that id.
+func hermesRemotePickerName(baseURL, upstream string) string {
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" {
+		return ""
+	}
+	remote, ok := hermesConfiguredRemoteForBase(baseURL)
+	if !ok {
+		return ""
+	}
+	candidate := remote.Name + "/" + upstream
+	ep, ok := resolveRemoteEndpoint(candidate)
+	if !ok || strings.TrimRight(ep.BaseURL, "/") != strings.TrimRight(baseURL, "/") || ep.UpstreamModel != upstream {
+		return ""
+	}
+	return candidate
 }
 
 func (h *Hermes) Onboard() error {
@@ -766,7 +804,16 @@ func applyHermesManagedProviders(cfg map[string]any, baseURL string, model strin
 	cfg["custom_providers"] = customProviders
 }
 
-func hermesManagedCurrentModel(cfg map[string]any, baseURL string) string {
+// hermesManagedCurrentModel reports the model oaica wrote into cfg, or "".
+//
+// The endpoint is read FROM the config rather than passed in: Configure writes
+// two shapes — the daemon's /v1 for a local model, the remote's own base for a
+// user-remote model (hermesBaseURLFor) — and checking only against the daemon
+// made the remote shape, written by the same launch, read as a config oaica
+// never touched (2026-09-26 audit, tenth round). A non-daemon endpoint counts
+// only when a configured remote actually serves it; anything else is a foreign
+// config and still reports nothing.
+func hermesManagedCurrentModel(cfg map[string]any) string {
 	modelCfg, _ := cfg["model"].(map[string]any)
 	if modelCfg == nil {
 		return ""
@@ -778,8 +825,16 @@ func hermesManagedCurrentModel(cfg map[string]any, baseURL string) string {
 	}
 
 	configBaseURL, _ := modelCfg["base_url"].(string)
-	if hermesNormalizeURL(configBaseURL) != hermesNormalizeURL(baseURL) {
+	if strings.TrimSpace(configBaseURL) == "" {
 		return ""
+	}
+	remoteName := ""
+	if hermesNormalizeURL(configBaseURL) != hermesNormalizeURL(hermesBaseURL()) {
+		remote, ok := hermesConfiguredRemoteForBase(configBaseURL)
+		if !ok {
+			return ""
+		}
+		remoteName = remote.Name
 	}
 
 	current, _ := modelCfg["default"].(string)
@@ -798,7 +853,7 @@ func hermesManagedCurrentModel(cfg map[string]any, baseURL string) string {
 	}
 
 	apiURL, _ := entry["api"].(string)
-	if hermesNormalizeURL(apiURL) != hermesNormalizeURL(baseURL) {
+	if hermesNormalizeURL(apiURL) != hermesNormalizeURL(configBaseURL) {
 		return ""
 	}
 
@@ -807,6 +862,13 @@ func hermesManagedCurrentModel(cfg map[string]any, baseURL string) string {
 		return ""
 	}
 
+	// A remote config stores the bare upstream id; report the picker name the
+	// launch used, so this answer agrees with what the launcher saved.
+	if remoteName != "" {
+		if picker := hermesRemotePickerName(configBaseURL, current); picker != "" {
+			return picker
+		}
+	}
 	return current
 }
 
