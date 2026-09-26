@@ -876,6 +876,7 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 	}
 
 	var newModels []any
+	written := make(map[string]bool, len(models))
 	for _, m := range models {
 		entry, _ := openclawModelConfig(m)
 		// Merge existing fields (user customizations)
@@ -885,6 +886,30 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 					entry[k] = v
 				}
 			}
+		}
+		written[m.Name] = true
+		newModels = append(newModels, entry)
+	}
+	// Rows this launch did not write stay in the file, unless they are rows a
+	// previous launch wrote: the provider's list is oaica's to replace (a pinned
+	// contract — a deselected model must leave), but it is also where a user's
+	// own local models live, and publishing the selection alone deleted every
+	// one of them on an otherwise ordinary launch (2026-09-27 audit, round 21).
+	// openclawModelConfig always writes a "cost" object; an entry without one
+	// was not written by oaica, so it is carried over as it stands. An entry
+	// with no id cannot be matched to a launched model and is kept whole.
+	for _, raw := range existingModels {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			newModels = append(newModels, raw)
+			continue
+		}
+		id, _ := entry["id"].(string)
+		if id == "" || written[id] {
+			continue
+		}
+		if _, ours := entry["cost"]; ours {
+			continue
 		}
 		newModels = append(newModels, entry)
 	}
