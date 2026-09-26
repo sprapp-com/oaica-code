@@ -96,8 +96,24 @@ func (c *ClaudeDesktop) ConfigureAutodiscovery() error {
 			if err := writeClaudeDesktopMeta(target.meta, claudeDesktopProfileID, claudeDesktopProfileName); err != nil {
 				return err
 			}
-			// Before overwriting the profile's credential, remember what was there.
+			// Before overwriting the profile's credential, remember what was there
+			// — and get that memory onto disk before the overwrite, not at the end
+			// of the walk. Windows has two third-party profile roots and the
+			// second one's writes can fail on their own (a locked or unwritable
+			// directory, a path shadowed by a file); when they did, the whole
+			// mutate returned first and the state was published never, leaving
+			// the first root holding a key oaica wrote with no record of it. A
+			// later `--restore` then read that profile as one oaica had never
+			// touched and left the secret in place, with the failed configure as
+			// the only symptom the user ever saw. Publishing here is safe in the
+			// other direction too: a record whose profile write then fails makes
+			// restore put the same value back or delete a key that is not there
+			// (2026-09-27 audit, round 18). The lock is already held for the whole
+			// walk, so this is the same critical section, written twice.
 			if err := recordClaudeDesktopGatewayKeyInjection(restore, target.profile, key); err != nil {
+				return err
+			}
+			if err := writeClaudeDesktopRestoreState(*restore); err != nil {
 				return err
 			}
 			if err := writeClaudeDesktopGatewayProfile(target.profile, key, true); err != nil {
