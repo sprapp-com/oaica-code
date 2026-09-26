@@ -568,7 +568,11 @@ func WriteRemoteList(w io.Writer) error {
 		// redactBaseURL: a remote configured as https://key@host/v1 carries
 		// the credential in the URL's userinfo, and list output lands in
 		// terminals, shell history and tickets. Same fix as doctor's.
-		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", printableName(r.Name), redactBaseURL(r.BaseURL), printableName(d.Wire), printableName(d.ToolFormat), printableName(remoteAuthLabel(r)))
+		// printableName around it: redaction strips the credential but does not
+		// escape a control character, so this field — unlike every sibling in
+		// the row — could still forge a fabricated remote from a newline
+		// (2026-09-26 audit, round 16).
+		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", printableName(r.Name), printableName(redactBaseURL(r.BaseURL)), printableName(d.Wire), printableName(d.ToolFormat), printableName(remoteAuthLabel(r)))
 	}
 	return nil
 }
@@ -603,7 +607,10 @@ func WriteRemoteShow(w io.Writer, name string) error {
 	// login, from `auth_via`, or from base_url's userinfo (2026-09-26 audit).
 	key := authSourceProse(r.authSource())
 	fmt.Fprintf(w, "name:          %s\n", printableName(r.Name))
-	fmt.Fprintf(w, "base_url:      %s\n", redactBaseURL(r.BaseURL))
+	// printableName, like every field around it: redactBaseURL handles the
+	// credential in the URL's userinfo, but a control character in the field
+	// became a second field line in this output (2026-09-26 audit, round 16).
+	fmt.Fprintf(w, "base_url:      %s\n", printableName(redactBaseURL(r.BaseURL)))
 	// printableName, like the name above it: the version is the other field a
 	// control character in remotes.json turns into a second field line in this
 	// output (see validateRemoteVersion — add-time validation is not the only
