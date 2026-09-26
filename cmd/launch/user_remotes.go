@@ -408,11 +408,17 @@ func loadUserRemotes() ([]userRemote, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := make([]userRemote, 0, len(f.Remotes))
-	for _, r := range f.Remotes {
+	for i, r := range f.Remotes {
 		r.Name = strings.TrimSpace(r.Name)
 		r.BaseURL = strings.TrimRight(strings.TrimSpace(r.BaseURL), "/")
 		if r.Name == "" || r.BaseURL == "" {
-			continue // skip malformed entries rather than fail the whole file
+			// Skipped rather than failing the whole file, but not silently:
+			// this is the user's own hand-edited store, and a row dropped here
+			// is a remote that simply does not exist on every screen that
+			// lists them, with nothing saying which file or which row
+			// (2026-09-26 audit, tenth round).
+			warnSkippedRemoteRow(path, i+1, r)
+			continue
 		}
 		out = append(out, r)
 	}
@@ -426,6 +432,41 @@ func loadUserRemotes() ([]userRemote, error) {
 		}
 	}
 	return out, nil
+}
+
+// warnSkippedRemoteRow reports a remotes.json row that loadUserRemotes could
+// not use and therefore dropped: one with no name, no base_url, or neither.
+// Such a row is not merely unused — it is a remote that is absent from the
+// picker, from `remote list` and from `doctor` at once, and before this the
+// user had no way to learn that the cause was a row in their own file rather
+// than a box that was down, a key that was missing, or oaica ignoring them
+// (2026-09-26 audit, tenth round).
+//
+// Reported through noticeWriter from the loader itself, like the warning for a
+// store that cannot be read at all (warnUnreadableRemotesFile): this is the one
+// place every path that reads the store goes through, so the listing, doctor,
+// the picker and a "<remote>/<model>" lookup all say it. A skipped row is
+// therefore reported once per load, which can be more than once in a command —
+// deliberately, since the alternative is silence on whichever path the user
+// happened to take.
+func warnSkippedRemoteRow(path string, row int, r userRemote) {
+	who := fmt.Sprintf("row %d", row)
+	if r.Name != "" {
+		// printableName, not the raw field: remotes.json is hand-edited, and a
+		// name carrying a control character would forge a line in this warning
+		// exactly as it would in `remote list`.
+		who += " (" + printableName(r.Name) + ")"
+	}
+	reason := "it has no base_url"
+	switch {
+	case r.Name == "" && r.BaseURL == "":
+		reason = "it has neither a name nor a base_url"
+	case r.Name == "":
+		reason = "it has no name"
+	}
+	fmt.Fprintf(noticeWriter(),
+		"%sWarning: %s %s is skipped: %s — a remote needs both, so nothing this row configures is offered; fix the row or remove it.%s\n",
+		ansiYellow, path, who, reason, ansiReset)
 }
 
 // findUserRemoteForModel splits a "<remote>/<model>" picker name and returns
