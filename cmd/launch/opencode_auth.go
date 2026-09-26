@@ -2,6 +2,7 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,13 +33,30 @@ type opencodeAuthEntry struct {
 	Expires int64 `json:"expires"`
 }
 
-// OpencodeAuthPath returns the path to opencode's auth.json.
+// OpencodeAuthPath returns the modern path to opencode's auth.json. It is the
+// WRITE path only for a caller that has no readers — everything on the read
+// side goes through opencodeAuthPaths, which honours $OPENCODE_AUTH_FILE and
+// $XDG_DATA_HOME, so a writer using this constant directly could report
+// success for a key no reader would ever look for (2026-09-26 audit).
+// opencodeStorePath is the path the WRITER should use.
 func OpencodeAuthPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, ".local", "share", "opencode", "auth.json"), nil
+}
+
+// opencodeStorePath is the single store `oaica signin opencode:<provider>`
+// reads and writes: the FIRST location a reader would consult. Writing
+// anywhere else is what let the command print "Saved API key" while
+// opencodeCredential found nothing — with $OPENCODE_AUTH_FILE set (a
+// non-standard install, or a test) the readers consult that path and no other.
+func opencodeStorePath() (string, error) {
+	if paths := opencodeAuthPaths(); len(paths) > 0 {
+		return paths[0], nil
+	}
+	return "", errors.New("no opencode auth store location could be resolved")
 }
 
 // opencodeAuthPaths lists every place opencode's store may live, highest
@@ -145,7 +163,7 @@ func opencodeCredential(provider string) (externalCredential, bool) {
 // OpencodeKnownProviders lists provider ids already present in opencode's
 // auth.json, sorted, for offering as signin choices alongside "add a new one".
 func OpencodeKnownProviders() []string {
-	path, err := OpencodeAuthPath()
+	path, err := opencodeStorePath()
 	if err != nil {
 		return nil
 	}
@@ -161,10 +179,15 @@ func OpencodeKnownProviders() []string {
 	return names
 }
 
-// SaveOpencodeAPIKey writes/overwrites one provider's API key in opencode's
-// auth.json, preserving every other provider entry untouched.
+// SaveOpencodeAPIKey writes one provider's API key into the opencode store
+// readers use, preserving every other provider entry untouched.
+//
+// It refuses to replace an entry that is not itself an API key. An OAuth entry
+// carries a refresh token and an expiry that this command cannot re-mint — the
+// overwrite left the user with a store that looked signed in and was not, and
+// only `opencode auth login <provider>` could put it back (2026-09-26 audit).
 func SaveOpencodeAPIKey(provider, key string) error {
-	path, err := OpencodeAuthPath()
+	path, err := opencodeStorePath()
 	if err != nil {
 		return err
 	}
@@ -174,6 +197,11 @@ func SaveOpencodeAPIKey(provider, key string) error {
 	auth, err := readOpencodeAuth(path)
 	if err != nil {
 		return err
+	}
+	if entry, ok := auth[provider]; ok {
+		if t := strings.ToLower(strings.TrimSpace(entry.Type)); t != "" && t != "api" && t != "api_key" {
+			return fmt.Errorf("opencode already has a %q credential for %s (access token, refresh token and expiry) that an API key cannot replace — run `opencode auth login %s`, or remove that entry by hand first", entry.Type, provider, provider)
+		}
 	}
 	auth[provider] = opencodeAuthEntry{Type: "api", Key: key}
 

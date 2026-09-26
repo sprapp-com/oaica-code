@@ -327,6 +327,14 @@ type oaicaModelEntry struct {
 	// display-only picker name (e.g. ID "ollama/gpt-oss" → Upstream
 	// "gpt-oss:cloud"). Empty = ID is itself the upstream name.
 	Upstream string
+	// ContextLength and MaxOutputTokens are the router's own advertised
+	// windows ("context_length" / "max_completion_tokens" on /v1/models —
+	// tools/gateway/main.go emits both). The decoder used to drop them, which
+	// is why the documented "a genuinely live number always wins" layer was
+	// always empty: nothing downstream ever had a live number to win with
+	// (2026-09-26 audit). 0 = the router did not state one.
+	ContextLength   int
+	MaxOutputTokens int
 }
 
 // oaicaLiveModelEntries fetches /v1/models including each model's
@@ -529,6 +537,11 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 			Description string `json:"description"`
 			Stars       int    `json:"stars"`
 			Status      string `json:"status"`
+			// The gateway's own advertised windows (see oaicaModelEntry).
+			// Both are omitted when the gateway does not know them, so a
+			// missing field and a zero are the same thing here.
+			ContextLength       int `json:"context_length"`
+			MaxCompletionTokens int `json:"max_completion_tokens"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
@@ -536,7 +549,14 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 	}
 	entries := make([]oaicaModelEntry, 0, len(list.Data))
 	for _, m := range list.Data {
-		entries = append(entries, oaicaModelEntry{ID: m.ID, Description: m.Description, Stars: m.Stars, Unhealthy: m.Status == "unhealthy"})
+		entries = append(entries, oaicaModelEntry{
+			ID:              m.ID,
+			Description:     m.Description,
+			Stars:           m.Stars,
+			Unhealthy:       m.Status == "unhealthy",
+			ContextLength:   m.ContextLength,
+			MaxOutputTokens: m.MaxCompletionTokens,
+		})
 	}
 	return entries, respETag, nil
 }

@@ -305,19 +305,49 @@ func GenerateSection(ctx context.Context, llm LLM, sp Spec, sec Section, existin
 	return "", lastErr
 }
 
+// sectionTagEnd returns the index of the '>' closing a LEADING <section ...>
+// opening tag, or -1 when frag does not begin with one.
+//
+// Every offset here comes from frag itself. strings.ToLower can change a
+// rune's UTF-8 byte length, so an offset taken from a folded copy indexes the
+// wrong byte of the original — and a fragment that came out of Sanitize and
+// is spliced with that offset puts attribute-VALUE bytes into attribute-NAME
+// position, producing a live event handler in the stored page (2026-09-26
+// audit).
+func sectionTagEnd(frag string) int {
+	const open = "<section"
+	if len(frag) < len(open) || !strings.EqualFold(frag[:len(open)], open) {
+		return -1
+	}
+	if len(frag) > len(open) {
+		switch frag[len(open)] {
+		case ' ', '\t', '\n', '\r', '>', '/':
+		default:
+			return -1
+		}
+	}
+	return strings.IndexByte(frag, '>')
+}
+
 // ensureSectionID forces the id the plan assigned so nav anchors always
 // resolve, and the kind class so the theme applies.
 func ensureSectionID(frag string, sec Section) string {
-	lower := strings.ToLower(frag)
-	end := strings.Index(lower, ">")
-	if !strings.HasPrefix(lower, "<section") || end < 0 {
+	end := sectionTagEnd(frag)
+	if end < 0 {
 		return frag
 	}
 	classes := "sec sec-" + sec.Kind
 	open := frag[:end]
 	// drop any existing id/class from the opening tag, then re-add ours
 	open = regexp.MustCompile(`(?i)\s+(id|class)="[^"]*"`).ReplaceAllString(open, "")
-	return fmt.Sprintf(`%s id="%s" class="%s"%s`, open, html.EscapeString(sec.ID), classes, frag[end:])
+	rebuilt := fmt.Sprintf(`%s id="%s" class="%s"%s`, open, html.EscapeString(sec.ID), classes, frag[end:])
+	// The splice writes into attribute position, so re-assert the allowlist on
+	// the result: nothing reaches the store that a browser parses as a handler
+	// or as a URL the sanitizer would have refused.
+	if rendered := renderAllowlisted(rebuilt); rendered != "" {
+		return rendered
+	}
+	return rebuilt
 }
 
 // ---------- build / edit ----------
@@ -546,10 +576,27 @@ func Load(dir string) (*Site, error) {
 		}
 		b, err := os.ReadFile(filepath.Join(st, sectionsDir, name))
 		if err == nil {
-			s.Fragments[sec.ID] = string(b)
+			s.Fragments[sec.ID] = sanitizeStoredFragment(string(b))
 		}
 	}
 	return &s, nil
+}
+
+// sanitizeStoredFragment re-applies the allowlist to a fragment read off
+// disk. Stored state is data like any other: a section file may predate the
+// current pipeline (an older version's output, a restored backup, a hand edit,
+// a site directory received from someone), and Load is the single place every
+// read path funnels through. Sanitize is preferred because it also isolates
+// the section element; a fragment with no <section> is still re-rendered
+// through the allowlist rather than passed through verbatim.
+func sanitizeStoredFragment(b string) string {
+	if strings.TrimSpace(b) == "" {
+		return ""
+	}
+	if frag := Sanitize(b); frag != "" {
+		return frag
+	}
+	return strings.TrimSpace(renderAllowlisted(b))
 }
 
 // Export copies the publishable files (everything except StateDir) into dst.

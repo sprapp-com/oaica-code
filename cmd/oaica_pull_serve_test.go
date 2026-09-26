@@ -27,6 +27,8 @@ func withTempOaicaHome(t *testing.T) {
 
 func TestAutoPopulateModelManifest_CreatesEntry(t *testing.T) {
 	withTempOaicaHome(t)
+	restoreHF := hfURLIsTrustedForTest()
+	defer restoreHF()
 
 	autoPopulateModelManifest("my-model", "/home/x/.oaica/models/my-model.gguf")
 
@@ -47,6 +49,8 @@ func TestAutoPopulateModelManifest_CreatesEntry(t *testing.T) {
 
 func TestAutoPopulateModelManifest_NeverOverwritesExisting(t *testing.T) {
 	withTempOaicaHome(t)
+	restoreHF := hfURLIsTrustedForTest()
+	defer restoreHF()
 
 	// User already hand-configured this model with real detail.
 	if _, err := launch.ModelAdd(launch.ModelAddOptions{
@@ -83,6 +87,8 @@ func TestAutoPopulateModelManifest_NeverPanicsOnManifestError(t *testing.T) {
 // on the old "source=hf but no decrypt_key" guard.
 func TestOaicaPullFromHF_PlaintextNoDecryptKey(t *testing.T) {
 	withTempOaicaHome(t)
+	restoreHF := hfURLIsTrustedForTest()
+	defer restoreHF()
 	payload := []byte("GGUF plaintext weights")
 	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(payload)
@@ -114,6 +120,8 @@ func TestOaicaPullFromHF_PlaintextNoDecryptKey(t *testing.T) {
 
 func TestOaicaPullFromHF_PlaintextSHAMismatchCleansUp(t *testing.T) {
 	withTempOaicaHome(t)
+	restoreHF := hfURLIsTrustedForTest()
+	defer restoreHF()
 	payload := []byte("GGUF plaintext weights")
 	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(payload)
@@ -139,6 +147,8 @@ func TestOaicaPullFromHF_PlaintextSHAMismatchCleansUp(t *testing.T) {
 
 func TestOaicaPullFromHF_PlaintextSizeMismatchCleansUp(t *testing.T) {
 	withTempOaicaHome(t)
+	restoreHF := hfURLIsTrustedForTest()
+	defer restoreHF()
 	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("short"))
 	}))

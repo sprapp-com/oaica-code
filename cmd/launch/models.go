@@ -79,16 +79,20 @@ var (
 
 // lookupCloudModelLimit returns the token limits for a cloud model.
 // It normalizes explicit cloud source suffixes before checking the shared limit map.
+// A row is only a limit if it states a window both ways: every caller reads
+// ok as "this window is known" and writes l.Context into the environment
+// unexamined (tier_routing.go, codex.go, kimi.go, claude.go), where a zero
+// silently disables the auto-compact ceiling it is meant to set.
 func lookupCloudModelLimit(name string) (cloudModelLimit, bool) {
 	base, stripped := modelref.StripCloudSourceTag(name)
 	if stripped {
 		dynamicCloudModelLimitsMu.RLock()
 		l, ok := dynamicCloudModelLimits[base]
 		dynamicCloudModelLimitsMu.RUnlock()
-		if ok {
+		if ok && l.Context > 0 && l.Output > 0 {
 			return l, true
 		}
-		if l, ok := cloudModelLimits[base]; ok {
+		if l, ok := cloudModelLimits[base]; ok && l.Context > 0 && l.Output > 0 {
 			return l, true
 		}
 	}

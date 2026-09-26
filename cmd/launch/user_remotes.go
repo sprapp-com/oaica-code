@@ -853,13 +853,27 @@ func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]Laun
 		// and so the picker shows WHERE a model runs.
 		display := remoteDisplayID(id)
 		seen[display] = true
-		rm = append(rm, LaunchModel{
+		row := LaunchModel{
 			Name:         r.Name + "/" + display,
 			Remote:       true,
 			Wire:         d.Wire,
 			ToolFormat:   d.ToolFormat,
 			ToolReliable: d.ToolReliable,
-		}.WithCloudLimits())
+		}.WithCloudLimits()
+		// The sweep wins the id collision, but it carries no window to
+		// collide WITH: a /v1/models response lists ids. Without this, an id
+		// the catalog declares a window for came out at 0 and the launch fell
+		// back to defaultAgentContextLength (128000) on a vendor whose real
+		// window is 400000 (2026-09-26 audit).
+		if lim, ok := declared[id]; ok {
+			if row.ContextLength <= 0 {
+				row.ContextLength = lim.Context
+			}
+			if row.MaxOutputTokens <= 0 {
+				row.MaxOutputTokens = lim.Output
+			}
+		}
+		rm = append(rm, row)
 	}
 	extra := make([]string, 0, len(declared))
 	for id := range declared {

@@ -462,6 +462,13 @@ func pickerCacheInputPaths() []string {
 	if p, err := providerCatalogCachePath(); err == nil {
 		add(p)
 	}
+	// The synced cloud-limits catalog: its numbers are the window a cloud
+	// row is sized against (and the CLAUDE_CODE_* pair a launch exports), so
+	// `oaica model cloud-limits sync` changes the answer while no other input
+	// moves — the same reason providerCatalogCachePath is here.
+	if p, err := cloudLimitsCatalogCachePath(); err == nil {
+		add(p)
+	}
 	if p, err := oaicaLocalServersRegistryPath(); err == nil {
 		add(p)
 	}

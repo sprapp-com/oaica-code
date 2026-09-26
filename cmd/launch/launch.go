@@ -1514,9 +1514,11 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 			// Ollama's cloud catalog: own section, one explanation in the
 			// header instead of the same line repeated on all 18 rows.
 			items = append(items, ModelItem{
-				Name:        m.ID,
-				Recommended: true,
-				OllamaCloud: true,
+				Name:            m.ID,
+				Recommended:     true,
+				OllamaCloud:     true,
+				Details:         api.ModelDetails{ContextLength: m.ContextLength},
+				MaxOutputTokens: m.MaxOutputTokens,
 			})
 			continue
 		}
@@ -1530,6 +1532,13 @@ func (c *launcherClient) requestRecommendations(ctx context.Context) ([]ModelIte
 			Recommended:       true,
 			Local:             isLocal,
 			AvailabilityBadge: badge,
+			// The router's own windows, when it states them. Everything that
+			// sizes a session reads them from here (codex's context_window,
+			// the CLAUDE_CODE_* pairs, the picker's row detail), and
+			// cloudModelLimitsFromRecommendations below turns them into the
+			// per-launch limit layer that outranks both catalogs.
+			Details:         api.ModelDetails{ContextLength: m.ContextLength},
+			MaxOutputTokens: m.MaxOutputTokens,
 		})
 	}
 	for _, entry := range loraEntries {

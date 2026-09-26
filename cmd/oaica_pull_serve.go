@@ -59,15 +59,7 @@ import (
 // serves everything over TLS, so refusing anything that is not https costs
 // nothing but the throttle.
 func hfHostAcceptsToken(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	if u.Scheme != "https" {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	return host == "huggingface.co" || strings.HasSuffix(host, ".huggingface.co")
+	return hfURLIsTrusted(rawURL)
 }
 
 // oaicaHFToken opportunistically finds a HuggingFace token for faster HF
@@ -150,6 +142,9 @@ func oaicaModelsDir() (string, error) {
 }
 
 func oaicaModelPath(model string) (string, error) {
+	if err := validateModelName(model); err != nil {
+		return "", err
+	}
 	dir, err := oaicaModelsDir()
 	if err != nil {
 		return "", err
@@ -312,7 +307,11 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 	if key := oaicaLicenseKey(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	// Redirects refused: this request carries the distribution licence as a
+	// bearer, and net/http's rule for re-sending it compares hostnames only —
+	// a redirect to the same name on another port or a plaintext scheme keeps
+	// the credential. The router's manifest endpoint answers directly.
+	client := pullHTTPClient(noRedirects, 15*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -408,29 +407,39 @@ func oaicaPullModel(model string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// The distribution licence, NOT the router API key: these bytes are the
+	// paid artifact, and the entitlement for them is the licence. oaicaAuthorize
+	// (and so OAICA_API_KEY and the OAICA_HOST userinfo form) is deliberately
+	// not attached here — a machine whose only credential is the userinfo key
+	// gets a visible 401 from the router rather than a silently different
+	// entitlement path (2026-09-26 audit, B-aside: documented, not changed).
 	if key := oaicaLicenseKey(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	client := &http.Client{Timeout: 0} // large file, no overall timeout
+	client := pullHTTPClient(noRedirects, 0) // large file, no overall timeout; bounded by size + stall guard instead
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("pull failed: %w", err)
+		return "", launch.RedactError(fmt.Errorf("pull failed: %w", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("pull failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("pull failed: HTTP %d: %s", resp.StatusCode, readPullErrorBody(resp.Body))
 	}
 
 	tmpPath := destPath + ".partial"
-	f, err := os.Create(tmpPath)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
 	fmt.Fprintf(os.Stderr, "pulling %s (%s)...\n", model, humanBytes(manifest.SizeBytes))
-	written, err := io.Copy(f, &progressReader{r: resp.Body, total: manifest.SizeBytes, label: model})
+	src := io.Reader(newStallGuard(resp.Body, pullStallTimeout))
+	if manifest.SizeBytes > 0 {
+		src = newCappedReader(src, manifest.SizeBytes)
+	}
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(f, hasher), &progressReader{r: src, total: manifest.SizeBytes, label: model})
 	if err != nil {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("pull interrupted: %w", err)
@@ -441,6 +450,16 @@ func oaicaPullModel(model string) (string, error) {
 	if manifest.SizeBytes > 0 && written != manifest.SizeBytes {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("pull incomplete: got %d bytes, expected %d", written, manifest.SizeBytes)
+	}
+	// The HF plaintext path checks this digest; so must this one. Without it a
+	// manifest's size is the only thing between the router and the installed
+	// model, and size_bytes: 0 removes even that.
+	if manifest.SHA256 != nil && strings.TrimSpace(*manifest.SHA256) != "" {
+		got := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(got, strings.TrimSpace(*manifest.SHA256)) {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("sha256 mismatch: got %s, expected %s", got, strings.TrimSpace(*manifest.SHA256))
+		}
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return "", err
@@ -458,6 +477,13 @@ func oaicaPullModel(model string) (string, error) {
 func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (string, error) {
 	if manifest.HFURL == nil {
 		return "", fmt.Errorf("router said source=hf but didn't include hf_url")
+	}
+	// The allowlist hfHostAcceptsToken applies to the TOKEN, applied to the
+	// request itself: hf_url chooses the host, so without this the router could
+	// name loopback, the LAN, or a metadata endpoint and this command would
+	// fetch it and install the body as the model.
+	if !hfURLIsTrusted(*manifest.HFURL) {
+		return "", fmt.Errorf("router sent an hf_url that is not an https HuggingFace URL; refusing to fetch it")
 	}
 	// decrypt_key is optional: the gateway catalog serves PUBLIC, plaintext
 	// GGUFs with decrypt_key: null (shipping a key for a plaintext blob would
@@ -488,23 +514,24 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 		// this machine's HuggingFace token as a bearer on the next pull.
 		req.Header.Set("Authorization", "Bearer "+hfToken)
 	}
-	client := &http.Client{Timeout: 0}
+	client := pullHTTPClient(trustedHostRedirects(hfURLIsTrusted), 0)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("HF download failed: %w", err)
+		return "", launch.RedactError(fmt.Errorf("HF download failed: %w", err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HF download failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("HF download failed: HTTP %d: %s", resp.StatusCode, readPullErrorBody(resp.Body))
 	}
 
 	tmpPath := destPath + ".partial"
-	f, err := os.Create(tmpPath)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+
+	body := io.Reader(newStallGuard(resp.Body, pullStallTimeout))
 
 	if key == nil {
 		// Plaintext blob: stream it straight through, verifying size and (when
@@ -512,7 +539,11 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 		// tag provides on the encrypted path.
 		fmt.Fprintf(os.Stderr, "pulling %s from HuggingFace (%s)...\n", model, humanBytes(manifest.SizeBytes))
 		hasher := sha256.New()
-		written, err := io.Copy(io.MultiWriter(f, hasher), &progressReader{r: resp.Body, total: manifest.SizeBytes, label: model})
+		src := body
+		if manifest.SizeBytes > 0 {
+			src = newCappedReader(src, manifest.SizeBytes)
+		}
+		written, err := io.Copy(io.MultiWriter(f, hasher), &progressReader{r: src, total: manifest.SizeBytes, label: model})
 		if err != nil {
 			os.Remove(tmpPath)
 			return "", fmt.Errorf("pull interrupted: %w", err)
@@ -539,21 +570,28 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	}
 
 	fmt.Fprintf(os.Stderr, "pulling %s from HuggingFace (%s encrypted, decrypting as it streams)...\n", model, humanBytes(manifest.SizeBytes))
-	// No exact-size verification here (unlike the R2/fallback path) —
-	// manifest.SizeBytes is the ENCRYPTED blob's size, not the decrypted
-	// plaintext size (chunked AES-GCM adds ~32 bytes/8MB-chunk overhead),
-	// so they'll never match exactly. GCM's authentication tag already
-	// catches truncation/corruption per-chunk (decryptChunkedAESGCMStream
-	// errors out immediately on a bad tag) — that's the real integrity
-	// check here, a byte-count comparison would just be redundant and
-	// wrong given the size mismatch.
-	written, err := decryptChunkedAESGCMStream(&progressReader{r: resp.Body, total: manifest.SizeBytes, label: model}, f, key)
+	// The plaintext size is not comparable to manifest.SizeBytes — that is the
+	// ENCRYPTED blob's size (chunked AES-GCM adds ~32 bytes/chunk), so the
+	// check belongs on the CIPHERTEXT the frame reader consumed: GCM
+	// authenticates each chunk, but a blob that stops exactly on a chunk
+	// boundary decrypts cleanly and is not complete (2026-09-26 audit).
+	// Counting what came off the wire is what tells the two apart.
+	ct := &countingReader{r: body}
+	if manifest.SizeBytes > 0 {
+		ct.r = newCappedReader(ct.r, manifest.SizeBytes)
+	}
+	written, err := decryptChunkedAESGCMStream(&progressReader{r: ct, total: manifest.SizeBytes, label: model}, f, key)
 	if err != nil {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("pull/decrypt interrupted: %w", err)
 	}
 	f.Close()
 	fmt.Fprintln(os.Stderr)
+
+	if manifest.SizeBytes > 0 && ct.n != manifest.SizeBytes {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("pull incomplete: got %d encrypted bytes, expected %d — the transfer stopped early", ct.n, manifest.SizeBytes)
+	}
 	_ = written
 
 	if err := os.Rename(tmpPath, destPath); err != nil {
@@ -591,6 +629,12 @@ func decryptChunkedAESGCMStream(r io.Reader, w io.Writer, key []byte) (int64, er
 			return written, fmt.Errorf("reading chunk length: %w", err)
 		}
 		ctLen := binary.BigEndian.Uint32(lenBuf)
+		// Bound BEFORE allocating: this is a 4-byte field the sender writes,
+		// and make([]byte, ctLen) on 0xFFFFFFFF is a 4 GiB allocation from a
+		// 17-byte response — a fatal OOM the sender chooses (2026-09-26 audit).
+		if ctLen == 0 || ctLen > maxEncryptedChunkBytes || ctLen < uint32(gcm.Overhead()) {
+			return written, fmt.Errorf("chunk length %d is out of range (max %d)", ctLen, maxEncryptedChunkBytes)
+		}
 		if _, err := io.ReadFull(r, nonceBuf); err != nil {
 			return written, fmt.Errorf("reading nonce: %w", err)
 		}

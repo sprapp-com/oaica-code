@@ -45,25 +45,82 @@ func cloudLimitsCatalogCachePath() (string, error) {
 }
 
 // cloudLimitsFromCatalog merges the embedded default with the synced
-// override (synced entries win by key). Errors reading/parsing either
-// source are swallowed — same "degrade to fewer known limits, never crash"
-// stance as providerCatalog().
+// override. Errors reading/parsing either source are swallowed — same
+// "degrade to fewer known limits, never crash" stance as providerCatalog().
+//
+// The merge follows provider_catalog.go's two rules, which this catalog was
+// missing (2026-09-26 audit):
+//
+//   - a synced row ADDS aliases the embedded default does not list, at any
+//     version — that is what sync is for;
+//   - a synced row REPLACES a value the embedded default already states only
+//     when the synced document bumps its own version above the embedded one.
+//     A synced file is of unknown age; without the gate a cache fetched when a
+//     window was wrong outranked the binary forever, and nothing could correct
+//     it (provider_catalog.go: "treating it as newer than the binary is how
+//     both a dropped field and a stale endpoint reached real hosts").
+//
+// Zero means "states nothing" throughout these catalogs (see
+// mergeDeclaredModelLimits), and here it is also what keeps a row out of the
+// table: a limit with no context is not a limit, and its Context was written
+// verbatim into CLAUDE_CODE_MAX_CONTEXT_TOKENS / AUTO_COMPACT_WINDOW /
+// codex's context_window — where 0 turns auto-compact off instead of on.
 func cloudLimitsFromCatalog() map[string]cloudModelLimit {
-	out := map[string]cloudModelLimit{}
-	add := func(b []byte) {
-		var f cloudLimitsCatalogFile
-		if json.Unmarshal(b, &f) != nil {
-			return
-		}
-		for k, v := range f.Limits {
-			out[k] = v
-		}
+	embedded, embeddedVersion := parseCloudLimitsCatalog(cloudLimitsEmbeddedDefault)
+	if embedded == nil {
+		embedded = map[string]cloudModelLimit{}
 	}
-	add(cloudLimitsEmbeddedDefault)
+	merged := make(map[string]cloudModelLimit, len(embedded))
+	for k, v := range embedded {
+		merged[k] = v
+	}
+
+	var synced map[string]cloudModelLimit
+	syncedVersion := 0
 	if path, err := cloudLimitsCatalogCachePath(); err == nil {
 		if b, err := os.ReadFile(path); err == nil {
-			add(b)
+			synced, syncedVersion = parseCloudLimitsCatalog(b)
 		}
 	}
-	return out
+	newer := syncedVersion > embeddedVersion
+	for name, l := range synced {
+		if l.Context <= 0 || l.Output <= 0 {
+			// Zero states nothing: keep whatever the embedded row said, and if
+			// there is no embedded row this alias simply has no known window.
+			continue
+		}
+		if prev, ok := merged[name]; ok && !newer {
+			// A same-or-older document may only fill in a field the embedded
+			// row left unstated, never overrule one it carries.
+			if prev.Context <= 0 {
+				prev.Context = l.Context
+			}
+			if prev.Output <= 0 {
+				prev.Output = l.Output
+			}
+			merged[name] = prev
+			continue
+		}
+		merged[name] = l
+	}
+
+	// A row that states no usable window is dropped rather than kept as a
+	// zero-valued limit any caller would act on.
+	for name, l := range merged {
+		if l.Context <= 0 || l.Output <= 0 {
+			delete(merged, name)
+		}
+	}
+	return merged
+}
+
+// parseCloudLimitsCatalog parses a catalog document, returning its rows and
+// its declared version. A document that does not parse yields a nil map and
+// version 0 — the caller keeps the other side rather than losing everything.
+func parseCloudLimitsCatalog(b []byte) (map[string]cloudModelLimit, int) {
+	var f cloudLimitsCatalogFile
+	if json.Unmarshal(b, &f) != nil {
+		return nil, 0
+	}
+	return f.Limits, f.Version
 }

@@ -60,9 +60,19 @@ var allowedAttrs = map[string]bool{
 
 // safeURL accepts relative, fragment, http(s), mailto and tel URLs only.
 // data: and javascript: (in any casing or with leading whitespace) are out.
+//
+// A leading "//" is NOT a relative path: the browser resolves it against the
+// document's scheme and loads it from another origin. WHATWG folds "\\" and
+// "/\" to the same thing in a special-scheme relative URL, so every slash /
+// backslash spelling of a double leading separator is refused. This was found
+// by the 2026-09-26 audit: "//evil.example/phish" was emitted verbatim into a
+// deployed page.
 func safeURL(raw string) (string, bool) {
 	u := strings.TrimSpace(raw)
 	if u == "" {
+		return "", false
+	}
+	if isProtocolRelative(u) {
 		return "", false
 	}
 	lower := strings.ToLower(u)
@@ -80,20 +90,74 @@ func safeURL(raw string) (string, bool) {
 	return "", false
 }
 
+// isProtocolRelative reports whether u begins with a doubled slash separator
+// in any of the spellings a browser treats as one.
+func isProtocolRelative(u string) bool {
+	if len(u) < 2 {
+		return false
+	}
+	slash := func(b byte) bool { return b == '/' || b == '\\' }
+	return slash(u[0]) && slash(u[1])
+}
+
+var srcsetDescriptorRe = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?[wx]$`)
+
+// safeSrcset validates every candidate in a srcset value. Each candidate is a
+// URL plus an optional density/width descriptor ("2x", "640w"); the URL gets
+// the same check as src. The WHOLE attribute is dropped if any candidate is
+// unsafe — a partly-trusted srcset still hands the browser an attacker URL.
+// (2026-09-26 audit: srcset was allowlisted but never URL-checked.)
+func safeSrcset(raw string) (string, bool) {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, c := range parts {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			return "", false
+		}
+		fields := strings.Fields(c)
+		u, ok := safeURL(fields[0])
+		if !ok {
+			return "", false
+		}
+		desc := ""
+		if len(fields) > 1 {
+			if len(fields) != 2 || !srcsetDescriptorRe.MatchString(fields[1]) {
+				return "", false
+			}
+			desc = " " + fields[1]
+		}
+		out = append(out, u+desc)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, ", "), true
+}
+
+var (
+	sectionOpenRe  = regexp.MustCompile(`(?i)<section(?:\s|>|/|$)`)
+	sectionCloseRe = regexp.MustCompile(`(?i)</section\s*>`)
+)
+
 // stripWrapping removes reasoning blocks and markdown fences, then isolates
 // the first <section> element. Returns "" if no section tag is present.
+//
+// The scan runs case-insensitively OVER THE ORIGINAL STRING via regexp, never
+// by folding to lower case and slicing with those offsets: several runes (İ
+// U+0130, Ⱥ U+023A, ẞ, Ω U+2126, …) change UTF-8 length when lowercased, which
+// desynchronises the two strings and sliced this fragment out of range — a
+// PANIC on model output, which is remote input (2026-09-26 audit).
 func stripWrapping(raw string) string {
 	s := thinkRe.ReplaceAllString(raw, "")
 	s = fenceRe.ReplaceAllString(s, "")
-	lower := strings.ToLower(s)
-	start := strings.Index(lower, "<section")
-	if start < 0 {
+	loc := sectionOpenRe.FindStringIndex(s)
+	if loc == nil {
 		return ""
 	}
-	s = s[start:]
-	lower = lower[start:]
-	if end := strings.LastIndex(lower, "</section>"); end >= 0 {
-		s = s[:end+len("</section>")]
+	s = s[loc[0]:]
+	if closes := sectionCloseRe.FindAllStringIndex(s, -1); len(closes) > 0 {
+		s = s[:closes[len(closes)-1][1]]
 	} else {
 		s += "</section>"
 	}
@@ -124,8 +188,15 @@ func renderAllowlisted(fragment string) string {
 				continue
 			}
 			val := a.Val
-			if key == "href" || key == "src" {
+			switch key {
+			case "href", "src":
 				v, ok := safeURL(val)
+				if !ok {
+					continue
+				}
+				val = v
+			case "srcset":
+				v, ok := safeSrcset(val)
 				if !ok {
 					continue
 				}
