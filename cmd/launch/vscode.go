@@ -346,7 +346,13 @@ func (v *VSCode) updateSettings() {
 	}
 
 	var settings map[string]any
-	if err := json.Unmarshal(data, &settings); err != nil {
+	// UseNumber: settings.json is the user's file and it is written back whole
+	// below, to delete two legacy keys. Through float64 every number in it is
+	// re-encoded from a float64, so an integer above 2^53 changes value and
+	// 1.0 becomes 1 (2026-09-26 audit).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&settings); err != nil {
 		return
 	}
 

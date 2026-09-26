@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -742,7 +743,13 @@ func readClaudeDesktopJSON(path string) (map[string]any, error) {
 		return nil, err
 	}
 	var cfg map[string]any
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	// UseNumber: the caller writes this document back whole, so every number
+	// in it has to survive decoding exactly. Through float64 an integer above
+	// 2^53 changes value and 1.0 becomes 1 — oaica edited a file it was only
+	// asked to add a profile to (2026-09-26 audit).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
 	}
 	if cfg == nil {

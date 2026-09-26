@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -160,7 +161,14 @@ func clineModelIDFor(model string) string {
 func readClineConfig(configPath string) (map[string]any, error) {
 	config := make(map[string]any)
 	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, &config); err != nil {
+		// UseNumber: this document is the user's, and oaica writes it back
+		// whole after adding one provider entry. Decoding into map[string]any
+		// makes every number in it a float64, so an integer larger than 2^53
+		// comes back as a different number and 1.0 comes back as 1 — a config
+		// changed by a command that only meant to add a key (2026-09-26 audit).
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&config); err != nil {
 			return nil, fmt.Errorf("failed to parse config: %w, at: %s", err, configPath)
 		}
 	} else if !os.IsNotExist(err) {
