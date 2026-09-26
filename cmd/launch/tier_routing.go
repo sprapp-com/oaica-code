@@ -394,6 +394,14 @@ func routeForDisguised(primary, leg launchEndpoint) proxyRoute {
 //
 // When the primary is not a user remote, the generic resolver applies.
 func resolveSecondaryEndpoint(primary launchEndpoint, sonnetModel string) (launchEndpoint, error) {
+	// Trimmed here, like resolveLaunchEndpoint trims the primary and
+	// agent_routing.go's flag extraction trims the tier flags. A padded value
+	// matched no remote namespace, no alias, no ":local" suffix and no native
+	// tier, so it fell through to the "on the primary's remote" contract and
+	// ran the tier on the PRIMARY's host with the PRIMARY's credential, under a
+	// model id no backend serves — the user asked for another remote's model
+	// and silently got their primary's backend (2026-09-26 audit, tenth round).
+	sonnetModel = strings.TrimSpace(sonnetModel)
 	// A user alias wins in a tier slot exactly as it does in the primary slot
 	// (resolveLaunchEndpoint resolves it first, before every other source).
 	// Without this the alias NAME was treated as a literal upstream id and, at

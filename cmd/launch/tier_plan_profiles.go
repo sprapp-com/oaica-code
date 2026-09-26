@@ -183,7 +183,14 @@ func PlanSet(name string, profile TierPlanProfile) error {
 	if len(name) > maxPlanNameLength {
 		return fmt.Errorf("plan name %d chars exceeds the %d-char limit", len(name), maxPlanNameLength)
 	}
-	if strings.TrimSpace(profile.Model) == "" {
+	// Normalised on write for every slot, not just the one emptiness is
+	// checked on: these strings become launch args and tier resolution inputs,
+	// and a padded one is not the model the user named — see
+	// resolveSecondaryEndpoint (2026-09-26 audit, tenth round).
+	profile.Model = strings.TrimSpace(profile.Model)
+	profile.SonnetModel = strings.TrimSpace(profile.SonnetModel)
+	profile.HaikuModel = strings.TrimSpace(profile.HaikuModel)
+	if profile.Model == "" {
 		return errors.New("--model is required")
 	}
 	if profile.RoutePolicy != "" {
@@ -319,15 +326,18 @@ func resolvePlanModels(planName, model, sonnetModel, haikuModel string) (resolve
 	}
 	resolvedModel = model
 	if resolvedModel == "" {
-		resolvedModel = prof.Model
+		resolvedModel = strings.TrimSpace(prof.Model)
 	}
 	resolvedSonnet = sonnetModel
 	if resolvedSonnet == "" {
-		resolvedSonnet = prof.SonnetModel
+		// Trimmed on the way out as well as on the way in: plans.json is
+		// hand-editable and plans written by earlier versions carry whatever
+		// was typed (2026-09-26 audit, tenth round).
+		resolvedSonnet = strings.TrimSpace(prof.SonnetModel)
 	}
 	resolvedHaiku = haikuModel
 	if resolvedHaiku == "" {
-		resolvedHaiku = prof.HaikuModel
+		resolvedHaiku = strings.TrimSpace(prof.HaikuModel)
 	}
 	return resolvedModel, resolvedSonnet, resolvedHaiku, nil
 }
