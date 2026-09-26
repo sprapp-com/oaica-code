@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -347,14 +346,13 @@ func writeHermesConfig(configPath, model string, models []string) error {
 	}
 	yamlDeleteKey(providersNode, hermesLegacyKey)
 
-	customValue, err := yamlNodeAsAny(yamlNodeValue(root, "custom_providers"))
-	if err != nil {
-		return fmt.Errorf("parse hermes custom providers: %w", err)
-	}
-	if customProviders := hermesWithoutManagedCustomProviders(customValue); len(customProviders) == 0 {
+	// Filtered as nodes, not as a decoded map: oaica removes the one entry it
+	// owns and must leave the entries it does not — comments, key order,
+	// formatting — exactly as the user wrote them (2026-09-27 audit, round 18).
+	if customProviders := hermesPreservedCustomProvidersNode(yamlNodeValue(root, "custom_providers")); customProviders == nil {
 		yamlDeleteKey(root, "custom_providers")
-	} else if err := yamlSetValue(root, "custom_providers", customProviders); err != nil {
-		return err
+	} else {
+		yamlSetNode(root, "custom_providers", customProviders)
 	}
 
 	// launch writes the minimum provider/default-model settings needed to
@@ -375,13 +373,9 @@ func writeHermesConfig(configPath, model string, models []string) error {
 
 	// use Hermes' built-in web toolset for now.
 	// TODO(parthsareen): move this to using Ollama web search
-	toolsetsValue, err := yamlNodeAsAny(yamlNodeValue(root, "toolsets"))
-	if err != nil {
-		return fmt.Errorf("parse hermes toolsets: %w", err)
-	}
-	if err := yamlSetValue(root, "toolsets", mergeHermesToolsets(toolsetsValue)); err != nil {
-		return err
-	}
+	// Appended as a node for the same reason as custom_providers above: the
+	// user's own toolsets are theirs, comments included.
+	yamlSetNode(root, "toolsets", hermesToolsetsNode(yamlNodeValue(root, "toolsets")))
 
 	data, err := yamlMarshalDocument(document)
 	if err != nil {
@@ -1063,54 +1057,95 @@ func hermesStringListAny(models []string) []any {
 	return out
 }
 
-func mergeHermesToolsets(current any) any {
-	added := false
-	switch existing := current.(type) {
-	case []any:
-		out := make([]any, 0, len(existing)+1)
-		for _, item := range existing {
-			out = append(out, item)
-			if s, _ := item.(string); s == "web" {
-				added = true
-			}
-		}
-		if !added {
-			out = append(out, "web")
-		}
-		return out
-	case []string:
-		out := append([]string(nil), existing...)
-		if !slices.Contains(out, "web") {
-			out = append(out, "web")
-		}
-		asAny := make([]any, 0, len(out))
-		for _, item := range out {
-			asAny = append(asAny, item)
-		}
-		return asAny
-	case string:
-		if strings.TrimSpace(existing) == "" {
-			return []any{"hermes-cli", "web"}
-		}
-		parts := strings.Split(existing, ",")
-		out := make([]any, 0, len(parts)+1)
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			if part == "web" {
-				added = true
-			}
-			out = append(out, part)
-		}
-		if !added {
-			out = append(out, "web")
-		}
-		return out
-	default:
-		return []any{"hermes-cli", "web"}
+// hermesPreservedCustomProvidersNode returns the custom_providers sequence with
+// the entry oaica manages removed and every other entry kept as the node the
+// user wrote, or nil when nothing is left (the caller then deletes the key).
+//
+// A subtree oaica only FILTERS must not be re-encoded: decoding it to
+// map[string]any and writing the map back deleted the comments and formatting
+// inside every entry it deliberately preserved (2026-09-27 audit, round 18).
+func hermesPreservedCustomProvidersNode(current *yaml.Node) *yaml.Node {
+	if current == nil || current.Kind != yaml.SequenceNode {
+		return nil
 	}
+	preserved := *current
+	preserved.Content = nil
+	for _, item := range current.Content {
+		if hermesManagedCustomProviderNode(item) {
+			continue
+		}
+		preserved.Content = append(preserved.Content, item)
+	}
+	if len(preserved.Content) == 0 {
+		return nil
+	}
+	return &preserved
+}
+
+// hermesManagedCustomProviderNode reports whether a custom_providers entry is
+// the one oaica writes — the same test hermesManagedCustomProvider makes on a
+// decoded map, asked of the node instead.
+func hermesManagedCustomProviderNode(entry *yaml.Node) bool {
+	if entry == nil || entry.Kind != yaml.MappingNode {
+		return false
+	}
+	name := yamlNodeValue(entry, "name")
+	if name == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(name.Value), hermesProviderName)
+}
+
+// hermesToolsetsNode returns the toolsets sequence with "web" present, keeping
+// the user's own entries as the nodes they wrote. A value that is not a sequence
+// (a comma list, an empty value, a missing key) becomes one, as the encoder used
+// to produce it, but the value node's own comments travel with it.
+func hermesToolsetsNode(current *yaml.Node) *yaml.Node {
+	if current != nil && current.Kind == yaml.SequenceNode {
+		out := *current
+		out.Content = append([]*yaml.Node(nil), current.Content...)
+		if !hermesNodeListHas(&out, "web") {
+			out.Content = append(out.Content, hermesScalarNode("web"))
+		}
+		return &out
+	}
+
+	out := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	if current != nil {
+		out.HeadComment, out.LineComment, out.FootComment = current.HeadComment, current.LineComment, current.FootComment
+	}
+
+	var items []string
+	if current != nil && current.Kind == yaml.ScalarNode {
+		for _, part := range strings.Split(current.Value, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				items = append(items, part)
+			}
+		}
+	}
+	if len(items) == 0 {
+		items = []string{"hermes-cli"}
+	}
+	for _, item := range items {
+		out.Content = append(out.Content, hermesScalarNode(item))
+	}
+	if !hermesNodeListHas(out, "web") {
+		out.Content = append(out.Content, hermesScalarNode("web"))
+	}
+	return out
+}
+
+func hermesNodeListHas(sequence *yaml.Node, want string) bool {
+	for _, item := range sequence.Content {
+		if item.Kind == yaml.ScalarNode && item.Value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hermesScalarNode(value string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
 }
 
 func hermesAttachedCommand(name string, args ...string) *exec.Cmd {
