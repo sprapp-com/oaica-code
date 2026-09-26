@@ -185,6 +185,9 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 	if selected, ok := findLaunchModel(models, primary); ok {
 		primary = selected.Name
 	}
+	if err := deepSeekHarnessRejectRemoteModels(primary, models); err != nil {
+		return err
+	}
 
 	settingsPath, err := deepSeekHarnessSettingsPath()
 	if err != nil {
@@ -219,6 +222,49 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 		return err
 	}
 	return writeDeepSeekHarnessFile(patchPath, patchData)
+}
+
+// deepSeekHarnessRejectRemoteModels refuses a selection the harness settings
+// cannot route to.
+//
+// Every other integration that CAN translate a user-remote row does it with two
+// things the harness store does not have: one endpoint per provider block, and a
+// credential field. Harness settings hold a single llm-pi-ai provider (the
+// daemon's baseURL, with apiKeyEnv naming the OLLAMA_LAUNCH_DSH_API_KEY oaica
+// sets for the child), the web-search block points at that same daemon /v1, and
+// the model rows carry no endpoint or key of their own — so a remote row written
+// as id "box/big-model" is a name only the remote knows, posted to the daemon,
+// which does not resolve namespaced remotes. Every request fails model-not-found
+// after the launch has already validated a key, and the settings advertise the
+// model as available.
+//
+// Refusing here keeps the failure at the point the user can act on it. Same
+// shape and same answer as museRejectRemoteModels and codexAppRejectRemoteModels;
+// lift this when the harness store grows a per-provider credential.
+func deepSeekHarnessRejectRemoteModels(primary string, models []LaunchModel) error {
+	reported := map[string]bool{}
+	refuse := func(model LaunchModel) error {
+		name := strings.TrimSpace(model.Name)
+		if !model.Remote || name == "" || reported[name] {
+			return nil
+		}
+		reported[name] = true
+		return fmt.Errorf("the DeepSeek Harness cannot be pointed at the remote model %q: its settings carry a single endpoint and a single credential for every model row, both naming the local daemon, which does not resolve namespaced remotes. Add the remote to the harness's own settings, or launch a daemon-backed model", name)
+	}
+
+	// The primary is written as the default model and into the web-search block,
+	// so it decides what every request names; check it first.
+	if model, ok := findLaunchModel(models, primary); ok {
+		if err := refuse(model); err != nil {
+			return err
+		}
+	}
+	for _, model := range models {
+		if err := refuse(model); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeDeepSeekHarnessSettings is the load → mutate → publish half of
