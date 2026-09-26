@@ -187,6 +187,7 @@ func TestRunInteractiveTUI_IntegrationActionsUseLaunchIntegration(t *testing.T) 
 					return prefetchedAccount
 				},
 				accountStateUpdates: accountUpdates,
+				ensureLicense:       stubLicenseGate(),
 			}
 
 			cmd := &cobra.Command{}
@@ -255,7 +256,8 @@ func TestRunLauncherAction_GUIAppsExitTUILoop(t *testing.T) {
 			launchIntegration: func(ctx context.Context, req launch.IntegrationLaunchRequest) error {
 				return nil
 			},
-			runModel: unexpectedModelLaunch(t),
+			runModel:      unexpectedModelLaunch(t),
+			ensureLicense: stubLicenseGate(),
 		})
 		if err != nil {
 			t.Fatalf("expected nil error for %s, got %v", integration, err)
@@ -271,7 +273,8 @@ func TestRunLauncherAction_GUIAppsExitTUILoop(t *testing.T) {
 		launchIntegration: func(ctx context.Context, req launch.IntegrationLaunchRequest) error {
 			return nil
 		},
-		runModel: unexpectedModelLaunch(t),
+		runModel:      unexpectedModelLaunch(t),
+		ensureLicense: stubLicenseGate(),
 	})
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
@@ -294,7 +297,8 @@ func TestRunLauncherAction_IntegrationContinuesAfterCancellation(t *testing.T) {
 		launchIntegration: func(ctx context.Context, req launch.IntegrationLaunchRequest) error {
 			return launch.ErrCancelled
 		},
-		runModel: unexpectedModelLaunch(t),
+		runModel:      unexpectedModelLaunch(t),
+		ensureLicense: stubLicenseGate(),
 	})
 	if err != nil {
 		t.Fatalf("expected nil error on cancellation, got %v", err)

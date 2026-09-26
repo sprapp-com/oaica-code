@@ -2017,6 +2017,7 @@ func runInteractiveTUIE(cmd *cobra.Command) error {
 		runModel:            launchInteractiveModel,
 		accountState:        accountPrefetch.StateIfReady,
 		accountStateUpdates: accountPrefetch.StateUpdates,
+		ensureLicense:       launch.RequireLicense,
 	}
 
 	for {
@@ -2042,6 +2043,16 @@ type launcherDeps struct {
 	runModel            func(*cobra.Command, string) error
 	accountState        func() *launch.AccountState
 	accountStateUpdates func(context.Context) <-chan *launch.AccountState
+	// ensureLicense is the licence gate for a launch taken from the bare
+	// `oaica` MENU. That path dispatches straight to launchIntegration and
+	// never runs LaunchCmd's PreRunE (which is where the gate lives for
+	// `oaica launch …`), so without this an unlicensed box configured and
+	// started integrations from the menu — the primary way the command is
+	// used — while the same box refused `oaica launch claude`. A nil field is
+	// an error at the dispatch site rather than a silent skip, so a new caller
+	// cannot wire the menu up without deciding this (2026-09-27 audit, round
+	// 22).
+	ensureLicense func(*cobra.Command, []string) error
 }
 
 func runInteractiveTUIStep(cmd *cobra.Command, deps launcherDeps) (bool, error) {
@@ -2094,7 +2105,19 @@ func runLauncherAction(cmd *cobra.Command, action tui.TUIAction, deps launcherDe
 		return true, nil
 	case tui.TUIActionLaunchIntegration:
 		saveLauncherSelection(action)
+		// Same gate the `oaica launch …` subcommand runs in its PreRunE: the
+		// menu is the other way into an integration, and it bypassed the gate
+		// entirely (see launcherDeps.ensureLicense).
+		if deps.ensureLicense == nil {
+			return false, fmt.Errorf("internal: the launcher menu has no licence check wired")
+		}
 		req := action.IntegrationLaunchRequest()
+		// The integration name is the arg the subcommand's own PreRunE would
+		// see; the gate ignores both today, but passing them keeps the two
+		// entry points answering to the same call.
+		if err := deps.ensureLicense(cmd, []string{req.Name}); err != nil {
+			return true, err
+		}
 		if deps.accountState != nil {
 			req.AccountState = deps.accountState()
 			req.AccountStateProvider = deps.accountState
