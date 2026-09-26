@@ -38,7 +38,11 @@ type UsageStatsRow struct {
 // values mean "no filter" for that dimension.
 type UsageStatsFilter struct {
 	Since time.Time // zero = all time
-	Model string    // exact match, empty = any
+	// Model is the model id to count, empty = any. It is matched in the space
+	// the log stores a model in: a row's model is bounded to
+	// maxLoggedModelBytes by appendRequestLog (request_log.go), so the reader
+	// bounds the filter the same way — see LoadUsageStatsCountingUnreadable.
+	Model string
 }
 
 // UsageSinceCutoff turns the `oaica usage --since` value into the cutoff
@@ -87,6 +91,23 @@ func LoadUsageStats(filter UsageStatsFilter) ([]UsageStatsRow, error) {
 // rows (2026-09-26 audit, third round).
 func LoadUsageStatsCountingUnreadable(filter UsageStatsFilter) ([]UsageStatsRow, int, error) {
 	rows := []UsageStatsRow{}
+	// The filter is compared in the SAME space the log stores a model in.
+	// appendRequestLog bounds every row's model to maxLoggedModelBytes
+	// (request_log.go), so an id longer than that is on disk in its bounded
+	// form only; a filter compared against the RAW argument matched nothing and
+	// `oaica usage --model <that id>` printed "No launch traffic logged yet" —
+	// a false zero reported as an empty log, with no error and no unreadable
+	// warning, for a machine that had just sent that traffic (2026-09-26 audit,
+	// eleventh round).
+	//
+	// The bound is lossy in the same way the report already is: two ids sharing
+	// their first maxLoggedModelBytes bytes are stored as the same string, which
+	// is the aggregation key, so they were ONE bucket before this filter could
+	// match either. Bounding the filter adds no ambiguity the report did not
+	// already have (TestUsageModelFilterMatchesWithinTheStoredSpace pins that),
+	// and re-bounding is idempotent, so a truncated id copied out of the report
+	// still matches its own rows.
+	filter.Model = boundedModel(filter.Model)
 	path, err := requestLogPath()
 	if err != nil {
 		return rows, 0, err
