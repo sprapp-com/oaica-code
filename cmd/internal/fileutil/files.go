@@ -21,6 +21,15 @@ import (
 const maxBackupsPerFile = 5
 
 // ReadJSON reads a JSON object file into a generic map.
+//
+// A document that is `null` comes back as an EMPTY map, not a nil one.
+// Unmarshalling `null` into a map succeeds with a nil result, so this used to
+// return
+// (nil, nil): a caller could not tell a document that failed to load from an
+// empty one, and the first write to it would panic — assigning to an entry of a
+// nil map is a runtime error (2026-09-27 audit, round 21, F15). Every caller
+// today only reads, which a nil map survives, so this closes the class rather
+// than a live crash.
 func ReadJSON(path string) (map[string]any, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -29,6 +38,9 @@ func ReadJSON(path string) (map[string]any, error) {
 	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
+	}
+	if result == nil {
+		result = map[string]any{}
 	}
 	return result, nil
 }
