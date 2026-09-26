@@ -2169,7 +2169,7 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 		return
 	}
 	defer resp.Body.Close()
-	relayUpstreamResponse(w, resp)
+	relayUpstreamResponse(w, resp, key)
 }
 
 // relayUpstreamResponse copies an upstream GET /v1/models response back to the
@@ -2196,7 +2196,13 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 // /v1/models, where the body IS the document — a client that gets the first
 // 16 MiB of a catalog parses it happily and concludes the models it cannot see
 // do not exist (2026-09-26 audit).
-func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
+// secret, when non-empty, is a credential this process injected into the
+// request that produced this response (an upstream's bearer or api key). It is
+// redacted as a LITERAL on top of the shape-based rules, because an upstream
+// echoing a key back need not put it in a URL — quoting the header it was sent
+// is the obvious way, and no pattern can tell that string from a word. The
+// caller is the only one that knows it (2026-09-26 audit).
+func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response, secret string) {
 	const maxRelayedBody = 16 << 20
 	// One byte past the cap is what distinguishes "exactly the limit" from
 	// "there was more".
@@ -2210,13 +2216,14 @@ func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
 			fmt.Sprintf("upstream response is larger than the %d-byte limit this proxy relays", maxRelayedBody))
 		return
 	}
-	body = []byte(redactCredentials(string(body)))
+	redact := func(s string) string { return redactSecret(redactCredentials(s), secret) }
+	body = []byte(redact(string(body)))
 	for k, vs := range resp.Header {
 		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Transfer-Encoding") {
 			continue
 		}
 		for _, v := range vs {
-			w.Header().Add(k, redactCredentials(v))
+			w.Header().Add(k, redact(v))
 		}
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -2273,7 +2280,7 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 		return
 	}
 	defer resp.Body.Close()
-	relayUpstreamResponse(w, resp)
+	relayUpstreamResponse(w, resp, headerValue)
 }
 
 // nativeModelCatalogCache memoizes the CATALOG, not one resolved alias per
@@ -2735,6 +2742,31 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 		return 0, false
 	}
 	defer resp.Body.Close()
+
+	// A FAILING upstream response is the vendor's diagnosis, and it is relayed
+	// the way every other failure path in this file is relayed — redacted, with
+	// the literal credential we injected removed on top of the shape-based
+	// rules. This leg copied the upstream's headers and wrote its body through
+	// untouched, so an error quoting the URL it was called with, or a
+	// diagnostic header echoing it ("bad key: sk-live-…" — a shape no pattern
+	// can recognise), handed the client a working credential; the client is
+	// Claude Code, which prints it into the session transcript and into
+	// whatever bug report the user pastes it into (2026-09-26 audit).
+	//
+	// A SUCCESSFUL body is the model's own answer and stays byte-for-byte —
+	// the relay's whole contract — because redacting it would corrupt the
+	// user's content, and a streamed body cannot be redacted safely at all (a
+	// secret straddling two reads is invisible to any per-chunk rule). The
+	// split is the one this proxy already makes everywhere: failures are ours
+	// to sanitize, an answer is not.
+	if resp.StatusCode >= 300 {
+		relayUpstreamResponse(w, resp, headerValue)
+		// relayed is false: a body the health feed only reads for a sub-300
+		// status, and this is not one (see feedPassthroughRouteHealth's switch:
+		// 5xx counts against the leg on the status alone, 4xx counts as the leg
+		// working).
+		return resp.StatusCode, false
+	}
 
 	for k, vs := range resp.Header {
 		for _, v := range vs {

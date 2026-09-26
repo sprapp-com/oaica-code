@@ -44,7 +44,7 @@ func oversizeBody(n int) *http.Response {
 // is the bug — the client cannot tell it apart from the real document.
 func TestAnOversizeUpstreamResponseIsRefusedNotTruncated(t *testing.T) {
 	rec := httptest.NewRecorder()
-	relayUpstreamResponse(rec, oversizeBody(relayBodyCap+1))
+	relayUpstreamResponse(rec, oversizeBody(relayBodyCap+1), "")
 
 	if rec.Code == http.StatusOK {
 		t.Errorf("a %d-byte upstream body was relayed as a %d-byte HTTP %d — the client reads that as the whole document, so every model past the cut is silently gone",
@@ -62,7 +62,7 @@ func TestAnOversizeUpstreamResponseIsRefusedNotTruncated(t *testing.T) {
 // refuses the largest response the proxy was built to carry.
 func TestAnUpstreamResponseAtTheCapIsRelayedWhole(t *testing.T) {
 	rec := httptest.NewRecorder()
-	relayUpstreamResponse(rec, oversizeBody(relayBodyCap))
+	relayUpstreamResponse(rec, oversizeBody(relayBodyCap), "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("a body of exactly the cap was refused: HTTP %d %s", rec.Code, rec.Body.String())

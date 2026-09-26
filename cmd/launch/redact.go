@@ -309,6 +309,27 @@ func redactQuotedQueryCredentials(text string) string {
 	})
 }
 
+// redactSecret replaces every literal occurrence of a credential this process
+// KNOWS — the value it injected into an upstream request — with REDACTED.
+//
+// It exists because redactCredentials' rules are shape-based: a URL's userinfo,
+// a credential-bearing query value. An upstream that echoes a key back does not
+// have to put it in a URL. It can quote the header it was sent ("bad key:
+// sk-live-…"), and no pattern can recognise that as a credential — it looks
+// like any other word. Only the caller knows the string, so only the caller can
+// name it (2026-09-26 audit).
+//
+// Nothing shorter than 8 characters is replaced: a leg configured with a
+// placeholder ("none", "sk") would otherwise have that substring cut out of
+// ordinary prose, mangling a diagnosis to hide nothing.
+func redactSecret(text, secret string) string {
+	secret = strings.TrimSpace(secret)
+	if len(secret) < 8 || !strings.Contains(text, secret) {
+		return text
+	}
+	return strings.ReplaceAll(text, secret, "REDACTED")
+}
+
 // redactCredentials replaces every credential a piece of text could carry
 // with REDACTED: the userinfo of a URL (including one url.Parse refuses, whose
 // password may hold a "/" or a newline), a credential-bearing query value, and
