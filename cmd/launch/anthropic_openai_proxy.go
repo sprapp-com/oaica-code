@@ -1694,8 +1694,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// redactURL the upstream body/transport error before it reaches
 			// the child (audit 2026-09-01 L1): url.Error embeds the full URL
 			// — userinfo in a misconfigured remotes.json base_url would land
-			// in an LLM-driven child's context.
-			writeUpstreamError(w, resp, text)
+			// in an LLM-driven child's context. The key this leg injected goes
+			// through redactSecret on top of those shapes — a vendor that names
+			// the credential it refused is the ordinary rejection, and its text
+			// is prose no pattern can recognise (2026-09-26 audit, ninth round).
+			writeUpstreamError(w, resp, text, route.resolveKey())
 			return
 		}
 
@@ -1724,9 +1727,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// the estimate to 0, which disabled it (2026-09-26 audit).
 		estInputTokens, _, _ := contextFitPlan(calib, calibKey, len(body))
 		if anthReq.Stream {
-			delivered = handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
+			delivered = handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens, route.resolveKey())
 		} else {
-			delivered = handleNonStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
+			delivered = handleNonStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens, route.resolveKey())
 		}
 		// Now the 2xx verdict (see the note at the status feed above). A
 		// request the client abandoned mid-turn says nothing about the leg —
@@ -1763,7 +1766,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 // It returns whether the turn reached the client. False is not "the status was
 // bad" — it is "this response was never a turn", which is what the caller's
 // route health must be fed (2026-09-26 audit).
-func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) bool {
+//
+// secret is the credential this leg injected upstream, so an error object that
+// names it is redacted literally as well as by shape (see
+// redactUpstreamDiagnosis); "" is fine when the leg carries no key.
+func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int, secret string) bool {
 	// Bounded: the size of a whole turn is the upstream's choice
 	// (2026-09-26 audit).
 	respBody, err := httpbody.ReadCapped(body, httpbody.DefaultMax, "the upstream response")
@@ -1778,7 +1785,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// written into input_tokens, and the route's breaker recorded a healthy
 	// 200 — a dead turn reported as a successful one that consumed tokens
 	// (2026-09-26 audit).
-	if msg := upstreamErrorMessage(string(respBody)); msg != "" {
+	if msg := upstreamErrorMessage(string(respBody), secret); msg != "" {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream error: "+msg)
 		return false
 	}
@@ -1818,7 +1825,11 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // stream was cut short or the upstream reported an error mid-answer — the
 // status byte may already have been a 200 either way, which is why the
 // caller's route health is fed this and not the status (2026-09-26 audit).
-func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) bool {
+//
+// secret is the credential this leg injected upstream; every recognition site
+// below renders the upstream's own text to the client, so it is passed to
+// upstreamErrorMessage for the literal redaction (see redactUpstreamDiagnosis).
+func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int, secret string) bool {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, http.StatusInternalServerError, "streaming not supported by response writer")
@@ -1948,7 +1959,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// a plain JSON error object has no "data:" prefix at all, and
 			// used to be skipped line by line until the stream "ended"
 			// cleanly with nothing in it.
-			if m := upstreamErrorMessage(line); m != "" {
+			if m := upstreamErrorMessage(line, secret); m != "" {
 				upstreamErr = m
 			}
 			continue
@@ -1963,7 +1974,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			// Some upstreams report a mid-stream failure as an SSE frame
 			// carrying an error object rather than a choice.
-			if m := upstreamErrorMessage(payload); m != "" {
+			if m := upstreamErrorMessage(payload, secret); m != "" {
 				upstreamErr = m
 			}
 			continue
@@ -1976,7 +1987,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// audit, seventh round). The cheap substring guard keeps the probe off
 		// the ordinary delta frames an answer is made of.
 		if strings.Contains(payload, `"error"`) {
-			if m := upstreamErrorMessage(payload); m != "" {
+			if m := upstreamErrorMessage(payload, secret); m != "" {
 				upstreamErr = m
 				continue
 			}
@@ -2143,14 +2154,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 //
 // The message is returned REDACTED, and redaction lives here rather than at
 // the call sites because every caller renders the result to the launched
-// client: the non-streaming body (:1637), the two streaming recognition sites
-// (:1801, :1816) and the two emit sites fed from them (:1901, :1912). Only the
-// non-200 branch sanitized, through writeUpstreamError's redactCredentials —
-// so an upstream answering an error object over HTTP 200 handed the client the
-// credential its message quoted back (a request URL carrying userinfo or a
-// query key), into an LLM's context window and the transcript the user pastes
-// into a ticket (2026-09-26 audit, fifth round).
-func upstreamErrorMessage(s string) string {
+// client: the non-streaming body and the three streaming recognition sites.
+// Only the non-200 branch sanitized, through writeUpstreamError's
+// redactCredentials — so an upstream answering an error object over HTTP 200
+// handed the client the credential its message quoted back (a request URL
+// carrying userinfo or a query key), into an LLM's context window and the
+// transcript the user pastes into a ticket (2026-09-26 audit, fifth round).
+//
+// secret is the credential this leg injected upstream. redactCredentials
+// cannot see it — the shape rules match URLs, and a vendor naming the key it
+// rejected writes it as ordinary prose — so it is redacted as a LITERAL too
+// (2026-09-26 audit, ninth round).
+func upstreamErrorMessage(s, secret string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "{") {
 		return ""
@@ -2165,10 +2180,10 @@ func upstreamErrorMessage(s string) string {
 		return ""
 	}
 	if m := strings.TrimSpace(probe.Error.Message); m != "" {
-		return redactCredentials(m)
+		return redactUpstreamDiagnosis(m, secret)
 	}
 	if t := strings.TrimSpace(probe.Error.Type); t != "" {
-		return "upstream reported " + redactCredentials(t)
+		return "upstream reported " + redactUpstreamDiagnosis(t, secret)
 	}
 	return "upstream reported an error"
 }
@@ -2196,14 +2211,12 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 // relayUpstreamResponse copies an upstream GET /v1/models response back to the
 // client with every text surface run through redactCredentials.
 //
-// It used to be a verbatim io.Copy of the body plus every header, which made
-// these two passthroughs the only upstream-facing paths in this proxy that
-// could hand a credential to the launched client — and the upstream here is
-// deliberately NOT api.anthropic.com: it is a plan row's own base, or a user's
-// mirror, reached with the key in the base URL. A mirror whose error page
-// quotes the request URL, or that echoes the route in a diagnostic header,
-// therefore put the key on the client's terminal, which is the exact surface
-// the message paths redact (2026-09-26 audit, seventh round).
+// It used to be a verbatim io.Copy of the body plus every header, which put the
+// key on the client's terminal — and the upstream here is deliberately NOT
+// api.anthropic.com: it is a plan row's own base, or a user's mirror, reached
+// with the key in the base URL. A mirror whose error page quotes the request
+// URL, or that echoes the route in a diagnostic header, therefore leaked the
+// key (2026-09-26 audit, seventh round).
 //
 // The response is bounded and its length recomputed: redaction can change the
 // byte count, and a relayed Content-Length that no longer matches the body
@@ -2937,15 +2950,20 @@ func (s *statusCapturingWriter) status() int {
 // 502 on purpose: they mean OUR key for that remote is wrong, and handing
 // Claude Code an authentication_error would send it into its own login flow.
 // (2026-09-26 audit.)
-func writeUpstreamError(w http.ResponseWriter, resp *http.Response, text string) {
+//
+// secret is the credential this leg injected upstream and is what lets the
+// re-emitted text lose it: an upstream refusing the call names the key it
+// refused, and that is prose no shape rule recognises (2026-09-26 audit, ninth
+// round).
+func writeUpstreamError(w http.ResponseWriter, resp *http.Response, text, secret string) {
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests, http.StatusServiceUnavailable, 529:
 		if v := resp.Header.Get("Retry-After"); v != "" {
 			w.Header().Set("Retry-After", v)
 		}
-		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactCredentials(text)))
+		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactUpstreamDiagnosis(text, secret)))
 	default:
-		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactCredentials(text)))
+		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactUpstreamDiagnosis(text, secret)))
 	}
 }
 

@@ -330,6 +330,23 @@ func redactSecret(text, secret string) string {
 	return strings.ReplaceAll(text, secret, "REDACTED")
 }
 
+// redactUpstreamDiagnosis sanitizes upstream-authored text this proxy is about
+// to hand to the launched client: the shape-based rules first, then the literal
+// credential this process injected into the request that produced the text
+// (redactSecret).
+//
+// Both halves are needed and neither subsumes the other. A vendor's refusal
+// routinely quotes the request URL (userinfo, a query key — redactCredentials'
+// shapes) AND names the key it rejected, bare, as ordinary prose ("invalid api
+// key sk-live-…") — a string no pattern can tell from a word. The relay paths
+// that already carry a `secret` parameter (relayUpstreamResponse,
+// anthropicPassthrough) redact both; this is the same work named once so the
+// translated leg's message paths cannot drift back to the shapes alone
+// (2026-09-26 audit, ninth round).
+func redactUpstreamDiagnosis(text, secret string) string {
+	return redactSecret(redactCredentials(text), secret)
+}
+
 // redactCredentials replaces every credential a piece of text could carry
 // with REDACTED: the userinfo of a URL (including one url.Parse refuses, whose
 // password may hold a "/" or a newline), a credential-bearing query value, and
