@@ -36,7 +36,7 @@ func TestAnUnreadableServeRegistryIsNotReportedAsEmpty(t *testing.T) {
 
 	// The reader keeps the two states apart: an absent file yields no keys and
 	// no error, this one must not answer the same way.
-	if keys, err := localServerKeys(home); err == nil {
+	if keys, _, err := localServerKeys(home); err == nil {
 		t.Fatalf("localServerKeys over a corrupt registry = %q, nil; want an error: a registry the scan cannot read is not a registry with no keys in it", keys)
 	}
 
@@ -63,7 +63,7 @@ func TestAnAbsentServeRegistryIsQuietlyEmpty(t *testing.T) {
 	home := t.TempDir()
 	setLaunchTestHome(t, home)
 
-	keys, err := localServerKeys(home)
+	keys, _, err := localServerKeys(home)
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("localServerKeys with no registry = (%q, %v), want (none, nil): an absent file is nothing to scan, not a failure", keys, err)
 	}

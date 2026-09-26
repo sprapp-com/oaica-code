@@ -216,31 +216,6 @@ func sameModelSelection(a, b []string) bool {
 	return true
 }
 
-// selectionIsDeclaredBy reports whether declared holds every name in wanted,
-// in any order, under sameModelSelection's per-name rule. It is the drift
-// question for a store that keeps more than the current selection — "does what
-// the editor says it holds include everything this launch would write" — where
-// equality would call a store that still declares the whole selection
-// unchanged only by accident of position (2026-09-27 audit, round 26).
-func selectionIsDeclaredBy(declared, wanted []string) bool {
-	if len(wanted) == 0 {
-		return false
-	}
-	for _, want := range wanted {
-		found := false
-		for _, have := range declared {
-			if modelNamesAreTheSame(have, want) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-
 // modelNamesAreTheSame is sameModelSelection's per-name rule: equal strings, or
 // two names that resolve to one endpoint under one upstream model.
 func modelNamesAreTheSame(a, b string) bool {
@@ -1113,35 +1088,39 @@ func integrationConsumesTierFlags(name string) bool {
 }
 
 // liveEditorDeclaration is launchEditorIntegration's drift term: does what the
-// editor says it holds already include this selection?
+// editor's stores hold already equal what this launch would write?
 //
-// Two readings of one question. The first compares in the picker's vocabulary,
-// which is what the integrations that translate their store's id back to a
-// picker name (cline, pi, droid) answer with, and keeps the exact-order,
-// same-length semantics it always had. The second compares in the STORE's
-// vocabulary — the ids the writers embed (launchModelWriteID) — because for a
-// row whose picker name is a display label there is no way back from the stored
-// id to the label by name alone: the ollama-cloud catalogue row is picked as
-// "ollama/gpt-oss" and served as "gpt-oss:cloud", so the store holds an id no
-// picker name equals, the first reading answered false on every run, and each
-// launch re-resolved the inventory and rewrote a config that had not changed
-// (2026-09-27 audit, round 26).
+// An editor that can answer for its own stores answers (storeDeclarationEditor:
+// OpenClaw reads its provider list and the agent primary it also writes,
+// opencode reads the (provider block, model id) pairs, Cline reads the endpoint
+// recorded beside the id in both of its documents). Those are the integrations
+// whose stores hold an id the picker name of a row does not equal — the
+// ollama-cloud catalogue row is picked as "ollama/gpt-oss" and served as
+// "gpt-oss:cloud" — so no comparison the launcher makes in the picker's
+// vocabulary can see them, and each launch re-resolved the inventory and
+// rewrote a config that had not changed (2026-09-27 audit, round 26).
 //
-// The second reading asks whether the store declares EVERY id the selection is
-// written as; extra rows are not drift. That is the shape of a store that keeps
-// history beside the current selection (opencode's recent list, and any store
-// an older launch left entries in), where position-by-position equality called
-// a store that still declares the whole selection "changed".
+// Every other editor is asked in the picker's vocabulary, exact order and
+// length, which is what its Models() translates its store back into (pi, droid,
+// muse, vscode). This is the reading that must NOT be reached for a store that
+// answers in ids: a store holding the LOCAL model "gpt-oss" looks equal to the
+// selection that picked the cloud row of that name, and the launch then left
+// the config pointing at a model it did not choose (2026-09-27 audit, round 27,
+// F2).
 func (c *launcherClient) liveEditorDeclaration(ctx context.Context, editor Editor, models []string) bool {
-	declared := editor.Models()
-	if sameModelSelection(declared, models) {
-		return true
+	declarer, ok := editor.(storeDeclarationEditor)
+	if !ok {
+		return sameModelSelection(editor.Models(), models)
 	}
 	if len(models) == 0 {
 		return false
 	}
+	// The rows the picker was built from, so the editor can name each row the
+	// way its own writer would. A model the inventory has no row for is
+	// carried as its own bare row, which resolves to the id a child CLI would
+	// be handed — the same answer a store would hold for it.
 	inventory, _ := c.modelInventory().Load(ctx)
-	return selectionIsDeclaredBy(declared, storeIDsForSelection(inventory, models))
+	return declarer.DeclaresSelection(selectionRows(inventory, models))
 }
 
 func (c *launcherClient) launchEditorIntegration(ctx context.Context, name string, runner Runner, editor Editor, saved *config.IntegrationConfig, req IntegrationLaunchRequest) error {

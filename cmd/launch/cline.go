@@ -169,10 +169,29 @@ func (c *Cline) Edit(models []LaunchModel) error {
 			if err := clineRefuseForeignLegacyEndpoint(legacyConfig); err != nil {
 				return err
 			}
-			if err := writeClineProvidersConfig(providersPath, providersConfig, models[0]); err != nil {
+			// Both documents are BUILT before either is staged, so the refusals
+			// that live in their builders (the user's own provider under the
+			// "ollama" key, a foreign legacy endpoint) are raised here, in the
+			// read phase, and not one document into the publish.
+			providersData, err := clineProvidersConfigData(providersConfig, models[0])
+			if err != nil {
 				return err
 			}
-			return writeClineLegacyGlobalState(legacyPath, legacyConfig, models[0])
+			legacyData, err := clineLegacyGlobalStateData(legacyConfig, models[0])
+			if err != nil {
+				return err
+			}
+			// fileutil.PublishAll, not the two writers one after the other: each
+			// of those stages and renames its own file, so a second half that
+			// could not be staged (a read-only directory, a full disk) failed
+			// after the first had already been published and left the pair
+			// describing two different selections, which is the one thing these
+			// two files are never allowed to be (2026-09-27 audit, round 27,
+			// F5).
+			return fileutil.PublishAll(
+				fileutil.PublishFile{Path: providersPath, Data: providersData, Integration: "cline"},
+				fileutil.PublishFile{Path: legacyPath, Data: legacyData, Integration: "cline"},
+			)
 		})
 	})
 }
@@ -345,7 +364,18 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model L
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
+	data, err := clineProvidersConfigData(config, model)
+	if err != nil {
+		return err
+	}
+	return fileutil.WriteWithBackup(configPath, data, "cline")
+}
 
+// clineProvidersConfigData is providers.json as a write of model leaves it, in
+// memory. The writer above, and the pair publish in Cline.Edit, both publish
+// this document — one builder, so the bytes Edit stages with its sibling and
+// the bytes a standalone call writes cannot differ.
+func clineProvidersConfigData(config map[string]any, model LaunchModel) ([]byte, error) {
 	providers, _ := config["providers"].(map[string]any)
 	if providers == nil {
 		providers = make(map[string]any)
@@ -371,7 +401,7 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model L
 	// delete its key (2026-09-27 audit, round 21). Redacted, because the value
 	// is file-derived and may carry credentials in its userinfo or query.
 	if !clineEndpointWasOurs(previousBaseURL) {
-		return fmt.Errorf("Cline's %q provider is configured with an endpoint oaica did not write (%s), so it is yours: Cline has one provider under that name, and pointing it at the local daemon would rewrite its base URL and delete its API key. Remove or rename that provider in Cline's own settings, or launch a different integration", clineLaunchProvider, redactBaseURL(previousBaseURL))
+		return nil, fmt.Errorf("Cline's %q provider is configured with an endpoint oaica did not write (%s), so it is yours: Cline has one provider under that name, and pointing it at the local daemon would rewrite its base URL and delete its API key. Remove or rename that provider in Cline's own settings, or launch a different integration", clineLaunchProvider, redactBaseURL(previousBaseURL))
 	}
 
 	settings["provider"] = clineLaunchProvider
@@ -396,11 +426,7 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model L
 	config["lastUsedProvider"] = clineLaunchProvider
 	config["providers"] = providers
 
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return err
-	}
-	return fileutil.WriteWithBackup(configPath, data, "cline")
+	return json.MarshalIndent(config, "", "  ")
 }
 
 // writeClineLegacyGlobalState publishes globalState.json from config, which its
@@ -410,14 +436,24 @@ func writeClineLegacyGlobalState(configPath string, config map[string]any, model
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
+	data, err := clineLegacyGlobalStateData(config, model)
+	if err != nil {
+		return err
+	}
+	return fileutil.WriteWithBackup(configPath, data, "cline")
+}
 
+// clineLegacyGlobalStateData is globalState.json as a write of model leaves it,
+// in memory — the second half of the pair that Cline.Edit publishes with
+// clineProvidersConfigData (see its comment).
+func clineLegacyGlobalStateData(config map[string]any, model LaunchModel) ([]byte, error) {
 	// Before anything is mutated: the same refusal writeClineProvidersConfig
 	// makes, for the same reason. It ALSO runs a frame up, in Cline.Edit's read
 	// phase, because this writer is the second of the pair: a launch refused
 	// here would already have published providers.json. Same helper, so the two
 	// call sites cannot drift (2026-09-27 audit, round 26).
 	if err := clineRefuseForeignLegacyEndpoint(config); err != nil {
-		return err
+		return nil, err
 	}
 
 	// The same two branches the providers.json write above takes: for a
@@ -435,11 +471,7 @@ func writeClineLegacyGlobalState(configPath string, config map[string]any, model
 
 	config["welcomeViewCompleted"] = true
 
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return err
-	}
-	return fileutil.WriteWithBackup(configPath, data, "cline")
+	return json.MarshalIndent(config, "", "  ")
 }
 
 func (c *Cline) Models() []string {
@@ -469,6 +501,86 @@ func (c *Cline) Models() []string {
 	}
 	baseURL, _ := config["actModeOllamaBaseUrl"].(string)
 	return []string{clinePickerNameFor(modelID, baseURL)}
+}
+
+// clineStoreKey names one model as one of Cline's documents records it: the
+// model id the entry holds, then the endpoint recorded beside it. The endpoint
+// is half the identity — Cline's provider settings dial a base URL, so an entry
+// keeping the daemon's URL for a model only a remote serves is a different
+// model — and a key built from the id alone cannot tell them apart
+// (2026-09-27 audit, round 27, F4). Joined with NUL: an id cannot contain one,
+// so no two different entries build one key.
+func clineStoreKey(modelID, baseURL string) string {
+	return modelID + "\x00" + strings.TrimRight(baseURL, "/")
+}
+
+// clineHeldStoreKeys is the key of each half of Cline's pair as the documents
+// hold it now, in the order Edit publishes them (providers.json, then
+// globalState.json). A half that is absent, that names another provider, or
+// that the provider settings are not currently using contributes no key: those
+// are states in which the store does not hold this integration's selection, and
+// the write that would publish it is what the caller is asking about.
+func clineHeldStoreKeys(home string) []string {
+	var keys []string
+	if config, err := fileutil.ReadJSON(clineProvidersPath(home)); err == nil {
+		if config["lastUsedProvider"] == clineLaunchProvider {
+			providers, _ := config["providers"].(map[string]any)
+			provider, _ := providers[clineLaunchProvider].(map[string]any)
+			settings, _ := provider["settings"].(map[string]any)
+			modelID, _ := settings["model"].(string)
+			baseURL, _ := settings["baseUrl"].(string)
+			if modelID != "" {
+				keys = append(keys, clineStoreKey(modelID, baseURL))
+			}
+		}
+	}
+	if config, err := fileutil.ReadJSON(clineLegacyGlobalStatePath(home)); err == nil {
+		if config["actModeApiProvider"] == clineLaunchProvider {
+			modelID, _ := config["actModeOllamaModelId"].(string)
+			baseURL, _ := config["actModeOllamaBaseUrl"].(string)
+			if modelID != "" {
+				keys = append(keys, clineStoreKey(modelID, baseURL))
+			}
+		}
+	}
+	return keys
+}
+
+// DeclaresSelection reports whether BOTH halves of Cline's pair already hold
+// what a write of models would leave. Cline keeps one model (it is a narrowing
+// editor) in two documents, and the pair is the selection: one half holding it
+// is not the configuration the launch would publish, so the keys are compared
+// as a whole list rather than one document at a time.
+//
+// The keys carry the endpoint as well as the id, which is what makes this
+// answer about the store rather than about a name: a half holding the LOCAL
+// model "gpt-oss" beside the daemon's URL, when the launch picked the cloud row
+// of that name and would write "gpt-oss:cloud", used to read as current — the
+// launch left Cline asking the daemon for a model this launch did not choose
+// (2026-09-27 audit, round 27, F2), and a half holding a remote's id beside the
+// daemon's URL did the same for a remote model (F4).
+func (c *Cline) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) != 1 {
+		// Cline's stores hold one model; anything else is not a state they can
+		// declare (NarrowToStoredModels narrows first, so this is the shape a
+		// caller that skipped that would hit).
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	row := models[0]
+	id := clineWriteModelID(row)
+	want := []string{
+		clineStoreKey(id, clineProviderBaseURLFor(row.Name)),
+		clineStoreKey(id, clineLegacyBaseURLFor(row.Name)),
+	}
+	held := clineHeldStoreKeys(home)
+	if len(held) != len(want) {
+		return false
+	}
+	return sameStoreStrings(held, want)
 }
 
 func clineProviderModel(home string) string {

@@ -971,27 +971,28 @@ func launchModelWriteIDs(models []LaunchModel) []string {
 	return ids
 }
 
-// storeIDsForSelection is launchModelWriteIDs for a selection of NAMES — the
-// form a launch carries and saves. Each name is looked up in the inventory the
-// picker was built from, so the ollama-cloud catalogue row named "ollama/
-// gpt-oss" answers with the id its store holds ("gpt-oss:cloud"); a name with
-// no row keeps the id a child CLI would be handed (childModelIDFor), which is
-// what a store writes for a model it resolves directly. The order and the
-// length of names are preserved, so the result is comparable position by
-// position.
-func storeIDsForSelection(inventory []LaunchModel, names []string) []string {
-	ids := make([]string, 0, len(names))
+// selectionRows is a selection of NAMES as the ROWS the picker was built from:
+// the inventory row for each name (findLaunchModel's own resolution, alias hop
+// included), or a bare row carrying the name itself when the inventory has no
+// such row — the shape a store holds for a model it resolves directly. The
+// order of the names is preserved, and so is the length: one row per name.
+//
+// It replaces the ids-only form that stood here. An empty name cannot be an id,
+// so that form DROPPED it and returned a shorter list, which a store holding
+// the very rows the launch would write then read as drift; and an id is not
+// enough to name a row anyway — the provider block or the endpoint recorded
+// beside it is half the identity, and only a ROW carries that far enough for
+// the editor to apply its own rule (2026-09-27 audit, round 27).
+func selectionRows(inventory []LaunchModel, names []string) []LaunchModel {
+	rows := make([]LaunchModel, 0, len(names))
 	for _, name := range names {
-		if name == "" {
-			continue
-		}
 		if row, ok := findLaunchModel(inventory, name); ok {
-			ids = append(ids, launchModelWriteID(row))
+			rows = append(rows, row)
 			continue
 		}
-		ids = append(ids, childModelIDFor(name))
+		rows = append(rows, LaunchModel{Name: name})
 	}
-	return ids
+	return rows
 }
 
 func launchModelsFromNames(names []string) []LaunchModel {

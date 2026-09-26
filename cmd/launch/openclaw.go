@@ -880,9 +880,14 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 
 	var newModels []any
 	written := make(map[string]bool, len(models))
-	for _, m := range models {
-		entry, _ := openclawModelConfig(m)
+	// openclawStoredRows, not the selection as it came: the provider's list is
+	// keyed by id, so two rows naming one id used to publish two entries
+	// OpenClaw cannot tell apart (2026-09-27 audit, round 27, F6). The same
+	// helper answers DeclaresSelection, so the list written and the list
+	// compared against are built by one rule.
+	for _, m := range openclawStoredRows(models) {
 		id := openclawModelID(m)
+		entry, _ := openclawModelConfig(m)
 		// Merge existing fields (user customizations)
 		if existing, ok := existingByID[id]; ok {
 			for k, v := range existing {
@@ -1294,14 +1299,31 @@ func (c *Openclaw) Models() []string {
 		return nil
 	}
 
+	config, err := openclawReadConfig(home)
+	if err != nil {
+		return nil
+	}
+	return openclawProviderModelIDs(config)
+}
+
+// openclawReadConfig reads whichever config OpenClaw is using: its own, or the
+// legacy path an older install left behind. One reader, so the two callers that
+// ask what the file holds (Models and DeclaresSelection) cannot read different
+// files.
+func openclawReadConfig(home string) (map[string]any, error) {
 	config, err := fileutil.ReadJSON(filepath.Join(home, ".openclaw", "openclaw.json"))
 	if err != nil {
 		config, err = fileutil.ReadJSON(filepath.Join(home, ".clawdbot", "clawdbot.json"))
 		if err != nil {
-			return nil
+			return nil, err
 		}
 	}
+	return config, nil
+}
 
+// openclawProviderModelIDs reads the ids of the entries under OpenClaw's ollama
+// provider, in file order — the ids the writer puts there (openclawModelID).
+func openclawProviderModelIDs(config map[string]any) []string {
 	modelsSection, _ := config["models"].(map[string]any)
 	providers, _ := modelsSection["providers"].(map[string]any)
 	ollama, _ := providers["ollama"].(map[string]any)
@@ -1316,4 +1338,115 @@ func (c *Openclaw) Models() []string {
 		}
 	}
 	return result
+}
+
+// openclawStoredRows is the selection as a write leaves it at the head of
+// OpenClaw's provider: the rows in order, each id once. Two rows that name the
+// same backend — a catalogue row and the daemon row of the id it is served as —
+// used to be written twice, which the provider's own list, keyed by id, cannot
+// tell apart (2026-09-27 audit, round 27, F6). The writer and
+// DeclaresSelection both build their list from this, so what gets published
+// and what counts as already published are one rule.
+func openclawStoredRows(models []LaunchModel) []LaunchModel {
+	seen := make(map[string]bool, len(models))
+	rows := make([]LaunchModel, 0, len(models))
+	for _, m := range models {
+		id := openclawModelID(m)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		rows = append(rows, m)
+	}
+	return rows
+}
+
+// openclawStoredIDs is openclawStoredRows' ids, in the same order.
+func openclawStoredIDs(models []LaunchModel) []string {
+	rows := openclawStoredRows(models)
+	ids := make([]string, 0, len(rows))
+	for _, m := range rows {
+		ids = append(ids, openclawModelID(m))
+	}
+	return ids
+}
+
+// openclawPrimaryIs reports whether the default agent's primary is this string.
+func openclawPrimaryIs(config map[string]any, primary string) bool {
+	agents, _ := config["agents"].(map[string]any)
+	defaults, _ := agents["defaults"].(map[string]any)
+	modelConfig, _ := defaults["model"].(map[string]any)
+	got, _ := modelConfig["primary"].(string)
+	return got == primary
+}
+
+// openclawSessionsAgree reports whether every session in OpenClaw's main-agent
+// session state already names the primary this launch would write. It is the
+// same document, read by the same rule, that clearSessionModelOverride
+// rewrites, so a stale session model or a stale override is drift here exactly
+// when Edit would fix it: a session left naming another model shadows the
+// primary on the next TUI launch, which is the state F1 was about — a store
+// that "declares the selection" while the app still runs something else
+// (2026-09-27 audit, round 27).
+func openclawSessionsAgree(home, primary string) bool {
+	path := filepath.Join(home, ".openclaw", "agents", "main", "sessions", "sessions.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// No session state at all: nothing shadows the primary.
+		return os.IsNotExist(err)
+	}
+	var sessions map[string]map[string]any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&sessions); err != nil {
+		// Session state that cannot be read is not state that agrees: say so,
+		// so the launch writes what it can rather than leaving a file it
+		// could not read as the source of truth.
+		return false
+	}
+	for _, sess := range sessions {
+		if override, _ := sess["modelOverride"].(string); override != "" && override != primary {
+			return false
+		}
+		if model, _ := sess["model"].(string); model != "" && model != primary {
+			return false
+		}
+	}
+	return true
+}
+
+// DeclaresSelection reports whether OpenClaw's config already holds what a
+// write of models would leave: the provider's model list begins with exactly
+// the ids the write would publish — rows after them are the user's own models,
+// which the writer carries over (openclawEditConfig) — and the two fields the
+// same write owns, agents.defaults.model.primary and the session state that
+// shadows it, already name the first of them.
+//
+// The list alone was read as the answer, and it is not the store: the primary
+// is a second field of the same write, so a config left pointing at a model
+// this launch did not choose read as current, Edit was skipped, and the app
+// kept running that model (2026-09-27 audit, round 27, F1). The list is read as
+// a PREFIX and not as an equality for the mirror-image reason: the rows after
+// the selection are the user's own models, which are not drift.
+func (c *Openclaw) DeclaresSelection(models []LaunchModel) bool {
+	want := openclawStoredIDs(models)
+	if len(want) == 0 {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	config, err := openclawReadConfig(home)
+	if err != nil {
+		return false
+	}
+	if !declaresPrefix(openclawProviderModelIDs(config), want) {
+		return false
+	}
+	primary := openclawPrimaryModel(models[0])
+	if !openclawPrimaryIs(config, primary) {
+		return false
+	}
+	return openclawSessionsAgree(home, primary)
 }

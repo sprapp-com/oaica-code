@@ -568,11 +568,12 @@ func readModelJSONModels() []string {
 	return opencodeStateModelIDs(opencodeIsDaemonProviderID)
 }
 
-// opencodeStateModelIDs returns the model id of every entry in opencode's model
-// state whose provider block pred accepts, in the order the state lists them —
-// the one scan both readers of this file share, so the ids Edit writes and the
-// ids a reader reports cannot drift apart.
-func opencodeStateModelIDs(pred func(string) bool) []string {
+// opencodeStateEntries returns every entry of opencode's model state as its
+// (provider block, model id) pair, in the order the state lists them — the one
+// scan of this file, so the ids Edit writes and the ids a reader reports cannot
+// drift apart. An entry missing either half is not an entry this file can read
+// and is skipped.
+func opencodeStateEntries() [][2]string {
 	statePath, err := openCodeStatePath()
 	if err != nil {
 		return nil
@@ -586,20 +587,78 @@ func opencodeStateModelIDs(pred func(string) bool) []string {
 		return nil
 	}
 	recent, _ := state["recent"].([]any)
-	var models []string
+	var entries [][2]string
 	for _, entry := range recent {
 		e, ok := entry.(map[string]any)
 		if !ok {
 			continue
 		}
-		if pid, _ := e["providerID"].(string); !pred(pid) {
+		pid, _ := e["providerID"].(string)
+		id, ok := e["modelID"].(string)
+		if !ok || id == "" {
 			continue
 		}
-		if id, ok := e["modelID"].(string); ok && id != "" {
-			models = append(models, id)
+		entries = append(entries, [2]string{pid, id})
+	}
+	return entries
+}
+
+// opencodeStateModelIDs returns the model id of every entry in opencode's model
+// state whose provider block pred accepts, in the order the state lists them.
+func opencodeStateModelIDs(pred func(string) bool) []string {
+	var models []string
+	for _, entry := range opencodeStateEntries() {
+		if pred(entry[0]) {
+			models = append(models, entry[1])
 		}
 	}
 	return models
+}
+
+// opencodeStoreKey names one model the way opencode's state holds it: the
+// provider BLOCK that declares it, then the model id under it. The block is the
+// endpoint, so the daemon's "llama3.2" and a remote's are different keys and
+// two different models. NUL-joins them because a block name and a model id both
+// come from config and neither can contain NUL, so no pair of different entries
+// can build one key.
+func opencodeStoreKey(providerID, modelID string) string {
+	return providerID + "\x00" + modelID
+}
+
+// opencodeHeldStoreKeys is the key of every entry of opencode's state that
+// names a block this integration writes, in state order.
+func opencodeHeldStoreKeys() []string {
+	var keys []string
+	for _, entry := range opencodeStateEntries() {
+		if opencodeIsOurProviderBlock(entry[0]) {
+			keys = append(keys, opencodeStoreKey(entry[0], entry[1]))
+		}
+	}
+	return keys
+}
+
+// DeclaresSelection reports whether opencode's state already holds what a write
+// of models would leave: the same (provider block, model id) pairs, in order,
+// at the head of the recent list. Entries after them are the picker's history,
+// which Edit leaves in place (its DeleteFunc removes only the pairs it is about
+// to write), so they are not drift.
+//
+// The pairs are compared as pairs and not as ids: a model id alone cannot tell
+// the daemon's block from a remote's, so a state keeping the remote's
+// attribution while this launch would move the model to the daemon read as
+// current and the launch left opencode dialling the remote (2026-09-27 audit,
+// round 27, F3).
+func (o *OpenCode) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) == 0 {
+		return false
+	}
+	daemonID := opencodeDaemonProviderID(models)
+	want := make([]string, 0, len(models))
+	for _, m := range models {
+		pid, mid := opencodeProviderFor(m, daemonID)
+		want = append(want, opencodeStoreKey(pid, mid))
+	}
+	return declaresPrefix(opencodeHeldStoreKeys(), want)
 }
 
 func buildModelEntries(modelList []LaunchModel) map[string]any {

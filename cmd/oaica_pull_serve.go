@@ -13,6 +13,7 @@ package cmd
 // this thin client doesn't run. This file replaces it.
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
@@ -29,6 +30,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -177,6 +179,61 @@ type oaicaLocalServerEntry struct {
 	// for loopback-only servers). The launcher's translation proxy sends it
 	// as the bearer for "<model>:local" launches; the registry file is 0600.
 	APIKey string `json:"api_key,omitempty"`
+	// extra holds every field of a row this struct does not model, so a rewrite
+	// of the registry hands them back rather than deleting them. Every writer
+	// here replaces the file whole (register, unregister, drop), so a field a
+	// user or a future build added was gone after the next `oaica serve`
+	// (2026-09-27 audit, round 27, B-F). Same stance as the integration stores:
+	// what a writer did not write is not its to delete.
+	extra map[string]json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON reads a row and keeps whatever it does not model.
+func (e *oaicaLocalServerEntry) UnmarshalJSON(b []byte) error {
+	type plain oaicaLocalServerEntry
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*e = oaicaLocalServerEntry(p)
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(b, &all); err != nil {
+		return err
+	}
+	for _, k := range []string{"model", "origin", "pid", "started_at", "api_key"} {
+		delete(all, k)
+	}
+	if len(all) > 0 {
+		e.extra = all
+	}
+	return nil
+}
+
+// MarshalJSON writes a row as the fields this struct models, then the fields it
+// carried from the file, in a stable order.
+func (e oaicaLocalServerEntry) MarshalJSON() ([]byte, error) {
+	type plain oaicaLocalServerEntry
+	base, err := json.Marshal(plain(e))
+	if err != nil || len(e.extra) == 0 {
+		return base, err
+	}
+	keys := make([]string, 0, len(e.extra))
+	for k := range e.extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := bytes.TrimRight(base, "}")
+	for _, k := range keys {
+		kb, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ',')
+		out = append(out, kb...)
+		out = append(out, ':')
+		out = append(out, e.extra[k]...)
+	}
+	return append(out, '}'), nil
 }
 
 func oaicaRegisterLocalServer(model, origin, apiKey string) error {

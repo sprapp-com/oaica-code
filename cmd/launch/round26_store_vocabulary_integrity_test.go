@@ -66,6 +66,12 @@ func TestOpenclawPrimaryNamesTheModelItsProviderDeclares(t *testing.T) {
 // TestTheDriftTermReadsTheStoresOwnVocabulary is the launcher half: a store
 // that declares the daemon-side id is not drift for a selection saved under the
 // picker name.
+//
+// It drives the real OpenClaw store, not a stand-in: the editor that answers in
+// the store's vocabulary is the one whose writers embed an id no picker name
+// equals, and the term reaches it through the editor's own reader
+// (storeDeclarationEditor) rather than through any flat list the test could
+// fake (2026-09-27 audit, round 27).
 func TestTheDriftTermReadsTheStoresOwnVocabulary(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 
@@ -78,14 +84,18 @@ func TestTheDriftTermReadsTheStoresOwnVocabulary(t *testing.T) {
 		{Name: "ollama/gpt-oss", Remote: true, Upstream: row.Upstream},
 	}}
 
-	store := fakeEditor{models: []string{"gpt-oss:cloud"}}
-	if !c.liveEditorDeclaration(t.Context(), store, []string{"gpt-oss"}) {
+	if err := (&Openclaw{}).Edit([]LaunchModel{row}); err != nil {
+		t.Fatalf("Openclaw.Edit: %v", err)
+	}
+	if !c.liveEditorDeclaration(t.Context(), &Openclaw{}, []string{"gpt-oss"}) {
 		t.Error("liveEditorDeclaration(store declaring gpt-oss:cloud, selection gpt-oss) = false: the store holds exactly the model this selection is written as, so the launch re-resolves the inventory and rewrites an unchanged config on every run")
 	}
 
 	// It is not a rubber stamp: a store declaring something else is drift.
-	other := fakeEditor{models: []string{"llama3.2"}}
-	if c.liveEditorDeclaration(t.Context(), other, []string{"gpt-oss"}) {
+	if err := (&Openclaw{}).Edit([]LaunchModel{{Name: "llama3.2"}}); err != nil {
+		t.Fatalf("Openclaw.Edit: %v", err)
+	}
+	if c.liveEditorDeclaration(t.Context(), &Openclaw{}, []string{"gpt-oss"}) {
 		t.Error("liveEditorDeclaration said an unrelated store matches the selection: the config would be left pointing at a model the launch did not choose")
 	}
 }

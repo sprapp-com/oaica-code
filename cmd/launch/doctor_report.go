@@ -18,6 +18,7 @@ package launch
 //     key in someone's support ticket.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -123,7 +124,7 @@ func reportSecrets() []reportSecret {
 		// A read error is not swallowed here: the report warns about it below
 		// (buildDoctorReport), so an unscannable registry shrinks the value
 		// list VISIBLY rather than silently (2026-09-27 audit).
-		keys, _ := localServerKeys(home)
+		keys, _, _ := localServerKeys(home)
 		for _, k := range keys {
 			add("an `oaica serve --api-key` value in ~/.oaica/local_servers.json", k)
 		}
@@ -144,26 +145,115 @@ func reportSecrets() []reportSecret {
 // may hold a credential the scan cannot see, and returning nil for both made
 // the leak check silently smaller — the one state it must never be wrong
 // about. The error is returned so the caller can say so out loud.
-func localServerKeys(home string) ([]string, error) {
+func localServerKeys(home string) (keys, unclassified []string, err error) {
 	path := filepath.Join(home, ".oaica", "local_servers.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	var entries []struct {
-		APIKey string `json:"api_key"`
+	keys, unclassified, err = jsonCredentialFields(b)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if err := json.Unmarshal(b, &entries); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+	return keys, unclassified, nil
+}
+
+// jsonCredentialFields reads a document's credential-shaped fields: every
+// string stored under "api_key" (the field `oaica serve` writes), and the names
+// of the other fields that a human would call credentials but this scan does
+// not model.
+//
+// The api_key values are read from the document's TOKENS rather than through a
+// struct: a struct decode keeps ONE value per key, so a row carrying "api_key"
+// twice answered with the second alone — the first is just as printable as the
+// second, and it was invisible to a scan whose whole job is to know what must
+// not be printed. Any depth is read for the same reason: a value does not stop
+// needing redaction by being nested (2026-09-27 audit, round 27, B-D).
+//
+// The unclassified names are the other half of the same honesty: a document
+// that spells the field "APIKey", or holds a "token" beside it, has credentials
+// this scan cannot identify, and the report says so rather than presenting a
+// clean scan it did not earn.
+func jsonCredentialFields(doc []byte) (keys, unclassified []string, err error) {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.UseNumber()
+
+	// One frame per open object or array. In an object the tokens alternate
+	// key, value — tracked exactly, so a string VALUE that happens to be spelled
+	// "api_key" is not mistaken for a key.
+	type frame struct {
+		object    bool
+		expectKey bool
 	}
-	keys := make([]string, 0, len(entries))
-	for _, e := range entries {
-		keys = append(keys, e.APIKey)
+	var stack []frame
+	// keyIsOurs is set by an object key: whether the value that follows is one
+	// to collect.
+	keyIsOurs := false
+
+	for {
+		tok, terr := dec.Token()
+		if terr == io.EOF {
+			return keys, unclassified, nil
+		}
+		if terr != nil {
+			return nil, nil, terr
+		}
+
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{':
+				stack = append(stack, frame{object: true, expectKey: true})
+			case '[':
+				stack = append(stack, frame{object: false})
+			default: // '}' or ']': the value it closes is done
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+				if len(stack) > 0 && stack[len(stack)-1].object {
+					stack[len(stack)-1].expectKey = true
+				}
+				keyIsOurs = false
+			}
+			continue
+		}
+
+		if len(stack) == 0 || !stack[len(stack)-1].object {
+			continue // a bare array element: not a field
+		}
+		top := &stack[len(stack)-1]
+		if top.expectKey {
+			name, ok := tok.(string)
+			keyIsOurs = ok && name == "api_key"
+			if ok && !keyIsOurs && credentialFieldName(name) {
+				unclassified = append(unclassified, name)
+			}
+			top.expectKey = false
+			continue
+		}
+		if keyIsOurs {
+			if value, ok := tok.(string); ok && value != "" {
+				keys = append(keys, value)
+			}
+		}
+		keyIsOurs = false
+		top.expectKey = true
 	}
-	return keys, nil
+}
+
+// credentialFieldName reports whether a field name names a credential to a
+// human: the scan's job is to know what must not be printed, and a field it
+// cannot classify is one it must own up to.
+func credentialFieldName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, part := range []string{"key", "token", "secret", "password", "credential"} {
+		if strings.Contains(lower, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // readSecretFile returns a file's trimmed contents, or "" for any error —
@@ -275,8 +365,15 @@ func buildDoctorReport() (string, bool) {
 		// must not print. The warning names the path and the failure; the error
 		// text carries no file CONTENT, so it cannot itself leak a key
 		// (2026-09-27 audit).
-		if _, err := localServerKeys(home); err != nil {
+		if _, unclassified, err := localServerKeys(home); err != nil {
 			fmt.Fprintf(&b, "  WARNING: %v — an `oaica serve --api-key` value in that file cannot be read, so this report's leak check does NOT cover it\n", err)
+		} else if len(unclassified) > 0 {
+			// The scan models one field name. A document that carries others is
+			// one whose credentials this report cannot list, and saying so is the
+			// difference between a scan with a known edge and a scan that looks
+			// complete (2026-09-27 audit, round 27, B-D).
+			fmt.Fprintf(&b, "  NOTE: %s holds field(s) named %s that this report does not classify, so any credential under them is not part of the leak check\n",
+				filepath.Join(home, ".oaica", "local_servers.json"), strings.Join(PrintableCells(unclassified), ", "))
 		}
 		// sensitive=true so the directory's own bits print (see describeFile):
 		// the cache holds the picker's fetched rows, not credentials, but a

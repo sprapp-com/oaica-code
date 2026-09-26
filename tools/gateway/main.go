@@ -892,12 +892,28 @@ func (g *gateway) apply(cfg gwConfig) error {
 		close(g.meterDone)
 		g.meterDone = nil
 	}
+	// Whatever the retired reporter had not yet delivered is taken out of its
+	// channel and handed to the reporter that replaces it. It used to be
+	// dropped in silence: a reload with reports queued retired the consumer and
+	// left them in a channel nobody would ever read, so the aggregated view at
+	// meterhub was missing records the local ledger had, and nothing said so
+	// (2026-09-27 audit, round 27, B-C). Closing the channel is not the
+	// alternative — a sender that read it under RLock can still be in its send,
+	// and that panics.
+	stranded := drainMeterChannel(g.meterCh)
 	if cfg.MeterHubAddr != "" {
 		g.meterCh = make(chan usageReport, 256)
 		g.meterDone = make(chan struct{})
 		go runMeterReporter(g.meterCh, g.meterDone, cfg.MeterHubAddr, cfg.MeterHubToken, meterReporterBackoff)
 	} else {
 		g.meterCh = nil
+	}
+	if n := requeueMeterReports(g.meterCh, stranded); n > 0 {
+		// What cannot be requeued (the new reporter is itself behind, or
+		// metering was switched off by this reload) is SAID, not lost quietly:
+		// the local ledger still has these records, so this is a delay in the
+		// aggregated view, and the operator is the one who can act on it.
+		log.Printf("oaica-gateway: reload dropped %d queued usage report(s) that the reporter it replaced had not delivered (the local ledger still has them)", n)
 	}
 
 	if cfg.EntitlementEnabled && cfg.MeterHubAddr != "" {
@@ -1027,6 +1043,48 @@ func runMeterReporter(ch <-chan usageReport, done <-chan struct{}, addr, token s
 	}
 }
 
+// drainMeterChannel takes every report currently queued on ch, in order, and
+// returns them. Called while apply() holds the write lock, so no sender is
+// between its read of g.meterCh and its send: the reports it returns are the
+// whole of what the retired reporter had left.
+func drainMeterChannel(ch chan usageReport) []usageReport {
+	if ch == nil {
+		return nil
+	}
+	var out []usageReport
+	for {
+		select {
+		case rep := <-ch:
+			out = append(out, rep)
+		default:
+			return out
+		}
+	}
+}
+
+// requeueMeterReports moves reports onto the reporter that replaced the one
+// that queued them, in order and without blocking (a full channel is the
+// condition reportUsage already drops for). It returns how many could NOT be
+// handed over.
+func requeueMeterReports(ch chan usageReport, reports []usageReport) int {
+	if len(reports) == 0 {
+		return 0
+	}
+	dropped := 0
+	for _, rep := range reports {
+		if ch == nil {
+			dropped++
+			continue
+		}
+		select {
+		case ch <- rep:
+		default:
+			dropped++
+		}
+	}
+	return dropped
+}
+
 // reportUsage sends e to the meter reporter's channel, non-blocking. A full
 // channel (meterhub down/slow for a while) drops the report rather than
 // stalling the request that triggered it — see meterCh's doc.
@@ -1141,6 +1199,11 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	models := g.cfg.Models
 	g.mu.RUnlock()
 	data := make([]map[string]any, 0, len(models))
+	// One deadline for the whole roster, not one per model: the budget is what
+	// this request is willing to spend on probe answers it does not have yet,
+	// and spending it once per model is how a roster with several cold
+	// upstreams held the caller for minutes (2026-09-27 audit, round 27, B-A).
+	healthDeadline := time.Now().Add(healthBudget)
 	for _, m := range models {
 		created := m.Created
 		if created == 0 {
@@ -1173,7 +1236,7 @@ func (g *gateway) modelsHandler(w http.ResponseWriter, r *http.Request) {
 			"input_modalities":  in,
 			"output_modalities": []string{"text"},
 		}
-		g.annotateHealth(m, entry)
+		g.annotateHealth(m, entry, healthDeadline)
 		data = append(data, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
