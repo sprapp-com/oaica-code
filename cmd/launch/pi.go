@@ -630,7 +630,33 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
+	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
 
+	// The whole load-mutate-save of BOTH documents runs under their locks, one
+	// lock per file (foreignStoreLockBase: the documents are Pi's, so the lock
+	// is oaica's and no stray .lock appears in ~/.pi). Pi has one provider slot
+	// and oaica rewrites the whole of both documents from one snapshot, so two
+	// Edits that overlap each read the same snapshot, each writes its own
+	// launch's models, and the rename that lands last publishes a document with
+	// the other launch's changes deleted while both launches report success.
+	// The other writer an entry can be lost to here is Pi itself — it owns
+	// these files and oaica models only part of each one (2026-09-26 audit,
+	// twelfth round).
+	//
+	// The reads below are INSIDE the locks, which is what makes them loads of
+	// the newest documents rather than of the ones this process saw on the way
+	// in. The two locks are taken in this order everywhere, so two oaica
+	// processes cannot deadlock on them.
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		return fileutil.WithFileLock(foreignStoreLockBase(settingsPath), func() error {
+			return piEditDocuments(configPath, settingsPath, models)
+		})
+	})
+}
+
+// piEditDocuments is Pi.Edit's load → mutate → save, run by Edit with both of
+// Pi's documents locked.
+func piEditDocuments(configPath, settingsPath string, models []LaunchModel) error {
 	config, err := readPiJSONDocument(configPath)
 	if err != nil {
 		return err
@@ -639,7 +665,6 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	// Both documents are read before either is written: a refusal on the
 	// second must not leave the first already rewritten, so the pair either
 	// updates together or the files stay exactly as the user wrote them.
-	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
 	settings, err := readPiJSONDocument(settingsPath)
 	if err != nil {
 		return err
