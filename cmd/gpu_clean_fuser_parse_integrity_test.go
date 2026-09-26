@@ -30,7 +30,7 @@ func TestFuserOutputYieldsThePIDsWhateverTheCommandLooksLike(t *testing.T) {
 		},
 		{
 			name: "a command with arguments in its name",
-			out: "/dev/nvidia0:        root       4321 F.... python3 -m vllm.entrypoints\n",
+			out:  "/dev/nvidia0:        root       4321 F.... python3 -m vllm.entrypoints\n",
 			want: []int{4321},
 		},
 		{
