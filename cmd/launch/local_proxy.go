@@ -53,27 +53,30 @@ func flushResponse(w http.ResponseWriter) {
 // the 2026-09-26 audit (the Anthropic-wire passthrough has always flushed, and
 // says why in its own copy loop).
 //
-// A write error means the client is gone; the read error is reported to the
-// caller only so it can log, not so it can be turned into a status (the status
-// line is long since sent).
-func relayFlushing(w http.ResponseWriter, src io.Reader) error {
+// It reports what reached the client: how many bytes were written, whether the
+// failure was the client leaving (a write error — the leg delivered, this side
+// had nowhere to put it) rather than the body dying (a read error), and that
+// error itself. The caller logs off those; neither can be turned into a status,
+// because the status line is long since sent.
+func relayFlushing(w http.ResponseWriter, src io.Reader) (written int64, clientGone bool, err error) {
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
-			if _, err := w.Write(buf[:n]); err != nil {
-				return err
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return written, true, writeErr
 			}
+			written += int64(n)
 			if canFlush {
 				flusher.Flush()
 			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				return nil
+				return written, false, nil
 			}
-			return readErr
+			return written, false, readErr
 		}
 	}
 }
@@ -272,7 +275,7 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 		}
 		w.WriteHeader(resp.StatusCode)
 		flushResponse(w)
-		_ = relayFlushing(w, resp.Body)
+		_, _, _ = relayFlushing(w, resp.Body)
 	})
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, listenPort))

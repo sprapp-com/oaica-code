@@ -183,8 +183,41 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 		req.Header = r.Header.Clone()
 		req.ContentLength = int64(len(body))
 
+		// The row is built BEFORE the upstream call and written from a defer,
+		// like the Anthropic proxy's rows: it used to be created behind the
+		// request, so a transport failure (refused connection, DNS, TLS,
+		// timeout) returned early and left no evidence at all — `oaica usage`
+		// reported ERR 0 for a session whose every turn failed (2026-09-26
+		// audit).
+		var entry *requestLogEntry
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") && len(body) > 0 {
+			var modelField struct {
+				Model string `json:"model"`
+			}
+			json.Unmarshal(body, &modelField)
+			lastLen, totalLen := extractLastAndTotalMessageLen(body)
+			e := requestLogEntry{
+				Timestamp:        time.Now().UTC().Format(time.RFC3339),
+				Model:            modelField.Model,
+				Path:             r.URL.Path,
+				Backend:          redactBaseURL(targetBaseURL),
+				LastMessageLen:   lastLen,
+				TotalMessagesLen: totalLen,
+				HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
+				WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
+			}
+			entry = &e
+			defer func() {
+				entry.DurationMs = time.Since(start).Milliseconds()
+				appendRequestLog(*entry)
+			}()
+		}
+
 		resp, err := proxyUpstreamClient.Do(req)
 		if err != nil {
+			if entry != nil {
+				entry.StatusCode = http.StatusBadGateway
+			}
 			// A transport error quotes the request URL verbatim.
 			http.Error(w, redactErr(err).Error(), http.StatusBadGateway)
 			return
@@ -195,28 +228,25 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 				w.Header().Add(k, v)
 			}
 		}
-		w.WriteHeader(resp.StatusCode)
-		flushResponse(w)
-		_ = relayFlushing(w, resp.Body)
+		rec := &statusCapturingWriter{ResponseWriter: w}
+		rec.WriteHeader(resp.StatusCode)
+		flushResponse(rec)
+		relayedBody, clientGone, relayErr := relayFlushing(rec, resp.Body)
 
-		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") && len(body) > 0 {
-			var modelField struct {
-				Model string `json:"model"`
+		// The status logged is the one the CLIENT ended up with, and a sub-300
+		// status is not by itself a delivered turn: a body that died mid-answer
+		// after the headers were already a 200 was logged as a clean turn, and
+		// so was an upstream that answered 200 and closed without a byte —
+		// neither is a turn any client can use, and a session of nothing but
+		// those reported ERR 0 (2026-09-26 audit). A client that hung up is the
+		// one case that is NOT a failed turn: the leg delivered, this side had
+		// nowhere to put it.
+		if entry != nil {
+			entry.StatusCode = rec.status()
+			if entry.StatusCode < 300 && !clientGone && r.Context().Err() == nil &&
+				(relayErr != nil || relayedBody == 0) {
+				entry.StatusCode = http.StatusBadGateway
 			}
-			json.Unmarshal(body, &modelField)
-			lastLen, totalLen := extractLastAndTotalMessageLen(body)
-			appendRequestLog(requestLogEntry{
-				Timestamp:        time.Now().UTC().Format(time.RFC3339),
-				Model:            modelField.Model,
-				Path:             r.URL.Path,
-				Backend:          redactBaseURL(targetBaseURL),
-				LastMessageLen:   lastLen,
-				TotalMessagesLen: totalLen,
-				HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
-				WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
-				StatusCode:       resp.StatusCode,
-				DurationMs:       time.Since(start).Milliseconds(),
-			})
 		}
 	})
 
