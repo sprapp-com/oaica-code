@@ -885,6 +885,76 @@ func (p *Pi) Models() []string {
 	return result
 }
 
+// piStoredOwnedIDs is the id of every entry under Pi's ollama provider that
+// this package wrote (isPiOllamaModel), in file order. Those are the entries
+// piEditDocuments owns and rebuilds, so they are the ones a write of a
+// selection leaves: an entry with no _launch marker is the user's and is
+// carried over untouched.
+func piStoredOwnedIDs(home string) []string {
+	config, err := fileutil.ReadJSON(filepath.Join(home, ".pi", "agent", "models.json"))
+	if err != nil {
+		return nil
+	}
+	providers, _ := config["providers"].(map[string]any)
+	ollama, _ := providers["ollama"].(map[string]any)
+	models, _ := ollama["models"].([]any)
+	var ids []string
+	for _, m := range models {
+		modelObj, ok := m.(map[string]any)
+		if !ok || !isPiOllamaModel(modelObj) {
+			continue
+		}
+		if id, ok := modelObj["id"].(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// DeclaresSelection reports whether Pi's store already holds what a write of
+// models would leave.
+//
+// The comparison is a set, and Pi is the one integration where that is the
+// honest reading. Its fallback (sameModelSelection) compares index by index,
+// and the list it compared is in no particular order on either side: the picker
+// hands back the models last-checked-first, and piEditDocuments keeps the
+// entries already in the file where they are and appends the new ones. So a
+// two-model launch agreed only when the save order happened to be sorted, and
+// every other launch read its own write as drift, re-resolved the inventory and
+// re-ran the configure step forever (2026-09-27 audit, round 30, A-F1). Pi's
+// primary is settings.defaultModel, not the order of this list, so the order
+// carries nothing the declaration needs to check.
+//
+// Only the entries this package wrote are compared, because the writer
+// preserves the rest (an entry without the _launch marker is the user's own
+// model in that provider slot) — they are not a selection it failed to remove.
+func (p *Pi) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) == 0 {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	seen := make(map[string]bool, len(models))
+	want := make([]string, 0, len(models))
+	for _, m := range models {
+		id := piModelIDFor(m)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		want = append(want, id)
+	}
+	held := piStoredOwnedIDs(home)
+	if len(held) != len(want) {
+		return false
+	}
+	slices.Sort(want)
+	slices.Sort(held)
+	return sameStoreStrings(held, want)
+}
+
 // piPickerNameFor is the inverse of piModelIDFor for an entry on disk: the
 // picker name that entry was written for.
 //

@@ -908,17 +908,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 	} else {
 		g.meterCh = nil
 	}
-	if n := requeueMeterReports(g.meterCh, stranded); n > 0 {
-		// What cannot be requeued (the new reporter is itself behind, or
-		// metering was switched off by this reload) is SAID, not lost quietly:
-		// the local ledger still has these records, so this is a delay in the
-		// aggregated view, and the operator is the one who can act on it. This
-		// counts only what was still QUEUED: a report the retired reporter had
-		// already taken off the channel and was retrying is reported by the
-		// reporter itself, which names its request id (round 29, B2) — the two
-		// lines together account for every record.
-		log.Printf("oaica-gateway: reload dropped %d queued usage report(s) that the reporter it replaced had not delivered (the local ledger still has them)", n)
-	}
+	droppedReports := requeueMeterReports(g.meterCh, stranded)
 
 	if cfg.EntitlementEnabled && cfg.MeterHubAddr != "" {
 		ttl := time.Duration(cfg.EntitlementCacheTTLSec) * time.Second
@@ -930,6 +920,16 @@ func (g *gateway) apply(cfg gwConfig) error {
 		g.entitlement = nil
 	}
 	g.mu.Unlock()
+
+	// Said OUTSIDE the lock, which is the point: a log write is an unbounded
+	// write to whatever stderr points at, and under the WRITE lock it froze
+	// every completion on the box — a pending writer blocks new readers
+	// outright (2026-09-27 audit, round 30, B1; the same shape round 29 fixed in
+	// reportUsage, one function away). The count is a plain int, so nothing is
+	// needed to carry it out.
+	if droppedReports > 0 {
+		log.Printf("oaica-gateway: reload dropped %d queued usage report(s) that the reporter it replaced had not delivered (the local ledger still has them)", droppedReports)
+	}
 
 	// Large-context admission control — see gwConfig.LargeContextTokenThreshold's
 	// doc. A negative threshold disables it; everything else gets sane
@@ -1497,15 +1497,22 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 		return
 	}
 	g.ledgerMu.Lock()
+	var writeErr error
 	if g.ledger != nil {
 		if _, err := g.ledger.Write(append(b, '\n')); err != nil {
-			// Audit L14: a silent failure here silently loses billing rows
-			// (disk full, fd closed). One log line per failure is cheap; the
-			// request still serves.
-			log.Printf("ledger write failed: %v", err)
+			writeErr = err
 		}
 	}
 	g.ledgerMu.Unlock()
+
+	if writeErr != nil {
+		// Audit L14: a silent failure here silently loses billing rows (disk
+		// full, fd closed). One log line per failure is cheap; the request still
+		// serves. Written after the lock for the reason round 30's B1 gives: the
+		// sink is not ours and the lock is held by every other ledger writer
+		// (2026-09-27 audit, round 30).
+		log.Printf("ledger write failed: %v", writeErr)
+	}
 
 	// Best-effort central aggregation — see meterCh's doc. Never blocks:
 	// reportUsage sends on a buffered channel with a non-blocking select.

@@ -988,6 +988,14 @@ func selectionRows(inventory []LaunchModel, names []string) []LaunchModel {
 	rows := make([]LaunchModel, 0, len(names))
 	seen := make(map[string]bool, len(names))
 	for _, name := range names {
+		// An empty name is not a model: the writer skips it (launchModelNames),
+		// so a declaration asked about it is asked about a row no write would
+		// leave — and for an editor that narrows to one entry (Cline) the empty
+		// name could take that one slot, configuring the integration with
+		// nothing (2026-09-27 audit, round 30, A-F2).
+		if name == "" {
+			continue
+		}
 		row, ok := findLaunchModel(inventory, name)
 		if !ok {
 			row = LaunchModel{Name: name}
