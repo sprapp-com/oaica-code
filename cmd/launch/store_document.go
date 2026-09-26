@@ -229,17 +229,28 @@ func mergeStoreDocument(had, now json.RawMessage, sch *jsonSchema) (json.RawMess
 
 	case shapeArray:
 		ha, na, ok := asJSONArrays(had, now)
-		if !ok || len(ha) != len(na) {
+		if !ok {
 			return now, false
 		}
 		carried := false
-		for i := range ha {
-			if sch.elem.shape == shapeStruct && !sameEntry(ha[i], na[i]) {
-				// Same length, but these two are not the same entry: a
-				// reordered list must not hand one entry's members to another.
+		// A list has no key to delete by, so an entry is matched to the old
+		// entry it IS (sameEntry: both objects sharing a scalar member) rather
+		// than to whatever sits at the same index. That is what lets a reorder
+		// keep each entry's own members, and it is what the length check used
+		// to stand in for: the old code bailed out of the whole ARRAY whenever
+		// the length changed, so adding or removing one entry switched off
+		// preservation for every entry it kept — `remote add <new>` deleted the
+		// hand-added note on <old>. The added entry matches nothing (it is new)
+		// and the removed one is simply not in the new list (nothing re-attaches
+		// it), which is the same contract as before, one entry at a time.
+		used := make([]bool, len(ha))
+		for i := range na {
+			j, ok := matchArrayEntry(ha, i, na[i], used, sch.elem)
+			if !ok {
 				continue
 			}
-			if m, c := mergeStoreDocument(ha[i], na[i], sch.elem); c {
+			used[j] = true
+			if m, c := mergeStoreDocument(ha[j], na[i], sch.elem); c {
 				na[i] = m
 				carried = true
 			}
@@ -254,6 +265,42 @@ func mergeStoreDocument(had, now json.RawMessage, sch *jsonSchema) (json.RawMess
 		return out, true
 	}
 	return now, false
+}
+
+// matchArrayEntry finds the old entry a new entry is: the same index when that
+// is a match, else the single unused old entry sharing the most with it.
+//
+// Position is checked first because it is the cheapest evidence and the common
+// case (a list rewritten in place). Otherwise the entry with the highest count
+// of shared identifying members wins, and only if that count is unique — two
+// candidates with the same score are two entries that cannot be told apart, and
+// merging one of them by guess would hand an entry's members to a stranger.
+// Declining costs only the carried members, which is the safe direction.
+func matchArrayEntry(had []json.RawMessage, i int, now json.RawMessage, used []bool, elem *jsonSchema) (int, bool) {
+	if elem.shape != shapeStruct {
+		return 0, false // nothing to align by: a list of scalars has no members
+	}
+	if i < len(had) && !used[i] && sameEntry(had[i], now) {
+		return i, true
+	}
+	best, bestScore, ties := -1, 0, 0
+	for j := range had {
+		if used[j] {
+			continue
+		}
+		score := sharedIdentityScore(had[j], now)
+		switch {
+		case score == 0:
+		case score > bestScore:
+			best, bestScore, ties = j, score, 1
+		case score == bestScore:
+			ties++
+		}
+	}
+	if best >= 0 && ties == 1 {
+		return best, true
+	}
+	return 0, false
 }
 
 func asJSONObjects(had, now json.RawMessage) (map[string]json.RawMessage, map[string]json.RawMessage, bool) {
@@ -278,26 +325,57 @@ func asJSONArrays(had, now json.RawMessage) ([]json.RawMessage, []json.RawMessag
 	return ha, na, true
 }
 
-// sameEntry reports whether two array elements are the same entry: both objects,
-// sharing at least one scalar member with the same value (a name, an id, a URL).
-// Without a shared scalar the pair is not evidence of an alignment, and merging
-// by index alone would attach one entry's unknown members to a different entry.
+// sameEntry reports whether two array elements are the same entry: both
+// objects, sharing at least one IDENTIFYING scalar member with the same value
+// (a name, an id, a URL). Without one the pair is not evidence of an
+// alignment, and merging by index alone would attach one entry's unknown
+// members to a different entry.
+//
+// Identity has to be a value that can identify, which rules out the empty
+// string: every remote in remotes.json carries `"api_key": ""` and
+// `"version": ""` when unset, so counting those as a shared scalar made every
+// entry in the file "the same entry" as every other — which is exactly how a
+// list of two remotes, reordered, had one entry's hand-added note re-attached
+// to the other (2026-09-26 audit).
 func sameEntry(a, b json.RawMessage) bool {
+	return sharedIdentityScore(a, b) > 0
+}
+
+// sharedIdentityScore counts the scalar members two objects share with equal,
+// non-empty values — the strength of the evidence that they are the same
+// entry. A higher score is a better match: two entries sharing a name and a
+// base URL are unmistakable, two sharing only a vendor field are a guess.
+func sharedIdentityScore(a, b json.RawMessage) int {
 	var ao, bo map[string]json.RawMessage
 	if json.Unmarshal(a, &ao) != nil || json.Unmarshal(b, &bo) != nil || ao == nil || bo == nil {
-		return false
+		return 0
 	}
+	n := 0
 	for k, av := range ao {
 		bv, ok := bo[k]
 		if !ok {
 			continue
 		}
 		at, bt := bytes.TrimSpace(av), bytes.TrimSpace(bv)
-		if scalarJSON(at) && scalarJSON(bt) && bytes.Equal(at, bt) {
-			return true
+		if identifyingScalar(at) && bytes.Equal(at, bt) {
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// identifyingScalar reports whether a JSON scalar can say WHICH entry this is:
+// a non-empty string, or a number/bool. An empty string is what an unset field
+// marshals to, so it is shared by every entry that has not set it and cannot
+// distinguish anything; null is not a scalar here (scalarJSON rejects it).
+func identifyingScalar(raw []byte) bool {
+	if !scalarJSON(raw) || len(raw) < 2 {
+		return len(raw) == 1 && raw[0] != '"' // a bare digit or letter
+	}
+	if raw[0] == '"' {
+		return len(raw) > 2 // "" is not an identity
+	}
+	return true
 }
 
 func scalarJSON(raw []byte) bool {
