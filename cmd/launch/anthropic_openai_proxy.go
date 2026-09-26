@@ -1478,6 +1478,37 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 
+		// Same local-only log the router path used to keep (request_log.go):
+		// model, which backend, sizes, status -- never content.
+		//
+		// Built BEFORE the upstream call, not after it: the row used to be
+		// created behind the request, so a transport failure (refused
+		// connection, DNS, TLS, timeout) returned early and left no row at
+		// all — `oaica usage` reported ERR 0 for a session whose every turn
+		// failed, which is the failure a user opens the report to find
+		// (2026-09-26 audit).
+		//
+		// The status logged is the one the CLIENT ended up with, not the one
+		// the upstream answered with before its body was read: an upstream
+		// that sends a JSON error object over HTTP 200 becomes a 502 for the
+		// client, and logging the 200 made `oaica usage` report a session
+		// whose every turn failed as errors: 0 (2026-09-26 audit). The
+		// breaker below still keys on the UPSTREAM status, deliberately —
+		// writeUpstreamError collapses a 4xx to a 502, and a 4xx is the leg
+		// working, not failing.
+		lastLen, totalLen := extractLastAndTotalMessageLen(body)
+		entry := requestLogEntry{
+			Timestamp:        time.Now().UTC().Format(time.RFC3339),
+			Model:            anthReq.Model,
+			Path:             r.URL.Path,
+			Backend:          route.Label + " " + redactBaseURL(route.BaseURL),
+			LastMessageLen:   lastLen,
+			TotalMessagesLen: totalLen,
+			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
+			WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
+			DurationMs:       time.Since(started).Milliseconds(),
+		}
+
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.BaseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
 			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
@@ -1500,6 +1531,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// (route_policy.go): consecutive failures escalate the session to
 			// the stronger secondary leg.
 			table.escalations.recordFail(table.SessionID, route.BaseURL)
+			// The attempt is logged even though it never reached a backend:
+			// a leg that refuses connections is the case an ERR column exists
+			// for, and the one it used to miss (2026-09-26 audit).
+			entry.StatusCode = http.StatusBadGateway
+			appendRequestLog(entry)
 			writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 			return
 		}
@@ -1522,31 +1558,8 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			table.escalations.recordOK(table.SessionID, route.BaseURL)
 		}
 
-		// Same local-only log the router path used to keep (request_log.go):
-		// model, which backend, sizes, status -- never content.
-		//
-		// The status logged is the one the CLIENT ended up with, not the one
-		// the upstream answered with before its body was read: an upstream
-		// that sends a JSON error object over HTTP 200 becomes a 502 for the
-		// client, and logging the 200 made `oaica usage` report a session
-		// whose every turn failed as errors: 0 (2026-09-26 audit). The
-		// breaker above still keys on the UPSTREAM status, deliberately —
-		// writeUpstreamError collapses a 4xx to a 502, and a 4xx is the leg
-		// working, not failing.
 		rec := &statusCapturingWriter{ResponseWriter: w}
 		w = rec
-		lastLen, totalLen := extractLastAndTotalMessageLen(body)
-		entry := requestLogEntry{
-			Timestamp:        time.Now().UTC().Format(time.RFC3339),
-			Model:            anthReq.Model,
-			Path:             r.URL.Path,
-			Backend:          route.Label + " " + redactBaseURL(route.BaseURL),
-			LastMessageLen:   lastLen,
-			TotalMessagesLen: totalLen,
-			HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
-			WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
-			DurationMs:       time.Since(started).Milliseconds(),
-		}
 		defer func() {
 			entry.StatusCode = rec.status()
 			appendRequestLog(entry)
@@ -2346,6 +2359,28 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 // primary was never failed over — the promise docs/CLAUDE_TIERS.md's failover
 // section makes for every leg (2026-09-26 audit).
 func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) int {
+	// The failed attempts on this leg are logged (request_log.go): a plan row
+	// on the anthropic wire whose upstream refuses connections left no
+	// evidence anywhere, so `oaica usage` reported a clean session for one
+	// where no turn ever succeeded (2026-09-26 audit).
+	started := time.Now()
+	lastLen, totalLen := extractLastAndTotalMessageLen(body)
+	failEntry := requestLogEntry{
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		Model:            requestLogModelFromBody(body),
+		Path:             r.URL.Path,
+		Backend:          redactBaseURL(upstream),
+		LastMessageLen:   lastLen,
+		TotalMessagesLen: totalLen,
+		HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
+		WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
+	}
+	logTransportFailure := func(status int) {
+		failEntry.StatusCode = status
+		failEntry.DurationMs = time.Since(started).Milliseconds()
+		appendRequestLog(failEntry)
+	}
+
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
@@ -2382,6 +2417,7 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
+		logTransportFailure(http.StatusBadGateway)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return 0
 	}

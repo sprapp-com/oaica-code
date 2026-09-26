@@ -103,6 +103,21 @@ func appendRequestLog(entry requestLogEntry) {
 	f.Write(append(b, '\n'))
 }
 
+// requestLogModelFromBody reads the model id a completion request names. Used
+// by the passthrough leg, which forwards the client's body verbatim and so has
+// no translated request struct to read it from; an unparseable or absent field
+// logs an empty model rather than skipping the row — the row's job is to
+// record that the attempt happened and failed (2026-09-26 audit).
+func requestLogModelFromBody(body []byte) string {
+	var parsed struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	return parsed.Model
+}
+
 // extractLastAndTotalMessageLen pulls the same two signals
 // classifyFlashplan uses server-side, from either shape (OpenAI
 // messages[] or Anthropic top-level system + messages[]) — best-effort,

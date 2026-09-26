@@ -80,6 +80,37 @@ func TestWriteFileAtomicWritesThroughADanglingSymlink(t *testing.T) {
 	}
 }
 
+// The backup-on-overwrite writer has the same rename, so it had the same
+// failure: a symlinked integration config (a dotfiles repo, a backed-up
+// directory) was replaced by a regular file and never updated by oaica again.
+func TestWriteWithBackupWritesThroughASymlink(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir) // BackupDir() hangs off the home directory
+	real := filepath.Join(dir, "real", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(real), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "openclaw.json")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteWithBackup(link, []byte(`{"theme":"light"}`)); err != nil {
+		t.Fatalf("WriteWithBackup: %v", err)
+	}
+	if fi, err := os.Lstat(link); err != nil {
+		t.Fatalf("the configured path disappeared: %v", err)
+	} else if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the symlink at %s was replaced by a regular file — the integration config the user keeps stops being updated", link)
+	}
+	if got, err := os.ReadFile(real); err != nil || string(got) != `{"theme":"light"}` {
+		t.Errorf("symlink target = %q (err %v), want the new content written through the link", got, err)
+	}
+}
+
 // The control: an ordinary path is written atomically as before, with the mode
 // asserted and no temp file left behind.
 func TestWriteFileAtomicStillReplacesAPlainPath(t *testing.T) {

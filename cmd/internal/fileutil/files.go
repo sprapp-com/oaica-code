@@ -166,6 +166,11 @@ func writeBackupCopy(srcPath string, integration string) (string, error) {
 // existing file first. Callers may optionally pass one integration name to
 // store backups under BackupDir()/.../<integration>/.
 func WriteWithBackup(path string, data []byte, integration ...string) error {
+	// Same reason as WriteFileAtomic: a symlinked destination is FOLLOWED, or
+	// the rename replaces the link and the file the user keeps (a
+	// git-managed ~/.openclaw, a backed-up config directory) keeps its old
+	// content while this reports success (2026-09-26 audit).
+	path = writtenTarget(path)
 	backupIntegration := ""
 	if len(integration) > 0 {
 		backupIntegration = integration[0]

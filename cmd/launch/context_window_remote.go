@@ -10,6 +10,7 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,6 +24,11 @@ var remoteContextWindowFn = cachedRemoteContextWindow
 // probeTimeout is intentionally short: this runs on every launch, before the
 // first token. A slow /models must not add seconds of startup latency.
 const probeTimeout = 2 * time.Second
+
+// maxRemoteModelsBytes bounds the /models document this probe will decode — a
+// few thousand entries' worth, far past any real catalog and far short of
+// anything that threatens the process (2026-09-26 audit).
+const maxRemoteModelsBytes = 4 << 20
 
 // probeCacheTTL bounds how long a probe result is reused. The wizard's
 // oversize step probes EVERY candidate model, and withContextWindows then
@@ -99,7 +105,13 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 		return 0
 	}
 	var parsed remoteModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	// Bounded: this body is written by a host the user does not control and is
+	// read on the startup path, before the first token. Unbounded, a never-
+	// ending or absurdly large model list allocates until the process dies —
+	// every other upstream read in this proxy has a cap, and this probe, which
+	// runs on EVERY launch, had none (2026-09-26 audit). Truncation makes
+	// Decode fail, which is the fail-closed answer for this function (0).
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRemoteModelsBytes)).Decode(&parsed); err != nil {
 		return 0
 	}
 	var meta *remoteModelMeta

@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -823,7 +824,14 @@ func configureOllamaWebSearch() {
 		return
 	}
 	var config map[string]any
-	if json.Unmarshal(data, &config) != nil {
+	// UseNumber: the document is rewritten wholesale below, and decoding into
+	// map[string]any turns every number into a float64 — a config holding an
+	// integer larger than 2^53 came back with a different value, silently
+	// changed by a command that meant to touch one plugin entry
+	// (2026-09-26 audit).
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if dec.Decode(&config) != nil {
 		return
 	}
 
@@ -937,7 +945,36 @@ func configureOllamaWebSearch() {
 	if err != nil {
 		return
 	}
-	_ = fileutil.WriteFileAtomic(configPath, out, 0o600)
+	// Nothing to say? Then say nothing. This ran on every launch and rewrote
+	// the file unconditionally, replacing the inode and moving the mtime of a
+	// config the OpenClaw daemon owns — a rewrite nobody asked for, and one
+	// whose only effect was to make the daemon's own concurrent edit losable
+	// (2026-09-26 audit). The comparison is on the marshalled document, so a
+	// config that is merely formatted differently is still left alone.
+	if before, err := json.Marshal(configOnDisk(data)); err == nil {
+		if after, err := json.Marshal(config); err == nil && bytes.Equal(before, after) {
+			return
+		}
+	}
+	// WriteWithBackup, like every other write in this integration
+	// (Openclaw.Edit): this is another tool's config, and the one write here
+	// that kept no copy was the one that ran on every launch (2026-09-26
+	// audit). It also skips the write outright when the bytes are identical.
+	_ = fileutil.WriteWithBackup(configPath, append(out, '\n'), "openclaw")
+}
+
+// configOnDisk re-reads a config document into the same shape the caller
+// mutates, so the two can be compared semantically (numbers as json.Number on
+// both sides; a decode failure yields an empty map, which never compares equal
+// to a real config and so never suppresses a write it cannot verify).
+func configOnDisk(data []byte) map[string]any {
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if dec.Decode(&m) != nil || m == nil {
+		return map[string]any{}
+	}
+	return m
 }
 
 // openclawModelConfig builds an OpenClaw model config entry with capability detection.
