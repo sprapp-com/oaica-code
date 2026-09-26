@@ -19,6 +19,7 @@ package launch
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,63 @@ func TestDroidEditKeepsTheUsersOwnLocalOllamaEntry(t *testing.T) {
 	// not a case of Edit having done nothing at all.
 	if len(droidEntriesFor(droidCustomModels(t, settingsPath), "llama3.2")) != 1 {
 		t.Errorf("the launched model was not written:\n%v", droidCustomModels(t, settingsPath))
+	}
+}
+
+// droidLegacyOllamaEntry is an entry the upstream `ollama config droid` wrote,
+// in the shape it wrote them until 2026-01-23 (upstream 771d9280e): the same
+// daemon apiKey, the model stored beside it, and an id carrying its own
+// "-[Ollama]-" segment — the substring its ownership test looked for.
+const droidLegacyOllamaEntry = `{
+  "model": "gemma2",
+  "displayName": "gemma2",
+  "baseUrl": "http://localhost:11434/v1",
+  "apiKey": "ollama",
+  "provider": "generic-chat-completion-api",
+  "maxOutputTokens": 64000,
+  "supportsImages": false,
+  "id": "custom:gemma2-[Ollama]-0",
+  "index": 0
+}`
+
+// An entry written by that older shape must still read as oaica's own. Round
+// 19 narrowed the marker to "the id this file writes", and droidPickerFromID
+// only stripped a trailing "-<digits>", so "custom:gemma2-[Ollama]-0" reversed
+// to the picker name "gemma2-[Ollama]", which is not the model stored beside it
+// — the entry read as the user's, was preserved, and a SECOND entry for the
+// same model was appended: the model appears twice in Droid's picker, the stale
+// row never updated or cleaned (2026-09-27 audit, round 20).
+func TestDroidEditReplacesALegacyOllamaEntry(t *testing.T) {
+	d := &Droid{}
+	home := t.TempDir()
+	setTestHome(t, home)
+	stubBareIndex(t, map[string][]string{})
+
+	dir := filepath.Join(home, ".factory")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(dir, "settings.json")
+	seed := `{"customModels":[` + droidLegacyOllamaEntry + `],"sessionDefaultSettings":{"model":"custom:gemma2-[Ollama]-0"}}`
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.Edit(testLaunchModels("gemma2")); err != nil {
+		t.Fatalf("Edit: %v", err)
+	}
+
+	entries := droidCustomModels(t, settingsPath)
+	if got := len(droidEntriesFor(entries, "gemma2")); got != 1 {
+		t.Errorf("Droid's settings hold %d entries for gemma2, want the one rebuilt entry: an entry written by the older id shape was read as the user's, kept, and a duplicate appended:\n%v", got, entries)
+	}
+	for _, e := range entries {
+		if id, _ := e["id"].(string); strings.Contains(id, "-[Ollama]-") {
+			t.Errorf("the superseded id shape is still in the file: %v", e)
+		}
+	}
+	if got := (&Droid{}).Models(); len(got) != 1 || got[0] != "gemma2" {
+		t.Errorf("Droid.Models() = %v, want [gemma2]: the picker name read back from the store decides whether the next launch rewrites it", got)
 	}
 }
 

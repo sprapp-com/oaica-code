@@ -334,10 +334,19 @@ func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
 	return picker, true
 }
 
+// droidLegacyIDSuffix is the segment the upstream `ollama config droid` put in
+// front of the index — "custom:<picker name>-[Ollama]-<index>" — until upstream
+// 771d9280e (2026-01-23) shortened it. Entries in that shape are in the wild,
+// and they are ollama's own (its ownership test was a substring match on this
+// marker), so they are recognised as oaica's and replaced rather than kept
+// beside a second copy of the same model.
+const droidLegacyIDSuffix = "-[Ollama]"
+
 // droidPickerFromID reverses the id this file writes for a launched model —
-// "custom:<picker name>-<index>" — and returns "" for an id it did not write.
-// Only the final "-<digits>" is stripped, so a name that ends in a number, or
-// carries ":"/"-"/"/" of its own, round-trips.
+// "custom:<picker name>-<index>", or the older "custom:<picker name>-[Ollama]-
+// <index>" — and returns "" for an id it did not write. Only a trailing
+// "-<digits>" (and the legacy marker before it) is stripped, so a name that
+// ends in a number, or carries ":"/"-"/"/" of its own, round-trips.
 func droidPickerFromID(id string) string {
 	rest, ok := strings.CutPrefix(id, "custom:")
 	if !ok {
@@ -352,7 +361,11 @@ func droidPickerFromID(id string) string {
 			return ""
 		}
 	}
-	return rest[:dash]
+	name := strings.TrimSuffix(rest[:dash], droidLegacyIDSuffix)
+	if name == "" {
+		return ""
+	}
+	return name
 }
 
 // droidRemoteForBase returns the configured remote serving baseURL — the
