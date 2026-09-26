@@ -864,7 +864,10 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 	ollama["apiKey"] = "ollama-local"
 	ollama["api"] = "ollama"
 
-	// Build map of existing models to preserve user customizations
+	// Build map of existing models to preserve user customizations. Keyed by the
+	// entry's "id", which openclawModelID writes — the same value the merge and
+	// the "written" set below use, so a row is matched to its own previous
+	// entry rather than to one whose picker label happened to match.
 	existingModels, _ := ollama["models"].([]any)
 	existingByID := make(map[string]map[string]any)
 	for _, m := range existingModels {
@@ -879,15 +882,16 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 	written := make(map[string]bool, len(models))
 	for _, m := range models {
 		entry, _ := openclawModelConfig(m)
+		id := openclawModelID(m)
 		// Merge existing fields (user customizations)
-		if existing, ok := existingByID[m.Name]; ok {
+		if existing, ok := existingByID[id]; ok {
 			for k, v := range existing {
 				if _, isNew := entry[k]; !isNew {
 					entry[k] = v
 				}
 			}
 		}
-		written[m.Name] = true
+		written[id] = true
 		newModels = append(newModels, entry)
 	}
 	// Rows this launch did not write stay in the file, unless they are rows a
@@ -1226,11 +1230,23 @@ func configOnDisk(data []byte) map[string]any {
 	return m
 }
 
+// openclawModelID is the id OpenClaw's ollama provider serves a row as: the
+// daemon-side id of an ollama-cloud catalogue row (LaunchModel.Upstream —
+// "gpt-oss:cloud"), whose picker label names the LOCAL model of that name
+// instead. It is also the key this file uses to merge the user's own fields
+// back into the row and to recognise the rows a previous launch wrote (see
+// openclawEditConfig), so the entry's "id" and that key have to be one value
+// (2026-09-27 audit, round 25).
+func openclawModelID(model LaunchModel) string { return launchModelWriteID(model) }
+
 // openclawModelConfig builds an OpenClaw model config entry with capability detection.
 // The second return value indicates whether the model is a cloud (remote) model.
+//
+// The entry's "id" is the id the provider serves the row AS (openclawModelID);
+// "name" stays the picker label, which is only a display string to OpenClaw.
 func openclawModelConfig(model LaunchModel) (map[string]any, bool) {
 	entry := map[string]any{
-		"id":    model.Name,
+		"id":    openclawModelID(model),
 		"name":  model.Name,
 		"input": []any{"text"},
 		"cost": map[string]any{

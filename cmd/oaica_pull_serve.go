@@ -191,7 +191,19 @@ func oaicaRegisterLocalServer(model, origin, apiKey string) error {
 	// one that renames last wins with the other's entry gone, while both
 	// report a clean start (2026-09-26 audit).
 	return fileutil.WithFileLock(path, func() error {
-		entries := oaicaReadLocalServers(path)
+		// A registry that cannot be READ is not an empty one: this write replaces
+		// the file whole, so treating an unreadable document as "no entries"
+		// deleted every other server's row — and the --api-key recorded with it,
+		// which is the credential the launcher's translation proxy sends for a
+		// "<model>:local" launch. One corrupt byte anywhere in the file was
+		// enough, and the servers it described are still running (2026-09-27
+		// audit, round 25). Refused instead: the file is the user's to move
+		// aside, and registration is best-effort at its call site, so the serve
+		// itself still starts.
+		entries, err := oaicaReadLocalServersStrict(path)
+		if err != nil {
+			return fmt.Errorf("not registering %s: %w — writing the registry would drop every server already recorded in it, so it was left as it is; move it aside to start a fresh one", model, err)
+		}
 		filtered := entries[:0]
 		for _, e := range entries {
 			if e.Model != model {
@@ -256,7 +268,13 @@ func oaicaDropLocalServers(match func(oaicaLocalServerEntry) bool, first bool) {
 		return
 	}
 	_ = fileutil.WithFileLock(path, func() error {
-		entries := oaicaReadLocalServers(path)
+		// Nothing is written when the file cannot be read: there is no entry to
+		// match, and a rewrite from an empty snapshot would drop the live
+		// servers' rows (the same rule oaicaRegisterLocalServer states).
+		entries, err := oaicaReadLocalServersStrict(path)
+		if err != nil {
+			return nil
+		}
 		filtered := entries[:0]
 		dropped := false
 		for _, e := range entries {
@@ -280,13 +298,35 @@ func oaicaDropLocalServers(match func(oaicaLocalServerEntry) bool, first bool) {
 	})
 }
 
-func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
+// oaicaReadLocalServersStrict reads the registry, keeping "the file is not
+// there" apart from "the file cannot be read". An absent registry is an empty
+// one — the first `oaica serve` on a box creates it. A present-but-unreadable
+// one is NOT empty: its entries (and the --api-keys in them) are unknown, and a
+// caller that rewrites the file from this answer destroys them, which is what
+// the nil-returning reader made oaicaRegisterLocalServer do (2026-09-27 audit,
+// round 25).
+func oaicaReadLocalServersStrict(path string) ([]oaicaLocalServerEntry, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	var entries []oaicaLocalServerEntry
-	if json.Unmarshal(b, &entries) != nil {
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return entries, nil
+}
+
+// oaicaReadLocalServers is the lenient form, for readers that only list (the
+// registry's tests). An unreadable file answers with no entries; a caller that
+// WRITES the file back must use oaicaReadLocalServersStrict, so an unreadable
+// document is refused instead of replaced.
+func oaicaReadLocalServers(path string) []oaicaLocalServerEntry {
+	entries, err := oaicaReadLocalServersStrict(path)
+	if err != nil {
 		return nil
 	}
 	return entries

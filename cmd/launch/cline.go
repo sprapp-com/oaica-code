@@ -160,10 +160,10 @@ func (c *Cline) Edit(models []LaunchModel) error {
 			if err != nil {
 				return err
 			}
-			if err := writeClineProvidersConfig(providersPath, providersConfig, models[0].Name); err != nil {
+			if err := writeClineProvidersConfig(providersPath, providersConfig, models[0]); err != nil {
 				return err
 			}
-			return writeClineLegacyGlobalState(legacyPath, legacyConfig, models[0].Name)
+			return writeClineLegacyGlobalState(legacyPath, legacyConfig, models[0])
 		})
 	})
 }
@@ -200,6 +200,25 @@ func clineModelIDFor(model string) string {
 		return ep.UpstreamModel
 	}
 	return model
+}
+
+// clineWriteModelID is the model id Cline's two stores should hold for a row:
+// the id the row's backend serves when its Name is a display-only picker label
+// (LaunchModel.Upstream — an ollama-cloud catalogue row, named "ollama/gpt-oss"
+// by the picker and served as "gpt-oss:cloud"), otherwise clineModelIDFor's own
+// answer for the row's name (the bare upstream id for a user-remote model, the
+// picker name otherwise).
+//
+// The picker label named the LOCAL model of that name for a cloud row, so Cline
+// asked the daemon for a model that was absent or — worse — a different one of
+// the same name, and the name stored never matched the name the launcher saves
+// for the selection, so every launch rewrote both files (2026-09-27 audit,
+// round 25).
+func clineWriteModelID(model LaunchModel) string {
+	if upstream := strings.TrimSpace(model.Upstream); upstream != "" {
+		return upstream
+	}
+	return clineModelIDFor(model.Name)
 }
 
 // clineEndpointWasOurs reports whether a base URL recorded in Cline's ollama
@@ -285,7 +304,7 @@ func readClineConfig(configPath string) (map[string]any, error) {
 // caller (Cline.Edit) read under this store's lock — the lock has to cover the
 // read as well as this write, so it is taken a frame up, where the document is
 // read. Nothing here acquires it again: WithFileLock does not nest.
-func writeClineProvidersConfig(configPath string, config map[string]any, model string) error {
+func writeClineProvidersConfig(configPath string, config map[string]any, model LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
@@ -304,8 +323,8 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 		settings = make(map[string]any)
 	}
 
-	baseURL := clineProviderBaseURLFor(model)
-	modelID := clineModelIDFor(model)
+	baseURL := clineProviderBaseURLFor(model.Name)
+	modelID := clineWriteModelID(model)
 	previousModel, _ := settings["model"].(string)
 	previousBaseURL, _ := settings["baseUrl"].(string)
 	previousTokenSource, _ := provider["tokenSource"].(string)
@@ -321,14 +340,14 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 	settings["provider"] = clineLaunchProvider
 	settings["model"] = modelID
 	settings["baseUrl"] = baseURL
-	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model.Name); ok {
 		settings["apiKey"] = ep.Token
 	} else {
 		delete(settings, "apiKey")
 	}
 	provider["settings"] = settings
 
-	if previousModel != model || previousBaseURL != baseURL || previousTokenSource != "manual" {
+	if previousModel != modelID || previousBaseURL != baseURL || previousTokenSource != "manual" {
 		provider["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
 	} else if _, ok := provider["updatedAt"].(string); !ok {
 		provider["updatedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -350,16 +369,34 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 // writeClineLegacyGlobalState publishes globalState.json from config, which its
 // caller (Cline.Edit) read under this store's lock — the same arrangement as
 // writeClineProvidersConfig above, for the same reason.
-func writeClineLegacyGlobalState(configPath string, config map[string]any, model string) error {
+func writeClineLegacyGlobalState(configPath string, config map[string]any, model LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
+	}
+
+	// Before anything is mutated: the same refusal writeClineProvidersConfig
+	// makes, for the same reason. This document holds the ollama endpoint the
+	// same way the providers entry does — ollamaBaseUrl plus each mode's own
+	// copy — and the write below repoints all of them at the daemon. A user
+	// whose Cline is set to their own server lost its endpoint and its model id
+	// here, in a document the providers guard never looks at (2026-09-27 audit,
+	// round 25). Redacted: the value is file-derived and may carry a credential
+	// in its userinfo or query.
+	for _, key := range []string{"actModeOllamaBaseUrl", "planModeOllamaBaseUrl", "ollamaBaseUrl"} {
+		recorded, _ := config[key].(string)
+		if strings.TrimSpace(recorded) == "" {
+			continue
+		}
+		if !clineEndpointWasOurs(recorded) {
+			return fmt.Errorf("Cline's legacy settings (%s) name an endpoint oaica did not write (%s), so it is yours: Cline keeps one Ollama endpoint for both modes, and pointing it at the local daemon would rewrite its base URL and model id. Remove or rename that endpoint in Cline's own settings, or launch a different integration", key, redactBaseURL(recorded))
+		}
 	}
 
 	// The same two branches the providers.json write above takes: for a
 	// user-remote model the state has to name the remote and the model id the
 	// remote knows, or Cline reads it as a daemon model (2026-09-26 audit).
-	baseURL := clineLegacyBaseURLFor(model)
-	modelID := clineModelIDFor(model)
+	baseURL := clineLegacyBaseURLFor(model.Name)
+	modelID := clineWriteModelID(model)
 	config["ollamaBaseUrl"] = baseURL
 	config["actModeApiProvider"] = clineLaunchProvider
 	config["actModeOllamaModelId"] = modelID

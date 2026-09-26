@@ -174,9 +174,18 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 		if model.MaxOutputTokens > 0 {
 			maxOutput = model.MaxOutputTokens
 		}
-		modelID := fmt.Sprintf("custom:%s-%d", model.Name, i)
+		// The id this file writes names the row, and entry.Model is what Droid
+		// sends to the endpoint: droidOwnedEntry recognises an entry only when
+		// the two agree, so both carry the id the row's backend serves
+		// (droidWriteModelID). Writing the picker label here named the LOCAL
+		// model of that name for an ollama-cloud catalogue row, and left the
+		// entry unrecognisable as this integration's own on the next launch —
+		// which then appended a second copy of the same row (2026-09-27 audit,
+		// round 25).
+		writeID := droidWriteModelID(model)
+		modelID := fmt.Sprintf("custom:%s-%d", writeID, i)
 		entry := modelEntry{
-			Model:           model.Name,
+			Model:           writeID,
 			DisplayName:     model.Name,
 			BaseURL:         envconfig.ConnectableHost().String() + "/v1",
 			APIKey:          droidDaemonKey,
@@ -196,7 +205,7 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 		// rebuild owns the fields above, and everything else the app put in
 		// that entry stays.
 		entryMap := droidEntryMap(entry)
-		for k, v := range ownedByPicker[model.Name] {
+		for k, v := range ownedByPicker[writeID] {
 			if _, isOurs := entryMap[k]; !isOurs {
 				entryMap[k] = v
 			}
@@ -278,6 +287,26 @@ func droidEntryMap(entry modelEntry) map[string]any {
 // long as nothing has to replace it — the daemon is unauthenticated, and a user
 // remote is not.
 const droidDaemonKey = "ollama"
+
+// droidWriteModelID is the name this file embeds in an entry's id and writes as
+// the entry's "model": the id the row's backend serves when the picker label is
+// display-only (LaunchModel.Upstream — an ollama-cloud catalogue row named
+// "ollama/gpt-oss" is served as "gpt-oss:cloud"), otherwise the row's own Name,
+// unchanged. The two fields move together because droidOwnedEntry recognises an
+// entry only where they agree (see its comment): writing the picker label in
+// both, as this did, named the LOCAL model of that name for a cloud row and
+// left the entry unreadable as oaica's on the next launch (2026-09-27 audit,
+// round 25).
+//
+// A user-remote row keeps its namespaced picker name in the id — that is the
+// identity the remote branch of droidOwnedEntry reads — while entry.Model takes
+// the remote's own id below.
+func droidWriteModelID(model LaunchModel) string {
+	if upstream := strings.TrimSpace(model.Upstream); upstream != "" {
+		return upstream
+	}
+	return model.Name
+}
 
 // droidOwnedEntry reports whether an existing customModels entry was written by
 // this integration (and may therefore be rebuilt), plus the picker name it was

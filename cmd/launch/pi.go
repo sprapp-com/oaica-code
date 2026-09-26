@@ -971,13 +971,11 @@ func hasContextWindow(cfg map[string]any) bool {
 	}
 }
 
-// piModelIDFor is the model id Pi should use: the bare upstream id for a
+// piModelIDFor is the model id Pi should use: the daemon-side id for an
+// ollama-cloud catalogue row (LaunchModel.Upstream), the bare upstream id for a
 // user-remote model, otherwise the picker name.
 func piModelIDFor(model LaunchModel) string {
-	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
-		return ep.UpstreamModel
-	}
-	return model.Name
+	return launchModelWriteID(model)
 }
 
 // piProviderAPI is the provider API value this package writes when it creates

@@ -273,14 +273,25 @@ func (v *VSCode) Edit(models []LaunchModel) error {
 	if err := fileutil.WithFileLock(foreignStoreLockBase(clmPath), func() error {
 		var entries []map[string]any
 		if data, err := os.ReadFile(clmPath); err == nil {
-			dec := json.NewDecoder(bytes.NewReader(data))
-			dec.UseNumber()
-			if err := dec.Decode(&entries); err != nil {
-				// This file lists every vendor in the chat model picker and Edit
-				// removes only the ollama entry, so a document it cannot read is
-				// one it cannot preserve: writing the ollama entry alone over it
-				// would delete every other vendor the user configured.
-				return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica replaces only the ollama vendor entry, so rewriting a file it cannot read would delete every other provider listed there", clmPath, err)
+			// An EMPTY store is not a corrupt one: Decode reports io.EOF for a
+			// zero-byte or whitespace-only document, which read as "not valid
+			// JSON" and failed the launch while an ABSENT file succeeded and
+			// wrote the vendor row. No oaica writer produces one (writes are
+			// atomic), so the trigger is another tool or an interrupted editor —
+			// the same rule json_document.go adopted in round 22 and this inline
+			// decoder never got (2026-09-27 audit, round 25).
+			if len(bytes.TrimSpace(data)) == 0 {
+				entries = nil
+			} else {
+				dec := json.NewDecoder(bytes.NewReader(data))
+				dec.UseNumber()
+				if err := dec.Decode(&entries); err != nil {
+					// This file lists every vendor in the chat model picker and Edit
+					// removes only the ollama entry, so a document it cannot read is
+					// one it cannot preserve: writing the ollama entry alone over it
+					// would delete every other vendor the user configured.
+					return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica replaces only the ollama vendor entry, so rewriting a file it cannot read would delete every other provider listed there", clmPath, err)
+				}
 			}
 		}
 

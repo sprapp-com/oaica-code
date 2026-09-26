@@ -372,6 +372,16 @@ func prepareEditorIntegration(name string, editor Editor, models []LaunchModel) 
 	if err := rejectServedModels(name, models); err != nil {
 		return err
 	}
+	// Every editor's writer resolves "user remote, else the daemon", so a row
+	// the OAICA router serves has no representation here either — it was written
+	// as a daemon model and 404'd on the first request (2026-09-27 audit,
+	// round 25). The refusal lives at the store writers rather than on the shared
+	// launch path, because a Runner may reach a router SKU through its own
+	// translation proxy (`oaica launch claude` does) and does not come through
+	// here.
+	if err := rejectUnexpressibleModels(name, models); err != nil {
+		return err
+	}
 	if err := promptSelectedRemoteKeys(models); err != nil {
 		return err
 	}
@@ -421,6 +431,12 @@ func prepareManagedSingleIntegration(name string, managed ManagedSingleModel, mo
 	// to prevent. A serve row the user SELECTED survives the filter (its key is
 	// its own name) and is still refused (2026-09-27 audit, round 22).
 	if err := rejectServedModels(name, singleEndpointModels(model, models)); err != nil {
+		return err
+	}
+	// Same scope rule and the same reason as prepareEditorIntegration above: the
+	// rows this store can hold, and the router family refused where it cannot be
+	// named (2026-09-27 audit, round 25).
+	if err := rejectUnexpressibleModels(name, singleEndpointModels(model, models)); err != nil {
 		return err
 	}
 	if err := remoteAPIKeyPrompt(model); err != nil {

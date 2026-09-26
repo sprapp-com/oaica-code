@@ -159,7 +159,7 @@ func TestRemoteRoutingHelpers(t *testing.T) {
 	t.Run("cline providers config uses remote triple", func(t *testing.T) {
 		home := t.TempDir()
 		path := filepath.Join(home, ".cline", "data", "settings", "providers.json")
-		if err := writeClineProvidersConfig(path, map[string]any{}, remoteModel); err != nil {
+		if err := writeClineProvidersConfig(path, map[string]any{}, LaunchModel{Name: remoteModel}); err != nil {
 			t.Fatal(err)
 		}
 		data, _ := os.ReadFile(path)

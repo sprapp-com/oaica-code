@@ -117,7 +117,14 @@ func (g *gateway) probeUpstreamHealthUncached(addr, upstreamID string) bool {
 // omitted entirely when the model is healthy so the common case costs
 // nothing and the catalog stays byte-stable for pollers.
 func (g *gateway) annotateHealth(m gwModel, entry map[string]any) {
-	if !g.probeUpstreamHealth(m.upstreamAddr(g.cfg.UpstreamAddr), m.upstreamID()) {
+	// Read under the lock: the caller (modelsHandler) released its RLock before
+	// this loop, and apply() writes g.cfg under the write lock on every reload —
+	// so this read raced a SIGHUP against a live /v1/models poll
+	// (2026-09-27 audit, round 25, -race proof in the round's test file).
+	g.mu.RLock()
+	addr := g.cfg.UpstreamAddr
+	g.mu.RUnlock()
+	if !g.probeUpstreamHealth(m.upstreamAddr(addr), m.upstreamID()) {
 		entry["status"] = "unhealthy"
 	}
 }

@@ -797,6 +797,10 @@ type gateway struct {
 	// local JSONL ledger already has it) rather than let a billing
 	// side-channel add latency or backpressure to real chat completions.
 	meterCh chan usageReport
+	// meterDone stops the reporter goroutine that drains meterCh — see the
+	// reload comment in apply(): runMeterReporter ranges over meterCh, so
+	// replacing the channel without closing it leaked one goroutine per reload.
+	meterDone chan struct{}
 
 	// entitlement is the subscriber-status cache — see entitlementCache's
 	// doc. nil when EntitlementEnabled is false.
@@ -867,18 +871,31 @@ func (g *gateway) apply(cfg gwConfig) error {
 
 	// (Re)start the meter reporter on every apply — a reload that changes
 	// MeterHubAddr must take effect without a process restart, same as
-	// every other config field here. startMeterReporter is idempotent-safe
-	// to call repeatedly: each call gets its own channel/goroutine: the OLD
-	// goroutine (if any) keeps draining its own now-orphaned channel until
-	// it empties and exits on its own — never killed mid-send, never leaks
-	// past a few pending reports.
+	// every other config field here. Each call gets its own channel and
+	// goroutine, and the OLD one is STOPPED here: runMeterReporter ranges over
+	// its channel, so it exits when that channel closes — and nothing closed
+	// it. The comment this replaces claimed the old goroutine "keeps draining
+	// its own now-orphaned channel until it empties and exits on its own",
+	// which it cannot: nobody sends on that channel any more and nobody closes
+	// it, so every reload parked one more goroutine on a receive that never
+	// returns (2026-09-27 audit, round 25). meterDone is that stop signal, and
+	// the channel itself is deliberately NOT closed: a sender that read it
+	// under RLock can still be in its send when the lock is dropped, and a send
+	// on a closed channel panics — the reporter's select on done and ch keeps
+	// the exit prompt without making the send unsafe.
+	//
 	// meterCh and entitlement are read under RLock by reportUsage and the
 	// completion path, so the writes happen under the same lock (2026-09-01
 	// security audit M4): a SIGHUP reload raced live requests before.
 	g.mu.Lock()
+	if g.meterDone != nil {
+		close(g.meterDone)
+		g.meterDone = nil
+	}
 	if cfg.MeterHubAddr != "" {
 		g.meterCh = make(chan usageReport, 256)
-		go runMeterReporter(g.meterCh, cfg.MeterHubAddr, cfg.MeterHubToken)
+		g.meterDone = make(chan struct{})
+		go runMeterReporter(g.meterCh, g.meterDone, cfg.MeterHubAddr, cfg.MeterHubToken, meterReporterBackoff)
 	} else {
 		g.meterCh = nil
 	}
@@ -929,6 +946,19 @@ func (g *gateway) apply(cfg gwConfig) error {
 	return nil
 }
 
+// entitlementSnapshot reads the current entitlement cache under the lock.
+//
+// The completion path asked for this field directly, outside every lock scope,
+// while apply() replaces it under the write lock on every reload — a SIGHUP
+// flipping EntitlementEnabled raced a live request (2026-09-27 audit, round 25,
+// -race proof in the round's test file). A snapshot is the whole fix: the cache
+// is immutable once built, so the handler can use it after releasing the lock.
+func (g *gateway) entitlementSnapshot() *entitlementCache {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.entitlement
+}
+
 // usageReport is what gets sent to meterhub's POST /ingest — same shape as
 // ledgerEntry plus the region label meterhub needs to tell gateways apart.
 type usageReport struct {
@@ -941,17 +971,35 @@ type usageReport struct {
 // test from leaving a real multi-second retry loop running past the test
 // function's return (it was measurably making unrelated wall-clock-
 // sensitive tests flakier under `go test ./...` before this existed).
+//
+// It is read ONCE, by the caller that starts the reporter, and passed to the
+// goroutine as an argument (runMeterReporter's backoff parameter). Read inside
+// the goroutine instead, it was a package var written by a test's t.Cleanup
+// while that goroutine was still retrying, which is a real data race the
+// round-25 `-race` run caught (2026-09-27 audit, round 25).
 var meterReporterBackoff = func(attempt int) time.Duration { return time.Duration(attempt) * time.Second }
 
 // runMeterReporter drains ch and POSTs each report to meterhub, retrying
 // a failed send a bounded number of times with backoff before giving up on
 // that one record (the local JSONL ledger already has it durably — a
 // meterhub outage can never lose billing data, only delay the aggregated
-// view). Exits when ch is closed AND drained.
-func runMeterReporter(ch <-chan usageReport, addr, token string) {
+// view). Exits when ch is closed and drained, or when done is closed — which
+// is how apply() retires the reporter of the config it is replacing; see the
+// reload comment there for why ch is not the stop signal.
+func runMeterReporter(ch <-chan usageReport, done <-chan struct{}, addr, token string, backoff func(int) time.Duration) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	const maxAttempts = 3
-	for rep := range ch {
+	for {
+		var rep usageReport
+		var ok bool
+		select {
+		case <-done:
+			return
+		case rep, ok = <-ch:
+			if !ok {
+				return
+			}
+		}
 		body, err := json.Marshal(rep)
 		if err != nil {
 			continue
@@ -973,7 +1021,7 @@ func runMeterReporter(ch <-chan usageReport, addr, token string) {
 				}
 			}
 			if attempt < maxAttempts {
-				time.Sleep(meterReporterBackoff(attempt))
+				time.Sleep(backoff(attempt))
 			}
 		}
 	}
@@ -1647,8 +1695,8 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var isOverage bool
-	if g.entitlement != nil {
-		allowed, reason, overage := g.entitlement.check(label)
+	if ent := g.entitlementSnapshot(); ent != nil {
+		allowed, reason, overage := ent.check(label)
 		isOverage = overage
 		if !allowed {
 			if strings.HasPrefix(reason, "rate limit:") {

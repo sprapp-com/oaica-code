@@ -347,15 +347,14 @@ func (o *OpenCode) Models() []string {
 	return nil
 }
 
-// opencodeModelID is the model id opencode expects for a picker model: the bare
-// upstream id for a user-remote model (the remote's /v1/chat/completions knows
-// it as that, not the namespaced picker name), otherwise the full picker name
-// (local/cloud, which opencode sends to the daemon as-is).
+// opencodeModelID is the model id opencode expects for a picker model: the
+// daemon-side id for an ollama-cloud catalogue row (LaunchModel.Upstream), the
+// bare upstream id for a user-remote model (the remote's
+// /v1/chat/completions knows it as that, not the namespaced picker name),
+// otherwise the full picker name (local/cloud, which opencode sends to the
+// daemon as-is).
 func opencodeModelID(m LaunchModel) string {
-	if ep, ok := resolveRemoteEndpoint(m.Name); ok {
-		return ep.UpstreamModel
-	}
-	return m.Name
+	return launchModelWriteID(m)
 }
 
 // opencodeDaemonProviderID is the provider-block id of the local daemon:
@@ -432,7 +431,10 @@ func opencodeProviderFor(m LaunchModel, daemonID string) (providerID, modelID st
 	if ep, ok := resolveRemoteEndpoint(m.Name); ok {
 		return ep.Name, ep.UpstreamModel
 	}
-	return daemonID, m.Name
+	// An ollama-cloud catalogue row is declared under the daemon's block (only
+	// a user remote gets a block of its own), under the id the daemon serves it
+	// as — the row's own Name is a display label (2026-09-27 audit, round 25).
+	return daemonID, launchModelWriteID(m)
 }
 
 // buildInlineConfig produces the JSON string for OPENCODE_CONFIG_CONTENT.

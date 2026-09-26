@@ -57,7 +57,7 @@ func TestAClineConfigKeepsNumbersOaicaDoesNotModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readClineConfig: %v", err)
 	}
-	if err := writeClineProvidersConfig(path, cfg, "oaica-launch"); err != nil {
+	if err := writeClineProvidersConfig(path, cfg, LaunchModel{Name: "oaica-launch"}); err != nil {
 		t.Fatalf("writeClineProvidersConfig: %v", err)
 	}
 

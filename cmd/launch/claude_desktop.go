@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -942,20 +941,15 @@ func readClaudeDesktopJSON(path string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cfg map[string]any
-	// UseNumber: the caller writes this document back whole, so every number
-	// in it has to survive decoding exactly. Through float64 an integer above
-	// 2^53 changes value and 1.0 becomes 1 — oaica edited a file it was only
-	// asked to add a profile to (2026-09-26 audit).
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, err
-	}
-	if cfg == nil {
-		cfg = map[string]any{}
-	}
-	return cfg, nil
+	// decodeJSONObject rather than a hand-rolled Decode: it is the package's
+	// rule (UseNumber, a never-nil map) AND the one place an empty store is
+	// distinguished from a corrupt one. Decoding here directly inherited neither
+	// half — a zero-byte claude_desktop_config.json that another tool had
+	// truncated failed every writer with "parse Claude Desktop config: EOF"
+	// while the readers that swallow errors reported "not configured", so the
+	// launcher retried the same failing configure on every launch, and an ABSENT
+	// file succeeded (2026-09-27 audit, round 25).
+	return decodeJSONObject(data)
 }
 
 func writeClaudeDesktopJSON(path string, cfg any) error {

@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -290,13 +289,12 @@ func museReadSettings(path string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var settings map[string]any
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&settings); err != nil {
-		return nil, err
-	}
-	return settings, nil
+	// decodeJSONObject, for both halves of its contract: UseNumber (above) and
+	// the empty-vs-corrupt rule the hand-rolled Decode here did not have — a
+	// zero-byte settings file made museBaseSettings fail the launch with "read
+	// muse settings …: EOF", while an ABSENT file started muse with defaults
+	// (2026-09-27 audit, round 25).
+	return decodeJSONObject(data)
 }
 
 // writeMuseSettings regenerates the settings file launch owns, replacing only
@@ -376,7 +374,7 @@ func writeMuseSettingsFileLocked(settingsPath string, models []LaunchModel, back
 		settings["schema_version"] = 1
 	}
 	settings["provider"] = museProviderID
-	settings["model"] = models[0].Name
+	settings["model"] = museCatalogModelID(models[0])
 	settings["endpoint_transport"] = map[string]any{
 		"base_url": envconfig.ConnectableHost().String() + "/v1",
 		// Ollama wants no credential, and muse refuses to start on the default
@@ -395,6 +393,16 @@ func writeMuseSettingsFileLocked(settingsPath string, models []LaunchModel, back
 	return fileutil.WriteFileAtomic(settingsPath, data, 0o600)
 }
 
+// museCatalogModelID is the id muse must name for a row: the daemon-side id of
+// an ollama-cloud catalogue row (LaunchModel.Upstream — "gpt-oss:cloud"), not
+// the row's picker name. It is what the catalog rows carry AND what the
+// settings "model" the session selects names, so muse starts the model the
+// launch resolved rather than a local model of the same name — and the id muse
+// reports back is the name the launcher's own selection carries, so the drift
+// check does not read every launch as a reconfigure (2026-09-27 audit,
+// round 25).
+func museCatalogModelID(model LaunchModel) string { return launchModelWriteID(model) }
+
 func museCatalogRows(models []LaunchModel) []museCatalogRow {
 	rows := make([]museCatalogRow, 0, len(models))
 	for i, model := range models {
@@ -408,7 +416,7 @@ func museCatalogRows(models []LaunchModel) []museCatalogRow {
 		}
 
 		rows = append(rows, museCatalogRow{
-			ModelID:      model.Name,
+			ModelID:      museCatalogModelID(model),
 			ProviderID:   museProviderID,
 			ProfileID:    museProfileID,
 			DisplayLabel: model.Name,

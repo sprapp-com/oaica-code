@@ -1116,6 +1116,42 @@ func rejectServedModels(integration string, models []LaunchModel) error {
 	return nil
 }
 
+// rejectUnexpressibleModels refuses, for a STORE WRITER, every row the store
+// cannot name: the rows whose endpoint is neither the local daemon nor a
+// configured user remote.
+//
+// Every writer behind prepareEditorIntegration and
+// prepareManagedSingleIntegration resolves a row as "user remote, else the
+// daemon" (resolveRemoteEndpoint and its row-aware form), and the daemon is the
+// fallback for anything that resolver does not claim. A row served by `oaica
+// serve` at its own origin and a row served by the OAICA router at ITS own
+// origin — with the OAICA credential, and not present on the daemon at all —
+// were both written as daemon models: the store then names an endpoint that has
+// never heard of the model, the launch reports success, and the first inference
+// 404s. rejectServedModels caught the first family and this asked about
+// LiveSource alone, so `oaica-<sku>` and `router/<sku>` rows went through the
+// same writers unnoticed (2026-09-27 audit, round 25).
+//
+// The row's own endpoint key decides, not a name shape: a model the daemon
+// genuinely serves under a router-shaped name keys "daemon" (routerPinnedRow)
+// and is written as before. The launch path's own refusal (launch.go) stays
+// narrower on purpose — a Runner may reach its model through a translation
+// proxy that does carry these families (`oaica launch claude` does) — so this
+// belongs at the store writers, where the endpoint is written down.
+func rejectUnexpressibleModels(integration string, models []LaunchModel) error {
+	for _, model := range models {
+		if model.Name == "" {
+			continue
+		}
+		switch key := launchModelEndpointKey(model); {
+		case key == "daemon", strings.HasPrefix(key, "remote:"):
+			continue
+		}
+		return fmt.Errorf("%s cannot be pointed at %q: %s, and %s's configuration names the local daemon for every row it writes — the daemon does not serve this model. Launch it on its own (`oaica launch --model %s`) to route it through its own origin, or add it to %s's own settings", integration, model.Name, nonDaemonRowReason(model), integration, model.Name, integration)
+	}
+	return nil
+}
+
 // singleEndpointModels keeps the rows a store that names ONE endpoint can
 // serve: the ones routed to the same endpoint as the primary, which is the row
 // that decides that store's base URL, wire and credential.
