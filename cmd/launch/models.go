@@ -369,6 +369,9 @@ func prepareEditorIntegration(name string, editor Editor, models []LaunchModel) 
 	// models writes a credential per row, and prompting for models[0] left a
 	// remote further down the selection written with an empty token
 	// (2026-09-27 audit, round 20).
+	if err := rejectServedModels(name, models); err != nil {
+		return err
+	}
 	if err := promptSelectedRemoteKeys(models); err != nil {
 		return err
 	}
@@ -411,6 +414,9 @@ func prepareManagedSingleIntegration(name string, managed ManagedSingleModel, mo
 	// for a remote that already has one, so the launch path's own hook in
 	// launchAfterConfiguration stays a backstop for the integrations that write
 	// nothing and configure inside Run.
+	if err := rejectServedModels(name, models); err != nil {
+		return err
+	}
 	if err := remoteAPIKeyPrompt(model); err != nil {
 		return err
 	}

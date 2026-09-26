@@ -1927,6 +1927,12 @@ func runIntegration(runner Runner, modelName string, models []LaunchModel, args 
 }
 
 func launchAfterConfiguration(name string, runner Runner, model string, models []LaunchModel, req IntegrationLaunchRequest) error {
+	// The same refusal the store writers make, for the integrations that write
+	// inside Run instead: the launch is what dials the endpoint, so it must not
+	// go out either (2026-09-27 audit, round 21).
+	if err := rejectServedModels(name, models); err != nil {
+		return err
+	}
 	if req.ConfigureOnly {
 		launch, err := ConfirmPrompt(fmt.Sprintf("Launch %s now?", runner))
 		if err != nil {
