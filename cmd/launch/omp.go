@@ -79,9 +79,17 @@ func (o *OMP) CurrentModel() string {
 		if !ok {
 			continue
 		}
-		if id, _ := entry["id"].(string); id != "" {
-			return id
+		id, _ := entry["id"].(string)
+		if id == "" {
+			continue
 		}
+		// A remote config stores the bare upstream id; report the picker name
+		// the launch used, so this answer agrees with what the launcher saved.
+		baseURL, _ := provider["baseUrl"].(string)
+		if picker := ompRemotePickerName(baseURL, id); picker != "" {
+			return picker
+		}
+		return id
 	}
 	return ""
 }
@@ -397,15 +405,39 @@ func ensureOMPProvider(cfg map[string]any, model string) map[string]any {
 		providers[ompProviderName] = provider
 	}
 
-	provider["baseUrl"] = ompBaseURLFor(model)
-	provider["api"] = "openai-responses"
-	// Flip to bearer when a user-remote model needs its token; the daemon is
-	// unauthenticated.
-	provider["auth"] = "none"
-	if ep, ok := resolveRemoteEndpoint(model); ok && ep.Token != "" {
-		provider["auth"] = "bearer"
+	ep, isRemote := resolveRemoteEndpoint(model)
+	if !isRemote {
+		// The daemon: omp talks to 127.0.0.1, which is genuinely
+		// unauthenticated, and it serves the Responses API.
+		provider["baseUrl"] = ompBaseURL()
+		provider["api"] = "openai-responses"
+		provider["auth"] = "none"
+		delete(provider, "apiKey")
+		provider["discovery"] = map[string]any{"type": "ollama"}
+		return provider
 	}
-	provider["discovery"] = map[string]any{"type": "ollama"}
+
+	// A user remote, reached directly. Everything here has to change with it:
+	// the wire is Chat Completions (what a user remote serves), Ollama
+	// discovery would probe /api/tags on a non-Ollama host, and the
+	// credential goes in apiKey — OMP's own documented field, whose value the
+	// provider's standard client sends as its auth header. `auth` is NOT
+	// where the key goes: its values are apiKey (the default), none and
+	// oauth, and writing a scheme name that does not exist leaves the request
+	// unauthenticated while claiming otherwise. Nothing else supplies the
+	// token either — OMP.Run passes the environment through untouched, where
+	// OLLAMA_API_KEY, if set, belongs to ollama.com and must not be sent to
+	// someone else's host.
+	provider["baseUrl"] = strings.TrimRight(ep.BaseURL, "/")
+	provider["api"] = "openai-completions"
+	delete(provider, "discovery")
+	if ep.Token != "" {
+		provider["apiKey"] = ep.Token
+		provider["auth"] = "apiKey"
+	} else {
+		delete(provider, "apiKey")
+		provider["auth"] = "none"
+	}
 	return provider
 }
 
@@ -413,34 +445,82 @@ func ompBaseURL() string {
 	return strings.TrimRight(envconfig.ConnectableHost().String(), "/") + "/v1"
 }
 
-// ompBaseURLFor is the provider base URL OMP should use: the remote's direct
-// base for a user-remote model, otherwise the daemon's /v1.
-func ompBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return strings.TrimRight(ep.BaseURL, "/")
-	}
-	return ompBaseURL()
-}
-
+// ompProviderHealthy reports whether the ollama provider holds the config
+// oaica wrote — for the daemon or for one of the configured user remotes.
+// Both shapes are checked, because both are written by ensureOMPProvider:
+// demanding the daemon's base URL made CurrentModel report "" for the config
+// the same launch had just written (2026-09-26 audit, tenth round).
 func ompProviderHealthy(provider map[string]any) bool {
 	baseURL, _ := provider["baseUrl"].(string)
-	if strings.TrimRight(baseURL, "/") != strings.TrimRight(ompBaseURL(), "/") {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if baseURL == "" {
 		return false
 	}
 	api, _ := provider["api"].(string)
-	if api != "openai-responses" {
-		return false
-	}
 	auth, _ := provider["auth"].(string)
-	if auth != "none" {
-		return false
-	}
 	discovery, _ := provider["discovery"].(map[string]any)
-	if discovery == nil {
+	discoveryType := ""
+	if discovery != nil {
+		discoveryType, _ = discovery["type"].(string)
+	}
+
+	if baseURL == strings.TrimRight(ompBaseURL(), "/") {
+		return api == "openai-responses" && auth == "none" && discoveryType == "ollama"
+	}
+
+	// A remote base URL is ours only when a configured remote actually serves
+	// it; anything else is a config oaica did not write.
+	if _, ok := ompConfiguredRemoteForBase(baseURL); !ok {
 		return false
 	}
-	discoveryType, _ := discovery["type"].(string)
-	return discoveryType == "ollama"
+	if api != "openai-completions" || discoveryType == "ollama" {
+		return false
+	}
+	key, _ := provider["apiKey"].(string)
+	if strings.TrimSpace(key) == "" {
+		// A remote with no credential: the only honest scheme.
+		return auth == "none"
+	}
+	return auth == "apiKey"
+}
+
+// ompConfiguredRemoteForBase returns the configured remote a provider base URL
+// belongs to, if any. Reads the remote store only — no network — so it is safe
+// on every picker-state read.
+func ompConfiguredRemoteForBase(baseURL string) (userRemote, bool) {
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, false
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == baseURL {
+			return r, true
+		}
+	}
+	return userRemote{}, false
+}
+
+// ompRemotePickerName maps a provider's base URL plus the model id written in
+// models.yml back to the picker name the launch used ("box/big-model"). The
+// config stores the bare upstream id, which is not a name the launcher can
+// check (a bare id matches neither a saved picker name nor a remote row), so
+// CurrentModel translates it back. Returns "" when no configured remote serves
+// that base URL under that id.
+func ompRemotePickerName(baseURL, upstream string) string {
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" {
+		return ""
+	}
+	remote, ok := ompConfiguredRemoteForBase(strings.TrimRight(baseURL, "/"))
+	if !ok {
+		return ""
+	}
+	candidate := remote.Name + "/" + upstream
+	ep, ok := resolveRemoteEndpoint(candidate)
+	if !ok || strings.TrimRight(ep.BaseURL, "/") != strings.TrimRight(baseURL, "/") || ep.UpstreamModel != upstream {
+		return ""
+	}
+	return candidate
 }
 
 func ompProvider(cfg map[string]any) (map[string]any, bool) {
