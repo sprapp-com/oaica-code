@@ -625,14 +625,22 @@ func opencodeStoreKey(providerID, modelID string) string {
 	return providerID + "\x00" + modelID
 }
 
-// opencodeHeldStoreKeys is the key of every entry of opencode's state that
-// names a block this integration writes, in state order.
+// opencodeHeldStoreKeys is the key of every entry of opencode's state, in state
+// order — a foreign provider's block included.
+//
+// The entries are NOT filtered down to the blocks this integration writes. The
+// key already names the block, so a foreign entry can never equal a key a
+// launch would write; dropping it cost nothing and bought a correctness bug.
+// opencode resolves the FIRST entry of `recent`, so a state whose head is
+// another provider's model does not hold this selection even when our pair sits
+// behind it — while Edit, which prepends, would have moved our pair in front.
+// The filtered list read that store as current and the launch was skipped
+// (2026-09-27 audit, round 28, F2).
 func opencodeHeldStoreKeys() []string {
-	var keys []string
-	for _, entry := range opencodeStateEntries() {
-		if opencodeIsOurProviderBlock(entry[0]) {
-			keys = append(keys, opencodeStoreKey(entry[0], entry[1]))
-		}
+	entries := opencodeStateEntries()
+	keys := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		keys = append(keys, opencodeStoreKey(entry[0], entry[1]))
 	}
 	return keys
 }

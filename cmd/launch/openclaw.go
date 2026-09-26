@@ -1340,6 +1340,19 @@ func openclawProviderModelIDs(config map[string]any) []string {
 	return result
 }
 
+// openclawProviderBaseURL reads models.providers.ollama.baseUrl — the address
+// OpenClaw dials for this provider. It is the value openclawEditConfig writes
+// from ConnectableHost(), and the one the declaration has to compare against:
+// the ids, the primary and the session file say WHICH models the app offers,
+// never WHERE it reaches them.
+func openclawProviderBaseURL(config map[string]any) string {
+	modelsSection, _ := config["models"].(map[string]any)
+	providers, _ := modelsSection["providers"].(map[string]any)
+	ollama, _ := providers["ollama"].(map[string]any)
+	baseURL, _ := ollama["baseUrl"].(string)
+	return baseURL
+}
+
 // openclawStoredRows is the selection as a write leaves it at the head of
 // OpenClaw's provider: the rows in order, each id once. Two rows that name the
 // same backend — a catalogue row and the daemon row of the id it is served as —
@@ -1439,6 +1452,16 @@ func (c *Openclaw) DeclaresSelection(models []LaunchModel) bool {
 	}
 	config, err := openclawReadConfig(home)
 	if err != nil {
+		return false
+	}
+	// The provider's address is part of what the store says: OpenClaw dials
+	// baseUrl, and a config left on a since-moved daemon (OLLAMA_HOST is read
+	// live, so moving the daemon is the documented case) is a store that does
+	// not hold this selection. Without this the declaration answered true, the
+	// launch skipped its rewrite, and the app kept talking to the old endpoint
+	// (2026-09-27 audit, round 28, F1). Compared against the writer's own
+	// source, so the two cannot drift.
+	if openclawProviderBaseURL(config) != envconfig.ConnectableHost().String() {
 		return false
 	}
 	if !declaresPrefix(openclawProviderModelIDs(config), want) {

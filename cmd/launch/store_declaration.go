@@ -52,22 +52,6 @@ func sameStoreStrings(a, b []string) bool {
 	return true
 }
 
-func selectionContains(held, want []string) bool {
-	for _, w := range want {
-		found := false
-		for _, h := range held {
-			if h == w {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return len(want) > 0
-}
-
 // declaresPrefix reports whether held begins with want: the store's own
 // entries, in order, are the selection's — anything after them is history the
 // editor's writer keeps, which is not drift (opencode's recent list, OpenClaw's

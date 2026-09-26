@@ -1088,27 +1088,45 @@ func requeueMeterReports(ch chan usageReport, reports []usageReport) int {
 // reportUsage sends e to the meter reporter's channel, non-blocking. A full
 // channel (meterhub down/slow for a while) drops the report rather than
 // stalling the request that triggered it — see meterCh's doc.
+//
+// The read of g.meterCh and the send are ONE critical section, which is what
+// drainMeterChannel's doc claims of them. apply() drains the channel it is
+// about to retire while holding the write lock, so a sender that dropped the
+// read lock in between had its report land in the retired channel: never
+// delivered by any reporter, and never counted as dropped either, so the only
+// trace was a record missing from meterhub's aggregate — the exact silence
+// round 27 set out to remove (2026-09-27 audit, round 28, B-F1). The send is a
+// non-blocking select, so the read lock is held for a bounded time.
+func (g *gateway) reportUsage(e ledgerEntry) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	ch := g.meterCh
+	if ch == nil {
+		return
+	}
+	if meterReportSendHook != nil {
+		meterReportSendHook()
+	}
+	select {
+	case ch <- usageReport{ledgerEntry: e, Region: g.cfg.Region}:
+	default:
+		log.Printf("oaica-gateway: meterhub report channel full, dropping report for %s (local ledger still has it)", e.RequestID)
+	}
+}
+
+// meterReportSendHook, when non-nil, runs inside reportUsage's critical
+// section, immediately before the send. A test seam, same shape as
+// meterReporterBackoff: it lets a test hold a report between its read of
+// g.meterCh and its send and observe that a reload's swap cannot proceed in
+// that window.
+var meterReportSendHook func()
+
 // calibrator returns the per-session prompt-size calibrator, building it on
 // first use. Bounded at maxCalibratedSessions -- the gateway sees every
 // client's sessions, so this map must never grow without limit.
 func (g *gateway) calibrator() *promptCalibrator {
 	g.calibOnce.Do(func() { g.calib = newPromptCalibrator(maxCalibratedSessions) })
 	return g.calib
-}
-
-func (g *gateway) reportUsage(e ledgerEntry) {
-	g.mu.RLock()
-	ch := g.meterCh
-	region := g.cfg.Region
-	g.mu.RUnlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case ch <- usageReport{ledgerEntry: e, Region: region}:
-	default:
-		log.Printf("oaica-gateway: meterhub report channel full, dropping report for %s (local ledger still has it)", e.RequestID)
-	}
 }
 
 func (g *gateway) reload(path string) {

@@ -60,7 +60,7 @@ func PublishAll(files ...PublishFile) error {
 	for _, f := range files {
 		path := writtenTarget(f.Path)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return fmt.Errorf("%s: %w", path, err)
+			return discard(staged, fmt.Errorf("%s: %w", path, err))
 		}
 		sf := &stagedFile{publish: f, path: path}
 		staged = append(staged, sf)
@@ -73,15 +73,15 @@ func PublishAll(files ...PublishFile) error {
 		case err == nil:
 			sf.backupPath, err = writeBackupCopy(path, f.Integration)
 			if err != nil {
-				return fmt.Errorf("%s: backup failed: %w", path, err)
+				return discard(staged, fmt.Errorf("%s: backup failed: %w", path, err))
 			}
 		case !os.IsNotExist(err):
-			return fmt.Errorf("%s: read existing file: %w", path, err)
+			return discard(staged, fmt.Errorf("%s: read existing file: %w", path, err))
 		}
 
 		tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 		if err != nil {
-			return fmt.Errorf("%s: create temp failed: %w", path, err)
+			return discard(staged, fmt.Errorf("%s: create temp failed: %w", path, err))
 		}
 		sf.tmpPath = tmp.Name()
 		if _, err := tmp.Write(f.Data); err != nil {
@@ -110,7 +110,13 @@ func PublishAll(files ...PublishFile) error {
 	return nil
 }
 
-// discard removes the temp files of a set that never became visible.
+// discard removes the temp files of a set that never became visible. Every
+// failure between the first staged document and the first rename leaves through
+// here — a document that failed while an earlier one was already staged used to
+// return directly, and the staged file's temp was left in the user's config
+// directory holding the config bytes it had just written. The read-only
+// directory that makes a staging failure likely is also the one the user may
+// not be able to clean (2026-09-27 audit, round 28, F3).
 func discard(staged []*stagedFile, err error) error {
 	for _, sf := range staged {
 		if sf.tmpPath != "" {

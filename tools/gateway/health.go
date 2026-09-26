@@ -96,6 +96,16 @@ func (g *gateway) startUpstreamProbe(addr, upstreamID string) *probeFlight {
 	go func() {
 		healthy := g.probeUpstreamHealthUncached(addr, upstreamID)
 		upstreamProbes.Lock()
+		// The map is created here if it is gone, exactly as startUpstreamProbe
+		// creates it: the probe outlives the request that started it, and a test
+		// helper that discards the map between two tests in one binary used to
+		// turn a landing probe into "assignment to entry in nil map" — every
+		// test passing and the package failing (2026-09-27 audit, round 28,
+		// B-F2). Nothing at runtime nil's it, but the goroutine must not assume
+		// it.
+		if upstreamProbes.m == nil {
+			upstreamProbes.m = map[string]upstreamProbe{}
+		}
 		upstreamProbes.m[addr] = upstreamProbe{at: time.Now(), health: healthy}
 		delete(upstreamProbes.flights, addr)
 		upstreamProbes.Unlock()
