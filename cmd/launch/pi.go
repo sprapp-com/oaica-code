@@ -654,8 +654,33 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	if !ok {
 		ollama = map[string]any{
 			"baseUrl": piProviderBaseURL(models),
-			"api":     "openai-completions",
+			"api":     piProviderAPI,
 			"apiKey":  piProviderKey(models),
+		}
+	} else {
+		// Pi has ONE provider slot, and every model this package registers is
+		// served from its baseUrl with its apiKey — so the slot has to match
+		// the models of THIS launch. It used to be written once and reused
+		// thereafter: after a remote-backed launch the slot kept that remote's
+		// URL and token, so a later local-model launch registered the daemon's
+		// model in a provider pointed at someone else's API, with that
+		// credential, and the run failed at the far end (2026-09-26 audit,
+		// tenth round).
+		//
+		// A user who hand-configured this slot for their own endpoint is told,
+		// not silently rewritten.
+		// Only a slot THIS package wrote is repointed: piProviderAPI is the
+		// value it sets on creation, and an entry carrying anything else was
+		// configured by the user — their endpoint, their key, their choice (the
+		// case TestPiEdit pins).
+		if api, _ := ollama["api"].(string); api == piProviderAPI {
+			wantBase, wantKey := piProviderBaseURL(models), piProviderKey(models)
+			if oldBase, _ := ollama["baseUrl"].(string); strings.TrimRight(oldBase, "/") != strings.TrimRight(wantBase, "/") {
+				fmt.Fprintf(noticeWriter(), "%s  Warning: repointing Pi's ollama provider from %s to %s — Pi serves every oaica-registered model from this one provider, and this launch's models resolve there%s\n",
+					ansiYellow, piPrintableBaseURL(oldBase), piPrintableBaseURL(wantBase), ansiReset)
+			}
+			ollama["baseUrl"] = wantBase
+			ollama["apiKey"] = wantKey
 		}
 	}
 
@@ -784,6 +809,16 @@ func piModelIDFor(model LaunchModel) string {
 	}
 	return model.Name
 }
+
+// piProviderAPI is the provider API value this package writes when it creates
+// Pi's ollama slot, and the marker that the slot is ours to repoint (see
+// Pi.Edit).
+const piProviderAPI = "openai-completions"
+
+// piPrintableBaseURL is a base URL as printed in a notice: doctor's rule (see
+// redactBaseURL), because a provider base URL is a shape this project allows to
+// carry a credential in its userinfo and this line goes to the terminal.
+func piPrintableBaseURL(baseURL string) string { return redactBaseURL(baseURL) }
 
 // piProviderBaseURL is the base URL Pi's single provider should use: the first
 // user-remote model's endpoint, otherwise the daemon's /v1.
