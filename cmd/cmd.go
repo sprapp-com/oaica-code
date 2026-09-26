@@ -1055,6 +1055,22 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// oaicaShortDigest renders a model ID in the list tables: the server's digest
+// truncated to the 12 characters these tables have always shown, or "-" when
+// the server reported none. The digest is the peer's, not ours — it arrives as
+// JSON from whatever OLLAMA_HOST points at — so its length cannot be sliced
+// blind: a short or absent digest would panic the CLI instead of printing the
+// table that was asked for.
+func oaicaShortDigest(digest string) string {
+	if digest == "" {
+		return "-"
+	}
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
 func ListHandler(cmd *cobra.Command, args []string) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
@@ -1077,7 +1093,7 @@ func ListHandler(cmd *cobra.Command, args []string) error {
 				size = format.HumanBytes(m.Size)
 			}
 
-			data = append(data, []string{m.Name, m.Digest[:12], size, format.HumanTime(m.ModifiedAt, "Never")})
+			data = append(data, []string{m.Name, oaicaShortDigest(m.Digest), size, format.HumanTime(m.ModifiedAt, "Never")})
 		}
 	}
 
@@ -1132,7 +1148,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				until = format.HumanTime(m.ExpiresAt, "Never")
 			}
 			ctxStr := strconv.Itoa(m.ContextLength)
-			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until})
+			data = append(data, []string{m.Name, oaicaShortDigest(m.Digest), format.HumanBytes(m.Size), procStr, ctxStr, until})
 		}
 	}
 
