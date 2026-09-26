@@ -61,14 +61,24 @@ func resolveNativeAnthropicAuth() (nativeAnthropicAuth, bool) {
 }
 
 // oauthBetaHeaderValue is the anthropic-beta value an OAuth bearer from
-// `claude /login` requires — Anthropic rejects the bearer without it. Claude
-// Code sends it on every request it makes, so the passthrough routes inherit
-// it by forwarding the client's headers verbatim (anthropicModelsPassthrough)
-// and never need this constant. A request oaica builds on its OWN behalf has
-// no client to copy headers from; resolveNativeModelAlias's /v1/models
-// GET is the one such request, and without this header an OAuth-only user's
-// lookup 401s — which is what made the native alias resolution silently
-// no-op for exactly the users the native picker rows exist for.
+// `claude /login` requires — Anthropic rejects the bearer without it.
+//
+// It has to be applied wherever oaica INJECTS such a credential, and not
+// merely hoped for from the client: whether a client sends this beta is a
+// function of how that client is authenticated, and on a native leg the client
+// is a child oaica pointed at a loopback proxy whose Authorization header is
+// the PROXY's token (anthropicPassthrough's header loop replaces it). Two
+// requests are on this footing — resolveNativeModelAlias's /v1/models GET,
+// which has no client to copy headers from at all, and every POST the
+// /v1/messages passthrough forwards with the native credential. Without the
+// header an OAuth-only user's lookup 401s (which is what made native alias
+// resolution silently no-op for exactly the users the native picker rows exist
+// for) and every turn of theirs 401s.
+//
+// anthropicPassthrough and applyNativeAnthropicAuth are where it is applied;
+// both merge it into what the client sent rather than replacing it, because the
+// client's own beta values carry prompt caching and dropping one would be a
+// silent downgrade of a request the fix was not about.
 const oauthBetaHeaderValue = "oauth-2025-04-20"
 
 // applyNativeAnthropicAuth puts auth on req the way the corresponding live
@@ -77,8 +87,24 @@ const oauthBetaHeaderValue = "oauth-2025-04-20"
 func applyNativeAnthropicAuth(req *http.Request, auth nativeAnthropicAuth) {
 	req.Header.Set(auth.Header, auth.Value)
 	if auth.Header == "Authorization" {
-		req.Header.Set("anthropic-beta", oauthBetaHeaderValue)
+		req.Header.Set("anthropic-beta", mergeAnthropicBeta(req.Header.Get("anthropic-beta"), oauthBetaHeaderValue))
 	}
+}
+
+// mergeAnthropicBeta appends beta to a client-supplied anthropic-beta value,
+// comma-separated the way the header is defined, skipping it when it is already
+// listed. The caller's value is preserved in place, so a client's own betas
+// (prompt-caching-2024-07-31 among them) survive a header oaica had to add.
+func mergeAnthropicBeta(clientValue, beta string) string {
+	for _, v := range strings.Split(clientValue, ",") {
+		if strings.EqualFold(strings.TrimSpace(v), beta) {
+			return clientValue
+		}
+	}
+	if strings.TrimSpace(clientValue) == "" {
+		return beta
+	}
+	return clientValue + "," + beta
 }
 
 // readClaudeOAuthAccessTokenFn is a var so tests can point it at a fixture

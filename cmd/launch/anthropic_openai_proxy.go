@@ -2948,6 +2948,20 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 		}
 	}
 	req.Header.Set(headerName, headerValue)
+	// The credential oaica injected, when it is the OAuth session `claude
+	// /login` wrote, is only accepted by api.anthropic.com alongside the beta
+	// that announces it (native_anthropic_auth.go's oauthBetaHeaderValue). The
+	// client cannot be relied on for it: on this leg the client is a child
+	// oaica launched against the proxy, whose Authorization header is the
+	// proxy's own token (replaced above), and the beta set Claude Code emits
+	// depends on how IT is authenticated, not on the credential the leg it is
+	// being pointed at needs. Merged into whatever the client sent — never
+	// replacing it — because those values carry the client's own betas
+	// (prompt caching among them) and dropping one is a silent downgrade of the
+	// request. A vendor key sent as x-api-key needs none and gets none.
+	if strings.EqualFold(headerName, "Authorization") {
+		req.Header.Set("anthropic-beta", mergeAnthropicBeta(req.Header.Get("anthropic-beta"), oauthBetaHeaderValue))
+	}
 	// The conversation-affinity header, on this leg too: docs/CLAUDE_TIERS.md
 	// promises it is sent "on every request that launch's proxy forwards",
 	// and the leg it exists for — a remote Anthropic-wire backend behind a
