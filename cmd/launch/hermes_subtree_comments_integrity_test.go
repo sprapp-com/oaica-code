@@ -38,8 +38,12 @@ func hermesSubtreeCommentEnv(t *testing.T) string {
 		"  # keep-custom-comment\n" +
 		"  - name: other\n" +
 		"    base_url: https://other.invalid/v1 # keep-custom-line\n" +
+		// The managed entry carries the endpoint oaica writes: ownership is
+		// tested on the endpoint as well as the name, because "Ollama" is
+		// Hermes' own name for Ollama and a hand-written entry may carry it
+		// (2026-09-27 audit, round 21).
 		"  - name: Ollama\n" +
-		"    base_url: https://stale.invalid/v1\n" +
+		"    base_url: http://127.0.0.1:11434/v1\n" +
 		"toolsets:\n" +
 		"  # keep-toolset-comment\n" +
 		"  - terminal\n"

@@ -344,7 +344,12 @@ func writeHermesConfig(configPath, model string, models []string) error {
 	if err := yamlSetValue(providersNode, hermesProviderKey, entry); err != nil {
 		return err
 	}
-	yamlDeleteKey(providersNode, hermesLegacyKey)
+	// The legacy key is removed only when the entry under it is one oaica wrote:
+	// "ollama" is Hermes' own provider name, so the entry there may be the
+	// user's (2026-09-27 audit, round 21).
+	if hermesLegacyProviderIsOurs(providers) {
+		yamlDeleteKey(providersNode, hermesLegacyKey)
+	}
 
 	// Filtered as nodes, not as a decoded map: oaica removes the one entry it
 	// owns and must leave the entries it does not — comments, key order,
@@ -883,7 +888,9 @@ func applyHermesManagedProviders(cfg map[string]any, baseURL string, model strin
 	entry["default_model"] = model
 	entry["models"] = hermesStringListAny(models)
 	providers[hermesProviderKey] = entry
-	delete(providers, hermesLegacyKey)
+	if hermesLegacyProviderIsOurs(providers) {
+		delete(providers, hermesLegacyKey)
+	}
 	cfg["providers"] = providers
 
 	customProviders := hermesWithoutManagedCustomProviders(cfg["custom_providers"])
@@ -998,13 +1005,71 @@ func hermesCustomProviders(current any) []any {
 	}
 }
 
+// hermesEndpointWasOurs reports whether an endpoint recorded in Hermes' config
+// is one oaica writes: the local daemon's /v1, or a configured remote's base.
+// The rule hermesManagedCurrentModel already applies to the model section, and
+// the one the ownership tests below need — "Ollama" is Hermes' own name for
+// Ollama, so a provider entry carrying it may be the USER's (their LAN server,
+// their key), and an entry that cannot be shown to be ours is theirs.
+// hermesEndpointWasOurs reports whether an endpoint recorded in Hermes' config
+// is one oaica writes: the local daemon (at whatever address OLLAMA_HOST names,
+// or at its documented default), or a configured remote's base.
+func hermesEndpointWasOurs(api string) bool {
+	api = hermesNormalizeURL(api)
+	if api == "" {
+		return false
+	}
+	if api == hermesNormalizeURL(hermesBaseURL()) || api == hermesNormalizeURL(hermesOllamaURL().String()) {
+		return true
+	}
+	// The daemon's default address. A legacy entry written by an earlier oaica
+	// carries it even when OLLAMA_HOST has since moved this machine's daemon
+	// elsewhere, and it is also where a user's own local Ollama provider points
+	// by default — the same provider, so an entry naming it is not theirs to
+	// lose.
+	for _, base := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
+		if api == base || api == base+"/v1" {
+			return true
+		}
+	}
+	_, ok := hermesConfiguredRemoteForBase(api)
+	return ok
+}
+
+// hermesEntryEndpoint reads the endpoint a provider or custom_providers entry
+// records: the providers map uses "api", the legacy custom_providers shape
+// "base_url".
+func hermesEntryEndpoint(entry map[string]any) string {
+	if api, _ := entry["api"].(string); strings.TrimSpace(api) != "" {
+		return api
+	}
+	base, _ := entry["base_url"].(string)
+	return base
+}
+
 func hermesManagedProviderEntry(providers map[string]any) map[string]any {
-	for _, key := range []string{hermesProviderKey, hermesLegacyKey} {
-		if entry, _ := providers[key].(map[string]any); entry != nil {
+	if entry, _ := providers[hermesProviderKey].(map[string]any); entry != nil {
+		return entry
+	}
+	if hermesLegacyProviderIsOurs(providers) {
+		if entry, _ := providers[hermesLegacyKey].(map[string]any); entry != nil {
 			return entry
 		}
 	}
 	return nil
+}
+
+// hermesLegacyProviderIsOurs reports whether the entry under the legacy "ollama"
+// key is one oaica wrote, and so may be consumed by — and removed after — this
+// launch's write. Without the test, a user's own provider keyed "ollama" was
+// adopted as the seed for oaica's entry and then deleted along with its key
+// (2026-09-27 audit, round 21).
+func hermesLegacyProviderIsOurs(providers map[string]any) bool {
+	entry, _ := providers[hermesLegacyKey].(map[string]any)
+	if entry == nil {
+		return false
+	}
+	return hermesEndpointWasOurs(hermesEntryEndpoint(entry))
 }
 
 func hermesWithoutManagedCustomProviders(current any) []any {
@@ -1036,9 +1101,17 @@ func hermesHasManagedCustomProvider(current any) bool {
 	return false
 }
 
+// hermesManagedCustomProvider reports whether a custom_providers entry is one
+// oaica wrote. The name alone is not an ownership test: "Ollama" is Hermes' own
+// name for Ollama, and a hand-written entry carrying it was deleted by an
+// unrelated launch (2026-09-27 audit, round 21). The endpoint has to be one
+// oaica writes as well.
 func hermesManagedCustomProvider(entry map[string]any) bool {
 	name, _ := entry["name"].(string)
-	return strings.EqualFold(strings.TrimSpace(name), hermesProviderName)
+	if !strings.EqualFold(strings.TrimSpace(name), hermesProviderName) {
+		return false
+	}
+	return hermesEndpointWasOurs(hermesEntryEndpoint(entry))
 }
 
 func hermesNormalizeURL(raw string) string {
@@ -1090,10 +1163,19 @@ func hermesManagedCustomProviderNode(entry *yaml.Node) bool {
 		return false
 	}
 	name := yamlNodeValue(entry, "name")
-	if name == nil {
+	if name == nil || !strings.EqualFold(strings.TrimSpace(name.Value), hermesProviderName) {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(name.Value), hermesProviderName)
+	// The name alone is not an ownership test — "Ollama" is Hermes' own name for
+	// Ollama, so a hand-written entry carrying it was deleted by an unrelated
+	// launch (2026-09-27 audit, round 21). The endpoint has to be one oaica
+	// writes as well; the legacy shape records it as base_url.
+	for _, key := range []string{"api", "base_url"} {
+		if node := yamlNodeValue(entry, key); node != nil && hermesEndpointWasOurs(node.Value) {
+			return true
+		}
+	}
+	return false
 }
 
 // hermesToolsetsNode returns the toolsets sequence with "web" present, keeping
