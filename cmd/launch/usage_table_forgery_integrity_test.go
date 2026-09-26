@@ -27,8 +27,8 @@ func TestUsageTableDoesNotPrintARawModelOrBackend(t *testing.T) {
 			OK:       1,
 		},
 		{
-			Model:   "other",
-			Backend: "https://box.example/v1\nthird    https://worse.example      1      1      0            1",
+			Model:    "other",
+			Backend:  "https://box.example/v1\nthird    https://worse.example      1      1      0            1",
 			Requests: 2,
 			OK:       2,
 		},
