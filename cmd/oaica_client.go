@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"github.com/ollama/ollama/cmd/launch"
 )
 
@@ -197,7 +197,7 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the router error body")
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return nil, launch.RedactError(fmt.Errorf("%s rejected the API key (HTTP %d)\n%s", launch.RedactBaseURL(oaicaHost()), resp.StatusCode, oaicaAuthHint))
 		}
@@ -332,7 +332,7 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return "", err
 	}
@@ -413,7 +413,7 @@ func oaicaListLoras() ([]oaicaLoraListEntry, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the router error body")
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 	var list oaicaLoraList
@@ -452,7 +452,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return "", err
 	}
@@ -519,7 +519,7 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +577,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return err
 	}
@@ -609,7 +609,7 @@ func oaicaAuthLogout(name string) error {
 		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return err
 	}
@@ -659,7 +659,7 @@ func oaicaAgentRun(task string) (string, error) {
 		return "", fmt.Errorf("couldn't reach agent sidecar at %s (is it running? see OAICA_AGENT_HOST): %w", oaicaAgentHost(), err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
 		return "", err
 	}

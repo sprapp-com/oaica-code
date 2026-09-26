@@ -14,6 +14,7 @@ package launch
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"io"
 	"net"
 	"net/http"
@@ -159,9 +160,9 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 	setRequestLogProxyPort(ln)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		body, err := io.ReadAll(r.Body)
+		body, err := httpbody.ReadCapped(r.Body, httpbody.DefaultMax, "the request body")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 

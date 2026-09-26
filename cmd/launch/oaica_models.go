@@ -14,7 +14,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"github.com/ollama/ollama/envconfig"
 )
 
@@ -528,7 +528,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host}
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the router error body")
 		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host, Body: strings.TrimSpace(string(body))}
 	}
 	var list struct {

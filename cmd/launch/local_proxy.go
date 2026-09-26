@@ -24,6 +24,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"io"
 	"net"
 	"net/http"
@@ -186,9 +187,9 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 				return
 			}
 		}
-		body, err := io.ReadAll(r.Body)
+		body, err := httpbody.ReadCapped(r.Body, httpbody.DefaultMax, "the request body")
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") && len(body) > 0 {

@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"github.com/ollama/ollama/cmd/launch"
 	"github.com/spf13/cobra"
 )
@@ -317,7 +318,9 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	// A manifest is small; its size is the router's choice, not oaica's
+	// (2026-09-26 audit).
+	body, _ := httpbody.ReadCapped(resp.Body, 8<<20, "the model manifest")
 	if resp.StatusCode != http.StatusOK {
 		var e struct {
 			Error struct {

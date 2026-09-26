@@ -50,6 +50,7 @@ import (
 
 	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/cmd/internal/httpbody"
 )
 
 // openAIMessage is the OpenAI chat-completions wire shape for one message.
@@ -1207,9 +1208,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		// Bounded: this body is written by the launched client, and an
+		// unbounded read of it is the proxy process's peak memory
+		// (2026-09-26 audit).
+		body, err := httpbody.ReadCapped(r.Body, httpbody.DefaultMax, "the request body")
 		if err != nil {
-			writeAnthropicError(w, http.StatusBadRequest, "read body: "+err.Error())
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "read body: "+err.Error())
 			return
 		}
 
@@ -1604,8 +1608,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		}()
 
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			text := strings.TrimSpace(string(respBody))
+			// A diagnostic, not an artifact: bounded so an upstream that
+			// answers an error with a gigabyte cannot become this process's
+			// memory (2026-09-26 audit).
+			text := strings.TrimSpace(string(httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the upstream error body")))
 			// An upstream context overflow is not an opaque backend failure:
 			// it is the SAME condition the clamp above tries to predict, and
 			// vLLM states the real numbers. Two things follow. (1) Re-emit it
@@ -1692,7 +1698,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 // bad" — it is "this response was never a turn", which is what the caller's
 // route health must be fed (2026-09-26 audit).
 func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) bool {
-	respBody, err := io.ReadAll(body)
+	// Bounded: the size of a whole turn is the upstream's choice
+	// (2026-09-26 audit).
+	respBody, err := httpbody.ReadCapped(body, httpbody.DefaultMax, "the upstream response")
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+redactErr(err).Error())
 		return false
