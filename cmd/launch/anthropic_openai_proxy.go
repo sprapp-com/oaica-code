@@ -207,6 +207,22 @@ func reasoningOf(reasoningContent, reasoning string) string {
 	return reasoning
 }
 
+// toolCallArgumentsSize is the size of the argument JSON the tool_use blocks
+// relay, for the output estimate. api.ToolCallFunction.Arguments is an ordered
+// map rather than the upstream's raw string, so it is measured by its rendered
+// form — the same bytes the converter writes into the client's block — and an
+// empty argument map (which renders "{}") counts nothing (2026-09-27 audit,
+// round 23).
+func toolCallArgumentsSize(calls []api.ToolCall) int {
+	n := 0
+	for i := range calls {
+		if s := calls[i].Function.Arguments.String(); s != "" && s != "{}" {
+			n += len(s)
+		}
+	}
+	return n
+}
+
 // cachedTokens returns the prefix-cache hit count, clamped to the prompt
 // size so a malformed upstream can never yield a negative input_tokens.
 func (u *openAIUsage) cachedTokens() int {
@@ -2064,9 +2080,13 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// The estimate counts what was relayed to the client, and a reasoning
 	// model's thinking is relayed as thinking deltas and billed as output just
 	// like its answer is — counting the answer alone made a long reasoning turn
-	// look nearly empty (2026-09-27 audit, round 17).
+	// look nearly empty (2026-09-27 audit, round 17). A tool call's argument
+	// JSON is relayed in the tool_use block and billed the same way, so a
+	// tool-only turn is not an empty one (2026-09-27 audit, round 23).
 	if !oaiResp.Usage.statedCompletionTokens() {
-		if produced := len(chatResp.Message.Content) + len(chatResp.Message.Thinking); produced > 0 {
+		produced := len(chatResp.Message.Content) + len(chatResp.Message.Thinking) +
+			toolCallArgumentsSize(chatResp.Message.ToolCalls)
+		if produced > 0 {
 			chatResp.Metrics.EvalCount = produced/4 + 1
 		}
 	}
@@ -2391,6 +2411,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				}
 				if tc.Function.Arguments != "" {
 					acc.args.WriteString(tc.Function.Arguments)
+					// The argument JSON reaches the client inside the tool_use
+					// block and the upstream bills it as output, so the output
+					// estimate counts it beside the answer and the thinking; a
+					// tool-only turn otherwise reported output_tokens: 0 for
+					// the turn that did the work (2026-09-27 audit, round 23).
+					streamedText += len(tc.Function.Arguments)
 				}
 			}
 
@@ -2596,7 +2622,10 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
 	emit(conv.Process(api.ChatResponse{Model: upstreamModel, Message: chatResp.Message}))
 
-	*streamedText = len(chatResp.Message.Content) + len(chatResp.Message.Thinking)
+	// The tool_use blocks this path relays are output too; see the streaming
+	// and non-streaming estimates (2026-09-27 audit, round 23).
+	*streamedText = len(chatResp.Message.Content) + len(chatResp.Message.Thinking) +
+		toolCallArgumentsSize(chatResp.Message.ToolCalls)
 	*finishReason = oaiResp.Choices[0].FinishReason
 	*finalUsage = oaiResp.Usage
 	return true

@@ -779,13 +779,14 @@ func qwenBaseURLFor(model string) string {
 	return qwenBaseURL()
 }
 
-// qwenModelIDFor is the model id Qwen should use: the bare upstream id for a
-// user-remote model, otherwise the picker name.
+// qwenModelIDFor is the model id Qwen should use, and it is answered by
+// childModelIDFor: the bare upstream id for a user-remote model, and otherwise
+// the id the endpoint actually serves — an alias resolved, an oaica source
+// prefix stripped, a ":cloud" catalogue row kept as the id the daemon routes.
+// Returning the raw `--model` spelling wrote a name beside the daemon's base
+// URL that the daemon does not answer to (2026-09-27 audit, round 23).
 func qwenModelIDFor(model string) string {
-	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // qwenKeyFor is the API key Qwen should use: the remote's token for a

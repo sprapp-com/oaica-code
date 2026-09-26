@@ -85,6 +85,14 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 		return err
 	}
 
+	// The id the app is pointed at must be one the endpoint this config names
+	// answers to. `--model` and a saved selection arrive in the picker's
+	// spelling (an alias, or the display-only `ollama/` prefix), and the app
+	// posts the root model and the catalogue slug verbatim to the provider base
+	// URL oaica wrote — so the spelling named a model the daemon does not have
+	// (2026-09-27 audit, round 23).
+	writeID := codexAppWriteModelID(primary, models)
+
 	// config.toml is Codex's own document: writeCodexAppConfig reads it, edits
 	// oaica's keys in it and publishes the whole thing back, so the read has to
 	// happen under the same cross-process lock every other writer of this file
@@ -102,11 +110,38 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 		if err != nil {
 			return err
 		}
-		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, singleEndpointModels(primary, models))); err != nil {
+		if err := writeCodexAppModelCatalog(catalogPath, writeID, codexAppCatalogModels(primary, writeID, singleEndpointModels(primary, models))); err != nil {
 			return err
 		}
-		return writeCodexAppConfig(configPath, primary, catalogPath)
+		return writeCodexAppConfig(configPath, writeID, catalogPath)
 	})
+}
+
+// codexAppWriteModelID is the id the ChatGPT app is pointed at: the id the row
+// the launch is for is served AS. LaunchModel.Upstream carries the backend's
+// own id when the picker label is display-only (an ollama-cloud catalogue row),
+// and childModelIDFor resolves an alias and strips oaica's own source prefixes.
+//
+// The row's own Name is otherwise left alone: an inventory row is already the
+// daemon-side id, and the inherited pin that a selection of "llama3.2" is
+// written as "llama3.2" — not as the "llama3.2:latest" row it resolves to —
+// holds because that is the spelling the user picked and the daemon answers to.
+func codexAppWriteModelID(primary string, models []LaunchModel) string {
+	if row, ok := findLaunchModel(models, primary); ok {
+		if upstream := strings.TrimSpace(row.Upstream); upstream != "" {
+			return upstream
+		}
+	}
+	return childModelIDFor(primary)
+}
+
+// codexAppRowModelID is codexAppWriteModelID's per-row rule, for the rows the
+// catalogue lists beside the primary: the id the backend actually serves.
+func codexAppRowModelID(model LaunchModel) string {
+	if upstream := strings.TrimSpace(model.Upstream); upstream != "" {
+		return upstream
+	}
+	return strings.TrimSpace(model.Name)
 }
 
 func (c *CodexApp) CurrentModel() string {
@@ -520,7 +555,13 @@ func writeCodexAppModelCatalog(path, primary string, models []LaunchModel) error
 	return fileutil.WriteWithBackup(path, append(data, '\n'), codexAppIntegrationName)
 }
 
-func codexAppCatalogModels(primary string, models []LaunchModel) []LaunchModel {
+// codexAppCatalogModels builds the catalogue: the launch target first (under
+// writeID, which is the id the app must post), then every row the endpoint the
+// app dials serves — each under the id that endpoint answers to, since the app
+// posts the slug verbatim. primary is the name the launch was FOR and is only
+// used to find its row: writeID may be a resolved alias or a `:cloud` id the
+// rows do not carry as a name.
+func codexAppCatalogModels(primary, writeID string, models []LaunchModel) []LaunchModel {
 	seen := make(map[string]bool, len(models)+1)
 	out := make([]LaunchModel, 0, len(models)+1)
 	add := func(model LaunchModel) {
@@ -535,15 +576,21 @@ func codexAppCatalogModels(primary string, models []LaunchModel) []LaunchModel {
 		seen[key] = true
 		out = append(out, model)
 	}
+	addID := func(model LaunchModel) {
+		model.Name = codexAppRowModelID(model)
+		add(model)
+	}
 
 	if model, ok := findLaunchModel(models, primary); ok {
-		model.Name = primary
+		model.Name = writeID
 		add(model)
 	} else {
-		add(fallbackLaunchModel(primary))
+		fallback := fallbackLaunchModel(primary)
+		fallback.Name = writeID
+		add(fallback)
 	}
 	for _, model := range models {
-		add(model)
+		addID(model)
 	}
 	return out
 }

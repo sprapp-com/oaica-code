@@ -733,13 +733,14 @@ func hermesBaseURLFor(model string) string {
 	return hermesBaseURL()
 }
 
-// hermesModelIDFor is the default model Hermes should select: the bare upstream
-// id for a user-remote model, otherwise the picker name.
+// hermesModelIDFor is the default model Hermes should select, answered by
+// childModelIDFor: the bare upstream id for a user-remote model, and otherwise
+// the id the endpoint it is written beside actually serves. The base URL
+// sibling already resolved the launch target; returning the raw spelling
+// instead wrote a model name the daemon does not have (2026-09-27 audit,
+// round 23).
 func hermesModelIDFor(model string) string {
-	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // hermesKeyFor is the provider API key: the remote's token for a user-remote

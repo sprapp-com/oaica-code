@@ -225,6 +225,19 @@ func modelNamesAreTheSame(a, b string) bool {
 	if a == b {
 		return true
 	}
+	// An alias and its target are one selection — `oaica model alias glm
+	// --target ollama/glm-5.3-flash:cloud` makes them the same model. A writer
+	// that stores the id the endpoint serves reads back the TARGET while the
+	// launcher saved the alias, so the pair compared as drift and every launch
+	// configured the integration again (2026-09-27 audit, round 23). Only a
+	// name that IS an alias is compared this way: childModelIDFor is not
+	// applied to both sides, so two unrelated names keep their own identities.
+	if target, ok := resolveModelAlias(a); ok && childModelIDFor(target) == childModelIDFor(b) {
+		return true
+	}
+	if target, ok := resolveModelAlias(b); ok && childModelIDFor(target) == childModelIDFor(a) {
+		return true
+	}
 	ae, aok := resolveRemoteEndpoint(a)
 	be, bok := resolveRemoteEndpoint(b)
 	if !aok || !bok {
@@ -1930,7 +1943,13 @@ func launchAfterConfiguration(name string, runner Runner, model string, models [
 	// The same refusal the store writers make, for the integrations that write
 	// inside Run instead: the launch is what dials the endpoint, so it must not
 	// go out either (2026-09-27 audit, round 21).
-	if err := rejectServedModels(name, models); err != nil {
+	//
+	// The rows are filtered to the endpoint the launch target belongs to, as
+	// every store writer's are: an integration whose WantsFullModelChoices() is
+	// true is handed the whole menu, so refusing on it meant one `oaica serve`
+	// row anywhere refused an ordinary launch of a model the daemon serves
+	// (2026-09-27 audit, round 23).
+	if err := rejectServedModels(name, singleEndpointModels(model, models)); err != nil {
 		return err
 	}
 	if req.ConfigureOnly {
