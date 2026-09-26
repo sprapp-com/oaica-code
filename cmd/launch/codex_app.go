@@ -77,17 +77,29 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 	if err != nil {
 		return err
 	}
-	if err := saveCodexAppRestoreState(configPath); err != nil {
-		return err
-	}
-	catalogPath, err := codexAppModelCatalogPath()
-	if err != nil {
-		return err
-	}
-	if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, models)); err != nil {
-		return err
-	}
-	return writeCodexAppConfig(configPath, primary, catalogPath)
+
+	// config.toml is Codex's own document: writeCodexAppConfig reads it, edits
+	// oaica's keys in it and publishes the whole thing back, so the read has to
+	// happen under the same cross-process lock every other writer of this file
+	// takes (the legacy cleanup in codex.go, and a concurrent `oaica launch
+	// chatgpt`). The restore-state file saved first is part of the same critical
+	// section — it records the snapshot of config.toml this entry is about to
+	// overwrite, so a state written from a stale snapshot is the same lost
+	// update one file over. The model catalog is a fresh document oaica owns end
+	// to end and takes no lock of its own.
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		if err := saveCodexAppRestoreState(configPath); err != nil {
+			return err
+		}
+		catalogPath, err := codexAppModelCatalogPath()
+		if err != nil {
+			return err
+		}
+		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, models)); err != nil {
+			return err
+		}
+		return writeCodexAppConfig(configPath, primary, catalogPath)
+	})
 }
 
 func (c *CodexApp) CurrentModel() string {
@@ -313,7 +325,25 @@ func (c *CodexApp) Restore() error {
 	if err != nil {
 		return err
 	}
+	if err := codexAppRestoreConfig(configPath); err != nil {
+		return err
+	}
+	return codexAppLaunchOrRestart("Restart ChatGPT to use your usual profile?", nil)
+}
 
+// codexAppRestoreConfig is CodexApp.Restore's load → mutate → save over Codex's
+// config.toml. Codex's file is the one `oaica launch chatgpt` and the legacy
+// cleanup write too, so the whole read-merge-publish runs under the store's
+// lock; the restart prompt stays with the caller, because a cross-process lock
+// held across a prompt blocks every other oaica command for as long as the user
+// takes to answer.
+func codexAppRestoreConfig(configPath string) error {
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		return codexAppRestoreConfigLocked(configPath)
+	})
+}
+
+func codexAppRestoreConfigLocked(configPath string) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -326,7 +356,7 @@ func (c *CodexApp) Restore() error {
 			if err := codexAppRemoveOwnedCatalog(); err != nil {
 				return codexAppRestoreFailure(configPath, err)
 			}
-			return codexAppLaunchOrRestart("Restart ChatGPT to use your usual profile?", nil)
+			return nil
 		}
 		return codexAppRestoreFailure(configPath, err)
 	}
@@ -362,7 +392,7 @@ func (c *CodexApp) Restore() error {
 	if err := removeCodexAppRestoreState(); err != nil {
 		return codexAppRestoreFailure(configPath, err)
 	}
-	return codexAppLaunchOrRestart("Restart ChatGPT to use your usual profile?", nil)
+	return nil
 }
 
 func codexAppRestoreFailure(configPath string, err error) error {

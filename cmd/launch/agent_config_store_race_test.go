@@ -55,6 +55,7 @@ const (
 	agentStorePi                     = "pi"
 	agentStoreCodexCleanup           = "codex-cleanup"
 	agentStoreCodexApp               = "codex-app"
+	agentStoreCodexAppRestore        = "codex-app-restore"
 	agentStoreOpenclawEdit           = "openclaw-edit"
 	agentStoreOpenclawWebSearch      = "openclaw-web-search"
 	agentStoreOpenclawDeviceScopes   = "openclaw-device-scopes"
@@ -111,6 +112,12 @@ func runAgentStoreWriter(kind, id string) error {
 		return cleanupCodexLegacyProfileConfig(path)
 	case agentStoreCodexApp:
 		return (&CodexApp{}).ConfigureWithModels(id, []LaunchModel{fallbackLaunchModel(id)})
+	case agentStoreCodexAppRestore:
+		path, err := codexConfigPath()
+		if err != nil {
+			return err
+		}
+		return codexAppRestoreConfig(path)
 	case agentStoreOpenclawEdit:
 		return (&Openclaw{}).Edit([]LaunchModel{{Name: id}})
 	case agentStoreOpenclawWebSearch:
