@@ -160,7 +160,9 @@ func ensureClaudeInstalled() (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to install claude: %w", err)
 	}
-	os.Remove(args[len(args)-1]) // fetched installer temp file
+	if tmp := claudeInstallerTempFile(runtime.GOOS, args); tmp != "" {
+		os.Remove(tmp) // fetched installer temp file
+	}
 
 	path, err := (&Claude{}).findPath()
 	if err != nil {
@@ -192,15 +194,44 @@ func checkClaudeInstallerDependencies() error {
 	return nil
 }
 
+// claudeInstallerTempFile is the path the installer command left behind for
+// this process to delete. The Windows arm's PowerShell removes both the
+// verified download and the .ps1 copy it made, so there is nothing left for Go
+// to remove — and its last argv element is the -Command script text, not a
+// path, so returning it would have this process try to delete the script
+// string. Only the unix arm's last argument is a file.
+func claudeInstallerTempFile(goos string, args []string) string {
+	if goos == "windows" || len(args) == 0 {
+		return ""
+	}
+	return args[len(args)-1]
+}
+
 func claudeInstallerCommand(goos string) (string, []string, error) {
 	switch goos {
 	case "windows":
+		// Verified-download flow (audit L3), same gate as kimi/qwen/muse: fetch
+		// to a temp file, check any SHA-256 pin, then run the FILE. This arm
+		// used to be
+		//
+		//	powershell -Command "irm https://claude.ai/install.ps1 | iex"
+		//
+		// which downloaded the script itself and evaluated it inline: no temp
+		// file, no hash, no pin, no unpinned warning, no bytes to review.
+		// Whatever the network answered ran with the user's privileges, so a
+		// compromised CDN, a DNS hijack or a MITM executed attacker code.
+		path, err := fetchInstallerScriptFn("https://claude.ai/install.ps1")
+		if err != nil {
+			return "", nil, err
+		}
+		// The download is shared code and writes a .sh name, which PowerShell
+		// will not execute as a script, so copy it to a .ps1 first.
 		return "powershell", []string{
 			"-NoProfile",
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"irm https://claude.ai/install.ps1 | iex",
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-claude.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
 		}, nil
 	case "darwin", "linux":
 		// Verified-download flow (audit L3): fetch to a temp file, check any

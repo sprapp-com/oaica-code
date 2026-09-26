@@ -26,9 +26,12 @@ import (
 const (
 	// https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.5
 	hermesDesktopMinVersion = "v0.16.0"
-	hermesInstallScript     = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup"
+	// The install scripts are NOT run from these strings: installer_dl.go
+	// downloads each to a temp file, enforces its SHA-256 pin, and the file it
+	// verified is what runs. A "curl … | bash" or "irm … | iex" here would be
+	// the unverified form those arms were moved off (2026-09-26 audit).
+	hermesUnixInstallURL    = "https://hermes-agent.nousresearch.com/install.sh"
 	hermesWindowsInstallURL = "https://hermes-agent.nousresearch.com/install.ps1"
-	hermesWindowsInstallCmd = "& ([scriptblock]::Create((irm " + hermesWindowsInstallURL + "))) -SkipSetup"
 	hermesProviderName      = "Ollama"
 	hermesProviderKey       = "ollama-launch"
 	hermesLegacyKey         = "ollama"
@@ -474,13 +477,47 @@ func (h *Hermes) ensureInstalledFor(command string) error {
 	return nil
 }
 
+// hermesWindowsInstallerCommand returns the Windows install command. It asks
+// installer_dl.go for a verified download — fetch to a temp file, enforce a
+// SHA-256 pin when one exists — and runs the FILE it handed back, the same gate
+// the unix arm below and the kimi/qwen/muse/claude installers use.
+//
+// This arm used to be
+//
+//	powershell -Command "& ([scriptblock]::Create((irm <url>))) -SkipSetup"
+//
+// which downloaded the script itself and evaluated it inline: no temp file, no
+// hash, no pin, no unpinned warning, no bytes to review. Whatever the network
+// answered ran with the user's privileges, so a compromised CDN, a DNS hijack
+// or a MITM executed attacker code (2026-09-26 audit, thirteenth round).
+func hermesWindowsInstallerCommand() (string, []string, error) {
+	path, err := fetchInstallerScriptFn(hermesWindowsInstallURL)
+	if err != nil {
+		return "", nil, err
+	}
+	// The download is shared code and writes a .sh name, which PowerShell will
+	// not execute as a script, so copy it to a .ps1 first. Both files are
+	// removed after the run.
+	return "powershell.exe", []string{
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-hermes.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer -SkipSetup; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
+	}, nil
+}
+
 func (h *Hermes) runInstallScript() error {
 	if hermesGOOS == "windows" {
-		return hermesAttachedCommand("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", hermesWindowsInstallCmd).Run()
+		bin, args, err := hermesWindowsInstallerCommand()
+		if err != nil {
+			return err
+		}
+		return hermesAttachedCommand(bin, args...).Run()
 	}
 	// Verified-download flow (audit L3): fetch + SHA-pin check, then execute
 	// the downloaded file instead of piping curl straight into bash.
-	return runInstallerScriptFn("https://hermes-agent.nousresearch.com/install.sh", "--skip-setup")
+	return runInstallerScriptFn(hermesUnixInstallURL, "--skip-setup")
 }
 
 func (h *Hermes) listModels(defaultModel string) []string {

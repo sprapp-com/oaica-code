@@ -289,7 +289,11 @@ func TestClaudeInstallerCommand(t *testing.T) {
 			name:    "windows",
 			goos:    "windows",
 			wantBin: "powershell",
-			want:    "irm https://claude.ai/install.ps1 | iex",
+			// Verified-download flow too: the fetched temp-file path (stubbed)
+			// that PowerShell copies to a .ps1 and runs — not "irm | iex".
+			// installer_windows_verified_download_integrity_test.go pins the
+			// rest (no inline fetch, nothing evaluated).
+			want: stubInstallerPath,
 		},
 		{
 			name:    "unsupported",
@@ -315,7 +319,7 @@ func TestClaudeInstallerCommand(t *testing.T) {
 			if bin != tt.wantBin {
 				t.Fatalf("bin = %q, want %q", bin, tt.wantBin)
 			}
-			if !slices.Contains(args, tt.want) {
+			if !strings.Contains(strings.Join(args, " "), tt.want) {
 				t.Fatalf("args = %v, want command containing %q", args, tt.want)
 			}
 		})

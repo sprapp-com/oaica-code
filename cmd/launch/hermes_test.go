@@ -1369,6 +1369,18 @@ exit 0
 		t.Fatal(err)
 	}
 
+	// Verified-download flow (audit L3): the Windows installer fetches through
+	// installer_dl.go, so the fetch is stubbed to a local path — no network in
+	// tests — and the fake powershell logs the argv it was handed.
+	oldFetch := fetchInstallerScriptFn
+	fetchInstallerScriptFn = func(u string) (string, error) {
+		if u != hermesWindowsInstallURL {
+			t.Errorf("verified download fetched %q, want %q", u, hermesWindowsInstallURL)
+		}
+		return stubInstallerPath, nil
+	}
+	t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+
 	DefaultConfirmPrompt = func(prompt string, options ConfirmOptions) (bool, error) {
 		if prompt != "Hermes is not installed. Install now?" {
 			t.Fatalf("unexpected install prompt %q", prompt)
@@ -1386,9 +1398,14 @@ exit 0
 		t.Fatal(err)
 	}
 	logs := string(data)
-	for _, want := range []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", hermesWindowsInstallURL, "-SkipSetup"} {
+	for _, want := range []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Copy-Item", stubInstallerPath, "-SkipSetup", "& $installer"} {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("expected PowerShell installer args to contain %q, got logs:\n%s", want, logs)
+		}
+	}
+	for _, banned := range []string{"irm ", "scriptblock", "Invoke-RestMethod", "Invoke-Expression"} {
+		if strings.Contains(logs, banned) {
+			t.Fatalf("PowerShell installer args still contain %q: the script must run from the verified file, never be evaluated inline. logs:\n%s", banned, logs)
 		}
 	}
 }
