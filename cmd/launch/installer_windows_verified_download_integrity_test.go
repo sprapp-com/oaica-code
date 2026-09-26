@@ -34,9 +34,9 @@ import (
 // to the file installer_dl.go verified, with nothing that fetches or evaluates
 // a remote script.
 func TestClaudeWindowsInstallerRunsTheVerifiedDownload(t *testing.T) {
-	restore := stubFetchInstallerScript(t)
-	defer restore()
-
+	// Overridden rather than stubFetchInstallerScript: that helper's restore is
+	// returned for `defer`, deferred funcs run before t.Cleanup, and the cleanup
+	// below would then put the STUB back for every test after this one.
 	fetched := ""
 	oldFetch := fetchInstallerScriptFn
 	fetchInstallerScriptFn = func(u string) (string, error) {
@@ -76,8 +76,9 @@ func TestClaudeWindowsInstallerRunsTheVerifiedDownload(t *testing.T) {
 // caller must not try to delete the last argv element — on Windows that is the
 // -Command script text, not a path.
 func TestClaudeInstallerCleansUpOnlyWhatItLeftBehind(t *testing.T) {
-	restore := stubFetchInstallerScript(t)
-	defer restore()
+	oldFetch := fetchInstallerScriptFn
+	fetchInstallerScriptFn = func(string) (string, error) { return stubInstallerPath, nil }
+	t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
 
 	_, winArgs, err := claudeInstallerCommand("windows")
 	if err != nil {
@@ -99,9 +100,9 @@ func TestClaudeInstallerCleansUpOnlyWhatItLeftBehind(t *testing.T) {
 // TestHermesWindowsInstallerRunsTheVerifiedDownload is the same pin for
 // hermes, whose Windows arm also has to keep passing -SkipSetup.
 func TestHermesWindowsInstallerRunsTheVerifiedDownload(t *testing.T) {
-	restore := stubFetchInstallerScript(t)
-	defer restore()
-
+	// Overridden rather than stubFetchInstallerScript: that helper's restore is
+	// returned for `defer`, deferred funcs run before t.Cleanup, and the cleanup
+	// below would then put the STUB back for every test after this one.
 	fetched := ""
 	oldFetch := fetchInstallerScriptFn
 	fetchInstallerScriptFn = func(u string) (string, error) {
