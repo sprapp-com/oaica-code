@@ -360,8 +360,28 @@ func printOpenclawReady(bin, token string, port int, firstLaunch bool) {
 	}
 }
 
-// openclawEnv returns the current environment with provider API keys cleared
-// so openclaw only uses the Ollama gateway, not keys from the user's shell.
+// openclawEnv returns the environment every OpenClaw child process (the
+// gateway, the TUI, `channels add`, the npm install) runs in: the launcher's
+// own environment minus every credential oaica hands out or reads, so openclaw
+// talks to the Ollama gateway with none of the user's keys in reach.
+//
+// The scrubbed set is DERIVED, not enumerated (2026-09-26 audit, round 13).
+// It used to be a hard-coded list of eight provider variables, which missed
+// the two the Claude Code path is careful about: the launcher's own router
+// token (OAICA_API_KEY was declared as a leg's TokenEnv in tier_routing.go)
+// and every configured remote's api_key_env (the auditor's repro kept
+// ZAI_API_KEY while tierPlan.childEnv stripped it). The set now comes from
+// tierPlan.credentialEnvNames() — the one function that decides which
+// variables a launched child must not inherit — applied through
+// scrubCredentialEnv, the same removal childEnv performs. Adding a remote, or
+// a name to a remote's api_key_env, changes what openclaw scrubs with no edit
+// here.
+//
+// The eight provider names are kept as well, on purpose: they are a policy
+// about OPENCLAW specifically (a shell OPENAI_API_KEY must not turn openclaw
+// into a direct OpenAI client), which no tier plan knows about. The catalog
+// only lists a provider while its key variable is set, so the derived set
+// cannot promise those names on its own.
 func openclawEnv() []string {
 	clear := map[string]bool{
 		"ANTHROPIC_API_KEY":     true,
@@ -380,12 +400,59 @@ func openclawEnv() []string {
 			env = append(env, e)
 		}
 	}
+	// scrubCredentialEnv REMOVES the entries (a blanked name still tells the
+	// child the variable is there), and leaves everything else — PATH, the
+	// user's own tooling — untouched. Applied after the loop above so the two
+	// rules read as one list.
+	env = scrubCredentialEnv(env, openclawCredentialEnvNames())
 	if _, ok := os.LookupEnv("OPENCLAW_PLUGIN_STAGE_DIR"); !ok {
 		if dir := openclawPluginStageDir(); dir != "" {
 			env = append(env, "OPENCLAW_PLUGIN_STAGE_DIR="+dir)
 		}
 	}
 	return env
+}
+
+// openclawCredentialEnvNames is openclawEnv's derived half: every variable
+// oaica itself could have read a real upstream credential from.
+//
+// It is computed through credentialEnvNames rather than by re-walking the
+// configuration, so the two launch paths cannot drift: the router leg
+// contributes the launcher's credential, and every configured remote (including
+// the built-ins loadUserRemotes merges in) contributes its api_key_env — both
+// names of a comma-joined spec included, which is what credentialEnvNames
+// splits for the Claude Code path too.
+//
+// Built here, per call, rather than taken from a launch's plan: openclawEnv
+// runs on every child process this integration spawns, several of them on
+// paths that never resolve a model, and this is a file read either way.
+func openclawCredentialEnvNames() []string {
+	plan := tierPlan{
+		// The router leg. The name is the one tier_routing.go declares as that
+		// leg's TokenEnv; openclaw_env_credential_integrity_test.go pins the
+		// two together by resolving the router through the real code.
+		Primary: launchEndpoint{
+			Source:         sourceRouter,
+			RemoteEndpoint: RemoteEndpoint{Name: "oaica", TokenEnv: "OAICA_API_KEY"},
+		},
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		// A remotes.json that will not parse still must not openclaw the
+		// launcher's own credential: the router leg above is already named.
+		return plan.credentialEnvNames()
+	}
+	for _, r := range remotes {
+		// APIKeyEnv is the row's raw (possibly comma-joined) spec, which is
+		// what credentialEnvNames splits; TokenEnv would add only the one name
+		// keyEnvName happened to pick. No model, no base URL: nothing here is
+		// served, this plan exists for its credential names.
+		plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, routeFor(launchEndpoint{
+			Source:         sourceUserRemote,
+			RemoteEndpoint: RemoteEndpoint{Name: r.Name, APIKeyEnv: r.APIKeyEnv},
+		}))
+	}
+	return plan.credentialEnvNames()
 }
 
 func openclawInstallEnv() []string {
