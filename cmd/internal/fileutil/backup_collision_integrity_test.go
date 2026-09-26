@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -145,5 +146,76 @@ func TestWriteWithBackup_PruneStillCountsSameSecondBackups(t *testing.T) {
 	}
 	if data, err := os.ReadFile(path); err != nil || string(data) != fmt.Sprintf(`{"v": %d}`, maxBackupsPerFile+3) {
 		t.Errorf("target holds %q (err %v), want the last write", data, err)
+	}
+}
+
+// The name is claimed by the creation itself (O_EXCL), not by the readdir that
+// picked it: two writers that resolve the same free name in the same instant
+// must not both win it, or the loser's copy truncates the winner's. That layer
+// is invisible to the tests above — they run one writer at a time, where
+// skipping the taken names is enough — so the race is exercised directly here:
+// with the claim removed, every writer lands on "<base>.<stamp>" and the count
+// collapses to one.
+func TestWriteWithBackup_ConcurrentBackupsAllSurvive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	frozen := time.Unix(1758888888, 0)
+	prev := timeNow
+	timeNow = func() time.Time { return frozen }
+	defer func() { timeNow = prev }()
+
+	// Several rounds, each on its own file: the race is what is being tested,
+	// and one round can interleave so favourably that a writer's copy is
+	// destroyed without the count moving. Rounds make a spurious pass unlikely;
+	// the fixed path is deterministic (a failed claim is simply retried), so it
+	// cannot fail here spuriously.
+	const rounds = 3
+	// Below maxBackupsPerFile: above it, pruning (correctly) discards the
+	// oldest copies and the count says nothing about the claim.
+	const writers = 4
+	for round := 0; round < rounds; round++ {
+		dir := t.TempDir()
+		base := fmt.Sprintf("concurrent-%d.json", round)
+		path := filepath.Join(dir, base)
+		if err := os.WriteFile(path, []byte(`{"owner":"the user"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make(chan error, writers)
+		start := make(chan struct{})
+		for i := 0; i < writers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				if err := WriteWithBackup(path, []byte(fmt.Sprintf(`{"owner":"oaica","writer":%d}`, i)), "filesync"); err != nil {
+					errs <- fmt.Errorf("writer %d: %w", i, err)
+				}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("a concurrent write failed: %v", err)
+		}
+
+		backupDir := filepath.Join(BackupDir(), "filesync")
+		entries, err := os.ReadDir(backupDir)
+		if err != nil {
+			t.Fatalf("read backup dir: %v", err)
+		}
+		n := 0
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), base+".") {
+				n++
+			}
+		}
+		if n != writers {
+			t.Errorf("round %d: got %d backups, want %d — a name was handed to two writers at once, so one copy replaced the other instead of claiming the next free name", round, n, writers)
+		}
 	}
 }
