@@ -88,32 +88,20 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 
 	usageShow := func() {
 		fmt.Fprintln(os.Stderr, "Available Commands:")
-		fmt.Fprintln(os.Stderr, "  /show info         Show details for this model")
-		fmt.Fprintln(os.Stderr, "  /show license      Show model license")
-		fmt.Fprintln(os.Stderr, "  /show modelfile    Show Modelfile for this model")
-		fmt.Fprintln(os.Stderr, "  /show parameters   Show parameters for this model")
-		fmt.Fprintln(os.Stderr, "  /show system       Show system message")
-		fmt.Fprintln(os.Stderr, "  /show template     Show prompt template")
+		fmt.Fprintln(os.Stderr, "  /show info         Show what the OAICA router publishes about this model")
+		fmt.Fprintln(os.Stderr, "  /show system       Show the session's system message")
+		fmt.Fprintln(os.Stderr, "  /show parameters   Show what a session sends — none: the router takes the model and the conversation")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "  /show license, modelfile, template: not available in this session — the")
+		fmt.Fprintln(os.Stderr, "  model is served by the OAICA API, which publishes no Modelfile for it.")
 		fmt.Fprintln(os.Stderr, "")
 	}
 
-	// only list out the most common parameters
-	usageParameters := func() {
-		fmt.Fprintln(os.Stderr, "Available Parameters:")
-		fmt.Fprintln(os.Stderr, "  /set parameter seed <int>             Random number seed")
-		fmt.Fprintln(os.Stderr, "  /set parameter num_predict <int>      Max number of tokens to predict")
-		fmt.Fprintln(os.Stderr, "  /set parameter top_k <int>            Pick from top k num of tokens")
-		fmt.Fprintln(os.Stderr, "  /set parameter top_p <float>          Pick token based on sum of probabilities")
-		fmt.Fprintln(os.Stderr, "  /set parameter min_p <float>          Pick token based on top token probability * min_p")
-		fmt.Fprintln(os.Stderr, "  /set parameter num_ctx <int>          Set the context size")
-		fmt.Fprintln(os.Stderr, "  /set parameter temperature <float>    Set creativity level")
-		fmt.Fprintln(os.Stderr, "  /set parameter repeat_penalty <float> How strongly to penalize repetitions")
-		fmt.Fprintln(os.Stderr, "  /set parameter repeat_last_n <int>    Set how far back to look for repetitions")
-		fmt.Fprintln(os.Stderr, "  /set parameter num_gpu <int>          The number of layers to send to the GPU")
-		fmt.Fprintln(os.Stderr, "  /set parameter stop <string> <string> ...   Set the stop parameters")
-		fmt.Fprintln(os.Stderr, "")
-	}
-
+	// usageShow lists what /show answers in a session served by the OAICA API.
+	// The Ollama subcommands it used to list (license, modelfile, template)
+	// asked a local daemon for a Modelfile, which this fork has no equivalent
+	// of — the router publishes a model's id, description and rating, and
+	// nothing else. They stay accepted and say so; see the /show arm.
 	scanner, err := readline.New(readline.Prompt{
 		Prompt:         ">>> ",
 		AltPrompt:      "... ",
@@ -287,10 +275,6 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				case "noformat":
 					oaicaSettingNotSent("noformat", "Nothing is in format mode to begin with.")
 				case "parameter":
-					if len(args) < 4 {
-						usageParameters()
-						continue
-					}
 					oaicaSettingNotSent("parameter", "Ollama generation parameters (num_ctx, temperature, …) are not sent to the router.")
 				case "system":
 					if len(args) < 3 {
@@ -339,65 +323,22 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		case isSlashCommand(line, "/show"):
 			args := strings.Fields(line)
 			if len(args) > 1 {
-				client, err := api.ClientFromEnvironment()
-				if err != nil {
-					fmt.Println("error: couldn't connect to ollama server")
-					return err
-				}
-				req := &api.ShowRequest{
-					Name:    opts.Model,
-					System:  opts.System,
-					Options: opts.Options,
-				}
-				resp, err := client.Show(cmd.Context(), req)
-				if err != nil {
-					fmt.Println("error: couldn't get model")
-					return err
-				}
-
 				switch args[1] {
 				case "info":
-					_ = showInfo(resp, false, os.Stderr)
-				case "license":
-					if resp.License == "" {
-						fmt.Println("No license was specified for this model.")
-					} else {
-						fmt.Println(resp.License)
-					}
-				case "modelfile":
-					fmt.Println(resp.Modelfile)
-				case "parameters":
-					fmt.Println("Model defined parameters:")
-					if resp.Parameters == "" {
-						fmt.Println("  No additional parameters were specified for this model.")
-					} else {
-						for _, l := range strings.Split(resp.Parameters, "\n") {
-							fmt.Printf("  %s\n", l)
-						}
-					}
-					fmt.Println()
-					if len(opts.Options) > 0 {
-						fmt.Println("User defined parameters:")
-						for k, v := range opts.Options {
-							fmt.Printf("  %-*s %v\n", 30, k, v)
-						}
-						fmt.Println()
+					if err := oaicaShowInfo(oaicaActiveModel); err != nil {
+						fmt.Printf("error: %v\n", err)
 					}
 				case "system":
-					switch {
-					case opts.System != "":
+					if strings.TrimSpace(opts.System) != "" {
 						fmt.Println(opts.System + "\n")
-					case resp.System != "":
-						fmt.Println(resp.System + "\n")
-					default:
-						fmt.Println("No system message was specified for this model.")
-					}
-				case "template":
-					if resp.Template != "" {
-						fmt.Println(resp.Template)
 					} else {
-						fmt.Println("No prompt template was specified for this model.")
+						fmt.Println("No system message was specified for this session. Set one with /set system <text>.")
 					}
+				case "parameters":
+					fmt.Println("This session sends no generation parameters — the router takes the model and the conversation. See /? /set.")
+					fmt.Println()
+				case "license", "modelfile", "template":
+					fmt.Printf("/show %s: not available in this session — %s is served by the OAICA API, which publishes no Modelfile for it.\n", args[1], oaicaActiveModel)
 				default:
 					fmt.Printf("Unknown command '/show %s'. Type /? for help\n", args[1])
 				}
@@ -647,6 +588,38 @@ func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChat
 	if opts.System != "" {
 		opts.Messages = append(opts.Messages, api.Message{Role: "system", Content: opts.System})
 	}
+	return nil
+}
+
+// oaicaShowInfo prints what the OAICA router publishes about a model — its id,
+// its "recommended for" line and its rating. Those three are the router's whole
+// record, so this is the honest /show info for a session here; the Ollama
+// version asked a local daemon for a Modelfile.
+//
+// A model the router no longer lists is not an error: a session can outlive a
+// rename, and /show must not be the command that ends it.
+func oaicaShowInfo(model string) error {
+	entries, err := oaicaListModelsDetailed()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.ID == model || strings.HasPrefix(model, e.ID+"+") {
+			fmt.Printf("model:  %s\n", model)
+			if e.Description != "" {
+				fmt.Printf("best for: %s\n", e.Description)
+			}
+			if e.Stars > 0 {
+				fmt.Printf("rating: %s\n", starString(e.Stars))
+			}
+			if e.Description == "" && e.Stars == 0 {
+				fmt.Println("the router publishes no description or rating for this model")
+			}
+			return nil
+		}
+	}
+	fmt.Printf("model:  %s\n", model)
+	fmt.Println("the router does not list this model — it may have been renamed or removed since this session started")
 	return nil
 }
 
