@@ -87,6 +87,17 @@ func normalizeSystemMessages(pathname string, body []byte) ([]byte, error) {
 		// Not JSON (or malformed) — forward as-is, let the backend reject it.
 		return body, nil
 	}
+	// Valid JSON that is not an object. json.Unmarshal accepts the literal
+	// `null` for a map by leaving it nil and reporting NO error, so the write
+	// below was an assignment to an entry in a nil map — a panic inside the
+	// serve proxy's handler on a single `curl -d null`, which net/http recovers
+	// per connection: the client got a dropped connection instead of an error
+	// and no usage row was written (2026-09-26 audit, ninth round). There is
+	// nothing here to rewrite in a number, a string, an array or null, so they
+	// take the same road as malformed input.
+	if parsed == nil {
+		return body, nil
+	}
 
 	if pathname == "/v1/messages" {
 		var strayContents []string
