@@ -961,10 +961,17 @@ func extractShardFlags(args []string) (map[string]int, []string) {
 			rest = append(rest, a)
 			continue
 		}
-		model, weightStr, ok := strings.Cut(spec, ":")
-		if !ok {
+		// The LAST colon separates the weight: this flag's vocabulary is the
+		// picker's, and picker ids carry colons of their own ("llama3.2:3b",
+		// "<name>:cloud", "<name>:local"). Cutting at the first one read the
+		// weight as "cloud:3", failed to parse it and dropped the entry with no
+		// message, so the split the user asked for silently degraded to plain
+		// failover (2026-09-27 audit, round 22).
+		cut := strings.LastIndex(spec, ":")
+		if cut < 0 {
 			continue
 		}
+		model, weightStr := spec[:cut], spec[cut+1:]
 		// Both halves trimmed: a padded model id matches no existing route
 		// and this flag's documented behaviour for a non-matching id is a
 		// SILENT no-op, so padding would look like the weight was ignored.

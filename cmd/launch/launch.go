@@ -1934,6 +1934,17 @@ func launchAfterConfiguration(name string, runner Runner, model string, models [
 		return err
 	}
 	if req.ConfigureOnly {
+		// The prompt below is a convenience for a user at the terminal; it must
+		// not decide the launch in the two non-interactive policies, where no
+		// user answers it. Auto-approve (--yes) returned true without printing
+		// anything, so `--config --yes` exec'd the agent the flag says not to
+		// launch; require-yes (headless, no --yes) failed the command AFTER the
+		// configuration had been written, handing a provisioning script a
+		// non-zero exit for the work it asked for. Both stop here now
+		// (2026-09-27 audit, round 22).
+		if currentLaunchConfirmPolicy.yes || currentLaunchConfirmPolicy.requireYesMessage {
+			return nil
+		}
 		launch, err := ConfirmPrompt(fmt.Sprintf("Launch %s now?", runner))
 		if err != nil {
 			return err
