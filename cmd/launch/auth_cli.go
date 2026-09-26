@@ -95,21 +95,24 @@ func AuthLogin(out io.Writer, provider, key string) error {
 		return fmt.Errorf("no key entered — %s unchanged", provider)
 	}
 
-	f, path, err := loadAuthStore()
-	if err != nil {
-		return err
-	}
 	label := ""
 	if known {
 		label = entry.PlanLabel
 	}
-	f.Providers[provider] = authCredential{
-		Type:    authCredentialTypeAPIKey,
-		Key:     key,
-		Label:   label,
-		SavedAt: nowUTC(),
-	}
-	if err := saveAuthStore(f, path); err != nil {
+	// Through updateAuthStore, which holds the store's cross-process lock
+	// across load-mutate-save. Eleven concurrent `auth login` calls used to
+	// print eleven successes and leave one key (2026-09-26 audit, fourth
+	// round).
+	path := authStorePath()
+	if err := updateAuthStore(func(f *authStoreFile) error {
+		f.Providers[provider] = authCredential{
+			Type:    authCredentialTypeAPIKey,
+			Key:     key,
+			Label:   label,
+			SavedAt: nowUTC(),
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Logged in to %s (%s). The key is stored in %s, mode 0600.\n", provider, maskKey(key), path)
@@ -204,27 +207,32 @@ func AuthLogout(out io.Writer, provider string) error {
 	if provider == "" {
 		return fmt.Errorf("usage: oaica auth logout <provider>")
 	}
-	f, path, err := loadAuthStore()
-	if err != nil {
-		return err
-	}
-	if _, ok := f.Providers[provider]; !ok {
-		// Case-insensitive fallback: `oaica auth logout ZAI` should work.
-		for name := range f.Providers {
-			if strings.EqualFold(name, provider) {
-				provider = name
-				ok = true
-				break
+	// Resolved inside the lock: a login landing between this read and the
+	// delete would otherwise be removed by a logout that never saw it.
+	found := false
+	if err := updateAuthStore(func(f *authStoreFile) error {
+		if _, ok := f.Providers[provider]; !ok {
+			// Case-insensitive fallback: `oaica auth logout ZAI` should work.
+			for name := range f.Providers {
+				if strings.EqualFold(name, provider) {
+					provider = name
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				return nil
 			}
 		}
-		if !ok {
-			fmt.Fprintf(out, "No stored credential for %s — nothing to remove.\n", provider)
-			return nil
-		}
-	}
-	delete(f.Providers, provider)
-	if err := saveAuthStore(f, path); err != nil {
+		found = true
+		delete(f.Providers, provider)
+		return nil
+	}); err != nil {
 		return err
+	}
+	if !found {
+		fmt.Fprintf(out, "No stored credential for %s — nothing to remove.\n", provider)
+		return nil
 	}
 	fmt.Fprintf(out, "Removed the stored key for %s.\n", provider)
 	if entry, known := knownAuthProvider(provider); known && entry.APIKeyEnv != "" {

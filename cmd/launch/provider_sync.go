@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 const defaultProviderSyncURL = "https://raw.githubusercontent.com/sprapp-com/oaica-code/main/cmd/launch/providers/providers.json"
@@ -68,7 +70,7 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 			return ProviderSyncReport{URL: display}, err
 		}
-		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
+		if err := fileutil.WriteFileAtomic(cachePath, body, 0o600); err != nil {
 			return ProviderSyncReport{URL: display}, err
 		}
 		saveCatalogETag(cachePath+".etag", display, newEtag)

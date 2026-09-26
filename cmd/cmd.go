@@ -2986,13 +2986,11 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 
 			var filter launch.UsageStatsFilter
 			filter.Model = model
-			if sinceStr != "" {
-				d, err := time.ParseDuration(sinceStr)
-				if err != nil {
-					return fmt.Errorf("--since %q: %w (examples: 1h, 30m, 24h)", sinceStr, err)
-				}
-				filter.Since = time.Now().Add(-d)
+			since, err := launch.UsageSinceCutoff(sinceStr, time.Now())
+			if err != nil {
+				return err
 			}
+			filter.Since = since
 
 			rows, unreadable, err := launch.LoadUsageStatsCountingUnreadable(filter)
 			if err != nil {

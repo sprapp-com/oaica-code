@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // catalogETagBinding is the on-disk shape: which catalog this validator
@@ -72,5 +74,5 @@ func saveCatalogETag(path, url, etag string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, b, 0o600)
+	_ = fileutil.WriteFileAtomic(path, b, 0o600)
 }

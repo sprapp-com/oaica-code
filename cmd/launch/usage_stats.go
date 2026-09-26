@@ -12,9 +12,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -37,6 +39,33 @@ type UsageStatsRow struct {
 type UsageStatsFilter struct {
 	Since time.Time // zero = all time
 	Model string    // exact match, empty = any
+}
+
+// UsageSinceCutoff turns the `oaica usage --since` value into the cutoff
+// instant, measured back from now. Empty means "all time" (the zero time).
+//
+// time.ParseDuration accepts a leading sign, and the cutoff is now MINUS the
+// duration: `--since -24h` put the cutoff 24 hours in the FUTURE, so every row
+// was filtered out and `oaica usage` printed an empty report with no error —
+// from a cron job or a health check, indistinguishable from a machine that
+// sent no traffic (2026-09-26 audit, fourth round). A zero duration is the
+// same silent-empty answer by a shorter route, so both are refused.
+func UsageSinceCutoff(sinceStr string, now time.Time) (time.Time, error) {
+	if strings.TrimSpace(sinceStr) == "" {
+		return time.Time{}, nil
+	}
+	d, err := time.ParseDuration(sinceStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("--since %q: %w (examples: 1h, 30m, 24h)", sinceStr, err)
+	}
+	if d <= 0 {
+		where := "in the future"
+		if d == 0 {
+			where = "at the current instant"
+		}
+		return time.Time{}, fmt.Errorf("--since %q: the duration must be positive (examples: 1h, 30m, 24h) — it is subtracted from the current time, so this puts the cutoff %s: every row is excluded and `oaica usage` reports an empty history as if the machine had sent no traffic", sinceStr, where)
+	}
+	return now.Add(-d), nil
 }
 
 // LoadUsageStats reads and aggregates requestLogPath() (best-effort: a

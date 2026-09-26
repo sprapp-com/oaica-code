@@ -75,6 +75,13 @@ type tierPlanProfiles struct {
 const tierPlanProfilesVersion = 1
 
 func tierPlanProfilesPath() (string, error) {
+	// OAICA_PLANS_FILE mirrors OAICA_AUTH_FILE / OAICA_REMOTES_FILE: it lets a
+	// test drive the real load → mutate → save path against a scratch file.
+	// The launch test binary's TestMain rewrites HOME to a shared directory, so
+	// redirecting HOME cannot isolate this store.
+	if p := strings.TrimSpace(os.Getenv("OAICA_PLANS_FILE")); p != "" {
+		return p, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -132,6 +139,28 @@ func (p *tierPlanProfiles) save() error {
 	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
+// updateTierPlanProfiles is the ONLY writer path for plans.json: it holds the
+// store's cross-process lock across load → mutate → save. Two writers used to
+// each read the same snapshot and the last rename won with the other's plan
+// absent — `oaica plan set a` while the launch wizard saves plan b left one of
+// them gone, both reporting success (2026-09-26 audit, fourth round).
+func updateTierPlanProfiles(mutate func(*tierPlanProfiles) error) error {
+	path, err := tierPlanProfilesPath()
+	if err != nil {
+		return err
+	}
+	return fileutil.WithFileLock(path, func() error {
+		p, err := loadTierPlanProfiles()
+		if err != nil {
+			return err
+		}
+		if err := mutate(p); err != nil {
+			return err
+		}
+		return p.save()
+	})
+}
+
 // PlanSet creates or replaces a named plan.
 func PlanSet(name string, profile TierPlanProfile) error {
 	name = strings.TrimSpace(name)
@@ -153,22 +182,20 @@ func PlanSet(name string, profile TierPlanProfile) error {
 			return fmt.Errorf("route_policy %q is not one of %s", profile.RoutePolicy, RoutePolicyList())
 		}
 	}
-	p, err := loadTierPlanProfiles()
-	if err != nil {
-		return err
-	}
-	if p.Profiles == nil {
-		p.Profiles = map[string]TierPlanProfile{}
-	}
-	p.Profiles[name] = profile
-	p.LastUsed = name
-	if cwd, err := os.Getwd(); err == nil {
-		if p.LastUsedByRepo == nil {
-			p.LastUsedByRepo = map[string]string{}
+	return updateTierPlanProfiles(func(p *tierPlanProfiles) error {
+		if p.Profiles == nil {
+			p.Profiles = map[string]TierPlanProfile{}
 		}
-		p.LastUsedByRepo[cwd] = name
-	}
-	return p.save()
+		p.Profiles[name] = profile
+		p.LastUsed = name
+		if cwd, err := os.Getwd(); err == nil {
+			if p.LastUsedByRepo == nil {
+				p.LastUsedByRepo = map[string]string{}
+			}
+			p.LastUsedByRepo[cwd] = name
+		}
+		return nil
+	})
 }
 
 // PlanLastUsed returns the plan name to offer as the wizard's
@@ -201,15 +228,18 @@ func PlanLastUsed() (string, error) {
 // the same argument could create a plan it could never remove.
 func PlanRemove(name string) (bool, error) {
 	name = strings.TrimSpace(name)
-	p, err := loadTierPlanProfiles()
-	if err != nil {
+	existed := false
+	if err := updateTierPlanProfiles(func(p *tierPlanProfiles) error {
+		if _, ok := p.Profiles[name]; !ok {
+			return nil
+		}
+		existed = true
+		delete(p.Profiles, name)
+		return nil
+	}); err != nil {
 		return false, err
 	}
-	if _, ok := p.Profiles[name]; !ok {
-		return false, nil
-	}
-	delete(p.Profiles, name)
-	return true, p.save()
+	return existed, nil
 }
 
 // PlanGet resolves a named plan, or an error naming the plans file if not

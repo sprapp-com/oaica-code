@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 const defaultCloudLimitsSyncURL = "https://raw.githubusercontent.com/sprapp-com/oaica-code/main/cmd/launch/cloud_limits/cloud_limits.json"
@@ -67,7 +69,7 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 			return CloudLimitsSyncReport{URL: display}, err
 		}
-		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
+		if err := fileutil.WriteFileAtomic(cachePath, body, 0o600); err != nil {
 			return CloudLimitsSyncReport{URL: display}, err
 		}
 		saveCatalogETag(cachePath+".etag", display, newEtag)

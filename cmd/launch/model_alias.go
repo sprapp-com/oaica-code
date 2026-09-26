@@ -34,6 +34,11 @@ type modelAliases struct {
 const modelAliasesVersion = 1
 
 func modelAliasesPath() (string, error) {
+	// OAICA_ALIASES_FILE: see tierPlanProfilesPath for why the store tests need
+	// a path variable rather than a redirected HOME.
+	if p := strings.TrimSpace(os.Getenv("OAICA_ALIASES_FILE")); p != "" {
+		return p, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -89,6 +94,28 @@ func (a *modelAliases) save() error {
 	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
+// updateModelAliases is the ONLY writer path for the aliases file: it holds the
+// store's cross-process lock across load → mutate → save. Set and Remove used
+// to load, mutate in memory and rename the whole file, so a `model alias set`
+// racing another one published its own snapshot last and the other alias was
+// gone with both commands reporting success (2026-09-26 audit, fourth round).
+func updateModelAliases(mutate func(*modelAliases) error) error {
+	path, err := modelAliasesPath()
+	if err != nil {
+		return err
+	}
+	return fileutil.WithFileLock(path, func() error {
+		a, err := loadModelAliases()
+		if err != nil {
+			return err
+		}
+		if err := mutate(a); err != nil {
+			return err
+		}
+		return a.save()
+	})
+}
+
 // ModelAliasSet creates or replaces an alias. target is stored verbatim
 // (not validated against any live source) — the whole point is working
 // without waiting on discovery/refresh to catch up.
@@ -104,27 +131,29 @@ func ModelAliasSet(name, target string) error {
 	if strings.Contains(name, "/") {
 		return fmt.Errorf("alias name %q must not contain '/' — that would be ambiguous with <remote>/<id> resolution", name)
 	}
-	a, err := loadModelAliases()
-	if err != nil {
-		return err
-	}
-	a.Aliases[name] = target
-	return a.save()
+	return updateModelAliases(func(a *modelAliases) error {
+		a.Aliases[name] = target
+		return nil
+	})
 }
 
 // ModelAliasRemove deletes an alias, reporting whether it existed.
 func ModelAliasRemove(name string) (bool, error) {
 	// Trimmed like ModelAliasSet trims the name it stores (2026-09-26 audit).
 	name = strings.TrimSpace(name)
-	a, err := loadModelAliases()
+	existed := false
+	err := updateModelAliases(func(a *modelAliases) error {
+		if _, ok := a.Aliases[name]; !ok {
+			return nil
+		}
+		existed = true
+		delete(a.Aliases, name)
+		return nil
+	})
 	if err != nil {
 		return false, err
 	}
-	if _, ok := a.Aliases[name]; !ok {
-		return false, nil
-	}
-	delete(a.Aliases, name)
-	return true, a.save()
+	return existed, nil
 }
 
 // resolveModelAlias returns (target, true) if name is a defined alias.

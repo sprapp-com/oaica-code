@@ -31,6 +31,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // authCredentialTypeAPIKey is the only type implemented. "oauth" is a
@@ -115,6 +117,29 @@ func saveAuthStore(f authStoreFile, path string) error {
 	// writeAtomic creates 0600; re-assert in case the file pre-existed with
 	// looser permissions from a hand-edit.
 	return os.Chmod(path, 0o600)
+}
+
+// updateAuthStore is the ONLY way a caller mutates the store: it holds the
+// cross-process lock across load → mutate → save, so two `oaica auth login`
+// commands (a provisioning script, two terminals) cannot each read the same
+// snapshot and have the last write silently drop the other's credential.
+// Eleven concurrent logins used to leave one key (2026-09-26 audit, fourth
+// round). Read-only callers keep using loadAuthStore directly.
+func updateAuthStore(mutate func(*authStoreFile) error) error {
+	path := authStorePath()
+	if path == "" {
+		return fmt.Errorf("cannot locate ~/.oaica/auth.json (no home directory) — set OAICA_AUTH_FILE")
+	}
+	return fileutil.WithFileLock(path, func() error {
+		f, _, err := loadAuthStore()
+		if err != nil {
+			return err
+		}
+		if err := mutate(&f); err != nil {
+			return err
+		}
+		return saveAuthStore(f, path)
+	})
 }
 
 // storedAuthKey returns the API key saved for provider, or "".

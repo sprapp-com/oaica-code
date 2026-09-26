@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/version"
 )
 
@@ -123,7 +124,7 @@ func saveUpdateCheckCache(c updateCheckCache) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, b, 0o600)
+	_ = fileutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // fetchLatestVersion parses "version=X.Y.Z" from updateCheckURL. Returns ""

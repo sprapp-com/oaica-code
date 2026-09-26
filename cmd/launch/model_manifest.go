@@ -137,6 +137,11 @@ type modelManifest struct {
 const modelManifestVersion = 1
 
 func modelManifestPath() (string, error) {
+	// OAICA_MODELS_FILE: see tierPlanProfilesPath for why the store tests need
+	// a path variable rather than a redirected HOME.
+	if p := strings.TrimSpace(os.Getenv("OAICA_MODELS_FILE")); p != "" {
+		return p, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -185,6 +190,37 @@ func (m *modelManifest) save() error {
 		return err
 	}
 	return fileutil.WriteFileAtomic(path, data, 0o600)
+}
+
+// updateModelManifest is the ONLY writer path for models.json: it holds the
+// store's cross-process lock across load → mutate → save. Every caller used to
+// load, mutate in memory and rename the whole file, so two that overlapped
+// each published their own snapshot and the later rename dropped the other's
+// entry while both reported success — the same lost update the auth, remotes
+// and plans stores had (2026-09-26 audit, fourth round).
+//
+// mutate reports whether it changed anything: `oaica model list` runs the local
+// scan (and so this writer) on every invocation, and a scan that found only
+// entries it ignores must not rewrite the file.
+func updateModelManifest(mutate func(*modelManifest) (bool, error)) error {
+	path, err := modelManifestPath()
+	if err != nil {
+		return err
+	}
+	return fileutil.WithFileLock(path, func() error {
+		m, err := loadModelManifest()
+		if err != nil {
+			return err
+		}
+		changed, err := mutate(m)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+		return m.save()
+	})
 }
 
 // Get returns the entry for id and whether it was found.

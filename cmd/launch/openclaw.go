@@ -528,7 +528,7 @@ func patchDeviceScopes() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, out, 0o600)
+	_ = fileutil.WriteFileAtomic(path, out, 0o600)
 }
 
 // readLocalDeviceID reads the local device ID from openclaw's identity file.
@@ -795,7 +795,7 @@ func clearSessionModelOverride(primary string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, out, 0o600)
+	_ = fileutil.WriteFileAtomic(path, out, 0o600)
 }
 
 // configureOllamaWebSearch keeps launch-managed OpenClaw installs on the
@@ -929,7 +929,7 @@ func configureOllamaWebSearch() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(configPath, out, 0o600)
+	_ = fileutil.WriteFileAtomic(configPath, out, 0o600)
 }
 
 // openclawModelConfig builds an OpenClaw model config entry with capability detection.

@@ -808,7 +808,7 @@ func writeCodexModelCatalog(catalogPath string, model LaunchModel) error {
 		return err
 	}
 
-	return os.WriteFile(catalogPath, data, 0o644)
+	return fileutil.WriteFileAtomic(catalogPath, data, 0o644)
 }
 
 func buildCodexModelEntry(launchModel LaunchModel) map[string]any {

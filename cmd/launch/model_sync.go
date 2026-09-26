@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 // defaultModelSyncURL is the hosted canonical catalog. Overridable with
@@ -295,7 +297,7 @@ func fetchModelCatalog(url, display string) (modelManifest, bool, error) {
 			cached.SavedAt = time.Now()
 			if b, jerr := json.Marshal(cached); jerr == nil {
 				_ = os.MkdirAll(filepath.Dir(cachePath), 0o700)
-				_ = os.WriteFile(cachePath, b, 0o600)
+				_ = fileutil.WriteFileAtomic(cachePath, b, 0o600)
 			}
 			return cached.Catalog, true, nil
 		}
@@ -316,7 +318,7 @@ func fetchModelCatalog(url, display string) (modelManifest, bool, error) {
 	etag := resp.Header.Get("ETag")
 	if b, jerr := json.Marshal(modelSyncCache{SavedAt: time.Now(), URL: display, ETag: etag, Catalog: catalog}); jerr == nil {
 		_ = os.MkdirAll(filepath.Dir(cachePath), 0o700)
-		_ = os.WriteFile(cachePath, b, 0o600)
+		_ = fileutil.WriteFileAtomic(cachePath, b, 0o600)
 	}
 	return catalog, false, nil
 }

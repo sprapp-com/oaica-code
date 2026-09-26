@@ -46,12 +46,10 @@ func ModelAdd(opts ModelAddOptions) (ModelManifestEntry, error) {
 	if err := validateModelManifestEntry(e); err != nil {
 		return ModelManifestEntry{}, err
 	}
-	m, err := loadModelManifest()
-	if err != nil {
-		return ModelManifestEntry{}, err
-	}
-	m.Put(e)
-	if err := m.save(); err != nil {
+	if err := updateModelManifest(func(m *modelManifest) (bool, error) {
+		m.Put(e)
+		return true, nil
+	}); err != nil {
 		return ModelManifestEntry{}, err
 	}
 	return e, nil
@@ -66,15 +64,13 @@ func ModelRemove(id string) (bool, error) {
 	// survived (2026-09-26 audit). ModelAdd/ModelShow/ModelAliasSet all trim;
 	// the removers were the odd ones out.
 	id = strings.TrimSpace(id)
-	m, err := loadModelManifest()
+	existed := false
+	err := updateModelManifest(func(m *modelManifest) (bool, error) {
+		existed = m.Remove(id)
+		return existed, nil
+	})
 	if err != nil {
 		return false, err
-	}
-	existed := m.Remove(id)
-	if existed {
-		if err := m.save(); err != nil {
-			return false, err
-		}
 	}
 	return existed, nil
 }

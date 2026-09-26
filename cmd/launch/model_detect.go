@@ -84,11 +84,6 @@ func ModelScan(dirs []string) (localScanReport, error) {
 	}
 	report := localScanReport{Dirs: dirs}
 
-	m, err := loadModelManifest()
-	if err != nil {
-		return report, err
-	}
-
 	type found struct{ id, raw, path, ext string }
 	var files []found
 	seen := map[string]bool{}
@@ -128,55 +123,61 @@ func ModelScan(dirs []string) (localScanReport, error) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
 
-	for _, f := range files {
-		engine, _ := engineForExt(f.ext)
-		e := ModelManifestEntry{
-			ID:     f.id,
-			Engine: engine,
-			// Quant comes from the raw filename, not the sanitized id —
-			// sanitize strips the quant tag, which is exactly what we want
-			// to capture here.
-			Quant:     quantSubmatch(f.raw),
-			ModelPath: f.path,
-			Source:    "local-scan",
-		}
-		if err := validateModelManifestEntry(e); err != nil {
-			report.Invalid = append(report.Invalid, fmt.Sprintf("%s: %v", f.id, err))
-			continue
-		}
-		prev, existed := m.Get(f.id)
-		switch {
-		case !existed:
-			m.Put(e)
-			report.Added = append(report.Added, f.id)
-		case prev.ModelPath == "":
-			// known but pathless: fill in the path, keep config. The source is
-			// deliberately not consulted — a catalog-shipped entry (Source
-			// "sync") has no path and never will, so requiring Source != "sync"
-			// here made "where do this model's weights live" unrecordable for
-			// every model the catalog lists, while the scan's own header and
-			// `oaica model list --help` both promise it fills a pathless entry.
-			// Refusing to REPOINT an entry that already names a different path
-			// (the default case) is the discipline that matters.
-			prev.ModelPath = f.path
-			if prev.Quant == "" {
-				prev.Quant = e.Quant
+	// The disk walk happens above, outside the lock: it is the slow part and it
+	// touches no store. Only the load → mutate → save is serialized, so a scan
+	// running beside `oaica model add` cannot publish a snapshot that drops the
+	// add — both commands used to rename the whole file, and the scan's rename
+	// (of a manifest it loaded before the walk) landed last
+	// (2026-09-26 audit, fourth round).
+	if err := updateModelManifest(func(m *modelManifest) (bool, error) {
+		before := len(report.Added) + len(report.Updated)
+		for _, f := range files {
+			engine, _ := engineForExt(f.ext)
+			e := ModelManifestEntry{
+				ID:     f.id,
+				Engine: engine,
+				// Quant comes from the raw filename, not the sanitized id —
+				// sanitize strips the quant tag, which is exactly what we want
+				// to capture here.
+				Quant:     quantSubmatch(f.raw),
+				ModelPath: f.path,
+				Source:    "local-scan",
 			}
-			m.Put(prev)
-			report.Updated = append(report.Updated, f.id)
-		case prev.ModelPath == f.path:
-			report.Ignored = append(report.Ignored, f.id)
-		default:
-			// same id, different path: two files claim the id. Keep the
-			// existing entry; the scan never silently repoints a model.
-			report.Ignored = append(report.Ignored, f.id+" (path differs: "+f.path+")")
+			if err := validateModelManifestEntry(e); err != nil {
+				report.Invalid = append(report.Invalid, fmt.Sprintf("%s: %v", f.id, err))
+				continue
+			}
+			prev, existed := m.Get(f.id)
+			switch {
+			case !existed:
+				m.Put(e)
+				report.Added = append(report.Added, f.id)
+			case prev.ModelPath == "":
+				// known but pathless: fill in the path, keep config. The source is
+				// deliberately not consulted — a catalog-shipped entry (Source
+				// "sync") has no path and never will, so requiring Source != "sync"
+				// here made "where do this model's weights live" unrecordable for
+				// every model the catalog lists, while the scan's own header and
+				// `oaica model list --help` both promise it fills a pathless entry.
+				// Refusing to REPOINT an entry that already names a different path
+				// (the default case) is the discipline that matters.
+				prev.ModelPath = f.path
+				if prev.Quant == "" {
+					prev.Quant = e.Quant
+				}
+				m.Put(prev)
+				report.Updated = append(report.Updated, f.id)
+			case prev.ModelPath == f.path:
+				report.Ignored = append(report.Ignored, f.id)
+			default:
+				// same id, different path: two files claim the id. Keep the
+				// existing entry; the scan never silently repoints a model.
+				report.Ignored = append(report.Ignored, f.id+" (path differs: "+f.path+")")
+			}
 		}
-	}
-
-	if len(report.Added) > 0 || len(report.Updated) > 0 {
-		if err := m.save(); err != nil {
-			return report, err
-		}
+		return len(report.Added)+len(report.Updated) > before, nil
+	}); err != nil {
+		return report, err
 	}
 	return report, nil
 }

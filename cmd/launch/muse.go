@@ -316,7 +316,7 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	if backup {
 		return fileutil.WriteWithBackup(settingsPath, data, "muse")
 	}
-	return os.WriteFile(settingsPath, data, 0o600)
+	return fileutil.WriteFileAtomic(settingsPath, data, 0o600)
 }
 
 func museCatalogRows(models []LaunchModel) []museCatalogRow {

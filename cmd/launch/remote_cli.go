@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -88,6 +89,34 @@ func saveUserRemotesFile(f userRemotesFile, path string) error {
 	return fileutil.WriteFileAtomic(path, append(b, '\n'), 0o600)
 }
 
+// updateUserRemotesFile is the ONLY writer path for remotes.json: it holds
+// the store's cross-process lock across load → mutate → save, so two
+// concurrent `oaica remote add` (a fleet-wiring script, two terminals) cannot
+// each read the same snapshot and lose one another's entry — eight concurrent
+// adds used to leave one remote, each printing "added"
+// (2026-09-26 audit, fourth round). Read-only callers keep using
+// loadUserRemotesFileRaw directly.
+func updateUserRemotesFile(mutate func(*userRemotesFile) error) (string, error) {
+	path := userRemotesPath()
+	if path == "" {
+		return "", fmt.Errorf("cannot locate ~/.oaica/remotes.json (no home directory) — set OAICA_REMOTES_FILE")
+	}
+	err := fileutil.WithFileLock(path, func() error {
+		f, _, err := loadUserRemotesFileRaw()
+		if err != nil {
+			return err
+		}
+		if err := mutate(&f); err != nil {
+			return err
+		}
+		return saveUserRemotesFile(f, path)
+	})
+	if err != nil {
+		return path, err
+	}
+	return path, nil
+}
+
 var (
 	validRemoteWires       = []string{"openai", "anthropic"}
 	validRemoteToolFormats = []string{"tool_calls", "freeform", "xml", "none"}
@@ -100,6 +129,38 @@ func oneOf(v string, allowed []string) bool {
 		}
 	}
 	return false
+}
+
+// validateRemoteBaseURL refuses a --base-url that cannot work, at the point the
+// user typed it (2026-09-26 audit, fourth round). Every value used to be
+// accepted verbatim: `remote add --base-url garbage` printed "added" and the
+// remote then failed at request time deep in the proxy ("unsupported protocol
+// scheme" from the appended "/chat/completions"), naming neither the remote nor
+// the flag — and a value carrying a newline forges a line in every listing that
+// prints it (`oaica remote list`, the picker, doctor output).
+func validateRemoteBaseURL(baseURL string) error {
+	for _, r := range baseURL {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("--base-url %q contains a control character — it is echoed by `oaica remote list` and in launch messages, so an embedded newline forges an extra line of output", baseURL)
+		}
+		if r == ' ' {
+			return fmt.Errorf("--base-url %q contains a space", baseURL)
+		}
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("--base-url %q is not a URL: %w (e.g. --base-url https://api.example.com)", baseURL, err)
+	}
+	// A bare host ("garbage", "not/absolute", "api.example.com") parses without
+	// error and with an empty scheme, which is exactly the value that reaches
+	// http.NewRequest as "<base>/chat/completions" and fails there.
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("--base-url %q: the scheme must be http or https (got %q) — oaica appends /chat/completions and /models to this value, so anything else fails at request time with an error that names neither the remote nor this flag", baseURL, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("--base-url %q has no host (e.g. --base-url https://api.example.com)", baseURL)
+	}
+	return nil
 }
 
 // RemoteAdd creates or replaces an entry in remotes.json. Returns the entry
@@ -115,6 +176,9 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 	}
 	if baseURL == "" {
 		return userRemote{}, fmt.Errorf("--base-url is required (e.g. --base-url https://api.example.com)")
+	}
+	if err := validateRemoteBaseURL(baseURL); err != nil {
+		return userRemote{}, err
 	}
 	if opts.APIKey != "" && opts.APIKeyEnv != "" {
 		return userRemote{}, fmt.Errorf("--api-key and --api-key-env are mutually exclusive")
@@ -138,51 +202,51 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 		ToolFormat: toolFormat,
 	}
 
-	f, path, err := loadUserRemotesFileRaw()
-	if err != nil {
-		return userRemote{}, err
-	}
-	replaced := false
-	for i := range f.Remotes {
-		if strings.TrimSpace(f.Remotes[i].Name) == name {
-			// Preserve every field this command has NO FLAG FOR, so
-			// `remote add` on an existing entry is an edit, not a silent
-			// reset. The rule is exact: a field with a flag is whatever you
-			// passed (absent means cleared), a field without one is left
-			// alone — anything else silently destroys a setting the user
-			// cannot type back (2026-09-26 audit).
-			//
-			// route_policy, weight and auth_via had no flag at all, and each
-			// one changes routing: weight 0 drops the leg from a weighted
-			// split entirely, a lost route_policy reverts remote-only to
-			// local-first, a lost auth_via re-prompts for a credential
-			// another tool already owns.
-			//
-			// Version HAS a flag and is still preserved when that flag was not
-			// passed (VersionSet). The usual "absent means cleared" rule exists
-			// so a field can be reset to its default by omitting it — but for
-			// Version the default is not neutral, it is a different endpoint,
-			// so the reset has to be typed (`--api-version v1`).
-			existing := f.Remotes[i]
-			if !opts.VersionSet {
-				r.Version = existing.Version
+	// The whole replace-or-append runs inside the store's lock, so a
+	// concurrent `remote add` for another name cannot be lost under ours.
+	if _, err := updateUserRemotesFile(func(f *userRemotesFile) error {
+		replaced := false
+		for i := range f.Remotes {
+			if strings.TrimSpace(f.Remotes[i].Name) == name {
+				// Preserve every field this command has NO FLAG FOR, so
+				// `remote add` on an existing entry is an edit, not a silent
+				// reset. The rule is exact: a field with a flag is whatever you
+				// passed (absent means cleared), a field without one is left
+				// alone — anything else silently destroys a setting the user
+				// cannot type back (2026-09-26 audit).
+				//
+				// route_policy, weight and auth_via had no flag at all, and each
+				// one changes routing: weight 0 drops the leg from a weighted
+				// split entirely, a lost route_policy reverts remote-only to
+				// local-first, a lost auth_via re-prompts for a credential
+				// another tool already owns.
+				//
+				// Version HAS a flag and is still preserved when that flag was not
+				// passed (VersionSet). The usual "absent means cleared" rule exists
+				// so a field can be reset to its default by omitting it — but for
+				// Version the default is not neutral, it is a different endpoint,
+				// so the reset has to be typed (`--api-version v1`).
+				existing := f.Remotes[i]
+				if !opts.VersionSet {
+					r.Version = existing.Version
+				}
+				r.ToolReliable = existing.ToolReliable
+				r.ForceTools = existing.ForceTools
+				r.PriceInputPerM = existing.PriceInputPerM
+				r.PriceOutputPerM = existing.PriceOutputPerM
+				r.RoutePolicy = existing.RoutePolicy
+				r.Weight = existing.Weight
+				r.AuthVia = existing.AuthVia
+				f.Remotes[i] = r
+				replaced = true
+				break
 			}
-			r.ToolReliable = existing.ToolReliable
-			r.ForceTools = existing.ForceTools
-			r.PriceInputPerM = existing.PriceInputPerM
-			r.PriceOutputPerM = existing.PriceOutputPerM
-			r.RoutePolicy = existing.RoutePolicy
-			r.Weight = existing.Weight
-			r.AuthVia = existing.AuthVia
-			f.Remotes[i] = r
-			replaced = true
-			break
 		}
-	}
-	if !replaced {
-		f.Remotes = append(f.Remotes, r)
-	}
-	if err := saveUserRemotesFile(f, path); err != nil {
+		if !replaced {
+			f.Remotes = append(f.Remotes, r)
+		}
+		return nil
+	}); err != nil {
 		return userRemote{}, err
 	}
 	return r, nil
@@ -202,34 +266,45 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 // knows about one field must not silently reset the other eleven.
 func savePromptedRemoteKey(name, key string) error {
 	name = strings.TrimSpace(name)
-	f, path, err := loadUserRemotesFileRaw()
+	missing := false
+	path, err := updateUserRemotesFile(func(f *userRemotesFile) error {
+		for i := range f.Remotes {
+			if strings.TrimSpace(f.Remotes[i].Name) == name {
+				f.Remotes[i].APIKey = key
+				return nil
+			}
+		}
+		missing = true
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	for i := range f.Remotes {
-		if strings.TrimSpace(f.Remotes[i].Name) == name {
-			f.Remotes[i].APIKey = key
-			return saveUserRemotesFile(f, path)
-		}
+	if missing {
+		return fmt.Errorf("remote %q is not in %s — cannot save its API key", name, path)
 	}
-	return fmt.Errorf("remote %q is not in %s — cannot save its API key", name, path)
+	return nil
 }
 
 // RemoteRemove deletes an entry from remotes.json. Returns whether it existed.
 func RemoteRemove(name string) (bool, error) {
 	name = strings.TrimSpace(name)
-	f, path, err := loadUserRemotesFileRaw()
-	if err != nil {
-		return false, err
-	}
-	out := f.Remotes[:0]
 	existed := false
-	for _, r := range f.Remotes {
-		if strings.TrimSpace(r.Name) == name {
-			existed = true
-			continue
+	if _, err := updateUserRemotesFile(func(f *userRemotesFile) error {
+		out := f.Remotes[:0]
+		for _, r := range f.Remotes {
+			if strings.TrimSpace(r.Name) == name {
+				existed = true
+				continue
+			}
+			out = append(out, r)
 		}
-		out = append(out, r)
+		if existed {
+			f.Remotes = out
+		}
+		return nil
+	}); err != nil {
+		return false, err
 	}
 	if !existed {
 		// A built-in provider isn't in the file, so say how to actually hide it.
@@ -239,10 +314,6 @@ func RemoteRemove(name string) (bool, error) {
 			}
 		}
 		return false, nil
-	}
-	f.Remotes = out
-	if err := saveUserRemotesFile(f, path); err != nil {
-		return false, err
 	}
 	return true, nil
 }
