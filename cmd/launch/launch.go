@@ -1863,7 +1863,7 @@ func launchAfterConfiguration(name string, runner Runner, model string, models [
 	if err := EnsureIntegrationInstalled(name, runner); err != nil {
 		return err
 	}
-	if err := ensureRemoteAPIKeyForModel(model); err != nil {
+	if err := remoteAPIKeyPrompt(model); err != nil {
 		return err
 	}
 	return runIntegration(runner, model, models, req.ExtraArgs)

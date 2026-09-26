@@ -22,6 +22,11 @@ import (
 	"golang.org/x/term"
 )
 
+// remoteAPIKeyPrompt is the credential prompt the launch path calls. It is a
+// variable so a test can drive the ordering without a terminal (2026-09-27
+// audit, round 19).
+var remoteAPIKeyPrompt = ensureRemoteAPIKeyForModel
+
 // ensureRemoteAPIKeyForModel checks whether modelName resolves to a user
 // remote with no key yet, and if so prompts for one (hidden input) and
 // persists it to ~/.oaica/remotes.json via savePromptedRemoteKey so future

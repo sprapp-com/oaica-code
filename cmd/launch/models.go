@@ -357,6 +357,18 @@ func pullMissingModel(ctx context.Context, client *api.Client, model string) err
 
 // prepareEditorIntegration persists models and applies editor-managed config files.
 func prepareEditorIntegration(name string, editor Editor, models []LaunchModel) error {
+	// The credential has to be on file before the store is written, not after:
+	// the writers below take a remote's token from the endpoint they resolve
+	// while configuring, so a key prompted for afterwards reached
+	// ~/.oaica/remotes.json while the config that had just been written kept
+	// the empty string, and the launch that used that config went out
+	// unauthenticated. Here is where "before the write" actually is — both
+	// write helpers, so neither path can forget (2026-09-27 audit, round 19).
+	if len(models) > 0 {
+		if err := remoteAPIKeyPrompt(models[0].Name); err != nil {
+			return err
+		}
+	}
 	if err := editor.Edit(models); err != nil {
 		return fmt.Errorf("setup failed: %w", err)
 	}
@@ -367,6 +379,14 @@ func prepareEditorIntegration(name string, editor Editor, models []LaunchModel) 
 }
 
 func prepareManagedSingleIntegration(name string, managed ManagedSingleModel, model string, models []LaunchModel) error {
+	// Same rule as prepareEditorIntegration: the credential must exist before
+	// the store is written (2026-09-27 audit, round 19). The prompt is a no-op
+	// for a remote that already has one, so the launch path's own hook in
+	// launchAfterConfiguration stays a backstop for the integrations that write
+	// nothing and configure inside Run.
+	if err := remoteAPIKeyPrompt(model); err != nil {
+		return err
+	}
 	var err error
 	if withModels, ok := managed.(ManagedModelListConfigurer); ok {
 		err = withModels.ConfigureWithModels(model, models)
