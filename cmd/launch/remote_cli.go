@@ -417,16 +417,11 @@ func RemoteRemove(name string) (bool, error) {
 }
 
 // remoteAuthLabel describes how a remote authenticates without ever revealing
-// the secret itself.
-func remoteAuthLabel(r userRemote) string {
-	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
-		return "env:" + env
-	}
-	if strings.TrimSpace(r.APIKey) != "" {
-		return "key"
-	}
-	return "none"
-}
+// the secret itself. It defers to userRemote.authSource so the listing and
+// `remote show` agree with key() about where the credential actually comes
+// from — a stored login or a reused one read "none" here while the proxy
+// authenticated with it (2026-09-26 audit, ninth round).
+func remoteAuthLabel(r userRemote) string { return r.authSource() }
 
 func sortedRemotes() ([]userRemote, error) {
 	remotes, err := loadUserRemotes()
@@ -483,12 +478,10 @@ func WriteRemoteShow(w io.Writer, name string) error {
 		return err
 	}
 	d := r.Descriptor()
-	key := "none"
-	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
-		key = "env:" + env
-	} else if strings.TrimSpace(r.APIKey) != "" {
-		key = "<set>"
-	}
+	// From the same resolution order the proxy uses (see authSource): this
+	// field answered "none" for a remote whose credential came from a stored
+	// login, from `auth_via`, or from base_url's userinfo (2026-09-26 audit).
+	key := authSourceProse(r.authSource())
 	fmt.Fprintf(w, "name:          %s\n", r.Name)
 	fmt.Fprintf(w, "base_url:      %s\n", redactBaseURL(r.BaseURL))
 	fmt.Fprintf(w, "version:       %s\n", orDash(r.Version))

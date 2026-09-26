@@ -216,6 +216,63 @@ func keyEnvNamesProse(apiKeyEnv string) string {
 	return strings.Join(splitKeyEnvNames(apiKeyEnv), " or ")
 }
 
+// authSource names WHERE this remote's credential comes from, or "none".
+//
+// It exists because the listing and `remote show` used to answer that question
+// from two fields alone — api_key_env and api_key — while key() resolves FIVE
+// sources. A remote logged in with `oaica auth login` (a stored credential), or
+// one reusing another tool's login via `auth_via`, or one carrying the
+// credential in base_url's userinfo (which prints REDACTED), therefore read
+// "none" in `oaica remote list`/`show` while the proxy authenticated with a
+// real credential. The AUTH column is exactly where a user looks to answer
+// "why is this remote not working", so it must not deny the source that is
+// actually in use (2026-09-26 audit, ninth round).
+//
+// The order mirrors key() so the two cannot disagree about which source wins.
+// A declared api_key_env is reported from the CONFIG even when this process
+// has no such variable set — the proxy may be launched from a shell that does,
+// and the label is about the remote's configuration, not this shell's.
+func (r userRemote) authSource() string {
+	if env := strings.TrimSpace(r.APIKeyEnv); env != "" {
+		if set := keyEnvNameSet(env); set != "" {
+			return "env:" + set
+		}
+		return "env:" + splitKeyEnvNames(env)[0]
+	}
+	if storedAuthKey(r.Name) != "" {
+		return "stored"
+	}
+	if via := strings.TrimSpace(r.AuthVia); via != "" && externalAuthKey(via, r.Name) != "" {
+		return "via:" + via
+	}
+	if strings.TrimSpace(r.APIKey) != "" {
+		return "key"
+	}
+	if _, token := splitRemoteUserinfo(r.BaseURL); token != "" {
+		return "url"
+	}
+	return "none"
+}
+
+// authSourceProse renders authSource for a one-line report field: the value
+// itself is never shown, only which source holds it.
+func authSourceProse(src string) string {
+	switch {
+	case src == "none":
+		return "none"
+	case src == "key":
+		return "<set>"
+	case src == "stored":
+		return "<set, stored by `oaica auth login`>"
+	case src == "url":
+		return "<set in base_url userinfo>"
+	case strings.HasPrefix(src, "via:"):
+		return "<set, reused from " + strings.TrimPrefix(src, "via:") + ">"
+	default:
+		return src
+	}
+}
+
 // keyEnvName returns the ONE variable name a consumer that re-reads the
 // credential per request should watch: the name actually set in the
 // environment, or the first acceptable name when none is. TokenEnv/KeyEnv
