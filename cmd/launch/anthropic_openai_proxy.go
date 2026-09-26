@@ -233,6 +233,13 @@ func (u *openAIUsage) cachedTokens() int {
 		return 0
 	}
 	if c > u.PromptTokens {
+		// The clamp target is itself unvalidated: a malformed upstream that
+		// states a NEGATIVE prompt_tokens made `0 > -5` true and returned -5,
+		// a cache-read count nobody stated, contradicting this function's own
+		// contract (2026-09-26 audit, fifteenth round).
+		if u.PromptTokens < 0 {
+			return 0
+		}
 		return u.PromptTokens
 	}
 	return c
@@ -274,7 +281,12 @@ type openAIStreamChunk struct {
 			// Message struct above for why this alias exists.
 			Reasoning string `json:"reasoning,omitempty"`
 			ToolCalls []struct {
-				Index    int    `json:"index"`
+				// Index is a POINTER because its zero value is meaningful
+				// here: an upstream that omits the field (several do) sent no
+				// index at all, and reading that as 0 merged every tool call
+				// in the stream into one accumulator (2026-09-26 audit,
+				// fifteenth round).
+				Index    *int   `json:"index"`
 				ID       string `json:"id,omitempty"`
 				Type     string `json:"type,omitempty"`
 				Function struct {
@@ -286,6 +298,33 @@ type openAIStreamChunk struct {
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
 	Usage *openAIUsage `json:"usage,omitempty"`
+}
+
+// startsANewToolCall reports whether an index-less tool-call delta begins the
+// NEXT call rather than continuing the accumulated one: it carries a fresh
+// identity (a name or an id) and the accumulated arguments are already a
+// COMPLETE JSON object, so the call in progress is finished.
+//
+// It exists because an upstream that omits `index` gives the accumulator
+// nothing to key on, and reading the missing index as 0 put every call in the
+// stream into one slot: the client got a single tool_use named after the last
+// call with all of the calls' arguments concatenated into {"_raw": ...}. The
+// rules are deliberately conservative in the direction that keeps ONE call
+// whole — a name repeated on every argument fragment of the same call (which
+// several upstreams do) is not a new call, because the arguments accumulated
+// so far are not yet valid JSON (2026-09-26 audit, fifteenth round).
+func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName string) bool {
+	if accID == "" && accName == "" {
+		return false
+	}
+	if deltaID != "" && accID != "" && deltaID != accID {
+		return true
+	}
+	if deltaName == "" {
+		return false
+	}
+	raw := strings.TrimSpace(accArgs)
+	return raw != "" && json.Valid([]byte(raw))
 }
 
 // mapToolChoice converts an Anthropic ToolChoice to an OpenAI tool_choice value.
@@ -2064,6 +2103,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		args strings.Builder
 	}
 	toolAccums := map[int]*toolAccum{}
+	// syntheticToolSlot is the accumulator slot for streams whose upstream
+	// omits tool-call indices; it advances when a delta starts a new call
+	// (see the accumulation loop below).
+	syntheticToolSlot := 0
 	finishReason := ""
 	var finalUsage *openAIUsage
 	// nonSSE collects the lines that carry no "data:" prefix. An upstream that
@@ -2181,7 +2224,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			completed = true
+			// The sentinel says the stream ENDED, not that it ever held a
+			// turn. An upstream that opens a stream and terminates it with
+			// [DONE] and no choice (an aborted generation, a gateway
+			// stripping frames) sent nothing, and believing the sentinel
+			// alone reported a successful EMPTY turn — a prompt billed and
+			// closed with message_stop the client could not tell from a real
+			// empty answer — and recorded the leg healthy, so its breaker
+			// never opened and `auto` never moved the session off it. Both
+			// sibling paths already refuse this exact condition
+			// (handleNonStreamResponse's `len(Choices) == 0`,
+			// adoptNonSSECompletion); the tail below now does too, including
+			// the adoption attempt (2026-09-26 audit, fifteenth round).
+			if started || len(toolAccums) > 0 || finishReason != "" {
+				completed = true
+			}
 			break
 		}
 
@@ -2208,6 +2265,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 		}
 
+		// A whole completion can arrive INSIDE an SSE frame, not only as a
+		// bare JSON body: an upstream that emulates streaming around a
+		// non-streaming backend answers stream:true with one data: frame
+		// whose choice carries `message` instead of `delta`. The reader below
+		// models only delta, so that frame parsed cleanly, contributed
+		// nothing, and the finish_reason it carried completed the turn — the
+		// client got 200, a plausible usage line and EMPTY content while the
+		// upstream's real answer (or its tool calls) was discarded, and the
+		// leg was recorded healthy (2026-09-26 audit, fifteenth round). Route
+		// the frame through the same adoption the unframed body uses, so the
+		// two shapes cannot disagree. The substring guard keeps the parse off
+		// the ordinary delta frames an answer is made of, and `!started`
+		// keeps a mid-stream whole message from being adopted as the turn.
+		if !started && len(toolAccums) == 0 && strings.Contains(payload, `"message"`) {
+			if adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText) {
+				completed = true
+				break
+			}
+		}
+
 		for _, choice := range chunk.Choices {
 			d := choice.Delta
 
@@ -2226,10 +2303,29 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			// Tool-call deltas — accumulate by index; flush later.
 			for _, tc := range d.ToolCalls {
-				acc, exists := toolAccums[tc.Index]
+				slot := 0
+				if tc.Index != nil {
+					slot = *tc.Index
+				} else {
+					// The upstream sent no index, so there is nothing to key
+					// on but the calls' own sequence: a delta that carries a
+					// fresh identity (a name or an id) while the accumulated
+					// arguments are already a COMPLETE JSON object begins the
+					// next call. Without this every index-less call in the
+					// stream landed in one accumulator (Go's zero value) and
+					// the client got ONE tool_use named after the last call,
+					// with all the calls' arguments concatenated into
+					// {"_raw": ...} (2026-09-26 audit, fifteenth round).
+					if acc, exists := toolAccums[syntheticToolSlot]; exists &&
+						startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name) {
+						syntheticToolSlot++
+					}
+					slot = syntheticToolSlot
+				}
+				acc, exists := toolAccums[slot]
 				if !exists {
 					acc = &toolAccum{}
-					toolAccums[tc.Index] = acc
+					toolAccums[slot] = acc
 				}
 				if tc.ID != "" {
 					acc.id = tc.ID
