@@ -409,15 +409,8 @@ func oaicaRunCmd(t *testing.T) *cobra.Command {
 	t.Helper()
 	cmd := &cobra.Command{}
 	cmd.SetContext(t.Context())
-	cmd.Flags().String("keepalive", "", "")
-	cmd.Flags().Bool("truncate", false, "")
-	cmd.Flags().Int("dimensions", 0, "")
 	cmd.Flags().Bool("verbose", false, "")
-	cmd.Flags().Bool("insecure", false, "")
 	cmd.Flags().Bool("nowordwrap", false, "")
-	cmd.Flags().String("format", "", "")
-	cmd.Flags().String("think", "", "")
-	cmd.Flags().Bool("hidethinking", false, "")
 	return cmd
 }
 

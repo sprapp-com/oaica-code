@@ -623,51 +623,13 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		ShowConnect: true,
 	}
 
-	format, err := cmd.Flags().GetString("format")
-	if err != nil {
-		return err
-	}
-	opts.Format = format
-
-	thinkFlag := cmd.Flags().Lookup("think")
-	if thinkFlag.Changed {
-		thinkStr, err := cmd.Flags().GetString("think")
-		if err != nil {
-			return err
-		}
-
-		// Handle different values for --think
-		switch thinkStr {
-		case "", "true":
-			// --think or --think=true
-			opts.Think = &api.ThinkValue{Value: true}
-		case "false":
-			opts.Think = &api.ThinkValue{Value: false}
-		case "high", "medium", "low", "max":
-			opts.Think = &api.ThinkValue{Value: thinkStr}
-		default:
-			return fmt.Errorf("invalid value for --think: %q (must be true, false, high, medium, low, or max)", thinkStr)
-		}
-	} else {
-		opts.Think = nil
-	}
-	hidethinking, err := cmd.Flags().GetBool("hidethinking")
-	if err != nil {
-		return err
-	}
-	opts.HideThinking = hidethinking
-
-	keepAlive, err := cmd.Flags().GetString("keepalive")
-	if err != nil {
-		return err
-	}
-	if keepAlive != "" {
-		d, err := time.ParseDuration(keepAlive)
-		if err != nil {
-			return err
-		}
-		opts.KeepAlive = &api.Duration{Duration: d}
-	}
+	// --format, --think, --keepalive and --hidethinking were parsed here and
+	// read only by chat()/generate() — the native Ollama path this fork's
+	// OAICA short-circuit below never reaches (2026-09-26 audit). They are no
+	// longer registered, so passing one is an unknown-flag error rather than a
+	// silent no-op; see cmd/oaica_run_flags_test.go for the pinned contract.
+	// --verbose is the exception: it now has a reader on the router path
+	// (oaicaChatTimed), so its promise is kept rather than removed.
 
 	prompts := args[1:]
 	var stdinRaw string // OAICA: raw piped stdin, kept separate from opts.Prompt so
@@ -738,6 +700,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		// opts.Prompt was every line joined with spaces, so "/model list"
 		// got sent to the model as literal chat text instead of being run).
 		activeModel := opts.Model
+		verbose := oaicaVerboseRequested(cmd)
 		lines := stdinLinesOrArgPrompt(stdinRaw, opts.Prompt)
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
@@ -754,7 +717,7 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 				}
 				continue
 			}
-			reply, err = oaicaChat(activeModel, []oaicaChatMessage{{Role: "user", Content: line}})
+			reply, err = oaicaChatTimed(os.Stderr, verbose, activeModel, []oaicaChatMessage{{Role: "user", Content: line}})
 			if err != nil {
 				return fmt.Errorf("OAICA request failed: %w", err)
 			}
@@ -2242,13 +2205,15 @@ func NewCLI() *cobra.Command {
 		RunE:    RunHandler,
 	}
 
-	runCmd.Flags().String("keepalive", "", "Duration to keep a model loaded (e.g. 5m)")
+	// Registered flags must have a reader on a path `run` actually reaches.
+	// --keepalive (local server), --format and --think (both read in chat())
+	// and --hidethinking were each read only by chat()/generate(), which the
+	// OAICA short-circuit in RunHandler bypasses for every input shape; they
+	// are gone rather than silently accepted (2026-09-26 audit). --verbose is
+	// read by oaicaChatTimed on the router path; --nowordwrap by RunHandler
+	// itself.
 	runCmd.Flags().Bool("verbose", false, "Show timings for response")
 	runCmd.Flags().Bool("nowordwrap", false, "Don't wrap words to the next line automatically")
-	runCmd.Flags().String("format", "", "Response format (e.g. json)")
-	runCmd.Flags().String("think", "", "Enable thinking mode: true/false, or high/medium/low/max for supported models")
-	runCmd.Flags().Lookup("think").NoOptDefVal = "true"
-	runCmd.Flags().Bool("hidethinking", false, "Hide thinking output (if provided)")
 	// `run` used to carry --insecure, --truncate and --dimensions, inherited
 	// from upstream Ollama, where they feed the embedding path. This fork's
 	// run never sends an embed request (RunHandler has no embedding branch,

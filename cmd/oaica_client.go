@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -288,9 +289,21 @@ type oaicaChatResponse struct {
 			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
+	// Usage is what --verbose reports. Optional by the OpenAI wire (a backend
+	// may omit it entirely), so it is a pointer: absent and zero are different
+	// answers, and only one of them may be presented as a measurement.
+	Usage *oaicaChatUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// oaicaChatUsage is the token accounting a router backend reports for one
+// completion, when it reports one.
+type oaicaChatUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // activeLocalLoras holds this CLI process's own per-request LoRA choice(s),
@@ -309,7 +322,52 @@ var activeLocalLoras []oaicaLoraRequestEntry
 // without a network. Defaults to the live request.
 var oaicaChat = oaicaChatLive
 
+// oaicaChatMetered is the same request, also returning the backend's token
+// counts. Separate from oaicaChat rather than folded into it because the
+// counts exist for --verbose alone: every other caller would have to ignore a
+// second return value, and the tests that stub oaicaChat (four of them) would
+// all have to stub this one too, for a line none of them assert.
+var oaicaChatMetered = oaicaChatMeteredLive
+
 func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
+	reply, _, err := oaicaChatComplete(model, messages)
+	return reply, err
+}
+
+func oaicaChatMeteredLive(model string, messages []oaicaChatMessage) (string, oaicaChatUsage, error) {
+	return oaicaChatComplete(model, messages)
+}
+
+// oaicaChatTimed sends one turn and, when verbose is on, reports on w what
+// `--verbose` has always promised ("Show timings for response") — the same
+// flag chat() reads on the native path via latest.Summary(). That path prints
+// its summary to STDOUT; this one writes to STDERR, because the one-shot shapes
+// the fork documents are piped (`oaica run <model> "prompt" | jq`,
+// `> answer.txt`) and a timing line on stdout is captured together with the
+// answer. Nothing here is invented: a duration is measured, token counts are
+// the backend's or reported as absent (2026-09-26 audit — the flag used to
+// have no reader at all on this path, so it silently did nothing).
+func oaicaChatTimed(w io.Writer, verbose bool, model string, messages []oaicaChatMessage) (string, error) {
+	if !verbose {
+		return oaicaChat(model, messages)
+	}
+	start := time.Now()
+	reply, usage, err := oaicaChatMetered(model, messages)
+	elapsed := time.Since(start).Round(time.Millisecond)
+	if err != nil {
+		fmt.Fprintf(w, "total duration: %s (request failed)\n", elapsed)
+		return reply, err
+	}
+	fmt.Fprintf(w, "total duration: %s\n", elapsed)
+	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		fmt.Fprintln(w, "token counts: not reported by this backend")
+		return reply, nil
+	}
+	fmt.Fprintf(w, "tokens: %d prompt, %d completion (%d total)\n", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+	return reply, nil
+}
+
+func oaicaChatComplete(model string, messages []oaicaChatMessage) (string, oaicaChatUsage, error) {
 	reqBody := oaicaChatRequest{
 		Model:              model,
 		Messages:           messages,
@@ -325,39 +383,43 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", err
+		return "", oaicaChatUsage{}, err
 	}
 	req, err := launch.NewRedactedRequest(http.MethodPost, oaicaHost()+"/v1/chat/completions", bytes.NewReader(buf))
 	if err != nil {
-		return "", err
+		return "", oaicaChatUsage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	oaicaAuthorize(req)
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
+		return "", oaicaChatUsage{}, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
 	if err != nil {
-		return "", err
+		return "", oaicaChatUsage{}, err
 	}
 	var out oaicaChatResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", oaicaChatUsage{}, fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 	if out.Error != nil {
-		return "", oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
+		return "", oaicaChatUsage{}, oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", oaicaChatUsage{}, fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	var usage oaicaChatUsage
+	if out.Usage != nil {
+		usage = *out.Usage
 	}
 	msg := out.Choices[0].Message
 	if msg.Content == "" && msg.ReasoningContent != "" {
-		return stripThinkTags(msg.ReasoningContent), nil
+		return stripThinkTags(msg.ReasoningContent), usage, nil
 	}
-	return stripThinkTags(msg.Content), nil
+	return stripThinkTags(msg.Content), usage, nil
 }
 
 // Some backends (MiniMax M3, notably — enable_thinking/reasoning.enabled are

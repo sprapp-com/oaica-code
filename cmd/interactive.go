@@ -673,7 +673,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		if sb.Len() > 0 && multiline == MultilineNone && oaicaActiveModel != "" {
 			// OAICA thin-client path: bypass Ollama's native chat() entirely,
 			// speak OpenAI-shaped /v1/chat/completions to api.oaica.com.
-			newHistory, reply, err := oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String())
+			newHistory, reply, err := oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String(), oaicaVerboseRequested(cmd))
 			oaicaHistory = newHistory
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
@@ -742,13 +742,25 @@ func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChat
 // in the history means every later request re-sends a prompt the user got no
 // reply to — once more for each retry — until the router's context is full of
 // turns the conversation never had (2026-09-26 audit).
-func oaicaTurn(model string, history []oaicaChatMessage, prompt string) ([]oaicaChatMessage, string, error) {
+//
+// verbose is the `/set verbose` state, re-read per turn so toggling it
+// mid-session takes effect on the next reply. The timings go to stderr — see
+// oaicaChatTimed for why they are not on stdout like the native path's.
+func oaicaTurn(model string, history []oaicaChatMessage, prompt string, verbose bool) ([]oaicaChatMessage, string, error) {
 	next := append(history, oaicaChatMessage{Role: "user", Content: prompt})
-	reply, err := oaicaChat(model, next)
+	reply, err := oaicaChatTimed(os.Stderr, verbose, model, next)
 	if err != nil {
 		return history, "", err
 	}
 	return append(next, oaicaChatMessage{Role: "assistant", Content: reply}), reply, nil
+}
+
+// oaicaVerboseRequested reports whether --verbose (or `/set verbose`, which
+// sets the same flag) is on. Unreadable state counts as off: a missing flag
+// definition must not turn into an error on the reply path.
+func oaicaVerboseRequested(cmd *cobra.Command) bool {
+	v, err := cmd.Flags().GetBool("verbose")
+	return err == nil && v
 }
 
 func NewCreateRequest(name string, opts runOptions) *api.CreateRequest {
