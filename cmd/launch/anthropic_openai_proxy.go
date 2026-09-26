@@ -1223,12 +1223,41 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 	// POST /v1/messages — the real work.
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		// A turn this proxy refuses LOCALLY — a bad proxy token, a body over
+		// the cap, an unparseable request, a denied entitlement, a prompt the
+		// window cannot hold — used to return with no row at all: the row was
+		// built further down, behind every one of those gates, so `oaica usage`
+		// reported ERR 0 for a session whose every turn was refused here,
+		// including the prompt-too-long 400 (the auto-compaction case the
+		// report exists to show). The row is created up front and written ONLY
+		// by refuse(); a turn that reaches a leg logs its own row — the
+		// translated path below, and the passthrough legs inside their own
+		// functions — so nothing is counted twice (2026-09-26 audit, ninth
+		// round).
+		var refusalRow *requestLogEntry
+		refusalStarted := time.Now()
+		if r.Method == http.MethodPost {
+			refusalRow = &requestLogEntry{
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Path:      r.URL.Path,
+				Backend:   table.Default.Label + " " + redactBaseURL(table.Default.BaseURL),
+			}
+		}
+		refuse := func(code int, msg string) {
+			if refusalRow != nil {
+				refusalRow.StatusCode = code
+				refusalRow.DurationMs = time.Since(refusalStarted).Milliseconds()
+				appendRequestLog(*refusalRow)
+			}
+			writeAnthropicError(w, code, msg)
+		}
+
 		if r.Method != http.MethodPost {
-			writeAnthropicError(w, http.StatusMethodNotAllowed, "method not allowed")
+			refuse(http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		if !table.authorized(r) {
-			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid proxy token")
+			refuse(http.StatusUnauthorized, "missing or invalid proxy token")
 			return
 		}
 		// Bounded: this body is written by the launched client, and an
@@ -1236,14 +1265,26 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// (2026-09-26 audit).
 		body, err := httpbody.ReadCapped(r.Body, httpbody.DefaultMax, "the request body")
 		if err != nil {
-			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "read body: "+err.Error())
+			refuse(http.StatusRequestEntityTooLarge, "read body: "+err.Error())
 			return
 		}
 
 		var anthReq anthropic.MessagesRequest
 		if err := json.Unmarshal(body, &anthReq); err != nil {
-			writeAnthropicError(w, http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
+			refuse(http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
 			return
+		}
+		// The body-derived features the report classifies on, filled in for a
+		// refusal that happens after this point (a denied entitlement, a prompt
+		// too long). A refusal BEFORE it — the token check, the body cap — had
+		// no body to read them from and logs zeroes: there the row's job is to
+		// record that the attempt happened at all.
+		if refusalRow != nil {
+			refusalRow.Model = anthReq.Model
+			refusalRow.LastMessageLen, refusalRow.TotalMessagesLen = extractLastAndTotalMessageLen(body)
+			refusalRow.HardSignalMatch = requestLogHardSignalRE.MatchString(string(body))
+			refusalRow.WouldBeHardByLen = refusalRow.LastMessageLen > requestLogHardLengthThreshold ||
+				refusalRow.TotalMessagesLen > requestLogHardLengthThreshold*3
 		}
 
 		// Native Anthropic passthrough (claude/*, anthropic/* tiers,
@@ -1291,7 +1332,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// reason — the gate must be asked about the model that is
 				// SPENT, whichever spelling produced it.
 				if allowed, reason := checkEntitlement(r, route.Label, route.UpstreamModel); !allowed {
-					writeAnthropicError(w, http.StatusForbidden, reason)
+					refuse(http.StatusForbidden, reason)
 					return
 				}
 				// Its upstream wants the plan's own model id, not the picker
@@ -1301,12 +1342,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// UpstreamModel is the CLI alias the client already sent.
 				rewritten, rerr := rewriteAnthropicRequestModel(body, route.UpstreamModel)
 				if rerr != nil {
-					writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for anthropic remote: "+rerr.Error())
+					refuse(http.StatusInternalServerError, "rewrite model for anthropic remote: "+rerr.Error())
 					return
 				}
 				upstream, headerName, headerValue, ok := route.anthropicPassthroughTarget()
 				if !ok {
-					writeAnthropicError(w, http.StatusUnauthorized,
+					refuse(http.StatusUnauthorized,
 						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
 					return
 				}
@@ -1328,7 +1369,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		chatReq, err := anthropic.FromMessagesRequest(anthReq)
 		if err != nil {
-			writeAnthropicError(w, http.StatusBadRequest, "convert request: "+err.Error())
+			refuse(http.StatusBadRequest, "convert request: "+err.Error())
 			return
 		}
 
@@ -1361,11 +1402,16 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// Off by default (see entitlement.go) — a hook point for a future
 		// license/entitlement product decision, not one made here.
 		if allowed, reason := checkEntitlement(r, route.Label, reqModel); !allowed {
-			writeAnthropicError(w, http.StatusForbidden, reason)
+			refuse(http.StatusForbidden, reason)
 			return
 		}
 
 		started := time.Now()
+		// The route is resolved from here down, so a refusal past this point is
+		// about THAT leg, not the default one the row was created with.
+		if refusalRow != nil {
+			refusalRow.Backend = route.Label + " " + redactBaseURL(route.BaseURL)
+		}
 
 		oaiReq := chatRequestToOpenAI(chatReq, anthReq, reqModel)
 		// Context-length-fit clamp -- real 2026-08-29 incident: Claude
@@ -1436,6 +1482,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// --oversize leg exists → serve on it instead of rejecting.
 				// Re-derive the budget against the new leg's window.
 				if over, swapped := table.oversizeSwap(route, estTokens, margin); swapped {
+					// Every refusal inside this crossover is a judgement about
+					// the leg being swapped TO, so the row must name it.
+					if refusalRow != nil {
+						refusalRow.Backend = over.Label + " " + redactBaseURL(over.BaseURL)
+					}
 					if over.NativePassthrough {
 						// A native oversize leg has no probed ContextWindow
 						// (it's always 0 — see oversizeSwap's doc) and no
@@ -1477,7 +1528,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						}
 						nativeBody, rerr := rewriteAnthropicRequestModel(body, realModel)
 						if rerr != nil {
-							writeAnthropicError(w, http.StatusInternalServerError, "rewrite model for oversize crossover: "+rerr.Error())
+							refuse(http.StatusInternalServerError, "rewrite model for oversize crossover: "+rerr.Error())
 							return
 						}
 						w.Header().Set("X-Oaica-Route", over.Label)
@@ -1489,13 +1540,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// label let the request through because the
 						// pre-swap label had been allowed).
 						if allowed, reason := checkEntitlement(r, over.Label, over.UpstreamModel); !allowed {
-							writeAnthropicError(w, http.StatusForbidden, reason)
+							refuse(http.StatusForbidden, reason)
 							return
 						}
 						if over.Wire == "anthropic" {
 							upstream, headerName, headerValue, ok := over.anthropicPassthroughTarget()
 							if !ok {
-								writeAnthropicError(w, http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
+								refuse(http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
 								return
 							}
 							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID)
@@ -1520,7 +1571,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					// request is answered on `over`, so `over` is the leg
 					// the gate has to judge (2026-09-26 audit).
 					if allowed, reason := checkEntitlement(r, route.Label, route.UpstreamModel); !allowed {
-						writeAnthropicError(w, http.StatusForbidden, reason)
+						refuse(http.StatusForbidden, reason)
 						return
 					}
 					fitBudget = route.ContextWindow - estTokens - margin
@@ -1530,7 +1581,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// Anthropic's own wording -- see promptTooLongMessage for
 				// why the exact phrasing is load-bearing for Claude Code's
 				// recovery path.
-				writeAnthropicError(w, http.StatusBadRequest,
+				refuse(http.StatusBadRequest,
 					promptTooLongMessage(estTokens, route.ContextWindow-minViableCompletion))
 				return
 			}
@@ -1540,7 +1591,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		}
 		oaiBody, err := json.Marshal(oaiReq)
 		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "marshal openai request: "+err.Error())
+			refuse(http.StatusInternalServerError, "marshal openai request: "+err.Error())
 			return
 		}
 
@@ -1577,6 +1628,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 
 		upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, route.BaseURL+"/chat/completions", bytes.NewReader(oaiBody))
 		if err != nil {
+			// `entry` exists by now (it is built just above), so this failure is
+			// recorded on it rather than dropped (2026-09-26 audit, ninth
+			// round). Its defer is registered below this point, so this append
+			// is the only one for this request.
+			entry.StatusCode = http.StatusInternalServerError
+			appendRequestLog(entry)
 			writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
 			return
 		}
