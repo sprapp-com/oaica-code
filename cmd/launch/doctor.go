@@ -94,12 +94,15 @@ func doctorChecks(w io.Writer) bool {
 		}
 		policy := r.RoutePolicy
 		if _, perr := parseRoutePolicy(policy); perr != nil {
-			status = "INVALID route_policy " + policy
+			status = "INVALID route_policy " + printableName(policy)
 			failed = true
 		}
 		suffix := ""
-		if r.RoutePolicy != "" {
-			suffix = "  (route_policy: " + r.RoutePolicy + ")"
+		if policy != "" {
+			// Quoted like a name: this value comes from the same hand-editable
+			// file and is printed on the same line (2026-09-26 audit, tenth
+			// round).
+			suffix = "  (route_policy: " + printableName(policy) + ")"
 		}
 		// The RESOLVED endpoint, not the configured prefix: the probe above
 		// fetched openAIBase()+"/models", so printing BaseURL showed a URL one
@@ -109,7 +112,7 @@ func doctorChecks(w io.Writer) bool {
 		// thing this line is for.
 		// Credential-embedded URLs (https://key@host/...) print
 		// redacted — doctor output lands in terminals and CI logs.
-		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", r.Name, redactBaseURL(r.openAIBase()), r.Wire, status, suffix)
+		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", printableName(r.Name), redactBaseURL(r.openAIBase()), r.Wire, status, suffix)
 	}
 	if len(remotes) == 0 {
 		fmt.Fprintln(w, "  (none configured)")

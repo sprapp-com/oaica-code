@@ -429,7 +429,33 @@ func RemoteRemove(name string) (bool, error) {
 
 // isControlRune reports whether r is a control character — the class that, in
 // a printed name, moves the cursor or starts a new line.
-func isControlRune(r rune) bool { return r < 0x20 || r == 0x7f }
+//
+// ASCII is not the class. U+2028 and U+2029 are line separators to most
+// consumers, U+0085 is NEL, U+202A–U+202E and U+2066–U+2069 are the bidi
+// overrides that move the cursor and reorder what follows, and the
+// zero-width/invisible forms (U+200B–U+200F, U+FEFF) hide or reorder text in a
+// terminal. An ASCII-only test let all of those into `remote add` and into
+// printableName, reaching the same forged-row output the ASCII class was added
+// to stop (2026-09-26 audit, tenth round).
+func isControlRune(r rune) bool {
+	switch {
+	case r < 0x20, r == 0x7f:
+		return true
+	case r == 0x85: // NEL
+		return true
+	case r >= 0x2028 && r <= 0x2029: // LINE / PARAGRAPH SEPARATOR
+		return true
+	case r >= 0x200b && r <= 0x200f: // ZWSP, ZWNJ, ZWJ, LRM, RLM
+		return true
+	case r >= 0x202a && r <= 0x202e: // LRE, RLE, PDF, LRO, RLO
+		return true
+	case r >= 0x2066 && r <= 0x2069: // LRI, RLI, FSI, PDI
+		return true
+	case r == 0xfeff: // BOM
+		return true
+	}
+	return false
+}
 
 // printableName renders a remote name for a one-line report: an ordinary name
 // as-is, one carrying control characters in Go-quoted form. remotes.json is

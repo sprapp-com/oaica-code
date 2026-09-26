@@ -230,6 +230,41 @@ func splitParamWords(name string) []string {
 // excludes ";" and "#" for the same reason.
 var queryCredentialValue = regexp.MustCompile(`(?i)[?&;#]([^=&#;\s]+)=(\s*[^&#;\s]*)`)
 
+// credentialPathSegment matches a base URL whose credential rides in a PATH
+// SEGMENT — a shape some self-hosted gateways use (http://gw.example/sk-live-…/v1)
+// instead of a header, a query parameter or the userinfo. Like every other rule
+// here it is textual, because the value reaches terminal output, shell history
+// and pasted support reports through strings built all over this program.
+//
+// Only segments that NAME THEMSELVES as credentials are matched: a known key
+// prefix followed by a token body. A rule that guessed at entropy would rewrite
+// ordinary paths (/v1, /api, /models) in output a user has to read, and the
+// point of this file is that a report stays readable while the secret does not
+// (2026-09-26 audit, tenth round). The cost of the narrow rule is a path like
+// /key-manager/v1 reading as /REDACTED/v1, which hides a word rather than a
+// credential.
+var credentialPathSegment = regexp.MustCompile(`(?i)/((?:sk|pk|rk|api[-_]?key|key|token|bearer|secret)[-_]?[a-z0-9-]{6,})(/|$|")`)
+
+// pathSecrets returns every path-segment credential text carries, in the form
+// it appears (no leading slash, no trailing separator).
+func pathSecrets(text string) []string {
+	var out []string
+	for _, m := range credentialPathSegment.FindAllStringSubmatch(text, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// redactPathCredentials replaces a path-segment credential with REDACTED,
+// keeping the slash: "/sk-live-…/v1" reads as "/REDACTED/v1", which still says
+// where in the URL the key was.
+func redactPathCredentials(text string) string {
+	if !strings.Contains(text, "/") {
+		return text
+	}
+	return credentialPathSegment.ReplaceAllString(text, "/REDACTED${2}")
+}
+
 // queryCredentialValueAll is queryCredentialValue for a string that IS one URL
 // (a remote's base_url, never free prose): the value runs to the next "&", ";"
 // or "#" even across whitespace, so a key pasted with a space in it is captured
@@ -413,7 +448,11 @@ func redactCredentials(text string) string {
 	text = redactQuotedQueryCredentials(text)
 	// The parse-error path re-states the credential fragment outside the URL's
 	// quotes, so it gets its own rule rather than relying on the quoted one.
-	return invalidPortFragment.ReplaceAllString(text, `invalid port "REDACTED"`)
+	text = invalidPortFragment.ReplaceAllString(text, `invalid port "REDACTED"`)
+	// And a base URL can carry its key as a path segment, with no userinfo and
+	// no query parameter to notice: doctor prints that URL, under a footer
+	// promising no credential values (2026-09-26 audit, tenth round).
+	return redactPathCredentials(text)
 }
 
 // redactBaseURL hides any userinfo embedded in a base URL, keeping the rest of
@@ -490,7 +529,10 @@ func baseURLSecrets(baseURL string) []string {
 			}
 		}
 	}
-	return append(out, querySecrets(baseURL)...)
+	// Third place a key can ride: a path segment (see credentialPathSegment).
+	// The scan is only as good as this list — a value missing from it is one the
+	// report can print while still claiming it holds no credentials.
+	return append(append(out, querySecrets(baseURL)...), pathSecrets(baseURL)...)
 }
 
 // userinfoSecret returns the credential a base URL carries, for a caller that
