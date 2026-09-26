@@ -228,6 +228,10 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			// An explicit end-of-stream marker: a proxy that sends this
+			// instead of message_stop has finished, so it is not the
+			// truncation case below.
+			acc.done = true
 			break
 		}
 		var envelope struct {
@@ -251,6 +255,14 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read SSE stream: %w", err)
+	}
+	// The body can end mid-turn — a dropped connection, an upstream timeout,
+	// a proxy that closed the stream early. Deltas that arrived are already
+	// with the caller, but a turn without message_stop is incomplete, and
+	// returning nil here would report the partial answer as the whole one
+	// (2026-09-26 audit).
+	if !acc.done {
+		return fmt.Errorf("SSE stream ended without message_stop: the turn is incomplete")
 	}
 	return nil
 }

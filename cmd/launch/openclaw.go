@@ -488,8 +488,14 @@ func patchDeviceScopes() {
 	}
 
 	var devices map[string]map[string]any
-	if err := json.Unmarshal(data, &devices); err != nil {
-		return
+	// json.Number, so the token timestamps and ids in the gateway's record
+	// come back as the text they went in as rather than a rounded float64.
+	{
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&devices); err != nil {
+			return
+		}
 	}
 
 	dev, ok := devices[deviceID]
@@ -529,7 +535,10 @@ func patchDeviceScopes() {
 	if err != nil {
 		return
 	}
-	_ = fileutil.WriteFileAtomic(path, out, 0o600)
+	// A backup, like every other write to this daemon's files: this function
+	// has no way to report a bad write, so it must not be the one write that
+	// leaves no copy behind.
+	_ = fileutil.WriteWithBackup(path, out, "openclaw")
 }
 
 // readLocalDeviceID reads the local device ID from openclaw's identity file.
@@ -793,8 +802,13 @@ func clearSessionModelOverride(primary string) {
 		return
 	}
 	var sessions map[string]map[string]any
-	if json.Unmarshal(data, &sessions) != nil {
-		return
+	// json.Number, as in patchDeviceScopes: session state carries timestamps.
+	{
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&sessions); err != nil {
+			return
+		}
 	}
 	changed := false
 	for _, sess := range sessions {
@@ -822,7 +836,7 @@ func clearSessionModelOverride(primary string) {
 	if err != nil {
 		return
 	}
-	_ = fileutil.WriteFileAtomic(path, out, 0o600)
+	_ = fileutil.WriteWithBackup(path, out, "openclaw")
 }
 
 // configureOllamaWebSearch keeps launch-managed OpenClaw installs on the

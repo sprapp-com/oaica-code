@@ -22,17 +22,27 @@ import (
 type terminalApprovalPrompter struct {
 	in  io.Reader
 	out io.Writer
+
+	// reader is built once and kept for the run. A bufio.Reader reads ahead,
+	// so one built per prompt swallows every answer already sitting in the
+	// pipe and the next prompt reads an exhausted source instead
+	// (2026-09-26 audit).
+	reader *bufio.Reader
 }
 
 func newTerminalApprovalPrompter(in io.Reader, out io.Writer) *terminalApprovalPrompter {
-	return &terminalApprovalPrompter{in: in, out: out}
+	return &terminalApprovalPrompter{in: in, out: out, reader: bufio.NewReader(in)}
 }
 
 func (p *terminalApprovalPrompter) PromptApproval(ctx context.Context, req agent.ApprovalRequest) (agent.Approval, error) {
 	if len(req.Calls) == 0 {
 		return agent.Approval{Allow: true}, nil
 	}
-	reader := bufio.NewReader(p.in)
+	reader := p.reader
+	if reader == nil {
+		reader = bufio.NewReader(p.in)
+		p.reader = reader
+	}
 	allowed := make([]string, 0, len(req.Calls))
 	for _, call := range req.Calls {
 		fmt.Fprintf(p.out, "\n  Run %s with %s?\n", call.ToolName, compactMap(call.Args))

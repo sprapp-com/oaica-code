@@ -177,6 +177,12 @@ func loadModelManifest() (*modelManifest, error) {
 // save writes the manifest atomically (unique temp file + rename) so a crash
 // mid-write can't corrupt an existing manifest — and so two processes writing
 // it do not share one temp buffer (2026-09-26 audit).
+//
+// The marshalled struct is a partial view of the file, so the write goes
+// through storeDocumentMerge: a top-level member this version does not model
+// belongs to whoever wrote it and is put back verbatim. Without that,
+// `oaica model add` deleted everything in models.json the struct has no field
+// for (2026-09-26 audit, later round).
 func (m *modelManifest) save() error {
 	path, err := modelManifestPath()
 	if err != nil {
@@ -189,7 +195,7 @@ func (m *modelManifest) save() error {
 	if err != nil {
 		return err
 	}
-	return fileutil.WriteFileAtomic(path, data, 0o600)
+	return fileutil.WriteFileAtomic(path, storeDocumentMerge(data, path), 0o600)
 }
 
 // updateModelManifest is the ONLY writer path for models.json: it holds the

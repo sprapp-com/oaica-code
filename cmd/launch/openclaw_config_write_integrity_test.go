@@ -11,10 +11,12 @@ package launch
 //     which its own concurrent edit (or an editor's save) is overwritten by a
 //     copy read moments earlier.
 //   - The whole document round-tripped through map[string]any, i.e. through
-//     float64, so a large integer in the config came back changed. The rest of
-//     the openclaw integration writes with a backup before overwriting
-//     (Openclaw.Edit → fileutil.WriteWithBackup); this function did not, so
-//     the one write with no backup was also the one that ran on every launch.
+//     float64, so a large integer in the config came back changed. This one
+//     also had no backup (Openclaw.Edit writes through
+//     fileutil.WriteWithBackup), so the write that ran on every launch was
+//     also the one with nothing to fall back on — as did
+//     patchDeviceScopes/clearSessionModelOverride, fixed alongside it in
+//     openclaw_state_write_integrity_test.go.
 //
 // The fix keeps the document intact: numbers decode as json.Number (verbatim
 // text, no float64), the write is skipped when the modified document is
@@ -151,6 +153,6 @@ func TestARealOpenclawChangeIsWrittenWithABackup(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("the previous config was overwritten with no backup in %s — this is a file oaica does not own, and every other openclaw write keeps a copy", filepath.Join(fileutil.BackupDir(), "openclaw"))
+		t.Errorf("the previous config was overwritten with no backup in %s — this is a file oaica does not own", filepath.Join(fileutil.BackupDir(), "openclaw"))
 	}
 }

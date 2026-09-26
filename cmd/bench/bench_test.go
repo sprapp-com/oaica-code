@@ -201,10 +201,12 @@ func TestBenchmarkModel_ServerError(t *testing.T) {
 
 	t.Setenv("OLLAMA_HOST", server.URL)
 
+	// This assertion used to read "Expected error to be handled internally":
+	// the benchmark swallowed a total failure and returned nil, so the run
+	// exited 0 over a report with no rows (2026-09-26 audit).
 	output := captureOutput(func() {
-		err := BenchmarkModel(fOpt)
-		if err != nil {
-			t.Errorf("Expected error to be handled internally, got returned error: %v", err)
+		if err := BenchmarkModel(fOpt); err == nil {
+			t.Errorf("every epoch failed, so BenchmarkModel must report a failed run")
 		}
 	})
 
@@ -248,10 +250,11 @@ func TestBenchmarkModel_Timeout(t *testing.T) {
 
 	t.Setenv("OLLAMA_HOST", server.URL)
 
+	// As above: a run whose every epoch timed out produced no rows, and used
+	// to return nil anyway.
 	output := captureOutput(func() {
-		err := BenchmarkModel(fOpt)
-		if err != nil {
-			t.Errorf("Expected timeout to be handled internally, got returned error: %v", err)
+		if err := BenchmarkModel(fOpt); err == nil {
+			t.Errorf("every epoch timed out, so BenchmarkModel must report a failed run")
 		}
 	})
 
@@ -276,10 +279,11 @@ func TestBenchmarkModel_NoMetrics(t *testing.T) {
 
 	t.Setenv("OLLAMA_HOST", server.URL)
 
+	// And again: no metrics ever arrived, so there is nothing to report as a
+	// measurement, and a zero-row run is not a successful one.
 	output := captureOutput(func() {
-		err := BenchmarkModel(fOpt)
-		if err != nil {
-			t.Errorf("Expected no error, got %v", err)
+		if err := BenchmarkModel(fOpt); err == nil {
+			t.Errorf("no epoch produced metrics, so BenchmarkModel must report a failed run")
 		}
 	})
 

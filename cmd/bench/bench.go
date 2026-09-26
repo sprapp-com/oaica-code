@@ -310,6 +310,10 @@ func BenchmarkModel(fOpt flagOptions) error {
 		fmt.Fprintf(os.Stderr, "Generated prompt targeting ~%d tokens (%d words, varied per epoch)\n", *fOpt.promptTokens, wordCount)
 	}
 
+	// A model that produced no rows at all is a failed benchmark, not an empty
+	// one: the run used to print nothing for it and exit 0 (2026-09-26 audit).
+	produced := make(map[string]int, len(models))
+
 	for _, model := range models {
 		// Fetch model info
 		infoCtx, infoCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -429,6 +433,7 @@ func BenchmarkModel(fOpt flagOptions) error {
 			if err != nil || responseMetrics == nil {
 				continue
 			}
+			produced[model]++
 
 			if short {
 				shortCount++
@@ -490,8 +495,23 @@ func BenchmarkModel(fOpt flagOptions) error {
 
 		// Unload model before moving to the next one
 		unloadModel(client, model, *fOpt.timeout)
+
+		if produced[model] == 0 {
+			fmt.Fprintf(os.Stderr, "WARNING: no epoch of '%s' produced metrics (%d requested)\n", model, *fOpt.epochs)
+		} else if produced[model] < *fOpt.epochs {
+			fmt.Fprintf(os.Stderr, "WARNING: only %d/%d epochs of '%s' produced metrics\n", produced[model], *fOpt.epochs, model)
+		}
 	}
 
+	var empty []string
+	for _, model := range models {
+		if produced[model] == 0 {
+			empty = append(empty, model)
+		}
+	}
+	if len(empty) > 0 {
+		return fmt.Errorf("no results for %s: every epoch failed, so the report would be missing that model entirely", strings.Join(empty, ", "))
+	}
 	return nil
 }
 
@@ -561,11 +581,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	if len(*fOpt.models) == 0 {
-		fmt.Fprintf(os.Stderr, "ERROR: No model(s) specified to benchmark.\n")
-		flag.Usage()
-		return
-	}
+	os.Exit(runBench(fOpt, os.Stderr, os.Stdout))
+}
 
-	BenchmarkModel(fOpt)
+// runBench runs the benchmark and returns the process exit code. It exists so
+// the exit path is a value a test can read: main used to call BenchmarkModel
+// and drop its error, so a run whose every epoch failed exited 0 over an empty
+// report (2026-09-26 audit).
+func runBench(fOpt flagOptions, errOut io.Writer, out io.Writer) int {
+	if len(*fOpt.models) == 0 {
+		fmt.Fprintf(errOut, "ERROR: No model(s) specified to benchmark.\n")
+		flag.Usage()
+		return 2
+	}
+	if err := BenchmarkModel(fOpt); err != nil {
+		fmt.Fprintf(errOut, "ERROR: %v\n", err)
+		return 1
+	}
+	return 0
 }
