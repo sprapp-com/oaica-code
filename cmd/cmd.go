@@ -2560,7 +2560,13 @@ instead (see cmd/launch/model_manifest.go).`,
 				ToolFormatSet: cmd.Flags().Changed("tool-format"),
 			})
 			if err != nil {
-				return err
+				// The boundary, not a courtesy: main.go prints what this
+				// returns with cobra.CheckErr and SilenceErrors is set, so
+				// nothing downstream redacts. Every message RemoteAdd can
+				// produce is redacted at its source, and this is what keeps a
+				// future one from reaching the terminal with the user's key in
+				// it (2026-09-26 audit, ninth round).
+				return launch.RedactError(err)
 			}
 			d := r.Descriptor()
 			// The RESOLVED endpoint (EndpointBase: base-url plus the version

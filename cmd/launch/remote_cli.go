@@ -182,26 +182,36 @@ func oneOf(v string, allowed []string) bool {
 // the flag — and a value carrying a newline forges a line in every listing that
 // prints it (`oaica remote list`, the picker, doctor output).
 func validateRemoteBaseURL(baseURL string) error {
+	// Every message below is printed to the terminal by main.go's
+	// cobra.CheckErr, and --base-url can itself carry the key as userinfo. The
+	// success line two functions over redacts for exactly that reason; these
+	// refusals did not, so a mistyped line put a live credential in the
+	// terminal, the CI log and the scrollback (2026-09-26 audit, ninth round).
+	// Redacted once here rather than at six call sites, so a seventh branch
+	// cannot be added without it.
+	shown := redactBaseURL(baseURL)
 	for _, r := range baseURL {
 		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("--base-url %q contains a control character — it is echoed by `oaica remote list` and in launch messages, so an embedded newline forges an extra line of output", baseURL)
+			return fmt.Errorf("--base-url %q contains a control character — it is echoed by `oaica remote list` and in launch messages, so an embedded newline forges an extra line of output", shown)
 		}
 		if r == ' ' {
-			return fmt.Errorf("--base-url %q contains a space", baseURL)
+			return fmt.Errorf("--base-url %q contains a space", shown)
 		}
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return fmt.Errorf("--base-url %q is not a URL: %w (e.g. --base-url https://api.example.com)", baseURL, err)
+		// url.Parse's own text re-states the whole URL, so the wrap needs the
+		// error redacted too, not just the value.
+		return fmt.Errorf("--base-url %q is not a URL: %w (e.g. --base-url https://api.example.com)", shown, redactErr(err))
 	}
 	// A bare host ("garbage", "not/absolute", "api.example.com") parses without
 	// error and with an empty scheme, which is exactly the value that reaches
 	// http.NewRequest as "<base>/chat/completions" and fails there.
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("--base-url %q: the scheme must be http or https (got %q) — oaica appends /chat/completions and /models to this value, so anything else fails at request time with an error that names neither the remote nor this flag", baseURL, u.Scheme)
+		return fmt.Errorf("--base-url %q: the scheme must be http or https (got %q) — oaica appends /chat/completions and /models to this value, so anything else fails at request time with an error that names neither the remote nor this flag", shown, u.Scheme)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("--base-url %q has no host (e.g. --base-url https://api.example.com)", baseURL)
+		return fmt.Errorf("--base-url %q has no host (e.g. --base-url https://api.example.com)", shown)
 	}
 	// A query or fragment is not part of the endpoint oaica talks to: the base
 	// is joined with "/v1/chat/completions" and "/v1/models", so a query
@@ -209,14 +219,14 @@ func validateRemoteBaseURL(baseURL string) error {
 	// intended, with a doctor line showing the mangled URL and a failure that
 	// names neither this flag nor the cause (2026-09-26 audit).
 	if u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("--base-url %q carries a query string or fragment — oaica appends /v1/chat/completions to this value, so anything after \"?\" or \"#\" truncates the path and every request goes to the wrong URL. Put the endpoint itself here (e.g. --base-url https://api.example.com/v1); a credential the endpoint needs in the query is not supported — use --api-key", baseURL)
+		return fmt.Errorf("--base-url %q carries a query string or fragment — oaica appends /v1/chat/completions to this value, so anything after \"?\" or \"#\" truncates the path and every request goes to the wrong URL. Put the endpoint itself here (e.g. --base-url https://api.example.com/v1); a credential the endpoint needs in the query is not supported — use --api-key", shown)
 	}
 	// url.Parse accepts any digits as a port; the failure surfaces much later as
 	// "address 99999999: invalid port" from the transport.
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("--base-url %q has port %q, which is not a usable TCP port (1-65535)", baseURL, p)
+			return fmt.Errorf("--base-url %q has port %q, which is not a usable TCP port (1-65535)", shown, p)
 		}
 	}
 	return nil
