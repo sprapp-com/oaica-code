@@ -86,24 +86,7 @@ func schemaFor(t reflect.Type) *jsonSchema {
 	case reflect.Struct:
 		s.shape = shapeStruct
 		s.fields = map[string]*jsonSchema{}
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if f.PkgPath != "" { // unexported
-				continue
-			}
-			name, opts := parseJSONTag(f)
-			if name == "-" {
-				continue
-			}
-			if name == "" {
-				name = f.Name
-			}
-			if _, ok := opts["string"]; ok {
-				s.fields[name] = &jsonSchema{shape: shapeOpaque}
-				continue
-			}
-			s.fields[name] = schemaFor(f.Type)
-		}
+		declareStructFields(s.fields, t, map[reflect.Type]bool{})
 	case reflect.Map:
 		s.shape = shapeMap
 		s.elem = schemaFor(t.Elem())
@@ -115,6 +98,102 @@ func schemaFor(t reflect.Type) *jsonSchema {
 		s.elem = schemaFor(t.Elem())
 	}
 	return s
+}
+
+// declareStructFields puts t's members into dst: its own fields first, then the
+// members the structs it EMBEDS promote.
+//
+// That order is not cosmetic. An embedded struct has no key of its own — its
+// members are promoted into the object being marshalled, so the schema has to
+// describe them as members of the outer struct or every promoted key looks
+// undeclared to the merge (which walked into it with a nil schema and panicked,
+// 2026-09-26 audit). And an outer field of the same name shadows the promoted
+// one, because that is what encoding/json does: there is one such key in the
+// marshalled object, and the outer field is what produced it.
+//
+// dst answers exactly one question about a key: does the type being written
+// declare it, or does it belong to whoever else put it there.
+func declareStructFields(dst map[string]*jsonSchema, t reflect.Type, seen map[reflect.Type]bool) {
+	if seen[t] {
+		return
+	}
+	seen[t] = true
+
+	// Embedded structs are resolved after the direct fields, and only into the
+	// names still free. Two of them promoting the SAME name at the same depth is
+	// the one case encoding/json resolves by dropping both from the document —
+	// so neither is the caller's, and the name goes back to being a stranger's,
+	// which is the direction that keeps a hand-written member (see `dead`).
+	var promoted []reflect.Type
+	dead := map[string]bool{}
+
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, opts := parseJSONTag(f)
+
+		if f.Anonymous {
+			// Only a struct reaches through: an embedded field that is not a
+			// struct is an ordinary member named by its type, and a json tag on
+			// an embedded field names the field itself rather than promoting it.
+			if f.Type.Kind() == reflect.Struct && name == "" && !marshalsItself(f.Type) {
+				promoted = append(promoted, f.Type)
+				continue
+			}
+			// An embedded POINTER to a struct is deliberately not followed: a
+			// nil one marshals to nothing, so its members are absent from the
+			// document by the caller's own choice, and declaring them would make
+			// the merge delete whatever is on disk under those names.
+			if f.PkgPath != "" && f.Type.Kind() != reflect.Struct {
+				continue
+			}
+		} else if f.PkgPath != "" { // unexported
+			continue
+		}
+
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		if _, ok := opts["string"]; ok {
+			dst[name] = &jsonSchema{shape: shapeOpaque}
+			continue
+		}
+		dst[name] = schemaFor(f.Type)
+	}
+
+	from := map[string]reflect.Type{}
+	for _, et := range promoted {
+		inner := schemaFor(et)
+		if inner.shape != shapeStruct {
+			continue
+		}
+		for name, fields := range inner.fields {
+			if dead[name] {
+				continue
+			}
+			src, wasPromoted := from[name]
+			if wasPromoted && src != et {
+				// Same depth, two sources: encoding/json emits no such key at
+				// all, so it is nobody's member and gets carried.
+				delete(dst, name)
+				dead[name] = true
+				continue
+			}
+			if _, taken := dst[name]; !taken {
+				dst[name] = fields
+				from[name] = et
+			}
+		}
+	}
+}
+
+// marshalsItself reports whether t produces its own JSON — time.Time, and every
+// type with a MarshalJSON. Nothing of such a type is described or re-attached.
+func marshalsItself(t reflect.Type) bool {
+	jm := reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	return t.Implements(jm) || reflect.PointerTo(t).Implements(jm)
 }
 
 func parseJSONTag(f reflect.StructField) (string, map[string]bool) {
@@ -170,7 +249,15 @@ func storeDocumentMergeValue(v any, path string) ([]byte, error) {
 // so one that is gone was deleted on purpose — `auth logout`, `alias rm`,
 // `model rm`); a struct's undeclared members belong to whoever wrote them and
 // are put back verbatim, at every depth.
+// A nil schema means "this position has no shape we know": the caller's value
+// stands and nothing under it is carried. It is terminal rather than fatal
+// because this is a preservation step — a document a user wrote must never be
+// able to panic a rewrite of it, and the walk reaches a nil schema for any key
+// the caller's type does not declare.
 func mergeStoreDocument(had, now json.RawMessage, sch *jsonSchema) (json.RawMessage, bool) {
+	if sch == nil {
+		return now, false
+	}
 	switch sch.shape {
 	case shapeStruct:
 		ho, no, ok := asJSONObjects(had, now)
