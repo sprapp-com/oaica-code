@@ -301,7 +301,16 @@ type oaicaManifest struct {
 }
 
 func oaicaFetchManifest(model string) (*oaicaManifest, error) {
-	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaHost()+"/v1/manifest/"+model, nil)
+	// The name is checked BEFORE the request, not after it. The guard for this
+	// shape already existed (validateModelName refuses separators, "." and
+	// ".."), but the pull path only reached it through oaicaModelPath, which
+	// runs once the manifest has been fetched — so an argument that was never a
+	// model name was put on the wire first, on the one request that carries the
+	// distribution licence as a bearer (2026-09-26 audit).
+	if err := validateModelName(model); err != nil {
+		return nil, err
+	}
+	req, err := launch.NewRedactedRequest(http.MethodGet, oaicaManifestURL(model), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -381,6 +390,17 @@ func oaicaPullURL(host, pullURL string) (string, error) {
 		return "", fmt.Errorf("router sent a pull_url that points at %s, not at the router", full.Host)
 	}
 	return base.String() + pullURL, nil
+}
+
+// oaicaManifestURL is the router's manifest endpoint for model, with the name
+// as ONE percent-escaped path segment. A model name is user input and a URL is
+// not a concatenation: unescaped, a "?" in the name ended the path and gave the
+// router a query it never had (everything after it stops being a model), a "#"
+// cut the request short at a fragment, and a separator addressed a different
+// endpoint on the same router. validateModelName refuses the separators and
+// runs first; this is what makes the rest of the name inert.
+func oaicaManifestURL(model string) string {
+	return oaicaHost() + "/v1/manifest/" + url.PathEscape(model)
 }
 
 // manifestDigest is the digest a manifest states for its model file, or "" when
