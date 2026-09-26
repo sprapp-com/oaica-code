@@ -242,3 +242,33 @@ func TestProxyStream_CompleteStreamStillEndsCleanly(t *testing.T) {
 		t.Errorf("message_delta.stop_reason = %v, want \"end_turn\" (Anthropic's name for upstream \"stop\")", delta["delta"])
 	}
 }
+
+// An upstream that ignores stream:true answers with a WHOLE completion as one
+// JSON body, with no "data:" frame anywhere. The reader recognises only SSE
+// frames, so the body matched nothing and the turn was reported as truncated:
+// the client got a 502 and no content on every retry even though the upstream
+// produced and billed a whole answer, and the failed verdict opened the leg's
+// breaker, moving the session off a leg that was in fact serving it
+// (2026-09-26 audit, fourteenth round).
+func TestProxyStream_WholeCompletionWithoutSSEFramesIsRelayed(t *testing.T) {
+	const answer = "hello from a non-streaming upstream"
+	up := streamUpstream(t, `{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"`+answer+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50000,"completion_tokens":7}}`, false)
+	defer up.Close()
+
+	proxy := startCalibProxy(t, up.URL, "sess-stream-whole")
+	body, status := postMessagesStream(t, proxy)
+	events := sseEvents(body)
+
+	if status != http.StatusOK {
+		t.Errorf("a complete non-SSE completion over a stream request got status %d, want 200 — the body is a whole answer, not a failure (events: %v)\nbody:\n%s", status, events, body)
+	}
+	if hasEvent(events, "error") {
+		t.Errorf("a complete non-SSE completion was reported as an error (events: %v)\nbody:\n%s", events, body)
+	}
+	if !strings.Contains(body, answer) {
+		t.Errorf("the answer text never reached the client:\n%s", body)
+	}
+	if !hasEvent(events, "message_stop") {
+		t.Errorf("the relayed completion did not end with message_stop (events: %v)\nbody:\n%s", events, body)
+	}
+}

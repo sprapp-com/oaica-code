@@ -519,6 +519,17 @@ func parseOpenAIToolCalls(tcs []struct {
 		return nil
 	}
 	out := make([]api.ToolCall, 0, len(tcs))
+	// seen drops a repeat of a call already emitted, keyed exactly as the
+	// streaming converter keys its accumulator (id when the upstream sent one,
+	// else name + canonical arguments). Without it two identical id-less calls
+	// each got the SAME synthesized id and the response carried two tool_use
+	// blocks sharing one id — a shape Anthropic never emits, and one that makes
+	// the tool_result round-trip ambiguous (one tool_result satisfies both
+	// blocks, and the follow-up request carries two tool messages with the same
+	// tool_call_id). The streaming path already emitted ONE block for this same
+	// body, so the two paths disagreed about it; they agree now
+	// (2026-09-26 audit, fourteenth round).
+	seen := make(map[string]bool, len(tcs))
 	for _, tc := range tcs {
 		var args api.ToolCallFunctionArguments
 		raw := strings.TrimSpace(tc.Function.Arguments)
@@ -548,6 +559,16 @@ func parseOpenAIToolCalls(tcs []struct {
 			}
 			id = anthropic.ToolCallIDFor(tc.Function.Name, key)
 		}
+		dedupKey := id
+		if tc.ID == "" {
+			// Same key the streaming accumulator uses for an id-less call
+			// (anthropic.go, toolCallsSent): the call's own identity.
+			dedupKey = "\x00" + tc.Function.Name + "\x00" + id
+		}
+		if seen[dedupKey] {
+			continue
+		}
+		seen[dedupKey] = true
 		out = append(out, api.ToolCall{
 			ID:       id,
 			Function: api.ToolCallFunction{Name: tc.Function.Name, Arguments: args},
@@ -2045,6 +2066,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	toolAccums := map[int]*toolAccum{}
 	finishReason := ""
 	var finalUsage *openAIUsage
+	// nonSSE collects the lines that carry no "data:" prefix. An upstream that
+	// ignores stream:true answers a stream request with a WHOLE completion as
+	// one JSON body, and the frame reader below would otherwise walk it line by
+	// line, match nothing, and report a truncated stream (see the adoption in
+	// the tail below).
+	var nonSSE strings.Builder
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -2146,6 +2173,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			if m := upstreamErrorMessage(line, secret); m != "" {
 				upstreamErr = m
 			}
+			if int64(nonSSE.Len()) < httpbody.DefaultMax {
+				nonSSE.WriteString(line)
+				nonSSE.WriteByte('\n')
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -2245,6 +2276,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// stop_reason=tool_use either way. An agent then runs the fabricated
 	// call instead of retrying the turn (2026-09-26 audit).
 	if !completed {
+		// Nothing streamed and no error seen: the body may be a whole
+		// completion the upstream sent instead of frames. Adopt it as the turn
+		// rather than reporting a failure over an answer that exists.
+		if !started && upstreamErr == "" &&
+			adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText) {
+			completed = true
+		}
+	}
+
+	if !completed {
 		msg := upstreamErr
 		if msg == "" {
 			if err := scanner.Err(); err != nil {
@@ -2337,6 +2378,47 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 	}
 	emit(events)
+	return true
+}
+
+// adoptNonSSECompletion handles a stream request the upstream answered with a
+// whole completion instead of SSE frames, and reports whether the body was one.
+//
+// It leaves the reader in exactly the state a completed frame stream would
+// have reached — content and tool calls emitted, finishReason, finalUsage and
+// streamedText set — so the caller's existing tail runs unchanged and the
+// per-field usage gating and cache-read patching apply to this shape too.
+// Reporting it as a truncated stream instead cost the client a 502 with no
+// content on every retry (the upstream produced and billed a whole answer) and
+// marked the leg failed, so three such turns opened its breaker and moved the
+// session off a leg that was serving it (2026-09-26 audit, fourteenth round).
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) bool {
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	var oaiResp openAIChatResponse
+	if err := json.Unmarshal([]byte(raw), &oaiResp); err != nil {
+		return false
+	}
+	// No choices is not an answer: the same body the non-streaming path
+	// refuses ("upstream returned no completion choices"), so it keeps the
+	// failure verdict here.
+	if len(oaiResp.Choices) == 0 {
+		return false
+	}
+
+	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
+		onUsage(oaiResp.Usage.PromptTokens)
+	}
+
+	// Content and tool calls first, with Done unset, so the converter opens and
+	// closes their content blocks before the tail's done event.
+	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
+	emit(conv.Process(api.ChatResponse{Model: upstreamModel, Message: chatResp.Message}))
+
+	*streamedText = len(chatResp.Message.Content) + len(chatResp.Message.Thinking)
+	*finishReason = oaiResp.Choices[0].FinishReason
+	*finalUsage = oaiResp.Usage
 	return true
 }
 
