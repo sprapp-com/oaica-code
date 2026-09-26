@@ -158,6 +158,20 @@ func clineModelIDFor(model string) string {
 	return model
 }
 
+// clineLegacyBaseURLFor is the server root the legacy global state records for
+// a model: the remote's own root for a user-remote model, otherwise the
+// daemon's (unchanged). The legacy state carries a root — the daemon value has
+// never had the /v1 the providers.json entry carries — so the remote form drops
+// its version prefix too (remoteBaseURL) and both shapes stay the same kind of
+// value. Writing the daemon's root for a model only the remote serves sent
+// Cline to 127.0.0.1 for it (2026-09-26 audit).
+func clineLegacyBaseURLFor(model string) string {
+	if remote, _, ok := findUserRemoteForModel(model); ok {
+		return remoteBaseURL(remote)
+	}
+	return clineOllamaRootURL()
+}
+
 func readClineConfig(configPath string) (map[string]any, error) {
 	config := make(map[string]any)
 	if data, err := os.ReadFile(configPath); err == nil {
@@ -236,13 +250,17 @@ func writeClineLegacyGlobalState(configPath string, config map[string]any, model
 		return err
 	}
 
-	baseURL := clineOllamaRootURL()
+	// The same two branches the providers.json write above takes: for a
+	// user-remote model the state has to name the remote and the model id the
+	// remote knows, or Cline reads it as a daemon model (2026-09-26 audit).
+	baseURL := clineLegacyBaseURLFor(model)
+	modelID := clineModelIDFor(model)
 	config["ollamaBaseUrl"] = baseURL
 	config["actModeApiProvider"] = clineLaunchProvider
-	config["actModeOllamaModelId"] = model
+	config["actModeOllamaModelId"] = modelID
 	config["actModeOllamaBaseUrl"] = baseURL
 	config["planModeApiProvider"] = clineLaunchProvider
-	config["planModeOllamaModelId"] = model
+	config["planModeOllamaModelId"] = modelID
 	config["planModeOllamaBaseUrl"] = baseURL
 
 	config["welcomeViewCompleted"] = true
