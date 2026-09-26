@@ -167,6 +167,35 @@ func WriteUsageStatsJSON(w, warn io.Writer, rows []UsageStatsRow, unreadable int
 	return nil
 }
 
+// WriteUsageStatsTable writes the human table `oaica usage` prints. It lives
+// here, beside the reader, rather than in the command's RunE, because the model
+// and backend cells are printed rows of a report nothing else re-checks: the
+// model is the CLIENT's request body (request_log.go), and the backend is a
+// base URL from the user's own remotes.json (redactBaseURL). Either can carry a
+// newline or a control character, and a raw one forges an extra row — a
+// traffic line the log never recorded, complete with request counts — in the
+// command a user runs to find out what their traffic actually was. Both cells
+// are printed through printableName, the same quoting `remote list` and
+// `doctor` use.
+func WriteUsageStatsTable(w io.Writer, rows []UsageStatsRow, unreadable int) {
+	var totalReqs, totalErrs int
+	var totalChars int64
+	fmt.Fprintf(w, "%-28s %-45s %8s %8s %6s %14s\n", "MODEL", "BACKEND", "REQS", "OK", "ERR", "CHARS")
+	for _, r := range rows {
+		fmt.Fprintf(w, "%-28s %-45s %8d %8d %6d %14d\n", printableName(r.Model), printableName(r.Backend), r.Requests, r.OK, r.Errors, r.CharsSum)
+		totalReqs += r.Requests
+		totalErrs += r.Errors
+		totalChars += r.CharsSum
+	}
+	fmt.Fprintf(w, "\ntotal requests: %d  errors: %d  chars: %d\n", totalReqs, totalErrs, totalChars)
+	// A dropped row must not be silent: this report is read as authoritative
+	// over an append-only log nothing rotates (2026-09-26 audit, third round).
+	if unreadable > 0 {
+		fmt.Fprintf(w, "warning: %d log line(s) could not be read and are NOT counted above (over-long or corrupt entries).\n", unreadable)
+	}
+	fmt.Fprintln(w, "(request counts and message char-length only — no token counts locally; real token/$ cost lives on the gateway's usage ledger)")
+}
+
 // maxLogLineBytes caps how much of one line is held in memory. Beyond it the
 // line is truncated and counted as unreadable — a corrupt write cannot make
 // this read unbounded.

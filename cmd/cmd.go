@@ -3012,23 +3012,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				}
 				return nil
 			}
-			var totalReqs, totalErrs int
-			var totalChars int64
-			fmt.Printf("%-28s %-45s %8s %8s %6s %14s\n", "MODEL", "BACKEND", "REQS", "OK", "ERR", "CHARS")
-			for _, r := range rows {
-				fmt.Printf("%-28s %-45s %8d %8d %6d %14d\n", r.Model, r.Backend, r.Requests, r.OK, r.Errors, r.CharsSum)
-				totalReqs += r.Requests
-				totalErrs += r.Errors
-				totalChars += r.CharsSum
-			}
-			fmt.Printf("\ntotal requests: %d  errors: %d  chars: %d\n", totalReqs, totalErrs, totalChars)
-			// A dropped row must not be silent: this report is read as
-			// authoritative over an append-only log nothing rotates
-			// (2026-09-26 audit, third round).
-			if unreadable > 0 {
-				fmt.Printf("warning: %d log line(s) could not be read and are NOT counted above (over-long or corrupt entries).\n", unreadable)
-			}
-			fmt.Println("(request counts and message char-length only — no token counts locally; real token/$ cost lives on the gateway's usage ledger)")
+			launch.WriteUsageStatsTable(os.Stdout, rows, unreadable)
 			return nil
 		},
 	}
