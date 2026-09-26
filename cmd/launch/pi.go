@@ -813,9 +813,30 @@ func isPiOllamaModel(cfg map[string]any) bool {
 	return false
 }
 
+// hasContextWindow reports whether a model entry already carries a context
+// window, which is the marker Pi.Edit reads as "this entry is one createConfig
+// wrote, keep it as-is rather than rebuild it".
+//
+// The document this reads is the one readPiJSONDocument decoded, and that
+// decoder sets UseNumber — so the number arrives as json.Number and the
+// concrete cases below are unreachable from it. The guard used to switch on
+// float64/int/int64 alone (correct for the plain decode it was written
+// against), which after UseNumber landed (64640c6c, 2026-09-26) answered false
+// for every entry on disk: a _launch cloud row carrying a window was rebuilt
+// from scratch on every launch, so createConfig's handful of members replaced
+// it and everything oaica does not model in that entry — the window the router
+// reported among them — was deleted (2026-09-26 audit, twelfth round). The
+// concrete cases are kept so the helper is right whichever decoder fed it, the
+// same shape as toFloat64 in anthropic_openai_proxy.go. A value that does not
+// parse, or does not exceed zero, states no window.
 func hasContextWindow(cfg map[string]any) bool {
 	switch v := cfg["contextWindow"].(type) {
+	case json.Number:
+		n, err := v.Float64()
+		return err == nil && n > 0
 	case float64:
+		return v > 0
+	case float32:
 		return v > 0
 	case int:
 		return v > 0
