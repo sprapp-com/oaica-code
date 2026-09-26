@@ -239,10 +239,7 @@ State lives in <dir>/.oaica-site so edits regenerate one section at a time.`,
 			if err != nil {
 				return err
 			}
-			fmt.Printf("%s — %s (model %s)\n", site.Spec.Title, site.Spec.Tagline, site.Model)
-			for _, s := range site.Spec.Sections {
-				fmt.Printf("  %-16s %-12s %s\n", s.ID, s.Kind, s.Title)
-			}
+			writeSiteSections(os.Stdout, site)
 			return nil
 		},
 	}
@@ -294,4 +291,20 @@ State lives in <dir>/.oaica-site so edits regenerate one section at a time.`,
 
 	root.AddCommand(newCmd, editCmd, sectionsCmd, previewCmd, deployCmd)
 	return root
+}
+
+// writeSiteSections prints the `sections` listing: the header line and one row
+// per section.
+//
+// Every field here comes from site.json, which the model's plan wrote and a
+// hand edit can change — normalizeSpec TrimSpaces a title but cannot remove a
+// newline inside one. Printed raw, such a value paints a second row in the
+// listing (a name, a kind and a summary the spec never held), so each cell goes
+// through PrintableCell, the same quoting `oaica usage`, `model list` and
+// `remote list` apply at their own print sites (2026-09-26 audit, tenth round).
+func writeSiteSections(w io.Writer, site *sitebuilder.Site) {
+	fmt.Fprintf(w, "%s — %s (model %s)\n", launch.PrintableCell(site.Spec.Title), launch.PrintableCell(site.Spec.Tagline), launch.PrintableCell(site.Model))
+	for _, s := range site.Spec.Sections {
+		fmt.Fprintf(w, "  %-16s %-12s %s\n", launch.PrintableCell(s.ID), launch.PrintableCell(s.Kind), launch.PrintableCell(s.Title))
+	}
 }
