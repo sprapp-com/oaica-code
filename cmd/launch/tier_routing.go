@@ -80,7 +80,7 @@ const daemonProbeTTL = 5 * time.Minute
 // proxies to ollama.com answers /api/show without appearing in tags.
 // Returns (found, reachable).
 func daemonHasModelLive(model string) (bool, bool) {
-	host := envconfig.Host().String()
+	host := envconfig.ConnectableHost().String()
 	key := host + "|" + model
 	daemonProbeCache.Lock()
 	if daemonProbeCache.m == nil {
@@ -103,7 +103,7 @@ func daemonHasModelLiveUncached(model string) (bool, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	body, _ := json.Marshal(map[string]string{"model": model})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(envconfig.Host().String(), "/")+"/api/show", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(envconfig.ConnectableHost().String(), "/")+"/api/show", bytes.NewReader(body))
 	if err != nil {
 		return false, false
 	}
@@ -315,7 +315,7 @@ const oversizeNoneValue = "none"
 // slot cannot disagree about which host or which credential the daemon means.
 func daemonEndpoint(model string) launchEndpoint {
 	return launchEndpoint{Source: sourceDaemon, RemoteEndpoint: RemoteEndpoint{
-		Name: "ollama", BaseURL: strings.TrimRight(envconfig.Host().String(), "/") + "/v1", Token: "ollama",
+		Name: "ollama", BaseURL: strings.TrimRight(envconfig.ConnectableHost().String(), "/") + "/v1", Token: "ollama",
 		UpstreamModel: model, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
 	}}
 }

@@ -452,7 +452,7 @@ func buildInlineConfig(primary LaunchModel, models []LaunchModel) (string, error
 		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
 			add(m, ep.Name, ep.Name, ep.BaseURL, ep.Token)
 		} else {
-			add(m, localID, "Ollama", envconfig.Host().String()+"/v1", "")
+			add(m, localID, "Ollama", envconfig.ConnectableHost().String()+"/v1", "")
 		}
 	}
 

@@ -71,7 +71,7 @@ func copilotBaseURLFor(model string) string {
 	if ep, ok := resolveRemoteEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
-	return envconfig.Host().String() + "/v1"
+	return envconfig.ConnectableHost().String() + "/v1"
 }
 
 // copilotModelIDFor is the model id Copilot should use: the bare upstream id

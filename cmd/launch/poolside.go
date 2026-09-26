@@ -36,7 +36,7 @@ func poolsideBaseURLFor(model string) string {
 	if ep, ok := resolveRemoteEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
-	return envconfig.Host().String() + "/v1"
+	return envconfig.ConnectableHost().String() + "/v1"
 }
 
 // poolsideModelIDFor is the model id Poolside should use: the bare upstream id

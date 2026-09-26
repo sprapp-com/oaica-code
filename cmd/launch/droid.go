@@ -178,7 +178,7 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 		entry := modelEntry{
 			Model:           model.Name,
 			DisplayName:     model.Name,
-			BaseURL:         envconfig.Host().String() + "/v1",
+			BaseURL:         envconfig.ConnectableHost().String() + "/v1",
 			APIKey:          droidDaemonKey,
 			Provider:        "generic-chat-completion-api",
 			MaxOutputTokens: maxOutput,

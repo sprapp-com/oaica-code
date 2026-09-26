@@ -257,7 +257,7 @@ func openAIBaseURLAndKey(primary LaunchModel) (baseURL, apiKey, modelID string) 
 	if ep, ok := resolveRemoteEndpoint(primary.Name); ok {
 		return ep.BaseURL, ep.Token, ep.UpstreamModel
 	}
-	return envconfig.Host().String() + "/v1", "ollama", primary.Name
+	return envconfig.ConnectableHost().String() + "/v1", "ollama", primary.Name
 }
 
 func oaicaLaunchAuthorize(req *http.Request) {

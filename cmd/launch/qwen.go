@@ -659,7 +659,7 @@ func (q *Qwen) readConfig() (map[string]any, error) {
 }
 
 func qwenBaseURL() string {
-	return strings.TrimRight(envconfig.Host().String(), "/") + "/v1"
+	return strings.TrimRight(envconfig.ConnectableHost().String(), "/") + "/v1"
 }
 
 // qwenBaseURLFor is the provider base URL Qwen should use: the remote's direct

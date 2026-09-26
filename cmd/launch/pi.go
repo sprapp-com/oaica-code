@@ -910,7 +910,7 @@ func piPickerNameFor(id, providerBaseURL string) string {
 
 // piDaemonProviderBaseURL is the base URL piProviderBaseURL falls back to: the
 // local daemon's OpenAI-compatible endpoint.
-func piDaemonProviderBaseURL() string { return envconfig.Host().String() + "/v1" }
+func piDaemonProviderBaseURL() string { return envconfig.ConnectableHost().String() + "/v1" }
 
 // isPiOllamaModel reports whether a model config entry is managed by oaica launch
 func isPiOllamaModel(cfg map[string]any) bool {
@@ -981,7 +981,7 @@ func piProviderBaseURL(models []LaunchModel) string {
 			return strings.TrimRight(ep.BaseURL, "/")
 		}
 	}
-	return envconfig.Host().String() + "/v1"
+	return envconfig.ConnectableHost().String() + "/v1"
 }
 
 // piProviderKey is the API key Pi's single provider should use: the first
