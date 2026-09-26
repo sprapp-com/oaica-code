@@ -175,6 +175,65 @@ func editorStoredModels(editor Editor, models []string) (stored []string, droppe
 	return models, nil
 }
 
+// managedLiveConfigDrifted reports whether the managed app's live config names
+// a different model than the launch is about to use. An unconfigured app
+// (current == "") is not drift — that is the missing-config case, handled
+// separately — and the two names are compared through modelNamesAreTheSame, so
+// the two spellings of one user-remote model are not read as a change.
+func managedLiveConfigDrifted(current, target string) bool {
+	return current != "" && !modelNamesAreTheSame(current, target)
+}
+
+// sameModelSelection reports whether two selections name the same models,
+// treating a user remote's bare upstream id ("deepseek-chat") and its
+// namespaced picker name ("ds/deepseek-chat") as the same model.
+//
+// Both spellings are ones a launch can save: the picker hands out the
+// namespaced name, and `oaica launch <integration> <bare id>` resolves through
+// the bare sweep and saves what was typed — the same pair droidOwnedEntry
+// accepts on purpose. An editor whose store holds the bare id translates it
+// back to the picker name it belongs to (cline, omp), and that translation is
+// unconditional, so a selection saved under the other spelling compared as
+// different: liveConfigMatches was false on every run and each launch took the
+// configure path again — re-resolving the inventory, reprinting the
+// "configured" block, and rewriting a config that had not changed
+// (2026-09-27 audit, round 19).
+//
+// The two names have to resolve to the SAME endpoint and the same upstream
+// model, so two remotes serving the same id are still different selections.
+func sameModelSelection(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] == b[i] {
+			continue
+		}
+		if !modelNamesAreTheSame(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// modelNamesAreTheSame is sameModelSelection's per-name rule: equal strings, or
+// two names that resolve to one endpoint under one upstream model.
+func modelNamesAreTheSame(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	ae, aok := resolveRemoteEndpoint(a)
+	be, bok := resolveRemoteEndpoint(b)
+	if !aok || !bok {
+		return false
+	}
+	return strings.TrimRight(ae.BaseURL, "/") == strings.TrimRight(be.BaseURL, "/") &&
+		ae.UpstreamModel == be.UpstreamModel
+}
+
 // ManagedSingleModel is the narrow launch-owned config path for integrations
 // like Hermes that have one primary model selected by launcher, need launcher
 // to persist minimal config, and still keep their own model discovery and
@@ -1023,7 +1082,7 @@ func (c *launcherClient) launchEditorIntegration(ctx context.Context, name strin
 	models = stored
 
 	var launchModels []LaunchModel
-	liveConfigMatches := slices.Equal(editor.Models(), models)
+	liveConfigMatches := sameModelSelection(editor.Models(), models)
 	if needsConfigure || req.ModelOverride != "" || !savedMatchesModels(saved, models) || !liveConfigMatches {
 		launchModels = c.modelInventory().Resolve(ctx, models)
 		if err := prepareEditorIntegration(name, editor, launchModels); err != nil {
@@ -1054,8 +1113,14 @@ func (c *launcherClient) launchManagedSingleIntegration(ctx context.Context, nam
 	// current is the live managed app config; target may come from saved launch
 	// state. Rewrite when the live config is missing or has drifted so the app
 	// config converges with the model which launch is about to use.
+	//
+	// The names are compared through modelNamesAreTheSame, not `!=`: this
+	// integration's CurrentModel translates a stored user-remote id back to its
+	// namespaced picker name (ompRemotePickerName), so a launch saved under the
+	// bare id read as drift forever and every run configured the app again
+	// (2026-09-27 audit, round 19).
 	liveConfigMissing := current == ""
-	liveConfigDrifted := current != "" && target != current
+	liveConfigDrifted := managedLiveConfigDrifted(current, target)
 	configured := false
 	if needsConfigure || req.ModelOverride != "" || liveConfigMissing || liveConfigDrifted || !savedMatchesModels(saved, []string{target}) {
 		configureModels, err := c.managedSingleConfigureModels(ctx, managed, target)
