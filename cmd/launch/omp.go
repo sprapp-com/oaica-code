@@ -1,9 +1,7 @@
 package launch
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -318,17 +316,33 @@ func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) erro
 		return err
 	}
 
-	cfg := make(map[string]any)
-	switch existing, readErr := readOMPModelsConfig(); {
-	case readErr == nil:
-		cfg = existing
-	case errors.Is(readErr, fs.ErrNotExist):
-		// Nothing on disk yet — the empty map above is the whole document.
-	default:
+	// The document is edited as a yaml.Node so the user's comments, key order
+	// and scalar spellings survive; only the ollama provider entry is written
+	// back (2026-09-27 audit, round 17 — decoding into a map and marshalling
+	// the whole file back deleted every comment in it).
+	document, err := readYAMLDocument(path)
+	if err != nil {
 		// A document this function cannot parse is one it cannot preserve:
 		// oaica models exactly one provider in that file, so writing the
 		// parsed half back would delete every other provider the user has.
-		return fmt.Errorf("refusing to update %s: %v — oaica writes only the ollama provider in that file, so rewriting a document it cannot read would delete your other providers", path, readErr)
+		return fmt.Errorf("refusing to update %s: %v — oaica writes only the ollama provider in that file, so rewriting a document it cannot read would delete your other providers", path, err)
+	}
+	root := yamlRootMapping(document)
+
+	cfg := make(map[string]any)
+	decoded, err := yamlNodeAsAny(root)
+	if err != nil {
+		return fmt.Errorf("refusing to update %s: %v — oaica writes only the ollama provider in that file, so rewriting a document it cannot read would delete your other providers", path, err)
+	}
+	if decoded != nil {
+		// readYAMLDocument already proved the root is a mapping, so anything
+		// that decodes to something else is a document shape this function
+		// cannot preserve.
+		asMap, ok := decoded.(map[string]any)
+		if !ok {
+			return fmt.Errorf("refusing to update %s: the document's root is not a mapping — oaica writes only the ollama provider in that file, so rewriting a document it cannot read would delete your other providers", path)
+		}
+		cfg = asMap
 	}
 
 	provider := ensureOMPProvider(cfg, primary)
@@ -384,7 +398,14 @@ func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) erro
 	}
 	provider["models"] = merged
 
-	data, err := yaml.Marshal(cfg)
+	// Only the oaica-managed provider entry goes back into the user's document;
+	// every other provider — with its comments — is left untouched.
+	providersNode := yamlEnsureMapping(root, "providers")
+	if err := yamlSetValue(providersNode, ompProviderName, provider); err != nil {
+		return err
+	}
+
+	data, err := yamlMarshalDocument(document)
 	if err != nil {
 		return err
 	}
@@ -410,18 +431,18 @@ func writeOMPAgentConfigLocked(path string) error {
 		return err
 	}
 
-	cfg := make(map[string]any)
-	if data, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
-			return err
-		}
-		if cfg == nil {
-			cfg = make(map[string]any)
-		}
+	// One key is set, and it is set in the user's document rather than in a
+	// re-encoded copy of it: this file holds OMP's own settings beside ours,
+	// with their comments (2026-09-27 audit, round 17).
+	document, err := readYAMLDocument(path)
+	if err != nil {
+		return err
 	}
-	cfg["setupVersion"] = ompSetupVersion
+	if err := yamlSetValue(yamlRootMapping(document), "setupVersion", ompSetupVersion); err != nil {
+		return err
+	}
 
-	data, err := yaml.Marshal(cfg)
+	data, err := yamlMarshalDocument(document)
 	if err != nil {
 		return err
 	}

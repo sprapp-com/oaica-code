@@ -311,36 +311,79 @@ func (h *Hermes) Configure(model string) error {
 }
 
 func writeHermesConfig(configPath, model string, models []string) error {
-	cfg := map[string]any{}
-	if data, err := os.ReadFile(configPath); err == nil {
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
-			return fmt.Errorf("parse hermes config: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
+	// The user's document is edited as a yaml.Node, not decoded into a map and
+	// marshalled back: that rewrite deleted every comment in the file and
+	// re-rendered every scalar (1.0 became 1, a hand-written date became the
+	// encoder's timestamp) on every launch (2026-09-27 audit, round 17). Only
+	// the keys oaica manages are set below; the rest of the file — other
+	// providers' entries included — is left exactly as the user wrote it.
+	document, err := readYAMLDocument(configPath)
+	if err != nil {
+		return fmt.Errorf("parse hermes config: %w", err)
+	}
+	root := yamlRootMapping(document)
+
+	// The provider map is merged in Go (hermesUserProviders rebuilds the
+	// managed entry and hermesWithoutManagedCustomProviders filters the
+	// legacy list), so the value is decoded for that work and written back into
+	// the document afterwards.
+	providersValue, err := yamlNodeAsAny(yamlNodeValue(root, "providers"))
+	if err != nil {
+		return fmt.Errorf("parse hermes providers: %w", err)
+	}
+	providers := hermesUserProviders(providersValue)
+	entry := hermesManagedProviderEntry(providers)
+	if entry == nil {
+		entry = make(map[string]any)
+	}
+	entry["name"] = hermesProviderName
+	entry["api"] = hermesBaseURLFor(model)
+	entry["default_model"] = hermesModelIDFor(model)
+	entry["models"] = hermesStringListAny(models)
+
+	providersNode := yamlEnsureMapping(root, "providers")
+	if err := yamlSetValue(providersNode, hermesProviderKey, entry); err != nil {
 		return err
 	}
+	yamlDeleteKey(providersNode, hermesLegacyKey)
 
-	modelSection, _ := cfg["model"].(map[string]any)
-	if modelSection == nil {
-		modelSection = make(map[string]any)
+	customValue, err := yamlNodeAsAny(yamlNodeValue(root, "custom_providers"))
+	if err != nil {
+		return fmt.Errorf("parse hermes custom providers: %w", err)
 	}
-	applyHermesManagedProviders(cfg, hermesBaseURLFor(model), hermesModelIDFor(model), models)
+	if customProviders := hermesWithoutManagedCustomProviders(customValue); len(customProviders) == 0 {
+		yamlDeleteKey(root, "custom_providers")
+	} else if err := yamlSetValue(root, "custom_providers", customProviders); err != nil {
+		return err
+	}
 
 	// launch writes the minimum provider/default-model settings needed to
 	// bootstrap Hermes against Ollama. The active provider stays on a
 	// launch-owned key so /model stays aligned with the launcher-managed entry,
 	// and the Ollama endpoint lives in providers: so the picker shows one row.
-	modelSection["provider"] = hermesProviderKey
-	modelSection["default"] = hermesModelIDFor(model)
-	modelSection["base_url"] = hermesBaseURLFor(model)
-	modelSection["api_key"] = hermesKeyFor(model)
-	cfg["model"] = modelSection
+	modelSection := yamlEnsureMapping(root, "model")
+	for key, value := range map[string]string{
+		"provider": hermesProviderKey,
+		"default":  hermesModelIDFor(model),
+		"base_url": hermesBaseURLFor(model),
+		"api_key":  hermesKeyFor(model),
+	} {
+		if err := yamlSetValue(modelSection, key, value); err != nil {
+			return err
+		}
+	}
 
 	// use Hermes' built-in web toolset for now.
 	// TODO(parthsareen): move this to using Ollama web search
-	cfg["toolsets"] = mergeHermesToolsets(cfg["toolsets"])
+	toolsetsValue, err := yamlNodeAsAny(yamlNodeValue(root, "toolsets"))
+	if err != nil {
+		return fmt.Errorf("parse hermes toolsets: %w", err)
+	}
+	if err := yamlSetValue(root, "toolsets", mergeHermesToolsets(toolsetsValue)); err != nil {
+		return err
+	}
 
-	data, err := yaml.Marshal(cfg)
+	data, err := yamlMarshalDocument(document)
 	if err != nil {
 		return err
 	}
