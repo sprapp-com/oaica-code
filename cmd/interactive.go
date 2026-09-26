@@ -230,7 +230,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			}
 
 			opts.Model = args[1]
-			opts.Messages = []api.Message{}
+			oaicaHistory = resetConversation(&opts, oaicaHistory)
 			opts.LoadedMessages = nil
 			fmt.Printf("Loading model '%s'\n", opts.Model)
 			info, err := client.Show(cmd.Context(), &api.ShowRequest{Model: opts.Model})
@@ -286,11 +286,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			fmt.Printf("Created new model '%s'\n", args[1])
 			continue
 		case strings.HasPrefix(line, "/clear"):
-			opts.Messages = []api.Message{}
-			if opts.System != "" {
-				newMessage := api.Message{Role: "system", Content: opts.System}
-				opts.Messages = append(opts.Messages, newMessage)
-			}
+			oaicaHistory = resetConversation(&opts, oaicaHistory)
 			fmt.Println("Cleared session context")
 			continue
 		case strings.HasPrefix(line, "/set"):
@@ -677,15 +673,14 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		if sb.Len() > 0 && multiline == MultilineNone && oaicaActiveModel != "" {
 			// OAICA thin-client path: bypass Ollama's native chat() entirely,
 			// speak OpenAI-shaped /v1/chat/completions to api.oaica.com.
-			oaicaHistory = append(oaicaHistory, oaicaChatMessage{Role: "user", Content: sb.String()})
-			reply, err := oaicaChat(oaicaActiveModel, oaicaHistory)
+			newHistory, reply, err := oaicaTurn(oaicaActiveModel, oaicaHistory, sb.String())
+			oaicaHistory = newHistory
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
 				sb.Reset()
 				continue
 			}
 			fmt.Println(reply)
-			oaicaHistory = append(oaicaHistory, oaicaChatMessage{Role: "assistant", Content: reply})
 			sb.Reset()
 			continue
 		}
@@ -722,6 +717,38 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			sb.Reset()
 		}
 	}
+}
+
+// resetConversation starts a new conversation and returns the (empty) OAICA
+// history for it. The interactive session holds the conversation in two
+// places: opts.Messages, which the native path sends, and oaicaHistory, which
+// the OAICA thin-client path posts to the router. Every "this is a new
+// conversation now" site has to reset both — /clear did not, so a user who
+// cleared the context and then kept talking through the thin-client path kept
+// sending the conversation they had just cleared (2026-09-26 audit).
+func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChatMessage {
+	opts.Messages = []api.Message{}
+	if opts.System != "" {
+		opts.Messages = append(opts.Messages, api.Message{Role: "system", Content: opts.System})
+	}
+	return nil
+}
+
+// oaicaTurn appends the user's turn, asks the OAICA router for a reply, and
+// returns the conversation as it stands afterwards: the user turn plus the
+// reply on success, and NOTHING on failure.
+//
+// A failed turn must not be kept. The model never answered it, so leaving it
+// in the history means every later request re-sends a prompt the user got no
+// reply to — once more for each retry — until the router's context is full of
+// turns the conversation never had (2026-09-26 audit).
+func oaicaTurn(model string, history []oaicaChatMessage, prompt string) ([]oaicaChatMessage, string, error) {
+	next := append(history, oaicaChatMessage{Role: "user", Content: prompt})
+	reply, err := oaicaChat(model, next)
+	if err != nil {
+		return history, "", err
+	}
+	return append(next, oaicaChatMessage{Role: "assistant", Content: reply}), reply, nil
 }
 
 func NewCreateRequest(name string, opts runOptions) *api.CreateRequest {
