@@ -419,9 +419,23 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 // written into the same document, whose baseUrl is that remote's host. A value
 // left there is the bearer qwen attaches to that host the next time it is run
 // without oaica, so keeping the user's ollama.com key means handing it to an
-// endpoint that never asked for it. Loopback cannot disclose anything, which is
-// why the round-19 rule still holds there and the destruction it prevents is
-// still worth preventing.
+// endpoint that never asked for it.
+//
+// The rule is host-based, not "loopback": a loopback base URL is only as local
+// as what listens on it, and an `ssh -L` forward — how this fleet reaches a
+// remote box's vLLM — makes 127.0.0.1:PORT that box. The choice is deliberate
+// and the residual risk is accepted: the alternative is blanking the user's
+// ollama.com key on every launch of a keyless LOCAL endpoint (a plain llama.cpp
+// or `oaica serve` on this machine), which is the round-19 regression and hits
+// far more setups than a forwarded one. A user who forwards a keyless endpoint
+// to a shared host is handing out a key that the launch had no use for and that
+// they can rotate; a user whose local server gets their key deleted has no way
+// to know (2026-09-27 audit, round 21, F3 — behaviour kept, claim corrected).
+//
+// For the same reason the token of an AUTHENTICATED remote is written over
+// whatever is stored (2026-09-27 audit, round 21, F9): the provider entry can
+// only reach that remote with that token, and refusing instead would fail the
+// launch outright.
 func applyQwenOllamaKey(envCfg map[string]any, model string) {
 	key := qwenKeyFor(model)
 	if _, isRemote := resolveRemoteEndpoint(model); isRemote {

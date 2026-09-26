@@ -564,6 +564,19 @@ func (h *Hermes) runInstallScript() error {
 }
 
 func (h *Hermes) listModels(defaultModel string) []string {
+	// The list is written into the provider entry the launch configures, beside
+	// an `api` that is EITHER the daemon's /v1 or a user remote's base
+	// (hermesBaseURLFor). Reading the daemon's inventory for both advertised the
+	// local models — the daemon's, and every user-remote model the bare-id sweep
+	// finds — as available on the remote, so the user picked one and Hermes
+	// posted a model that remote does not serve (2026-09-27 audit, round 21,
+	// F6). Each endpoint is now listed from itself, and a remote that cannot be
+	// listed falls back to the model this launch configures rather than to
+	// another endpoint's models.
+	if remote, ok := hermesConfiguredRemoteForBase(hermesBaseURLFor(defaultModel)); ok {
+		return hermesRemoteModelList(remote, defaultModel)
+	}
+
 	client := hermesOllamaClient()
 	resp, err := client.List(context.Background())
 	if err != nil {
@@ -590,6 +603,34 @@ func (h *Hermes) listModels(defaultModel string) []string {
 	}
 	if len(models) == 0 {
 		return []string{defaultModel}
+	}
+	return models
+}
+
+// hermesRemoteModelList is the model list for a provider whose api is a user
+// remote: that remote's own inventory, in the bare ids the config selects by
+// (remoteDisplayID), with the launched model first. The launched model is added
+// from the endpoint oaica resolved rather than from the fetched list, so a
+// remote whose /v1/models omits it (llama-server reports one entry per loaded
+// model, and a proxy may report none) still gets a list that contains the model
+// Hermes was just configured to select.
+func hermesRemoteModelList(remote userRemote, defaultModel string) []string {
+	models := []string{hermesModelIDFor(defaultModel)}
+	seen := map[string]struct{}{models[0]: {}}
+	ids, err := fetchRemoteModelsCached(remote)
+	if err != nil {
+		return models
+	}
+	for _, id := range ids {
+		name := strings.TrimSpace(remoteDisplayID(id))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		models = append(models, name)
 	}
 	return models
 }
