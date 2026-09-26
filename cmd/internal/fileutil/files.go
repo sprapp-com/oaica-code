@@ -5,7 +5,9 @@ package fileutil
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -139,6 +141,73 @@ func BackupDir() string {
 	return filepath.Join(os.TempDir(), "ollama-backup")
 }
 
+// timeNow is the clock the backup name is stamped from. It is a variable so a
+// test can hold it still: the collision this stamp had at second granularity
+// only shows up when two backups land in the same second, and whether they do
+// otherwise depends on how fast the machine is.
+var timeNow = time.Now
+
+// backupName renders the name a backup of base gets when it is the first (seq 1)
+// or a later backup claimed within the same wall-clock second.
+func backupName(base string, stamp int64, seq int) string {
+	if seq <= 1 {
+		return fmt.Sprintf("%s.%d", base, stamp)
+	}
+	return fmt.Sprintf("%s.%d-%d", base, stamp, seq)
+}
+
+// writeNewFileExclusive creates dst and writes data, failing with os.ErrExist
+// rather than truncating when the name is already taken. The claim on the name
+// is the creation itself, so two writers racing for it cannot both win.
+func writeNewFileExclusive(dst string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return f.Close()
+}
+
+// nextBackupSeq returns the seq the next backup of name for stamp must use to
+// stay newer than every backup already claimed for that stamp.
+//
+// The names are what pruneOldBackups orders by, so a name freed by pruning must
+// not be handed out again: it would sort as the OLDEST name for that second
+// while holding the NEWEST bytes, and the bounded "keep the 5 most recent"
+// policy would then keep stale copies and delete the fresh one (observed with
+// eight writes inside one second, where the plain "<name>.<stamp>" was pruned
+// and then immediately re-claimed).
+func nextBackupSeq(dir, name string, stamp int64) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 1
+	}
+	first := fmt.Sprintf("%s.%d", name, stamp)
+	next := 1
+	for _, entry := range entries {
+		entryName := entry.Name()
+		if entryName != first && !strings.HasPrefix(entryName, first+"-") {
+			continue
+		}
+		seq := 1
+		if entryName != first {
+			parsed, err := strconv.Atoi(strings.TrimPrefix(entryName, first+"-"))
+			if err != nil {
+				continue
+			}
+			seq = parsed
+		}
+		if seq+1 > next {
+			next = seq + 1
+		}
+	}
+	return next
+}
+
 func writeBackupCopy(srcPath string, integration string) (string, error) {
 	dir := BackupDir()
 	name := filepath.Base(srcPath)
@@ -153,11 +222,39 @@ func writeBackupCopy(srcPath string, integration string) (string, error) {
 		return "", err
 	}
 
-	backupPath := filepath.Join(dir, fmt.Sprintf("%s.%d", name, time.Now().Unix()))
-	if err := copyFile(srcPath, backupPath); err != nil {
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
 		return "", err
 	}
-	_ = os.Chmod(backupPath, 0o600)
+
+	// Claim a FREE name, don't trust the timestamp to be one. At second
+	// granularity two backups of the same file collide, and the backup is
+	// what O_TRUNC used to eat: the second call overwrote the first — the
+	// copy holding the user's ORIGINAL pre-oaica content — with oaica's own
+	// intermediate write, so the file the user is promised a backup of was
+	// gone and nothing said so (2026-09-26 audit, round 11). One
+	// `oaica launch openclaw` reaches it: Openclaw.Edit writes
+	// ~/.openclaw/openclaw.json and configureOllamaWebSearch, called from the
+	// same Run, writes it again with no subprocess in between on any launch
+	// that is not the first. Same claim-a-free-name stance as
+	// quarantineAuthStore (cmd/launch/auth_store.go).
+	stamp := timeNow().Unix()
+	backupPath := ""
+	for seq := nextBackupSeq(dir, name, stamp); ; seq++ {
+		candidate := filepath.Join(dir, backupName(name, stamp, seq))
+		// No iteration cap: the starting seq is already past every name on
+		// disk, so this only loops again when another writer claimed the same
+		// name in between, and each iteration moves to a strictly higher seq.
+		if err := writeNewFileExclusive(candidate, data, 0o600); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return "", err
+		}
+		backupPath = candidate
+		break
+	}
+
 	pruneOldBackups(dir, name, maxBackupsPerFile)
 	return backupPath, nil
 }
@@ -236,6 +333,10 @@ func pruneOldBackups(dir, name string, keep int) {
 	type backupEntry struct {
 		name      string
 		timestamp int64
+		// seq is the "-N" a second backup claimed in the same second, so
+		// backups taken inside one second still order by when they were taken
+		// rather than by how their name happens to sort.
+		seq int64
 	}
 
 	prefix := name + "."
@@ -245,7 +346,17 @@ func pruneOldBackups(dir, name string, keep int) {
 			continue
 		}
 
-		timestamp, err := strconv.ParseInt(strings.TrimPrefix(entry.Name(), prefix), 10, 64)
+		stem := strings.TrimPrefix(entry.Name(), prefix)
+		seq := int64(1)
+		if dash := strings.IndexByte(stem, '-'); dash >= 0 {
+			parsed, err := strconv.ParseInt(stem[dash+1:], 10, 64)
+			if err != nil {
+				continue
+			}
+			seq = parsed
+			stem = stem[:dash]
+		}
+		timestamp, err := strconv.ParseInt(stem, 10, 64)
 		if err != nil {
 			continue
 		}
@@ -253,6 +364,7 @@ func pruneOldBackups(dir, name string, keep int) {
 		backups = append(backups, backupEntry{
 			name:      entry.Name(),
 			timestamp: timestamp,
+			seq:       seq,
 		})
 	}
 
@@ -263,6 +375,9 @@ func pruneOldBackups(dir, name string, keep int) {
 	sort.Slice(backups, func(i, j int) bool {
 		if backups[i].timestamp != backups[j].timestamp {
 			return backups[i].timestamp > backups[j].timestamp
+		}
+		if backups[i].seq != backups[j].seq {
+			return backups[i].seq > backups[j].seq
 		}
 		return backups[i].name > backups[j].name
 	})
