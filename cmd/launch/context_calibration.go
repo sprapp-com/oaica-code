@@ -177,10 +177,20 @@ func (c *promptCalibrator) estimate(key string, bodyBytes int) (est, sampleBytes
 // margin stayed anchored to the other leg's 600 KB). See
 // context_calibration_leg_isolation_integrity_test.go (2026-09-26 audit).
 //
-// The leg's identity is its base URL, falling back to its label for a leg
-// with no URL of its own (the native passthrough). sessionID keeps two
-// concurrent launches apart; a launcher that set none falls back to the label
-// for that too.
+// The leg's identity is its base URL AND the upstream model, falling back to
+// its label for a leg with no URL of its own (the native passthrough).
+// sessionID keeps two concurrent launches apart; a launcher that set none falls
+// back to the label for that too.
+//
+// The model belongs in the key for the reason the round above put the URL
+// there: one host is not one leg. The code says so itself — sameRoute
+// (context_window_remote.go) is "same base URL AND same upstream model", and
+// the documented same-remote tier split (`--model box/small --sonnet-model
+// box/big`) puts two tokenizers and two context windows behind one URL. Keyed
+// on the URL alone those legs shared a slot, so a 600 KB turn on the 262k leg
+// set the margin for the 32k leg and refused a 40 KB turn with the same
+// impossible message ("10017 tokens > 32752 maximum"), one level down
+// (2026-09-26 audit, twelfth round).
 func legCalibrationKey(sessionID string, r proxyRoute) string {
 	key := sessionID
 	if key == "" {
@@ -189,6 +199,8 @@ func legCalibrationKey(sessionID string, r proxyRoute) string {
 	leg := r.BaseURL
 	if leg == "" {
 		leg = r.Label
+	} else if r.UpstreamModel != "" {
+		leg += "\x00" + r.UpstreamModel
 	}
 	return key + "\x00" + leg
 }
