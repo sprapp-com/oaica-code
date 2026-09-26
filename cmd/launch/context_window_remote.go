@@ -94,7 +94,24 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 		return 0
 	}
 	if route.Key != "" {
-		req.Header.Set("Authorization", "Bearer "+route.Key)
+		// An Anthropic-wire row authenticates with x-api-key +
+		// anthropic-version, not a Bearer: this probe was the one consumer of
+		// a remote's /models that still sent "Authorization: Bearer" to every
+		// route, so zai-coding-plan, minimax-coding-plan and a raw
+		// api.anthropic.com row answered 401 and the launch ran with no real
+		// window — no CLAUDE_CODE_MAX_CONTEXT_TOKENS hint and no context-fit
+		// clamp ceiling in the proxy (2026-09-26 audit, tenth round). The
+		// branch below is the one fetchRemoteModels (user_remotes.go) and
+		// probeRemote (doctor.go) already take for the same URL, and
+		// x-api-key is the header the proxy's own passthrough injects for
+		// these rows (proxyRoute.anthropicPassthroughTarget,
+		// anthropic_openai_proxy.go).
+		if route.Wire == "anthropic" {
+			req.Header.Set("x-api-key", route.Key)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+route.Key)
+		}
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
