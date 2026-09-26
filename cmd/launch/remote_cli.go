@@ -56,6 +56,26 @@ type RemoteAddOptions struct {
 	// the new URL (2026-09-26 audit). Clearing is a typed intent precisely
 	// because it cannot be undone from anything oaica holds.
 	KeySet bool
+	// WireSet reports that the caller passed --wire, and ToolFormatSet that it
+	// passed --tool-format. Both follow Version's rule rather than the usual
+	// "absent means cleared" one, because neither default is neutral:
+	//
+	//   - Wire's default (openai) MOVES THE ENDPOINT. A row for a vendor that
+	//     speaks Anthropic natively 404s on <base>/chat/completions (the
+	//     2026-09-25 z.ai failure), so `oaica remote add zai --base-url <new>`
+	//     — a repoint with nothing to say about the wire — silently turned a
+	//     working passthrough row into a broken translated one, with a
+	//     confirmation line that did not mention it.
+	//   - ToolFormat's default is INFERRED from the wire, so clearing it
+	//     reverts a deliberate setting to whatever the wire implies: a model
+	//     pinned to "freeform" or "none" because it cannot hold a tool_use
+	//     loop went back to "tool_calls", which is precisely the pairing the
+	//     capability gate exists to refuse.
+	//
+	// Both are typeable, so the reset is available — it just has to be meant
+	// (`--wire openai`, `--tool-format tool_calls`).
+	WireSet       bool
+	ToolFormatSet bool
 }
 
 // loadUserRemotesFileRaw reads remotes.json WITHOUT merging builtinRemotes():
@@ -269,6 +289,20 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 				if !opts.VersionSet {
 					r.Version = existing.Version
 				}
+				// Wire and ToolFormat keep the same rule (see WireSet): their
+				// defaults are not neutral either, and an edit that mentions
+				// neither flag used to move the endpoint or re-open a tool loop
+				// the row had deliberately closed.
+				if !opts.WireSet {
+					r.Wire = existing.Wire
+				}
+				if !opts.ToolFormatSet {
+					r.ToolFormat = existing.ToolFormat
+				}
+				// Wire and ToolFormat keep the same rule (see WireSet): their
+				// defaults are not neutral either, and an edit that mentions
+				// neither flag used to move the endpoint or re-open a tool loop
+				// the row had deliberately closed.
 				// The credential is preserved unless the caller said something
 				// about it (KeySet) — see RemoteAddOptions.KeySet. Passing one
 				// of the two flags replaces BOTH fields, because the pair is
