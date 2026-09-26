@@ -871,6 +871,21 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		})
 	}
 
+	if r.Message.Thinking != "" && c.thinkingDone {
+		// Reasoning that arrives AFTER the thinking block was closed — the
+		// model answered (or a tool call was flushed) and only then emitted
+		// more reasoning — used to produce no event at all: the guard below
+		// is there to avoid re-opening a CLOSED block, not to discard text,
+		// so the client silently lost it with no error and nothing to
+		// diagnose, in exactly the shape agentic reasoning models produce
+		// (they re-emit reasoning between tool calls). An assistant turn's
+		// content is an ARRAY of blocks and the client renders them in
+		// arrival order, so this opens a NEW thinking block at the current
+		// index instead (2026-09-26 audit, fifteenth round).
+		c.thinkingStarted = false
+		c.thinkingDone = false
+	}
+
 	if r.Message.Thinking != "" && !c.thinkingDone {
 		if c.textStarted {
 			events = append(events, StreamEvent{
