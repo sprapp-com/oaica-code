@@ -1562,6 +1562,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		w = rec
 		defer func() {
 			entry.StatusCode = rec.status()
+			// Duration is set HERE, not where the entry was built: the row is
+			// now constructed before the upstream call, so a duration captured
+			// at construction would report the marshalling time and nothing
+			// else — a field that means "how long the request took" would
+			// silently become zero for every successful request.
+			entry.DurationMs = time.Since(started).Milliseconds()
 			appendRequestLog(entry)
 		}()
 
