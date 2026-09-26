@@ -343,12 +343,24 @@ func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) erro
 	var merged []any
 	seen := make(map[string]bool, len(ordered))
 	for _, model := range ordered {
-		if model.Name == "" || seen[model.Name] {
+		if model.Name == "" {
 			continue
 		}
-		seen[model.Name] = true
+		// Keyed on the id the entry will carry, not the picker name: that is
+		// what existingByID holds (and what the carry-over sweep below
+		// compares against), so the merge finds the row this same function
+		// wrote last time and preserves its unmodeled fields instead of
+		// rebuilding it from scratch and leaving the old copy behind as a
+		// duplicate (2026-09-26 audit, twelfth round).
+		id := ompModelID(model.Name)
+		if seen[id] {
+			// Two picker names resolving to one upstream id are ONE row in
+			// this file, which is keyed by id; keep the first.
+			continue
+		}
+		seen[id] = true
 		entry := ompModelConfig(model)
-		if existing, ok := existingByID[model.Name]; ok {
+		if existing, ok := existingByID[id]; ok {
 			for key, value := range existing {
 				if _, overridden := entry[key]; !overridden {
 					entry[key] = value
@@ -574,11 +586,24 @@ func ompModelEntriesByID(provider map[string]any) map[string]map[string]any {
 	return out
 }
 
-func ompModelConfig(modelInfo LaunchModel) map[string]any {
-	id := modelInfo.Name
-	if ep, ok := resolveRemoteEndpoint(modelInfo.Name); ok {
-		id = ep.UpstreamModel
+// ompModelID is the id this package writes into OMP's models.yml for a
+// model: the bare upstream id for a user remote, otherwise the picker name.
+//
+// It is the ONLY key for an entry in that file, so every lookup against the
+// existing document has to use it rather than the model's picker name. Using
+// the picker name missed the entry this same function had written, which both
+// dropped every field oaica does not model off the reconfigured row and left
+// the old row in place as a second copy of the same model (2026-09-26 audit,
+// twelfth round).
+func ompModelID(modelName string) string {
+	if ep, ok := resolveRemoteEndpoint(modelName); ok {
+		return ep.UpstreamModel
 	}
+	return modelName
+}
+
+func ompModelConfig(modelInfo LaunchModel) map[string]any {
+	id := ompModelID(modelInfo.Name)
 	entry := map[string]any{
 		"id":   id,
 		"name": id,
