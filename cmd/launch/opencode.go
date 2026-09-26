@@ -316,7 +316,7 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 			if pairSet[[2]string{pid, modelID}] {
 				return true
 			}
-			if pid == "ollama" || pid == "ollama-local" {
+			if opencodeIsDaemonProviderID(pid) {
 				return modelSet[modelID]
 			}
 			return false
@@ -392,6 +392,35 @@ func opencodeDaemonProviderID(models []LaunchModel) string {
 			return id
 		}
 	}
+}
+
+// opencodeIsDaemonProviderID reports whether a provider id is one the daemon
+// block has used: "ollama", or the "ollama-local"/"ollama-local-N" renames
+// opencodeDaemonProviderID falls back to. The two spellings were hard-coded at
+// the two call sites, so a launch that had renamed the block twice — a remote
+// literally named "ollama" AND one named "ollama-local" — left rows under
+// "ollama-local-2" that no launch would clean up: they stayed in opencode's
+// picker after the model was gone, and readModelJSONModels did not see the
+// daemon's own rows, so the launch rewrote the state file on every run
+// (2026-09-27 audit, round 21, F13).
+func opencodeIsDaemonProviderID(pid string) bool {
+	rest, ok := strings.CutPrefix(pid, "ollama")
+	if !ok {
+		return false
+	}
+	if rest == "" || rest == "-local" {
+		return true
+	}
+	digits, ok := strings.CutPrefix(rest, "-local-")
+	if !ok || digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // opencodeProviderFor reports which provider block declares m and the model id
@@ -510,8 +539,8 @@ func readModelJSONModels() []string {
 		if !ok {
 			continue
 		}
-		// Either spelling of the daemon block (see opencodeDaemonProviderID).
-		if pid, _ := e["providerID"].(string); pid != "ollama" && pid != "ollama-local" {
+		// Any id the daemon block has used (see opencodeDaemonProviderID).
+		if pid, _ := e["providerID"].(string); !opencodeIsDaemonProviderID(pid) {
 			continue
 		}
 		if id, ok := e["modelID"].(string); ok && id != "" {
