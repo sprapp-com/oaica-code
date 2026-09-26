@@ -125,6 +125,15 @@ func printPriceBanner(ep RemoteEndpoint) {
 // endpoint, warning-and-proceeding under --force-tools.
 func gateRemoteToolsEndpoint(ep RemoteEndpoint, wants ToolWire, force bool) error {
 	printPriceBanner(ep)
+	// Wire mismatch first, and NOT downgradable: an OpenAI-wire integration
+	// posts /chat/completions, and the translation proxy cannot carry that to a
+	// /v1/messages endpoint — the proxy's own note records the 404 it earns
+	// ("z.ai's /api/anthropic answers 404 ... to /chat/completions"). The tool
+	// gate below refuses on tool FORMAT, which --force-tools exists to override;
+	// forcing past this one would only send requests that cannot succeed.
+	if wants == toolWireOpenAI && ep.Wire == "anthropic" {
+		return fmt.Errorf("model %q on remote %q speaks the Anthropic wire (/v1/messages); this integration drives an OpenAI tool loop and posts to /chat/completions, where such an endpoint answers 404 — use it with the Anthropic-wire integrations (`oaica launch claude`, which speaks /v1/messages natively), or point this one at an OpenAI-compatible remote. --force-tools cannot help: the request shape is wrong, not the tool format", ep.UpstreamModel, ep.Name)
+	}
 	ok, reason := toolGateDecision(wants, ep)
 	if ok {
 		return nil
