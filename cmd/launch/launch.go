@@ -164,7 +164,7 @@ type narrowingEditor interface {
 // prepareEditorIntegration records every name it is handed as the integration's
 // state while the editor writes whatever it can hold, so for a narrowing editor
 // the recorded state was a list the store never contains: savedMatchesModels
-// and liveConfigMatches (slices.Equal(editor.Models(), models), below) were both
+// and liveConfigMatches (sameModelSelection(editor.Models(), models), below) were both
 // false on every launch, each run rewrote the config it had just read and
 // reprinted the configured block, and the extra selections were dropped without
 // a word (2026-09-26 audit, fifteenth round).

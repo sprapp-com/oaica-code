@@ -378,7 +378,7 @@ func clineProviderModel(home string) string {
 // provider settings as the remote's base URL, the legacy state as its root —
 // and they store, for a user-remote model, the bare upstream id. Answering
 // with that id names a model the launcher never saved (it saves the picker
-// name), so liveConfigMatches (slices.Equal(editor.Models(), models),
+// name), so liveConfigMatches (sameModelSelection(editor.Models(), models),
 // launch.go) was false on every run and each launch rewrote the config it had
 // just read (2026-09-26 audit, thirteenth round — the same fix pi, droid and
 // hermes carry). Either recorded form matches, because the two stores record
