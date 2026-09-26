@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
@@ -232,6 +233,62 @@ func validateRemoteBaseURL(baseURL string) error {
 	return nil
 }
 
+// validateRemoteVersion refuses an --api-version that cannot be the URL path
+// segment it is used as (2026-09-26 audit, round 13).
+//
+// The version was the one field `remote add` stored verbatim: only
+// strings.TrimSpace was applied, while --base-url right next to it went
+// through validateRemoteBaseURL. It is not decoration — openAIBase concatenates
+// it into the URL this remote serves EVERY request from
+// (remoteBaseURL(r)+"/"+v, and modelsURL under it), so:
+//
+//   - "v1?x=1" becomes "https://api.deepseek.com/v1?x=1/chat/completions": the
+//     query swallows the path and every request goes somewhere the user never
+//     configured, with a doctor line and a failure that name neither this flag
+//     nor the cause (the same shape --base-url already refuses);
+//   - "../../../../admin" becomes "https://api.deepseek.com/../../../../admin",
+//     a path traversal out of the base URL the user typed;
+//   - a control character forges a line wherever the value is printed —
+//     `oaica remote show` grew a second, fabricated `base_url:` row.
+//
+// THE RULE: the version may contain only what belongs in a URL PATH SEGMENT —
+// no "?" or "#", no "/", no dot-segment ("." or ".."), no control character,
+// no whitespace (ASCII or Unicode: a non-breaking space is a space to the URL
+// the transport builds).
+//
+// Normalised the same way openAIBase normalises it (TrimSpace, then trim of
+// the surrounding "/"), so a value that works is not refused for a reason the
+// user cannot see: "/v1/" and "v1" build the same URL and are both accepted.
+//
+// This is add/update-time only. remotes.json is hand-editable, so it cannot be
+// the only line of defence: WriteRemoteShow prints the value QUOTED for a
+// version that reached the file by hand (or before this rule existed).
+func validateRemoteVersion(version string) error {
+	v := strings.Trim(strings.TrimSpace(version), "/")
+	if v == "" || strings.EqualFold(v, remoteVersionNone) {
+		return nil // the default, or "append nothing at all"
+	}
+	// %q, not the raw value: this message is printed to the terminal and the
+	// value is exactly the one that can carry a newline.
+	shown := func() string { return strconv.Quote(strings.TrimSpace(version)) }
+	for _, r := range v {
+		switch {
+		case isControlRune(r):
+			return fmt.Errorf("--api-version %s contains a control character — it is concatenated into the URL this remote sends every request to and is printed by `oaica remote show`, so an embedded newline forges an extra field line there", shown())
+		case unicode.IsSpace(r):
+			return fmt.Errorf("--api-version %s contains whitespace — the version is one URL path segment (e.g. --api-version v4)", shown())
+		case r == '?', r == '#':
+			return fmt.Errorf("--api-version %s carries a query or fragment — oaica appends \"/chat/completions\" after this value, so anything after \"?\" or \"#\" truncates that path and every request goes to the wrong URL (put the endpoint's version prefix here, e.g. --api-version v1)", shown())
+		case r == '/':
+			return fmt.Errorf("--api-version %s contains a \"/\" — the version is ONE path segment appended to base_url, never a path of its own (\"..\" would climb out of the base URL)", shown())
+		}
+	}
+	if v == "." || v == ".." {
+		return fmt.Errorf("--api-version %s is a relative path segment — it is appended to base_url as one segment, so it must name a version (e.g. --api-version v1), not climb the path", shown())
+	}
+	return nil
+}
+
 // RemoteAdd creates or replaces an entry in remotes.json. Returns the entry
 // written so the caller can print a confirmation.
 func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
@@ -270,6 +327,15 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 	toolFormat := strings.ToLower(strings.TrimSpace(opts.ToolFormat))
 	if toolFormat != "" && !oneOf(toolFormat, validRemoteToolFormats) {
 		return userRemote{}, fmt.Errorf("--tool-format must be one of %s", strings.Join(validRemoteToolFormats, ", "))
+	}
+	// Checked here, not after the lock is taken: a version that cannot be a URL
+	// path segment must not be stored at all (see validateRemoteVersion). The
+	// value validated is the one the caller TYPED; a version the file already
+	// holds and this call did not mention (VersionSet false) is preserved
+	// untouched — refusing to repoint a row because of a stale field it was not
+	// asked about would be a different bug.
+	if err := validateRemoteVersion(opts.Version); err != nil {
+		return userRemote{}, err
 	}
 
 	r := userRemote{
@@ -538,7 +604,11 @@ func WriteRemoteShow(w io.Writer, name string) error {
 	key := authSourceProse(r.authSource())
 	fmt.Fprintf(w, "name:          %s\n", printableName(r.Name))
 	fmt.Fprintf(w, "base_url:      %s\n", redactBaseURL(r.BaseURL))
-	fmt.Fprintf(w, "version:       %s\n", orDash(r.Version))
+	// printableName, like the name above it: the version is the other field a
+	// control character in remotes.json turns into a second field line in this
+	// output (see validateRemoteVersion — add-time validation is not the only
+	// defence, because this file is hand-edited).
+	fmt.Fprintf(w, "version:       %s\n", orDash(printableName(r.Version)))
 	fmt.Fprintf(w, "wire:          %s\n", d.Wire)
 	fmt.Fprintf(w, "tool_format:   %s\n", d.ToolFormat)
 	fmt.Fprintf(w, "tool_reliable: %t\n", d.ToolReliable)
