@@ -24,6 +24,7 @@ package launch
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -119,8 +120,35 @@ func cloudLimitsFromCatalog() map[string]cloudModelLimit {
 // version 0 — the caller keeps the other side rather than losing everything.
 func parseCloudLimitsCatalog(b []byte) (map[string]cloudModelLimit, int) {
 	var f cloudLimitsCatalogFile
-	if json.Unmarshal(b, &f) != nil {
+	if parseCloudLimitsCatalogFileChecked(b, &f) != nil {
 		return nil, 0
 	}
 	return f.Limits, f.Version
+}
+
+// parseCloudLimitsCatalogFileChecked decodes a catalog body, refusing a
+// document that is not shaped like one. `{"message":"Not Found"}` from a proxy
+// answering 200, `{}`, `null` and any unrelated object all decode cleanly into
+// "this catalog has zero limits", and the cached copy wins over the embedded
+// default: syncing one of them silently reset every cloud alias's context
+// window to the built-in size, reported as `synced 0 cloud-alias limit(s)` with
+// exit 0, and the next run offline re-read it and reported success again
+// (2026-09-26 audit, sixth round). A document with no "limits" MEMBER is not an
+// empty catalog; "limits": null is not an empty map. Same rule as
+// parseModelCatalog and parseProviderCatalogFileChecked.
+func parseCloudLimitsCatalogFileChecked(b []byte, f *cloudLimitsCatalogFile) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(b, &members); err != nil {
+		return err
+	}
+	if _, ok := members["limits"]; !ok {
+		return fmt.Errorf(`the document has no "limits" member, so it is not a cloud-limits catalog (refusing to read it as an empty one)`)
+	}
+	if err := json.Unmarshal(b, f); err != nil {
+		return err
+	}
+	if f.Limits == nil {
+		return fmt.Errorf(`"limits" is null, not a limits map`)
+	}
+	return nil
 }

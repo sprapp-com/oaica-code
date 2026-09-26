@@ -5,7 +5,6 @@ package launch
 // provider_sync.go and model_sync.go.
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,7 +57,7 @@ func CloudLimitsSync(url string) (CloudLimitsSyncReport, error) {
 	// the built-in context size (`262144` → 1) until someone synced again
 	// (2026-09-26 audit, third round).
 	var f cloudLimitsCatalogFile
-	if err := json.Unmarshal(body, &f); err != nil {
+	if err := parseCloudLimitsCatalogFileChecked(body, &f); err != nil {
 		if fromCache {
 			return CloudLimitsSyncReport{URL: display}, fmt.Errorf("the cached cloud-limits catalog at %s is not readable as one (%v) — remove that file and run this again while online", cachePath, err)
 		}

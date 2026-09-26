@@ -782,6 +782,14 @@ func clearSessionModelOverride(primary string) {
 		if override, _ := sess["modelOverride"].(string); override != "" && override != primary {
 			delete(sess, "modelOverride")
 			delete(sess, "providerOverride")
+			// This branch is the function's whole reason to exist, and it used
+			// to leave `changed` false: with a session whose "model" already
+			// equalled the new primary (so the branch below does not co-fire)
+			// the deletion was discarded at `if !changed { return }` and the
+			// stale override survived on disk, shadowing the primary the user
+			// had just chosen on the next TUI launch (2026-09-26 audit, sixth
+			// round).
+			changed = true
 		}
 		if model, _ := sess["model"].(string); model != "" && model != primary {
 			sess["model"] = primary

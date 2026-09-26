@@ -16,6 +16,7 @@ package launch
 // touched by automation.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -138,113 +139,140 @@ func ModelSync(url string, prune bool) (ModelSyncReport, error) {
 		return ModelSyncReport{URL: display}, err
 	}
 
-	m, err := loadModelManifest()
-	if err != nil {
-		return ModelSyncReport{URL: display}, err
-	}
-
 	report := ModelSyncReport{URL: display, FromCache: fromCache}
-	// Membership is checked by TRIMMED id, because that is what the add loop
-	// stores (see the TrimSpace below). Looking up the raw catalog key made
-	// --prune delete the very row the same run had just added whenever a
-	// catalog key carried whitespace — one command reporting a model as both
-	// added and pruned (2026-09-26 audit).
-	inCatalog := make(map[string]bool, len(catalog.Models))
-	for listed := range catalog.Models {
-		if id := strings.TrimSpace(listed); id != "" {
-			inCatalog[id] = true
+	// The whole read-modify-write runs under the manifest lock, through the
+	// same updateModelManifest that `model add` and the scan use. This
+	// function used to loadModelManifest() → mutate → m.save() with no lock
+	// while model_manifest.go documents that helper as "the ONLY writer path
+	// for models.json": a sync running beside another `model sync`, a `model
+	// add`, or a scan published a snapshot it had read before that writer
+	// committed, so the other session's entry was gone and this run still
+	// reported its own as added. Two syncs in a provisioning script — the
+	// ordinary way a fleet is seeded — kept whichever finished last
+	// (2026-09-26 audit, sixth round).
+	//
+	// The callback's "changed" return is what keeps a no-op run from
+	// rewriting the file at all — an unconditional save publishes a stale
+	// snapshot even when this run had nothing to say, which is the same lost
+	// update by a quieter route. It is computed from the document rather than
+	// tracked at each mutation site: the branches below overlap (a user entry
+	// is filled from the catalog, a synced entry is merged, prune removes),
+	// and a branch that writes without setting a flag leaves the change in
+	// memory and out of the file while the run reports it applied.
+	err = updateModelManifest(func(m *modelManifest) (bool, error) {
+		before, err := json.Marshal(m)
+		if err != nil {
+			return false, err
 		}
-	}
-	for _, listed := range catalog.SortedIDs() {
-		// The manifest keys on the exact id, and `model add` trims while this
-		// loop used to store the catalog key verbatim — so a stray space in a
-		// hand-authored catalog produced a second entry for one model, one of
-		// which no command could address (rm/show do not trim either).
-		id := strings.TrimSpace(listed)
-		if id == "" {
-			report.Skipped = append(report.Skipped, fmt.Sprintf("%q: empty model id", listed))
-			continue
-		}
-		e := catalog.Models[listed]
-		e.ID = id
-		if err := validateModelManifestEntry(e); err != nil {
-			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: %v", id, err))
-			continue
-		}
-		prev, existed := m.Get(id)
-		switch {
-		case !existed:
-			e.Source = "sync"
-			e.SourceURL = display
-			m.Put(e)
-			report.Added = append(report.Added, id)
-		case prev.Source != "sync":
-			// The entry is the user's: hand-added (no Source) or registered
-			// by the local scan. Automation must not rewrite it — the same
-			// discipline the scan keeps when two files claim one id. Before
-			// this, sync replaced the entry wholesale (`e.Source = "sync"`),
-			// which both destroyed the user's model_path/launch_flags and
-			// re-labelled the entry as sync-sourced, so the NEXT `--prune`
-			// deleted a model the help promises is "never touched by
-			// automation". Only fields the entry is missing are filled in.
-			merged := prev
-			fillFromCatalog(&merged, e)
-			m.Put(merged)
-			report.Updated = append(report.Updated, id)
-		default:
-			e.Source = "sync"
-			e.SourceURL = display
-			// Local field notes win unless the catalog ships its own.
-			if e.Notes == "" {
-				e.Notes = prev.Notes
+		// Membership is checked by TRIMMED id, because that is what the add loop
+		// stores (see the TrimSpace below). Looking up the raw catalog key made
+		// --prune delete the very row the same run had just added whenever a
+		// catalog key carried whitespace — one command reporting a model as both
+		// added and pruned (2026-09-26 audit).
+		inCatalog := make(map[string]bool, len(catalog.Models))
+		for listed := range catalog.Models {
+			if id := strings.TrimSpace(listed); id != "" {
+				inCatalog[id] = true
 			}
-			// ModelPath is the merge policy's standing exception (see
-			// fillFromCatalog): a path comes from the filesystem or the user,
-			// never from a remote document. The catalog never carries one, so
-			// replacing the entry wholesale silently cleared a path the user
-			// had recorded — and every later sync erased it again.
-			if e.ModelPath == "" {
-				e.ModelPath = prev.ModelPath
-			}
-			m.Put(e)
-			report.Updated = append(report.Updated, id)
 		}
-	}
+		for _, listed := range catalog.SortedIDs() {
+			// The manifest keys on the exact id, and `model add` trims while this
+			// loop used to store the catalog key verbatim — so a stray space in a
+			// hand-authored catalog produced a second entry for one model, one of
+			// which no command could address (rm/show do not trim either).
+			id := strings.TrimSpace(listed)
+			if id == "" {
+				report.Skipped = append(report.Skipped, fmt.Sprintf("%q: empty model id", listed))
+				continue
+			}
+			e := catalog.Models[listed]
+			e.ID = id
+			if err := validateModelManifestEntry(e); err != nil {
+				report.Skipped = append(report.Skipped, fmt.Sprintf("%s: %v", id, err))
+				continue
+			}
+			prev, existed := m.Get(id)
+			switch {
+			case !existed:
+				e.Source = "sync"
+				e.SourceURL = display
+				m.Put(e)
+				report.Added = append(report.Added, id)
+			case prev.Source != "sync":
+				// The entry is the user's: hand-added (no Source) or registered
+				// by the local scan. Automation must not rewrite it — the same
+				// discipline the scan keeps when two files claim one id. Before
+				// this, sync replaced the entry wholesale (`e.Source = "sync"`),
+				// which both destroyed the user's model_path/launch_flags and
+				// re-labelled the entry as sync-sourced, so the NEXT `--prune`
+				// deleted a model the help promises is "never touched by
+				// automation". Only fields the entry is missing are filled in.
+				merged := prev
+				fillFromCatalog(&merged, e)
+				m.Put(merged)
+				report.Updated = append(report.Updated, id)
+			default:
+				e.Source = "sync"
+				e.SourceURL = display
+				// Local field notes win unless the catalog ships its own.
+				if e.Notes == "" {
+					e.Notes = prev.Notes
+				}
+				// ModelPath is the merge policy's standing exception (see
+				// fillFromCatalog): a path comes from the filesystem or the user,
+				// never from a remote document. The catalog never carries one, so
+				// replacing the entry wholesale silently cleared a path the user
+				// had recorded — and every later sync erased it again.
+				if e.ModelPath == "" {
+					e.ModelPath = prev.ModelPath
+				}
+				m.Put(e)
+				report.Updated = append(report.Updated, id)
+			}
+		}
 
-	if prune {
-		switch {
-		case len(catalog.Models) == 0:
-			// A document that declares no models is not evidence that every
-			// model the user has was withdrawn. The dangerous shape is not
-			// hypothetical: any 200 whose body is JSON without a "models"
-			// member — a CDN or captive-portal error page, `{}`, or the
-			// literal null — parsed as "zero models", so `--prune` deleted
-			// every synced entry and reported it as a successful sync.
-			report.Skipped = append(report.Skipped, "prune: the fetched catalog declares no models — nothing pruned")
-		default:
-			for _, id := range m.SortedIDs() {
-				entry := m.Models[id]
-				if entry.Source != "sync" {
-					continue
+		if prune {
+			switch {
+			case len(catalog.Models) == 0:
+				// A document that declares no models is not evidence that every
+				// model the user has was withdrawn. The dangerous shape is not
+				// hypothetical: any 200 whose body is JSON without a "models"
+				// member — a CDN or captive-portal error page, `{}`, or the
+				// literal null — parsed as "zero models", so `--prune` deleted
+				// every synced entry and reported it as a successful sync.
+				report.Skipped = append(report.Skipped, "prune: the fetched catalog declares no models — nothing pruned")
+			default:
+				for _, id := range m.SortedIDs() {
+					entry := m.Models[id]
+					if entry.Source != "sync" {
+						continue
+					}
+					// Only entries from THIS catalog are this catalog's to
+					// withdraw. An internal mirror synced with --url would
+					// otherwise have everything it supplied deleted by the next
+					// plain `model sync --prune`, which cannot know the mirror's
+					// entries at all.
+					if entry.SourceURL != "" && entry.SourceURL != display {
+						continue
+					}
+					if inCatalog[id] {
+						continue
+					}
+					m.Remove(id)
+					report.Pruned = append(report.Pruned, id)
 				}
-				// Only entries from THIS catalog are this catalog's to
-				// withdraw. An internal mirror synced with --url would
-				// otherwise have everything it supplied deleted by the next
-				// plain `model sync --prune`, which cannot know the mirror's
-				// entries at all.
-				if entry.SourceURL != "" && entry.SourceURL != display {
-					continue
-				}
-				if inCatalog[id] {
-					continue
-				}
-				m.Remove(id)
-				report.Pruned = append(report.Pruned, id)
 			}
 		}
-	}
 
-	if err := m.save(); err != nil {
+		after, err := json.Marshal(m)
+		if err != nil {
+			return false, err
+		}
+		// Marshal sorts map keys, so this is a content comparison and not a
+		// ordering one.
+		return !bytes.Equal(before, after), nil
+	})
+	if err != nil {
 		return report, err
 	}
 	return report, nil

@@ -140,10 +140,35 @@ func parseProviderCatalogFile(b []byte) providerCatalogFile {
 
 // parseProviderCatalogFileChecked is parseProviderCatalogFile for the sync
 // path, which must not cache a body it could not read.
+// parseProviderCatalogFileChecked decodes a catalog body, refusing a document
+// that is not shaped like one.
+//
+// "It parses as JSON" is not the question. `{"message":"Not Found"}` — a proxy
+// or CDN answering 200 for a path that does not exist — decodes cleanly into
+// "this catalog has zero providers", as do `{}`, `null` and any unrelated
+// object. Each was written over the previous cache and reported as
+// `synced 0 provider(s) ... (fresh)` with exit 0; because the cache wins over
+// the embedded default, every provider it does not mention then disappeared
+// from `oaica remote list` and the picker, and the next run offline re-read the
+// garbage and called it a success again (2026-09-26 audit, sixth round).
+//
+// A document with no "providers" MEMBER is not an empty catalog, and
+// "providers": null is not an empty LIST. This is parseModelCatalog's rule
+// (model_sync.go), which its two siblings never got.
 func parseProviderCatalogFileChecked(b []byte) (providerCatalogFile, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(b, &members); err != nil {
+		return providerCatalogFile{}, err
+	}
+	if _, ok := members["providers"]; !ok {
+		return providerCatalogFile{}, fmt.Errorf(`the document has no "providers" member, so it is not a provider catalog (refusing to read it as an empty one)`)
+	}
 	var f providerCatalogFile
 	if err := json.Unmarshal(b, &f); err != nil {
 		return providerCatalogFile{}, err
+	}
+	if f.Providers == nil {
+		return providerCatalogFile{}, fmt.Errorf(`"providers" is null, not a provider list`)
 	}
 	return f, nil
 }
