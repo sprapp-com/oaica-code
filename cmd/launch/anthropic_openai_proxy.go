@@ -34,6 +34,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1264,14 +1265,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
 					return
 				}
+				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID)
 				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
-					anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID),
-					r.Context().Err() != nil)
+					status, relayed, r.Context().Err() != nil)
 				return
 			}
+			status, relayed := nativeAnthropicPassthrough(w, r, body, table.SessionID)
 			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
-				nativeAnthropicPassthrough(w, r, body, table.SessionID),
-				r.Context().Err() != nil)
+				status, relayed, r.Context().Err() != nil)
 			return
 		}
 
@@ -1441,14 +1442,14 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 								writeAnthropicError(w, http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
 								return
 							}
+							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID)
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-								anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID),
-								r.Context().Err() != nil)
+								status, relayed, r.Context().Err() != nil)
 							return
 						}
+						status, relayed := nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID)
 						feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-							nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID),
-							r.Context().Err() != nil)
+							status, relayed, r.Context().Err() != nil)
 						return
 					}
 					route = over
@@ -1556,27 +1557,43 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		}
 		defer resp.Body.Close()
 		// Feed the circuit breaker (route_policy.go): 5xx-class answers that
-		// survived the retry budget count as failures; 2xx proves recovery.
-		// 4xx (bad request, context overflow) and 429 (shedding, alive) are
-		// the leg WORKING and must not open the breaker. The `auto` policy's
-		// per-session escalation eats the same signals (route_policy.go): a
-		// success clears the consecutive-failure counter — but NOT an active
-		// escalation, which only decays after autoEscalateHoldFor so one
-		// lucky 200 on the secondary can't bounce the session back onto a
-		// still-flapping primary.
-		switch {
-		case resp.StatusCode >= 500:
+		// survived the retry budget count as failures. 4xx (bad request,
+		// context overflow) and 429 (shedding, alive) are the leg WORKING and
+		// must not open the breaker. The `auto` policy's per-session
+		// escalation eats the same signals (route_policy.go): a success clears
+		// the consecutive-failure counter — but NOT an active escalation,
+		// which only decays after autoEscalateHoldFor so one lucky 200 on the
+		// secondary can't bounce the session back onto a still-flapping
+		// primary.
+		//
+		// The 2xx verdict is deliberately NOT taken here. The status byte
+		// proves the leg ANSWERED, not that the turn arrived: two shapes this
+		// proxy already recognises answer 200 and deliver nothing — a JSON
+		// error object over HTTP 200 (upstreamErrorMessage), and a stream cut
+		// short after the headers — and feeding those as successes gave a leg
+		// that can never finish a turn a perfect health record, so its circuit
+		// never opened and `auto` never escalated the session off it
+		// (2026-09-26 audit). It is decided below, on what reached the client.
+		if resp.StatusCode >= 500 {
 			table.breakers.recordFail(route.BaseURL)
 			table.escalations.recordFail(table.SessionID, route.BaseURL)
-		case resp.StatusCode < 300:
-			table.breakers.recordOK(route.BaseURL)
-			table.escalations.recordOK(table.SessionID, route.BaseURL)
 		}
 
 		rec := &statusCapturingWriter{ResponseWriter: w}
 		w = rec
+		// delivered is set by whichever relay runs below: false means the
+		// leg's response never became a turn, whatever its status byte said.
+		delivered := false
 		defer func() {
 			entry.StatusCode = rec.status()
+			if !delivered && rec.status() < 300 && r.Context().Err() == nil {
+				// The turn failed after the headers were already a 200 (a
+				// stream cut short mid-answer): the client got an error event,
+				// so the row must not read as a clean turn. `oaica usage`
+				// counts its ERR column off this field, and a session in which
+				// every turn was truncated reported ERR 0 (2026-09-26 audit).
+				entry.StatusCode = http.StatusBadGateway
+			}
 			// Duration is set HERE, not where the entry was built: the row is
 			// now constructed before the upstream call, so a duration captured
 			// at construction would report the marshalling time and nothing
@@ -1639,9 +1656,24 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// the estimate to 0, which disabled it (2026-09-26 audit).
 		estInputTokens, _, _ := contextFitPlan(calib, calibKey, len(body))
 		if anthReq.Stream {
-			handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
+			delivered = handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
 		} else {
-			handleNonStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
+			delivered = handleNonStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens)
+		}
+		// Now the 2xx verdict (see the note at the status feed above). A
+		// request the client abandoned mid-turn says nothing about the leg —
+		// the same line the transport-error branch and
+		// feedPassthroughRouteHealth draw (2026-09-26 audit).
+		if resp.StatusCode < 300 {
+			switch {
+			case r.Context().Err() != nil:
+			case delivered:
+				table.breakers.recordOK(route.BaseURL)
+				table.escalations.recordOK(table.SessionID, route.BaseURL)
+			default:
+				table.breakers.recordFail(route.BaseURL)
+				table.escalations.recordFail(table.SessionID, route.BaseURL)
+			}
 		}
 	})
 
@@ -1655,11 +1687,15 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 // usage.prompt_tokens so the caller can calibrate its prompt-size estimate.
 // estInputTokens is the prompt count to report in place of a flat zero when
 // the upstream sent no usage object at all.
-func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) {
+//
+// It returns whether the turn reached the client. False is not "the status was
+// bad" — it is "this response was never a turn", which is what the caller's
+// route health must be fed (2026-09-26 audit).
+func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) bool {
 	respBody, err := io.ReadAll(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+redactErr(err).Error())
-		return
+		return false
 	}
 	// An upstream can answer a JSON error object over HTTP 200 (vLLM and this
 	// fleet's own gateway both do), and the streaming path refuses that shape
@@ -1670,12 +1706,12 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// (2026-09-26 audit).
 	if msg := upstreamErrorMessage(string(respBody)); msg != "" {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream error: "+msg)
-		return
+		return false
 	}
 	var oaiResp openAIChatResponse
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "decode upstream response: "+redactErr(err).Error())
-		return
+		return false
 	}
 	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
 		onUsage(oaiResp.Usage.PromptTokens)
@@ -1693,6 +1729,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	w.WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(w)
 	_ = enc.Encode(anthResp)
+	return true
 }
 
 // handleStreamResponse reads OpenAI SSE chunks from body, feeds incremental
@@ -1702,11 +1739,16 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // the stream's final usage-only chunk (stream_options.include_usage) so the
 // caller can calibrate its prompt-size estimate. estInputTokens is the
 // converter's fallback when no usage chunk ever arrives.
-func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) {
+//
+// It returns whether the whole answer reached the client. False means the
+// stream was cut short or the upstream reported an error mid-answer — the
+// status byte may already have been a 200 either way, which is why the
+// caller's route health is fed this and not the status (2026-09-26 audit).
+func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) bool {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, http.StatusInternalServerError, "streaming not supported by response writer")
-		return
+		return false
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -1946,10 +1988,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// Nothing has been sent yet, so the caller gets a status it can
 			// act on (and retry) rather than an empty successful message.
 			writeAnthropicError(w, http.StatusBadGateway, msg)
-			return
+			return false
 		}
 		emitErr(msg)
-		return
+		return false
 	}
 	if upstreamErr != "" {
 		// A completion marker arrived after an error object: the error is
@@ -1957,10 +1999,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// over a fabricated stop_reason.
 		if !started {
 			writeAnthropicError(w, http.StatusBadGateway, upstreamErr)
-			return
+			return false
 		}
 		emitErr(upstreamErr)
-		return
+		return false
 	}
 
 	// Flush any pending tool calls before the done event so StreamConverter
@@ -2013,6 +2055,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 	}
 	emit(events)
+	return true
 }
 
 // upstreamErrorMessage extracts the message from an OpenAI-shaped error
@@ -2345,32 +2388,45 @@ func passthroughBreakerKey(route proxyRoute, oversize bool) string {
 // The classification deliberately matches the translated path's: 5xx-class and
 // transport failures count against the leg, sub-300 proves recovery, and 4xx /
 // 429 are the leg WORKING (bad request, shedding) and must not open it.
+// relayed says the upstream's body was relayed to its END — a 200 whose body
+// died in the middle is a dead turn the client saw, and counting it healthy
+// gave a leg that can never finish one a perfect record (2026-09-26 audit).
 //
 // clientGone says the request was built on a context the CALLER has since
 // cancelled. Status 0 means "no response", which covers both a dead leg and a
 // caller who hung up mid-flight — and those are opposite conclusions, so the
 // caller passes the context's state rather than this reading a 0 as a failure.
 // A cancelled request records NOTHING: it must not fail the leg, and it must
-// not clear an existing failure streak either (2026-09-26 audit).
-func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int, clientGone bool) {
+// not clear an existing failure streak either — and the same holds for a body
+// left incomplete, which is what our own cancellation produces (2026-09-26
+// audit).
+func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int, relayed, clientGone bool) {
 	switch {
 	case status == 0 && clientGone:
-		// The client left. Says nothing about the leg.
+		// The client left before the leg answered. Says nothing about the leg.
 	case status == 0 || status >= 500:
 		table.breakers.recordFail(breakerKey)
 		table.escalations.recordFail(sessionID, route.BaseURL)
-	case status < 300:
+	case status >= 300:
+		// 4xx / 429: the leg answering at all — not a health signal.
+	case clientGone:
+		// The client left mid-relay: an incomplete body is then our cancel,
+		// not the leg's doing.
+	case relayed:
 		table.breakers.recordOK(breakerKey)
 		table.escalations.recordOK(sessionID, route.BaseURL)
+	default:
+		table.breakers.recordFail(breakerKey)
+		table.escalations.recordFail(sessionID, route.BaseURL)
 	}
 }
 
-func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, sessionID string) int {
+func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, sessionID string) (int, bool) {
 	auth, ok := resolveNativeAnthropicAuth()
 	if !ok {
 		writeAnthropicError(w, http.StatusUnauthorized,
 			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
-		return 0
+		return 0, false
 	}
 	return anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value, sessionID)
 }
@@ -2382,13 +2438,16 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 // nativeAnthropicPassthrough's doc applies: no translation, no clamp, no
 // ledger, streaming relayed as it arrives.
 //
-// It returns the upstream status it relayed (0 when it never got one). That
-// is the caller's signal for the circuit breaker and the `auto` escalation:
-// this path returns from the handler BEFORE the OpenAI path's breaker switch,
-// so without it a passthrough leg's breaker read healthy forever and a dead
-// primary was never failed over — the promise docs/CLAUDE_TIERS.md's failover
-// section makes for every leg (2026-09-26 audit).
-func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) int {
+// It returns the upstream status it relayed (0 when it never got one) and
+// whether the body was relayed to its END. Those are the caller's signal for
+// the circuit breaker and the `auto` escalation: this path returns from the
+// handler BEFORE the OpenAI path's breaker switch, so without it a passthrough
+// leg's breaker read healthy forever and a dead primary was never failed over
+// — the promise docs/CLAUDE_TIERS.md's failover section makes for every leg.
+// The second value is why the caller does not use the status alone: a body that
+// dies after a 200 is a dead turn the client saw, and counting it healthy is
+// the same defect on this path (2026-09-26 audit).
+func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) (int, bool) {
 	// The failed attempts on this leg are logged (request_log.go): a plan row
 	// on the anthropic wire whose upstream refuses connections left no
 	// evidence anywhere, so `oaica usage` reported a clean session for one
@@ -2414,7 +2473,7 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
-		return 0
+		return 0, false
 	}
 	// Forward the client's own Anthropic-protocol headers (anthropic-
 	// version, anthropic-beta, content-type, ...) verbatim — Claude Code
@@ -2449,7 +2508,7 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	if err != nil {
 		logTransportFailure(http.StatusBadGateway)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
-		return 0
+		return 0, false
 	}
 	defer resp.Body.Close()
 
@@ -2466,14 +2525,20 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				return resp.StatusCode
+				// The client's own connection failed. This is the caller's
+				// client-gone case, not evidence about the leg.
+				return resp.StatusCode, false
 			}
 			if canFlush {
 				flusher.Flush()
 			}
 		}
 		if readErr != nil {
-			return resp.StatusCode
+			// A clean end of body is the only evidence that the leg delivered
+			// the whole answer; anything else (a body cut short, a read timed
+			// out, the transport giving up) is a turn the client never
+			// received in full.
+			return resp.StatusCode, errors.Is(readErr, io.EOF)
 		}
 	}
 }

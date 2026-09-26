@@ -82,7 +82,7 @@ func TestAPassthroughTransportFailureIsCounted(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
 
-	if got := anthropicPassthrough(rec, req, body, "http://"+dead, "x-api-key", "sk-ant-notarealkey", "sess-passthrough-fail"); got != 0 {
+	if got, _ := anthropicPassthrough(rec, req, body, "http://"+dead, "x-api-key", "sk-ant-notarealkey", "sess-passthrough-fail"); got != 0 {
 		t.Errorf("anthropicPassthrough returned %d, want 0 for a leg it never reached", got)
 	}
 	if rec.Code != 502 {
