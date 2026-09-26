@@ -79,9 +79,15 @@ func oaicaAuthorize(req *http.Request) {
 const oaicaAuthHint = "Run `oaica signin`, or set OAICA_API_KEY (get a key at https://oaica.com)"
 
 // oaicaWrapAuthError turns a router error payload into a CLI error, appending
-// oaicaAuthHint when the failure is about credentials.
-func oaicaWrapAuthError(msg string) error {
-	if strings.Contains(strings.ToLower(msg), "api key") {
+// oaicaAuthHint when the failure is about credentials. The HTTP status decides
+// that, not the wording: 401 and 403 are what a router returns when the key is
+// missing, wrong, or insufficient, and their message is prose it is free to
+// change ("unauthorized", "invalid bearer token", a proxy's rewrite). Keyed on
+// the text instead, the hint disappeared on exactly those, and appeared on
+// failures nobody can sign in their way out of — a rate limit scoped to a key,
+// a model that needs its own.
+func oaicaWrapAuthError(status int, msg string) error {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return fmt.Errorf("%s\n%s", msg, oaicaAuthHint)
 	}
 	return errors.New(msg)
@@ -342,7 +348,7 @@ func oaicaChatLive(model string, messages []oaicaChatMessage) (string, error) {
 		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 	if out.Error != nil {
-		return "", oaicaWrapAuthError(out.Error.Message)
+		return "", oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
@@ -462,7 +468,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 	if out.Error != nil {
-		return "", oaicaWrapAuthError(out.Error.Message)
+		return "", oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
 	}
 	return out.Model, nil
 }

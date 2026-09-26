@@ -7,6 +7,7 @@ package cmd
 // hint (P1-3).
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,8 +92,10 @@ func TestVersionHandlerPhrasing(t *testing.T) {
 }
 
 // P1-3: an auth failure from the router carries the fix on the next line.
+// The status is what makes it an auth failure — see
+// oaica_auth_hint_integrity_test.go for why the wording is not consulted.
 func TestOaicaWrapAuthErrorAppendsHint(t *testing.T) {
-	err := oaicaWrapAuthError("missing or invalid API key")
+	err := oaicaWrapAuthError(http.StatusUnauthorized, "missing or invalid API key")
 	lines := strings.Split(err.Error(), "\n")
 	if len(lines) != 2 {
 		t.Fatalf("want exactly one message line + one hint line, got %q", err.Error())
@@ -107,7 +110,7 @@ func TestOaicaWrapAuthErrorAppendsHint(t *testing.T) {
 	}
 
 	// Non-auth errors are passed through untouched.
-	if got := oaicaWrapAuthError("context length exceeded").Error(); got != "context length exceeded" {
+	if got := oaicaWrapAuthError(http.StatusBadRequest, "context length exceeded").Error(); got != "context length exceeded" {
 		t.Fatalf("non-auth error was rewritten: %q", got)
 	}
 }
