@@ -1361,6 +1361,15 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// the first is what the feed's clientGone documents. A wrapper
 			// that refused locally reports passthroughNotAttempted, which the
 			// feed handles on its own.
+			// Checked here as well as inside the passthrough wrapper so the
+			// refusal is a logged row: this is the one error the user must see,
+			// and a native leg is the only refusal path that used to write none
+			// (2026-09-26 audit, tenth round — the sibling anthropic-wire remote
+			// branch below has always refused through refuse()).
+			if _, ok := resolveNativeAnthropicAuth(); !ok {
+				refuse(http.StatusUnauthorized, noNativeAnthropicCredential)
+				return
+			}
 			status, relayed, _ := nativeAnthropicPassthrough(w, r, body, table.SessionID)
 			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false), route.BaseURL,
 				status, relayed, r.Context().Err() != nil)
@@ -1562,6 +1571,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID)
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 								crossoverEscalationLeg(route.BaseURL, over.BaseURL), status, relayed, r.Context().Err() != nil)
+							return
+						}
+						if _, ok := resolveNativeAnthropicAuth(); !ok {
+							refuse(http.StatusUnauthorized, noNativeAnthropicCredential)
 							return
 						}
 						status, relayed, _ := nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID)
@@ -2843,11 +2856,16 @@ func crossoverEscalationLeg(selectedBaseURL, servedBaseURL string) string {
 // only one of the two is evidence about the leg.
 const passthroughNotAttempted = -1
 
+// noNativeAnthropicCredential is the one wording for "this launch has no
+// Anthropic credential to send on a native claude/* leg" — the handler refuses
+// with it too, so that the refusal is a logged row (see the /v1/messages
+// handler's refusal machinery).
+const noNativeAnthropicCredential = "no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY"
+
 func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, sessionID string) (int, bool, bool) {
 	auth, ok := resolveNativeAnthropicAuth()
 	if !ok {
-		writeAnthropicError(w, http.StatusUnauthorized,
-			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
+		writeAnthropicError(w, http.StatusUnauthorized, noNativeAnthropicCredential)
 		// passthroughNotAttempted, not 0: nothing was sent, so this says
 		// nothing about the leg's health (see the feed's switch).
 		return passthroughNotAttempted, false, false
