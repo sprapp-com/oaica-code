@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
@@ -78,6 +79,9 @@ func saveUserRemotesFile(f userRemotesFile, path string) error {
 	if err != nil {
 		return err
 	}
+	// Members this struct does not model (`schema_note`, a hand-added label) are
+	// re-attached rather than deleted by the rewrite — see store_document.go.
+	b = storeDocumentMerge(b, path)
 	// 0o600: this file may hold plaintext bearer tokens (--api-key).
 	// Through the atomic writer, NOT os.WriteFile (2026-09-26 audit): an
 	// in-place O_TRUNC write makes the truncation window visible to every
@@ -106,8 +110,16 @@ func updateUserRemotesFile(mutate func(*userRemotesFile) error) (string, error) 
 		if err != nil {
 			return err
 		}
+		snapshot := storeDocumentSnapshot(f)
 		if err := mutate(&f); err != nil {
 			return err
+		}
+		if !storeDocumentChanged(snapshot, f) {
+			// Nothing to say. Writing anyway re-serialises a partial view of the
+			// document over the file — which is how `remote rm <typo>`, a
+			// command that removed nothing and reported it, deleted every
+			// hand-added member (2026-09-26 audit).
+			return nil
 		}
 		return saveUserRemotesFile(f, path)
 	})
@@ -159,6 +171,22 @@ func validateRemoteBaseURL(baseURL string) error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("--base-url %q has no host (e.g. --base-url https://api.example.com)", baseURL)
+	}
+	// A query or fragment is not part of the endpoint oaica talks to: the base
+	// is joined with "/v1/chat/completions" and "/v1/models", so a query
+	// SWALLOWS that path and every request goes somewhere the user never
+	// intended, with a doctor line showing the mangled URL and a failure that
+	// names neither this flag nor the cause (2026-09-26 audit).
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("--base-url %q carries a query string or fragment — oaica appends /v1/chat/completions to this value, so anything after \"?\" or \"#\" truncates the path and every request goes to the wrong URL. Put the endpoint itself here (e.g. --base-url https://api.example.com/v1); a credential the endpoint needs in the query is not supported — use --api-key", baseURL)
+	}
+	// url.Parse accepts any digits as a port; the failure surfaces much later as
+	// "address 99999999: invalid port" from the transport.
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("--base-url %q has port %q, which is not a usable TCP port (1-65535)", baseURL, p)
+		}
 	}
 	return nil
 }

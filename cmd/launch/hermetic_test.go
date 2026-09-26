@@ -3,7 +3,47 @@ package launch
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"testing"
 )
+
+// storePathEnvVars are the OAICA_*_FILE overrides every store resolves BEFORE
+// it falls back to HOME. Each one has to be masked here: a developer or CI box
+// that exports one makes the whole suite run against that file — and the store
+// tests write, so the suite destroys it. The three missing from this list until
+// 2026-09-26 (OAICA_MODELS_FILE, OAICA_PLANS_FILE, OAICA_ALIASES_FILE) were
+// exactly the stores whose tests write most: an exported OAICA_MODELS_FILE had
+// `go test ./cmd/launch/` overwrite the file with test content and fail ten
+// tests, and an exported OAICA_PLANS_FILE wedged the run.
+var storePathEnvVars = []string{
+	"OAICA_REMOTES_FILE",
+	"OAICA_AUTH_FILE",
+	"OAICA_MODELS_FILE",
+	"OAICA_PLANS_FILE",
+	"OAICA_ALIASES_FILE",
+	"OPENCODE_AUTH_FILE",
+}
+
+// TestEveryStoreOverrideIsMaskedForTests is the guard on the list above: while
+// a test binary is running, every one of these must be SET (to a path inside
+// the hermetic directory, or to the empty string, which the stores read as
+// "not set" and resolve through the hermetic HOME instead) — a developer or CI
+// box that exports one has the whole suite read and WRITE that file, and the
+// store tests save, so an exported path is a config file destroyed by
+// `go test`.
+func TestEveryStoreOverrideIsMaskedForTests(t *testing.T) {
+	hermetic := filepath.Join(os.TempDir(), "oaica-launch-tests")
+	for _, env := range storePathEnvVars {
+		v, set := os.LookupEnv(env)
+		if !set {
+			t.Errorf("%s is not masked for tests: a developer or CI box that exports it has the whole suite read and WRITE that file — the store tests save, so an exported path is a config file destroyed by `go test`", env)
+			continue
+		}
+		if v != "" && !strings.HasPrefix(v, hermetic) {
+			t.Errorf("%s = %q, which is outside the hermetic test directory %s — every store path the suite can write must live there, or be empty so the store resolves through the hermetic HOME", env, v, hermetic)
+		}
+	}
+}
 
 // hermeticTestEnv is called from TestMain before any test runs. It keeps the
 // whole test binary off the developer's own configuration and off the real
@@ -59,6 +99,25 @@ func hermeticTestEnv() {
 	os.Setenv("OAICA_API_KEY", "")
 	os.Setenv("OAICA_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-auth.json"))
 	os.Setenv("OPENCODE_AUTH_FILE", filepath.Join(os.TempDir(), "oaica-launch-tests", "no-opencode-auth.json"))
+	// The three stores whose overrides were NOT masked, which is the same hole
+	// stated three times: each resolves its env var before HOME, so a box that
+	// exported one had the suite run against that file — and these are the
+	// stores the suite WRITES. An exported OAICA_MODELS_FILE made `go test
+	// ./cmd/launch/` replace the developer's models.json with test content and
+	// fail ten tests; an exported OAICA_PLANS_FILE overwrote their plans and
+	// hung the run.
+	//
+	// Masked to the EMPTY string, not to a path: the stores read an empty value
+	// as "not set" and resolve through HOME, which TestMain has already
+	// repointed at the hermetic directory. A path here would be a single store
+	// shared by every test in the binary — and worse, it would follow the
+	// process rather than the test, so a fixture that isolates itself by moving
+	// HOME (withTempOaicaHome) would still write to the shared file. Empty
+	// keeps every test's isolation exactly as it was, while a var exported by
+	// the developer's shell can no longer reach any of them.
+	for _, env := range []string{"OAICA_MODELS_FILE", "OAICA_PLANS_FILE", "OAICA_ALIASES_FILE"} {
+		os.Setenv(env, "")
+	}
 	// The HuggingFace token is a credential this client transmits (`oaica pull`
 	// attaches it) and one the support report therefore scans for — so it is
 	// part of the ambient state a test must not inherit either.

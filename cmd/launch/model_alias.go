@@ -89,6 +89,9 @@ func (a *modelAliases) save() error {
 	if err != nil {
 		return err
 	}
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	data = storeDocumentMerge(data, path)
 	// Unique temp + rename (2026-09-26 audit): the aliases file is read by
 	// every launch and written by `oaica alias set`.
 	return fileutil.WriteFileAtomic(path, data, 0o600)
@@ -109,8 +112,15 @@ func updateModelAliases(mutate func(*modelAliases) error) error {
 		if err != nil {
 			return err
 		}
+		snapshot := storeDocumentSnapshot(a)
 		if err := mutate(a); err != nil {
 			return err
+		}
+		if !storeDocumentChanged(snapshot, a) {
+			// Nothing to say: writing anyway re-serialises a partial view over
+			// the file and drops the members it does not model (2026-09-26
+			// audit). See store_document.go.
+			return nil
 		}
 		return a.save()
 	})

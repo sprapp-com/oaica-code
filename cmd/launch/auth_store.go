@@ -110,6 +110,9 @@ func saveAuthStore(f authStoreFile, path string) error {
 	if err != nil {
 		return err
 	}
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	b = storeDocumentMerge(b, path)
 	b = append(b, '\n')
 	if err := writeAtomic(path, b); err != nil {
 		return err
@@ -135,8 +138,16 @@ func updateAuthStore(mutate func(*authStoreFile) error) error {
 		if err != nil {
 			return err
 		}
+		snapshot := storeDocumentSnapshot(f)
 		if err := mutate(&f); err != nil {
 			return err
+		}
+		if !storeDocumentChanged(snapshot, f) {
+			// A rewrite with nothing to say re-serialises a partial view over
+			// the file: `oaica auth logout <provider not logged in>` reported
+			// success and deleted every member the struct does not model
+			// (2026-09-26 audit). See store_document.go.
+			return nil
 		}
 		return saveAuthStore(f, path)
 	})

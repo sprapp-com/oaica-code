@@ -66,7 +66,35 @@ func copyFile(src, dst string) error {
 // perm is applied to the temp before the rename AND re-asserted on the target
 // afterwards: a pre-existing looser file (observed 0664 live, plaintext key
 // inside) is replaced by a new inode, but the target is what callers stat.
+// writtenTarget resolves the path the data must actually land at. A path that
+// is a symlink is FOLLOWED, up to a sane chain length, because rename(2)
+// replaces the link rather than writing through it: the write would succeed,
+// the client would name the configured path, and the file the user keeps (a
+// git-managed or backed-up directory they linked the store into) would keep its
+// old content forever (2026-09-26 audit). A link whose target does not exist
+// yet is still the user's chosen destination, so it is followed too.
+func writtenTarget(path string) string {
+	for i := 0; i < 8; i++ {
+		fi, err := os.Lstat(path)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return path
+		}
+		dest, err := os.Readlink(path)
+		if err != nil || dest == "" {
+			return path
+		}
+		if !filepath.IsAbs(dest) {
+			dest = filepath.Join(filepath.Dir(path), dest)
+		}
+		path = dest
+	}
+	// A chain this long is not something to follow further; writing at the last
+	// link's own path is the safe answer.
+	return path
+}
+
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	path = writtenTarget(path)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err

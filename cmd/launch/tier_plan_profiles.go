@@ -132,6 +132,9 @@ func (p *tierPlanProfiles) save() error {
 	if err != nil {
 		return err
 	}
+	// Members the struct does not model survive the rewrite — see
+	// store_document.go.
+	data = storeDocumentMerge(data, path)
 	// A unique temp + rename: two `oaica` processes both write plans.json
 	// (a launch wizard saving a plan while `oaica plan set` runs), and a
 	// fixed "<path>.tmp" let one publish the other's half-written buffer
@@ -154,8 +157,15 @@ func updateTierPlanProfiles(mutate func(*tierPlanProfiles) error) error {
 		if err != nil {
 			return err
 		}
+		snapshot := storeDocumentSnapshot(p)
 		if err := mutate(p); err != nil {
 			return err
+		}
+		if !storeDocumentChanged(snapshot, p) {
+			// Nothing to say: writing anyway re-serialises a partial view over
+			// the file and drops the members it does not model (2026-09-26
+			// audit). See store_document.go.
+			return nil
 		}
 		return p.save()
 	})
