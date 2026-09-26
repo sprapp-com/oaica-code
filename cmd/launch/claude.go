@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -66,8 +67,40 @@ func RunNative(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ() // deliberately untouched — no OAICA env injection at all
+	cmd.Env = nativeClaudeEnv()
 	return cmd.Run()
+}
+
+// nativeClaudeEnv is the environment the native Claude Code paths run with:
+// everything the user has, minus the two variables that REDIRECT Claude Code —
+// ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN.
+//
+// "Untouched environment" was the claim, and it does not survive a shell that
+// exports either: a user who once exported ANTHROPIC_BASE_URL (to a router, a
+// proxy, another tool's endpoint) gets Claude Code talking to that endpoint
+// instead of their own Anthropic account, carrying ANTHROPIC_AUTH_TOKEN to it —
+// the exact override these paths exist to escape, applied behind their back
+// (2026-09-27 audit, round 21, F14). ANTHROPIC_API_KEY is deliberately KEPT:
+// that is a legitimate native credential, and the help text promises it.
+//
+// A variable that was dropped is named on stderr, so the launch does not look
+// like it ignored a setting the user meant.
+func nativeClaudeEnv() []string {
+	redirect := []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"}
+	var dropped []string
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		key, _, _ := strings.Cut(e, "=")
+		if slices.Contains(redirect, key) {
+			dropped = append(dropped, key)
+			continue
+		}
+		env = append(env, e)
+	}
+	if len(dropped) > 0 {
+		fmt.Fprintf(os.Stderr, "claude native: ignoring %s from your environment so Claude Code uses your own Anthropic login instead\n", strings.Join(dropped, " and "))
+	}
+	return env
 }
 
 // nativeClaudePickerModels are the "claude/<alias>" picker entries: they run
@@ -106,7 +139,7 @@ func (c *Claude) runNative(tier string, extra []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ() // deliberately untouched — clean native environment
+	cmd.Env = nativeClaudeEnv()
 	return cmd.Run()
 }
 
