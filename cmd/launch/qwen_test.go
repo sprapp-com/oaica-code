@@ -196,8 +196,13 @@ func TestQwenConfigureMergesWithExistingSettings(t *testing.T) {
 	if envCfg["OPENROUTER_API_KEY"] != "openrouter-key" {
 		t.Fatalf("expected OPENROUTER_API_KEY to be preserved, got %v", envCfg["OPENROUTER_API_KEY"])
 	}
-	if envCfg[qwenOllamaEnvKey] != "ollama" {
-		t.Fatalf("expected %s to be updated, got %v", qwenOllamaEnvKey, envCfg[qwenOllamaEnvKey])
+	// PRESERVED, not overwritten: gemma4 is a daemon-backed model, the local
+	// daemon does not check this value, and OLLAMA_API_KEY is also how
+	// ollama.com is reached — a launch that needs no credential must not
+	// consume one (2026-09-26 audit, tenth round). This assertion used to pin
+	// the overwrite.
+	if envCfg[qwenOllamaEnvKey] != "old-ollama-key" {
+		t.Fatalf("expected %s to be left alone for a local model, got %v", qwenOllamaEnvKey, envCfg[qwenOllamaEnvKey])
 	}
 
 	modelProviders := cfg["modelProviders"].(map[string]any)

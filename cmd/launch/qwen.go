@@ -16,6 +16,10 @@ import (
 
 const qwenOllamaEnvKey = "OLLAMA_API_KEY"
 
+// qwenProviderNameSuffix marks a provider entry this package wrote, so a later
+// launch can recognise and replace it instead of appending a duplicate.
+const qwenProviderNameSuffix = " (Ollama)"
+
 var qwenGOOS = runtime.GOOS
 
 type Qwen struct{}
@@ -279,11 +283,11 @@ func (q *Qwen) Configure(model string) error {
 
 func applyQwenOllamaConfig(cfg map[string]any, model string) {
 	envCfg := qwenMap(cfg["env"])
-	envCfg[qwenOllamaEnvKey] = qwenKeyFor(model)
+	applyQwenOllamaKey(envCfg, model)
 	cfg["env"] = envCfg
 
 	modelProviders := qwenMap(cfg["modelProviders"])
-	modelProviders["openai"] = qwenMergeOpenAIProviders(modelProviders["openai"], qwenProvider(model))
+	modelProviders["openai"] = qwenMergeOpenAIProviders(modelProviders["openai"], qwenProvider(model), qwenBaseURLFor(model))
 	cfg["modelProviders"] = modelProviders
 
 	security := qwenMap(cfg["security"])
@@ -298,6 +302,28 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 	cfg["model"] = modelCfg
 }
 
+// applyQwenOllamaKey sets env.OLLAMA_API_KEY to what the configured provider
+// needs, without destroying a value that already works.
+//
+// For a DAEMON-backed launch the value is the literal placeholder "ollama" —
+// the local daemon does not check it — so an existing value is left alone:
+// OLLAMA_API_KEY is also how ollama.com is reached, and
+// `oaica launch qwen llama3.2` used to overwrite that with "ollama"
+// (2026-09-26 audit, tenth round). A launch that needs no credential must not
+// consume one.
+//
+// For a REMOTE-backed launch the base URL is ours and the provider only works
+// with that remote's token, so the value is written: leaving a stale key there
+// would be the silent-401 failure this function exists to prevent.
+func applyQwenOllamaKey(envCfg map[string]any, model string) {
+	if _, isRemote := resolveRemoteEndpoint(model); !isRemote {
+		if existing, _ := envCfg[qwenOllamaEnvKey].(string); strings.TrimSpace(existing) != "" {
+			return
+		}
+	}
+	envCfg[qwenOllamaEnvKey] = qwenKeyFor(model)
+}
+
 func qwenMap(value any) map[string]any {
 	if m, ok := value.(map[string]any); ok {
 		return m
@@ -305,15 +331,47 @@ func qwenMap(value any) map[string]any {
 	return map[string]any{}
 }
 
-func qwenMergeOpenAIProviders(value any, provider map[string]any) []any {
+// qwenMergeOpenAIProviders puts our provider first and drops the entry it owned
+// before, keeping every provider that is the user's.
+//
+// Ownership is "envKey is ours AND the name carries our suffix AND the base URL
+// is either this launch's target or the daemon's". Requiring only the daemon's
+// base URL — as this did — meant the entry written by a REMOTE-backed launch
+// never matched and never went away, so each launch appended another dead copy
+// (three launches of one remote model left three identical providers, all
+// pointing at the remote with the same envKey) (2026-09-26 audit, tenth round).
+// The suffix is required so a hand-written entry that merely uses the same env
+// key ("Remote Ollama", in this package's own merge test) is not treated as
+// ours.
+func qwenMergeOpenAIProviders(value any, provider map[string]any, targetBaseURL string) []any {
 	merged := []any{provider}
 	for _, existing := range qwenProviderList(value) {
-		if qwenIsOllamaProvider(existing) {
+		if qwenIsOllamaProvider(existing) || qwenIsOurProvider(existing, targetBaseURL) {
 			continue
 		}
 		merged = append(merged, existing)
 	}
 	return merged
+}
+
+// qwenIsOurProvider reports whether value is an entry this package wrote
+// before, for the base URL being configured now or for the daemon.
+func qwenIsOurProvider(value any, targetBaseURL string) bool {
+	provider, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	envKey, _ := provider["envKey"].(string)
+	if envKey != qwenOllamaEnvKey {
+		return false
+	}
+	name, _ := provider["name"].(string)
+	if !strings.HasSuffix(name, qwenProviderNameSuffix) {
+		return false
+	}
+	baseURL, _ := provider["baseUrl"].(string)
+	baseURL = strings.TrimRight(baseURL, "/")
+	return baseURL == strings.TrimRight(targetBaseURL, "/") || baseURL == qwenBaseURL()
 }
 
 func qwenProviderList(value any) []any {
@@ -443,7 +501,7 @@ func qwenProvider(model string) map[string]any {
 	id := qwenModelIDFor(model)
 	return map[string]any{
 		"id":      id,
-		"name":    fmt.Sprintf("%s (Ollama)", id),
+		"name":    id + qwenProviderNameSuffix,
 		"baseUrl": qwenBaseURLFor(model),
 		"envKey":  qwenOllamaEnvKey,
 	}
