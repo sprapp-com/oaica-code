@@ -55,6 +55,57 @@ type gpuHolder struct {
 	MemMiB int
 }
 
+// fuserPIDs reads the PIDs out of `fuser -v` output.
+//
+// fuser -v prints "USER PID ACCESS COMMAND": the header once, then one row per
+// holder, with the device name only on the first row of each device's block.
+// COMMAND is the process name as fuser sees it and can contain a space, so the
+// PID is found by its position in the row's fixed shape — the field before the
+// ACCESS column — and never by counting back from the end of the line
+// (2026-09-26 audit: a command with a space shifted that offset, Atoi failed on
+// a word of the command, and the holder disappeared from `oaica gpu ps`).
+func fuserPIDs(out string) []int {
+	var pids []int
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		for i, f := range fields {
+			pid, err := strconv.Atoi(f)
+			if err != nil || pid <= 0 || i+1 >= len(fields) {
+				continue
+			}
+			if !fuserAccessField(fields[i+1]) {
+				continue
+			}
+			pids = append(pids, pid)
+			break
+		}
+	}
+	return pids
+}
+
+// fuserAccessField reports whether a field is fuser's ACCESS column: at least
+// three characters from the set the column is built from (c current dir, e
+// executable, f open fd, F open fd, r root dir, m mmap) and dots for the flags
+// that do not apply — "F....", "F...m", "..c..". Requiring the character set
+// keeps a word of the command from being mistaken for it; requiring the column
+// itself is what makes the PID readable whatever the command looks like.
+func fuserAccessField(f string) bool {
+	if len(f) < 3 {
+		return false
+	}
+	for _, r := range f {
+		switch r {
+		case 'c', 'e', 'f', 'F', 'r', 'm', '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // listGPUHolders cross-references fuser's live driver-fd view (source of
 // truth for "is this process actually touching a GPU right now") with
 // nvidia-smi's compute-apps list (best-effort memory figures, can be
@@ -79,23 +130,8 @@ func listGPUHolders() ([]gpuHolder, error) {
 				return nil, fmt.Errorf("fuser not found on PATH — required for accurate GPU-holder detection (nvidia-smi's own list can be stale)")
 			}
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			// fuser -v format: "USER    PID ACCESS COMMAND" (header) or
-			// "/dev/nvidia0:  root  1234 F.... python3" (data rows, device
-			// name only on the FIRST row of a device's block).
-			pidField := fields[len(fields)-3]
-			if len(fields) == 3 {
-				// header row or malformed — skip
-				continue
-			}
-			pid, err := strconv.Atoi(pidField)
-			if err == nil && pid > 0 {
-				pids[pid] = true
-			}
+		for _, pid := range fuserPIDs(string(out)) {
+			pids[pid] = true
 		}
 	}
 
