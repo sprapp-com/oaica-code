@@ -265,6 +265,12 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 				r.RoutePolicy = existing.RoutePolicy
 				r.Weight = existing.Weight
 				r.AuthVia = existing.AuthVia
+				// ModelsPath: the vendor's declared model-list URL, set by
+				// hand in remotes.json because no flag writes it. Dropping it
+				// sent the picker at <base>/models instead, which for the
+				// vendor that needs it returns the wrong list or a 404, so
+				// its models disappeared from the picker (2026-09-26 audit).
+				r.ModelsPath = existing.ModelsPath
 				f.Remotes[i] = r
 				replaced = true
 				break

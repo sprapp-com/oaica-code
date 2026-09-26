@@ -908,6 +908,77 @@ func claudeCodeModelAlias(model string) string {
 	return model
 }
 
+// childEnv is the environment the launched agent runs in: the launcher's own
+// environment, minus every variable this launch reads an upstream credential
+// from, plus the plan's Claude Code variables.
+func (p tierPlan) childEnv(anthropicBaseURL, clientToken string) []string {
+	return append(scrubCredentialEnv(os.Environ(), p.credentialEnvNames()), p.envVars(anthropicBaseURL, clientToken)...)
+}
+
+// credentialEnvNames lists every environment variable this plan reads a REAL
+// upstream credential out of, which is the set that must not reach the child.
+//
+// The proxy attaches each route's real key upstream (see envVars), so the
+// child never needs any of them — and the key a leg is configured with is, by
+// design, the variable the user exported (api_key_env), which os.Environ()
+// therefore carried into the child for the taking: `env` in a Bash tool call,
+// an install hook, or a prompt-injected command spends the user's account.
+// Both names of a comma-joined api_key_env are included, because keyEnvName
+// picks whichever one is set and this cannot know which without reading them.
+func (p tierPlan) credentialEnvNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(spec string) {
+		for _, name := range strings.Split(spec, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	add(p.Primary.TokenEnv)
+	add(p.Secondary.TokenEnv)
+	add(p.Haiku.TokenEnv)
+	addRoute := func(r proxyRoute) { add(r.KeyEnv) }
+	addRoute(p.Routes.Default)
+	addRoute(p.Routes.Oversize)
+	for _, r := range p.Routes.ByModel {
+		addRoute(r)
+	}
+	for _, r := range p.Routes.Fallbacks {
+		addRoute(r)
+	}
+	return out
+}
+
+// scrubCredentialEnv drops NAME=... entries for the named variables. Removal,
+// not blanking: a blanked name still tells the child the variable is there.
+// Everything else — PATH, the user's own tooling, Claude Code's config — is
+// passed through untouched; this is a credential rule, not a clean slate.
+func scrubCredentialEnv(env []string, names []string) []string {
+	if len(names) == 0 {
+		return env
+	}
+	drop := make(map[string]bool, len(names))
+	for _, n := range names {
+		drop[n] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		if drop[name] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // envVars is the Claude Code environment for a plan. ANTHROPIC_AUTH_TOKEN is
 // the per-launch proxy token (see proxyRouteTable.ClientToken): the proxy
 // attaches each route's real key upstream, so no real key enters the child
@@ -1490,7 +1561,7 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), plan.envVars(anthropicBaseURL, clientToken)...)
+	cmd.Env = plan.childEnv(anthropicBaseURL, clientToken)
 	if err := cmd.Run(); err != nil {
 		claudeResumeHint(err, args)
 		return err

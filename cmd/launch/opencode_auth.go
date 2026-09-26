@@ -1,9 +1,11 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -194,20 +196,56 @@ func SaveOpencodeAPIKey(provider, key string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	auth, err := readOpencodeAuth(path)
+	// The store is read and written as the raw JSON document it is, not
+	// through opencodeAuthEntry: that struct carries five of the members a
+	// provider entry can have, and marshalling it back over the file deleted
+	// every other one — for every provider in the file, so adding a key for
+	// one provider silently signed the user out of another whose entry type
+	// oaica does not model (2026-09-26 audit). UseNumber is the same rule's
+	// other half: a number this package cannot represent must survive the
+	// round-trip rather than come back as a float.
+	doc, err := opencodeAuthReadDocument(path)
 	if err != nil {
 		return err
 	}
-	if entry, ok := auth[provider]; ok {
-		if t := strings.ToLower(strings.TrimSpace(entry.Type)); t != "" && t != "api" && t != "api_key" {
-			return fmt.Errorf("opencode already has a %q credential for %s (access token, refresh token and expiry) that an API key cannot replace — run `opencode auth login %s`, or remove that entry by hand first", entry.Type, provider, provider)
+	entry := doc[provider]
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	if existing, _ := entry["type"].(string); existing != "" {
+		if t := strings.ToLower(strings.TrimSpace(existing)); t != "api" && t != "api_key" {
+			return fmt.Errorf("opencode already has a %q credential for %s (access token, refresh token and expiry) that an API key cannot replace — run `opencode auth login %s`, or remove that entry by hand first", existing, provider, provider)
 		}
 	}
-	auth[provider] = opencodeAuthEntry{Type: "api", Key: key}
+	entry["type"] = "api"
+	entry["key"] = key
+	doc[provider] = entry
 
-	data, err := json.MarshalIndent(auth, "", "  ")
+	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
 	return fileutil.WriteWithBackup(path, data, "opencode")
+}
+
+// opencodeAuthReadDocument reads opencode's auth.json as the document it is:
+// one map per provider, untouched by any Go struct. A file that cannot be
+// parsed is REFUSED rather than rewritten — oaica writes one provider entry,
+// so overwriting a document it cannot read would delete the user's other
+// logins (store_document.go's discipline).
+func opencodeAuthReadDocument(path string) (map[string]map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return map[string]map[string]any{}, nil
+		}
+		return nil, err
+	}
+	doc := map[string]map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return nil, fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica writes only the one provider entry it was asked for, so rewriting a file it cannot read would delete every other login in it", path, err)
+	}
+	return doc, nil
 }

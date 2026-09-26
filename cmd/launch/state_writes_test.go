@@ -153,6 +153,10 @@ func TestRemoteAdd_PreservesFieldsItHasNoFlagFor(t *testing.T) {
 		RoutePolicy: string(RouteRemoteOnly),
 		Weight:      3,
 		AuthVia:     "opencode",
+		// ModelsPath is the other flagless field the rule covers: no
+		// `--models-path` flag exists anywhere, so a replace that drops it
+		// leaves the user unable to type it back (2026-09-26 audit).
+		ModelsPath: "/v1/models",
 	}}}
 	b, err := json.MarshalIndent(seed, "", "  ")
 	if err != nil {
@@ -169,6 +173,10 @@ func TestRemoteAdd_PreservesFieldsItHasNoFlagFor(t *testing.T) {
 	if got.RoutePolicy != string(RouteRemoteOnly) || got.Weight != 3 || got.AuthVia != "opencode" {
 		t.Errorf("remote add dropped flagless fields: route_policy=%q weight=%d auth_via=%q",
 			got.RoutePolicy, got.Weight, got.AuthVia)
+	}
+	if got.ModelsPath != "/v1/models" {
+		t.Errorf("remote add dropped models_path (got %q) — no flag sets it, so the vendor's declared model-list URL is unreachable afterwards and the picker falls back to <base>/models",
+			got.ModelsPath)
 	}
 
 	f, _, err := loadUserRemotesFileRaw()
