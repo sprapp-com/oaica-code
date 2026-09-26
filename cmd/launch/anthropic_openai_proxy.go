@@ -2544,6 +2544,16 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	// completions, which can run minutes on a large request (same
 	// reasoning as tier_routing.go's API_TIMEOUT_MS for the OAICA-routed
 	// path — a chat completion is not a quick metadata call).
+	//
+	// This is the same 10 minutes tier_routing.go exports to the child as
+	// API_TIMEOUT_MS=600000, and equal on purpose. The child's timer starts
+	// first, so when a turn really does run that long the child aborts on its
+	// own clock and retries on its own terms; this client only ever fires in
+	// the gap between the child giving up and its request being torn down,
+	// where its 502 is the truthful answer to a request nobody is waiting for
+	// any more. Neither timeout can abort the other's retry loop mid-turn,
+	// which is what a mismatch (say 30s here against 10 minutes there) would
+	// do — the child would retry a leg this side had already killed.
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
