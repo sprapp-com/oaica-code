@@ -62,6 +62,7 @@ const (
 	agentStoreOpenclawSessionOverrid = "openclaw-session-override"
 	agentStoreDsh                    = "dsh"
 	agentStoreHermes                 = "hermes"
+	agentStoreQwen                   = "qwen"
 	agentStoreOmpModels              = "omp-models"
 	agentStoreOmpAgent               = "omp-agent"
 	agentStoreClineEdit              = "cline-edit"
@@ -152,6 +153,8 @@ func runAgentStoreWriter(kind, id string) error {
 		return (&DeepSeekHarness{}).ConfigureWithModels(id, []LaunchModel{fallbackLaunchModel(id)})
 	case agentStoreHermes:
 		return (&Hermes{}).Configure(id)
+	case agentStoreQwen:
+		return (&Qwen{}).Configure(id)
 	case agentStoreOmpModels:
 		return writeOMPModelsConfig(id, []LaunchModel{fallbackLaunchModel(id)})
 	case agentStoreOmpAgent:

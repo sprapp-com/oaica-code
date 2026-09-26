@@ -325,19 +325,31 @@ func (q *Qwen) Configure(model string) error {
 		return err
 	}
 
-	cfg, err := q.readConfig()
-	if err != nil {
-		return err
-	}
+	// ~/.qwen is qwen's OWN store, so the lock is keyed under ~/.oaica/locks
+	// (foreignStoreLockBase) rather than dropped inside it, as the other foreign
+	// stores do. It has to cover the read as well as the publish: readConfig is
+	// called a frame down, and two overlapping writers that read before taking
+	// the lock each publish a snapshot taken before the other's settings landed
+	// — the launch that renames last decides model.name, auth.baseUrl,
+	// modelProviders.openai and env.OLLAMA_API_KEY while both report success, so
+	// one of them runs the other launch's model. qwen keeps its own keys in this
+	// document too, so a write it made between oaica's read and rename is lost
+	// the same way (2026-09-26 audit, fourteenth round).
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		cfg, err := q.readConfig()
+		if err != nil {
+			return err
+		}
 
-	applyQwenOllamaConfig(cfg, model)
+		applyQwenOllamaConfig(cfg, model)
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return err
+		}
 
-	return fileutil.WriteWithBackup(configPath, data, "qwen")
+		return fileutil.WriteWithBackup(configPath, data, "qwen")
+	})
 }
 
 func applyQwenOllamaConfig(cfg map[string]any, model string) {
