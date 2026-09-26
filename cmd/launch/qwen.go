@@ -405,14 +405,26 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 //
 // For a REMOTE-backed launch the base URL is ours and the provider only works
 // with that remote's token, so the value is written: leaving a stale key there
-// would be the silent-401 failure this function exists to prevent.
+// would be the silent-401 failure this function exists to prevent — unless the
+// remote resolves to NO token at all, which is a remote configured to need no
+// credential (no api_key, no api_key_env: a localhost vLLM/llama server behind
+// a tunnel, like this fleet's own `oaica serve`). Writing "" there consumed a
+// credential the launch had no use for, which is the same rule as the daemon
+// branch: a launch that needs no credential must not destroy one
+// (2026-09-27 audit, round 19).
 func applyQwenOllamaKey(envCfg map[string]any, model string) {
-	if _, isRemote := resolveRemoteEndpoint(model); !isRemote {
-		if existing, _ := envCfg[qwenOllamaEnvKey].(string); strings.TrimSpace(existing) != "" {
+	key := qwenKeyFor(model)
+	if _, isRemote := resolveRemoteEndpoint(model); isRemote {
+		if strings.TrimSpace(key) == "" {
 			return
 		}
+		envCfg[qwenOllamaEnvKey] = key
+		return
 	}
-	envCfg[qwenOllamaEnvKey] = qwenKeyFor(model)
+	if existing, _ := envCfg[qwenOllamaEnvKey].(string); strings.TrimSpace(existing) != "" {
+		return
+	}
+	envCfg[qwenOllamaEnvKey] = key
 }
 
 func qwenMap(value any) map[string]any {
