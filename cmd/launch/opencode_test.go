@@ -572,6 +572,21 @@ exit 0
 			return true, nil
 		})
 
+		// The installer script is FETCHED, and unstubbed this case downloaded
+		// it from the live network: its verdict then depended on whether
+		// opencode.ai answered, and on a slow or blocked network the failure
+		// it asserts was replaced by the download's own error — "expected
+		// install failure error, got download installer https://opencode.ai/
+		// install: ...", which is how it flaked in the full suite
+		// (2026-09-26 audit, fifteenth round). Stub the fetch, as its "unix
+		// install succeeds" sibling does: this case is about the installer
+		// COMMAND failing, not about the network.
+		oldFetch := fetchInstallerScriptFn
+		fetchInstallerScriptFn = func(string) (string, error) {
+			return filepath.Join(tmpDir, "opencode-install.sh"), nil
+		}
+		t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
+
 		_, err := ensureOpenCodeInstalled()
 		if err == nil || !strings.Contains(err.Error(), "failed to install opencode") {
 			t.Fatalf("expected install failure error, got %v", err)
