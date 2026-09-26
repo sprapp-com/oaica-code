@@ -123,8 +123,19 @@ func requestLogModelFromBody(body []byte) string {
 // messages[] or Anthropic top-level system + messages[]) — best-effort,
 // never errors, a shape it doesn't recognize just logs zero lengths
 // rather than failing the request.
+//
+// The Anthropic top-level `system` is counted into totalLen. Claude Code
+// sends its whole system prompt there — the largest single part of every
+// request it makes — and reading only messages[] meant CHARS (and so
+// would_be_hard_by_len) measured the conversation while ignoring the
+// prompt: a turn whose real input was ~40k chars logged a few hundred. The
+// router's own classifier never had this blind spot, because the
+// translation puts that system prompt at messages[0] before it sees it
+// (2026-09-26 audit, ninth round). lastLen stays the last MESSAGE's length,
+// exactly as the server-side signal is defined.
 func extractLastAndTotalMessageLen(body []byte) (lastLen, totalLen int) {
 	var parsed struct {
+		System   json.RawMessage `json:"system"`
 		Messages []struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
@@ -139,6 +150,9 @@ func extractLastAndTotalMessageLen(body []byte) (lastLen, totalLen int) {
 		}
 		return len(raw) // non-string content (blocks) — approximate with raw JSON length
 	}
+	// The OpenAI shape carries its system prompt as messages[0] and has no
+	// top-level field, so this is a no-op there (contentLen(nil) == 0).
+	totalLen = contentLen(parsed.System)
 	for _, m := range parsed.Messages {
 		totalLen += contentLen(m.Content)
 	}
