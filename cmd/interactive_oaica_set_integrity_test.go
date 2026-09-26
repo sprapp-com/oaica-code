@@ -143,6 +143,58 @@ func TestTheUnhonouredSetOptionsWriteNothing(t *testing.T) {
 	}
 }
 
+// And the /set help must not offer what its arms refuse — the invariant
+// TestTheHelpDoesNotOfferSave pins for usage(), applied to usageSet(). The arms
+// are deliberate: each names the option and says it is not sent in this
+// session, so the help text was the side that was wrong. Reading the two off
+// each other, rather than off a hand-written list, is what keeps them together.
+func TestTheSetHelpDoesNotOfferOptionsTheArmsRefuse(t *testing.T) {
+	src := interactiveSource(t)
+	help := src[strings.Index(src, "usageSet := func()"):]
+	if end := strings.Index(help, "usageShortcuts := func()"); end >= 0 {
+		help = help[:end]
+	}
+	if !strings.Contains(help, "Available Commands:") {
+		t.Fatalf("could not find the /set help block — re-read interactive.go before trusting this test:\n%s", help)
+	}
+	// Comments are stripped, as setCaseBlock does for the arm itself: the code
+	// this test is about explains what it no longer offers, by name.
+	var code []string
+	for _, l := range strings.Split(help, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "//") {
+			continue
+		}
+		code = append(code, l)
+	}
+	help = strings.Join(code, "\n")
+
+	block := setCaseBlock(t, src)
+	for _, opt := range []struct{ advertised, arm string }{
+		{"/set think", "think"},
+		{"/set nothink", "nothink"},
+		{"/set format", "format"},
+		{"/set noformat", "noformat"},
+		{"/set parameter", "parameter"},
+	} {
+		// Premise: this is an option the session refuses. If an arm stops
+		// refusing one, this test says so instead of passing vacuously.
+		if !strings.Contains(subcase(t, block, opt.arm), "oaicaSettingNotSent(") {
+			t.Fatalf("premise: /set %s no longer refuses the option — re-read interactive.go before trusting this test:\n%s", opt.arm, subcase(t, block, opt.arm))
+		}
+		if strings.Contains(help, opt.advertised) {
+			t.Errorf("the /set help still offers %q, while every /set %s answers that it is not sent in this session — help must not advertise what the session refuses:\n%s",
+				opt.advertised, opt.arm, help)
+		}
+	}
+
+	// The options the session DOES honour must still be offered.
+	for _, kept := range []string{"/set system", "/set history", "/set nohistory", "/set wordwrap", "/set nowordwrap", "/set verbose", "/set quiet"} {
+		if !strings.Contains(help, kept) {
+			t.Errorf("the /set help no longer lists %q, which this session honours", kept)
+		}
+	}
+}
+
 // setCaseBlock returns the `/set` arm of generateInteractive's command switch,
 // comments stripped, up to the arm after it.
 func setCaseBlock(t *testing.T, src string) string {

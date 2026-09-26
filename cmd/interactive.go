@@ -52,20 +52,23 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		fmt.Fprintln(os.Stderr, "")
 	}
 
+	// usageSet lists the options this session can actually honour. It used to
+	// list /set parameter, /set format json, /set noformat, /set think and
+	// /set nothink as well, and every one of those arms answers that the
+	// setting is not sent in this session: the help advertised five promises
+	// the REPL refuses (2026-09-26 audit, tenth round). They stay accepted and
+	// keep explaining why — see the /set arm — but the help only offers what
+	// is honoured, the invariant usage() above already keeps for the command
+	// it no longer runs.
 	usageSet := func() {
 		fmt.Fprintln(os.Stderr, "Available Commands:")
-		fmt.Fprintln(os.Stderr, "  /set parameter ...     Set a parameter")
 		fmt.Fprintln(os.Stderr, "  /set system <string>   Set system message")
 		fmt.Fprintln(os.Stderr, "  /set history           Enable history")
 		fmt.Fprintln(os.Stderr, "  /set nohistory         Disable history")
 		fmt.Fprintln(os.Stderr, "  /set wordwrap          Enable wordwrap")
 		fmt.Fprintln(os.Stderr, "  /set nowordwrap        Disable wordwrap")
-		fmt.Fprintln(os.Stderr, "  /set format json       Enable JSON mode")
-		fmt.Fprintln(os.Stderr, "  /set noformat          Disable formatting")
 		fmt.Fprintln(os.Stderr, "  /set verbose           Show LLM stats")
 		fmt.Fprintln(os.Stderr, "  /set quiet             Disable LLM stats")
-		fmt.Fprintln(os.Stderr, "  /set think             Enable thinking")
-		fmt.Fprintln(os.Stderr, "  /set nothink           Disable thinking")
 		fmt.Fprintln(os.Stderr, "")
 	}
 
