@@ -475,13 +475,25 @@ func patchDeviceScopes() {
 	if err != nil {
 		return
 	}
+	path := filepath.Join(home, ".openclaw", "devices", "paired.json")
+	// The gateway's pairing record, rewritten whole from a snapshot: the read of
+	// the device list and the publish of the patched copy take the store's lock,
+	// so two oaica launches cannot drop each other's pairing entries. Note this
+	// only orders oaica against oaica — the gateway itself writes this file
+	// without knowing about the lock. Best-effort, as the rest of this
+	// integration is.
+	_ = fileutil.WithFileLock(foreignStoreLockBase(path), func() error {
+		patchDeviceScopesLocked(home, path)
+		return nil
+	})
+}
 
+func patchDeviceScopesLocked(home, path string) {
 	deviceID := readLocalDeviceID(home)
 	if deviceID == "" {
 		return
 	}
 
-	path := filepath.Join(home, ".openclaw", "devices", "paired.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -678,6 +690,32 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 
 	configPath := filepath.Join(home, ".openclaw", "openclaw.json")
 	legacyPath := filepath.Join(home, ".clawdbot", "clawdbot.json")
+
+	// openclaw.json is OpenClaw's document and oaica models one part of it: the
+	// read below, the merge, and the whole-document write have to run under the
+	// same lock every other oaica writer of this file takes
+	// (configureOllamaWebSearch, and a concurrent `oaica launch openclaw`), or
+	// two commands each publish a snapshot taken before the other's entry and
+	// the rename that lands last deletes it while both report success
+	// (2026-09-26 audit, twelfth round). The lock is keyed off the file oaica
+	// publishes to, not off the legacy path it may have read from: that is the
+	// path every writer of this store resolves to, and the lock's identity is
+	// what makes two processes meet.
+	if err := fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		return openclawEditConfig(configPath, legacyPath, models)
+	}); err != nil {
+		return err
+	}
+
+	// Clear any per-session model overrides so the new primary takes effect
+	// immediately rather than being shadowed by a cached modelOverride. Its own
+	// file, so its own lock — taken after this one is released, to keep a single
+	// lock order (config, then session state) between any two oaica commands.
+	clearSessionModelOverride(models[0].Name)
+	return nil
+}
+
+func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
@@ -782,10 +820,6 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 	if err := fileutil.WriteWithBackup(configPath, out, "openclaw"); err != nil {
 		return err
 	}
-
-	// Clear any per-session model overrides so the new primary takes effect
-	// immediately rather than being shadowed by a cached modelOverride.
-	clearSessionModelOverride(models[0].Name)
 	return nil
 }
 
@@ -797,6 +831,19 @@ func clearSessionModelOverride(primary string) {
 		return
 	}
 	path := filepath.Join(home, ".openclaw", "agents", "main", "sessions", "sessions.json")
+	// Session state is a document of OpenClaw's that oaica rewrites whole, so the
+	// read and the publish belong under the same lock as any other oaica writer
+	// of it — without one, a session record another command had just updated is
+	// dropped by the publish of a snapshot taken before it (2026-09-26 audit).
+	// Best-effort, like every write in this integration: a lock that cannot be
+	// placed means no write, not a failed launch.
+	_ = fileutil.WithFileLock(foreignStoreLockBase(path), func() error {
+		clearSessionModelOverrideLocked(path, primary)
+		return nil
+	})
+}
+
+func clearSessionModelOverrideLocked(path, primary string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -851,6 +898,18 @@ func configureOllamaWebSearch() {
 		return
 	}
 	configPath := filepath.Join(home, ".openclaw", "openclaw.json")
+	// The same file Openclaw.Edit rewrites, and the same read-modify-publish
+	// shape: this rewrites whole sections of OpenClaw's config from a snapshot,
+	// so it takes the same lock, or the two commands publish over each other
+	// (2026-09-26 audit, twelfth round). Best-effort: if the lock cannot be
+	// placed, nothing is written and the launch continues.
+	_ = fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		configureOllamaWebSearchLocked(configPath)
+		return nil
+	})
+}
+
+func configureOllamaWebSearchLocked(configPath string) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return
