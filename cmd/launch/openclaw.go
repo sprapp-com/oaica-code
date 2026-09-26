@@ -771,7 +771,7 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 	// cannot serve, its primary pointing at a namespaced name that resolves
 	// nowhere. The refusal belongs where the user can still act on it, before
 	// the file is touched (2026-09-26 audit, round 16; same shape as
-	// museRejectRemoteModels).
+	// museRejectNonDaemonModels).
 	for _, m := range models {
 		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
 			return openclawRemoteRefusal(m.Name, ep.Name)

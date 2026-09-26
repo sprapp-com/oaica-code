@@ -303,14 +303,17 @@ func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
 		// (2026-09-27 audit, round 19). oaica's own daemon entries always carry
 		// both: the id is "custom:<picker>-<index>" and the model is the picker
 		// itself.
-		picker := droidPickerFromID(id)
-		if picker == "" || model == "" || picker != model {
+		if model == "" {
 			return "", false
 		}
-		return picker, true
+		for _, picker := range droidPickerCandidates(id) {
+			if picker == model {
+				return picker, true
+			}
+		}
+		return "", false
 	}
-	picker := droidPickerFromID(id)
-	if picker == "" || model == "" {
+	if model == "" {
 		return "", false
 	}
 	// The endpoint is matched against the configured remotes directly, NOT via
@@ -324,14 +327,17 @@ func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
 	// The picker has to name that remote's model, in either spelling a launch
 	// can save: "<remote>/<upstream>" for a namespaced picker, or the bare
 	// upstream id itself.
-	if prefix, bare, namespaced := strings.Cut(picker, "/"); namespaced {
-		if prefix != remote.Name || bare != model {
-			return "", false
+	for _, picker := range droidPickerCandidates(id) {
+		if prefix, bare, namespaced := strings.Cut(picker, "/"); namespaced {
+			if prefix != remote.Name || bare != model {
+				continue
+			}
+		} else if picker != model {
+			continue
 		}
-	} else if picker != model {
-		return "", false
+		return picker, true
 	}
-	return picker, true
+	return "", false
 }
 
 // droidLegacyIDSuffix is the segment the upstream `ollama config droid` put in
@@ -342,30 +348,40 @@ func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
 // beside a second copy of the same model.
 const droidLegacyIDSuffix = "-[Ollama]"
 
-// droidPickerFromID reverses the id this file writes for a launched model —
+// droidPickerCandidates reverses the id this file writes for a launched model —
 // "custom:<picker name>-<index>", or the older "custom:<picker name>-[Ollama]-
-// <index>" — and returns "" for an id it did not write. Only a trailing
-// "-<digits>" (and the legacy marker before it) is stripped, so a name that
-// ends in a number, or carries ":"/"-"/"/" of its own, round-trips.
-func droidPickerFromID(id string) string {
+// <index>" — and returns "" (no candidates) for an id it did not write. Only a
+// trailing "-<digits>" (and the legacy marker before it) is stripped, so a name
+// that ends in a number, or carries ":"/"-"/"/" of its own, round-trips.
+//
+// The legacy marker is offered as a second READING rather than stripped: a
+// model whose name ends in it ("foo-[Ollama]") is written as
+// "custom:foo-[Ollama]-0", which is byte-identical to a legacy id for "foo", so
+// no rule on the id alone can tell the two apart. Stripping unconditionally
+// made the new-format entry read as a foreign one — the user's — and every
+// launch appended another copy of the same model (2026-09-27 audit, round 21).
+// The caller decides by the model the entry stores, which is the field that
+// distinguishes the readings.
+func droidPickerCandidates(id string) []string {
 	rest, ok := strings.CutPrefix(id, "custom:")
 	if !ok {
-		return ""
+		return nil
 	}
 	dash := strings.LastIndex(rest, "-")
 	if dash <= 0 || dash == len(rest)-1 {
-		return ""
+		return nil
 	}
 	for _, r := range rest[dash+1:] {
 		if r < '0' || r > '9' {
-			return ""
+			return nil
 		}
 	}
-	name := strings.TrimSuffix(rest[:dash], droidLegacyIDSuffix)
-	if name == "" {
-		return ""
+	name := rest[:dash]
+	candidates := make([]string, 0, 2)
+	if stripped := strings.TrimSuffix(name, droidLegacyIDSuffix); stripped != name && stripped != "" {
+		candidates = append(candidates, stripped)
 	}
-	return name
+	return append(candidates, name)
 }
 
 // droidRemoteForBase returns the configured remote serving baseURL — the

@@ -14,7 +14,7 @@ package launch
 // to the local daemon, which does not resolve namespaced remotes: every
 // request fails model-not-found after the user has already answered the key
 // prompt. Same shape as muse's settings, and the same answer — refuse at the
-// point the user can act on it (museRejectRemoteModels).
+// point the user can act on it (museRejectNonDaemonModels).
 
 import (
 	"os"

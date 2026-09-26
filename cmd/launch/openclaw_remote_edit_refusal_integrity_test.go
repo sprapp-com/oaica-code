@@ -14,7 +14,7 @@ package launch
 // then refused, so the launch never happened, but OpenClaw was left configured
 // for a model the daemon cannot serve with its primary pointing nowhere.
 //
-// The refusal has to be inside Edit, before the write (museRejectRemoteModels).
+// The refusal has to be inside Edit, before the write (museRejectNonDaemonModels).
 
 import (
 	"os"

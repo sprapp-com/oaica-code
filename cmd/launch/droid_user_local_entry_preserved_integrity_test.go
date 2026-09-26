@@ -93,7 +93,7 @@ const droidLegacyOllamaEntry = `{
 }`
 
 // An entry written by that older shape must still read as oaica's own. Round
-// 19 narrowed the marker to "the id this file writes", and droidPickerFromID
+// 19 narrowed the marker to "the id this file writes", and droidPickerCandidates
 // only stripped a trailing "-<digits>", so "custom:gemma2-[Ollama]-0" reversed
 // to the picker name "gemma2-[Ollama]", which is not the model stored beside it
 // — the entry read as the user's, was preserved, and a SECOND entry for the

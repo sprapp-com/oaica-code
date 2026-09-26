@@ -231,7 +231,7 @@ func codexAppCatalogContainsModel(model string) bool {
 	return false
 }
 
-// codexAppRejectRemoteModels refuses a selection the ChatGPT app's config
+// codexAppRejectNonDaemonModels refuses a selection the ChatGPT app's config
 // cannot route to.
 //
 // The CLI codex path translates a user-remote row — codexBaseURLFor for the
