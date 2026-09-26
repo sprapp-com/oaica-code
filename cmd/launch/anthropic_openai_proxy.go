@@ -2148,10 +2148,26 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 // byte count, and a relayed Content-Length that no longer matches the body
 // truncates or hangs the client. The transfer encoding is dropped for the same
 // reason — this writes one fixed-length body.
+//
+// The bound is enforced, not just imposed: a LimitReader that is reached makes
+// io.ReadAll return the truncated bytes with no error at all, and the body was
+// then relayed with a Content-Length computed from itself, so the client could
+// not tell the shortened document from the whole one. These callers relay GET
+// /v1/models, where the body IS the document — a client that gets the first
+// 16 MiB of a catalog parses it happily and concludes the models it cannot see
+// do not exist (2026-09-26 audit).
 func relayUpstreamResponse(w http.ResponseWriter, resp *http.Response) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	const maxRelayedBody = 16 << 20
+	// One byte past the cap is what distinguishes "exactly the limit" from
+	// "there was more".
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRelayedBody+1))
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "read upstream response: "+redactErr(err).Error())
+		return
+	}
+	if len(body) > maxRelayedBody {
+		writeAnthropicError(w, http.StatusBadGateway,
+			fmt.Sprintf("upstream response is larger than the %d-byte limit this proxy relays", maxRelayedBody))
 		return
 	}
 	body = []byte(redactCredentials(string(body)))
