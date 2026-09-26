@@ -23,6 +23,12 @@ package fileutil
 // write, so a lock held on its inode would be held on a file that no longer
 // exists by the time the second writer looks — the lock file is created once
 // and never replaced.
+//
+// The platform half lives in lock_unix.go (flock) and lock_windows.go
+// (LockFileEx). lock_other.go is the honest no-op for platforms that have
+// neither; Windows is deliberately not in it, because oaica-windows-amd64 is a
+// release artifact and a silent no-op there shipped the lost update until the
+// 2026-09-26 audit.
 
 import (
 	"os"
