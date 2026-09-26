@@ -457,12 +457,8 @@ func qwenIsOllamaProvider(value any) bool {
 	return envKey == qwenOllamaEnvKey && strings.TrimRight(baseURL, "/") == qwenBaseURL()
 }
 
-func (q *Qwen) CurrentModel() string {
-	cfg, err := q.readConfig()
-	if err != nil {
-		return ""
-	}
-
+// qwenManagedModelName is the model name oaica wrote into cfg, or "".
+func qwenManagedModelName(cfg map[string]any) string {
 	if modelCfg, ok := cfg["model"].(map[string]any); ok {
 		if name, ok := modelCfg["name"].(string); ok {
 			return strings.TrimSpace(name)
@@ -486,6 +482,95 @@ func (q *Qwen) CurrentModel() string {
 
 	name, _ := provider["id"].(string)
 	return strings.TrimSpace(name)
+}
+
+// qwenManagedBaseURL is the endpoint the written config points at: the remote's
+// own base for a user-remote model, otherwise the daemon's /v1
+// (qwenBaseURLFor). security.auth.baseUrl is written by Configure beside the
+// provider list; the provider entry is the fallback for a config that predates
+// one of the two.
+func qwenManagedBaseURL(cfg map[string]any) string {
+	if security, ok := cfg["security"].(map[string]any); ok {
+		if auth, ok := security["auth"].(map[string]any); ok {
+			if baseURL, ok := auth["baseUrl"].(string); ok {
+				if trimmed := strings.TrimSpace(baseURL); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	if modelProviders, ok := cfg["modelProviders"].(map[string]any); ok {
+		if providers, ok := modelProviders["openai"].([]any); ok && len(providers) > 0 {
+			if provider, ok := providers[0].(map[string]any); ok {
+				baseURL, _ := provider["baseUrl"].(string)
+				return strings.TrimSpace(baseURL)
+			}
+		}
+	}
+	return ""
+}
+
+// qwenConfiguredRemoteForBase returns the configured remote a Qwen endpoint
+// belongs to, if any. Reads the remote store only — no network — so it is safe
+// on every picker-state read.
+func qwenConfiguredRemoteForBase(baseURL string) (userRemote, bool) {
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, false
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == strings.TrimRight(baseURL, "/") {
+			return r, true
+		}
+	}
+	return userRemote{}, false
+}
+
+// qwenRemotePickerName maps a configured Qwen endpoint plus the upstream id
+// written in the config back to the picker name the launch used
+// ("box/big-model"). Configure stores the bare upstream id (qwenModelIDFor),
+// which the launcher cannot match against what it saved, so CurrentModel
+// translates it back. Returns "" when no configured remote serves that endpoint
+// under that id.
+func qwenRemotePickerName(baseURL, upstream string) string {
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" {
+		return ""
+	}
+	remote, ok := qwenConfiguredRemoteForBase(baseURL)
+	if !ok {
+		return ""
+	}
+	candidate := remote.Name + "/" + upstream
+	ep, ok := resolveRemoteEndpoint(candidate)
+	if !ok || strings.TrimRight(ep.BaseURL, "/") != strings.TrimRight(baseURL, "/") || ep.UpstreamModel != upstream {
+		return ""
+	}
+	return candidate
+}
+
+func (q *Qwen) CurrentModel() string {
+	cfg, err := q.readConfig()
+	if err != nil {
+		return ""
+	}
+
+	name := qwenManagedModelName(cfg)
+	if name == "" {
+		return ""
+	}
+
+	// A remote config stores the bare upstream id; report the picker name the
+	// launch wrote, so this answer agrees with what the launcher saved. A
+	// non-daemon endpoint counts only when a configured remote actually serves
+	// it — anything else is a foreign config and keeps its own name.
+	baseURL := qwenManagedBaseURL(cfg)
+	if baseURL != "" && strings.TrimRight(baseURL, "/") != strings.TrimRight(qwenBaseURL(), "/") {
+		if picker := qwenRemotePickerName(baseURL, name); picker != "" {
+			return picker
+		}
+	}
+	return name
 }
 
 func (q *Qwen) Onboard() error {
