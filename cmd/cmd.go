@@ -2853,7 +2853,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 	planSetCmd.Flags().String("haiku-model", "", "Model for Haiku/background-tier requests (default: same as --model)")
 	planSetCmd.Flags().String("oversize", "", "Larger-context model for requests the current leg cannot hold")
 	planSetCmd.Flags().String("route-policy", "", launch.RoutePolicyList()+" (default: local-first)")
-	planSetCmd.Flags().String("description", "", "Free-text description shown in `oaica plan list`")
+	planSetCmd.Flags().String("description", "", "Free-text description shown by oaica plan list")
 
 	planListCmd := &cobra.Command{
 		Use:   "list",
@@ -3231,7 +3231,13 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 		showCmd,
 		runCmd,
 		stopCmd,
-		pullCmd,
+		// pullCmd is deliberately absent: it is not a daemon command. Its
+		// own definition says so ("NOT checkServerHeartbeat — that pings a
+		// local Ollama server this thin-client fork doesn't run"), and
+		// PullHandler talks to api.oaica.com's /v1/manifest + /v1/pull. It
+		// used to be listed here, so `oaica pull --help` documented
+		// OLLAMA_HOST — a variable it never reads, which a user then sets and
+		// finds changes nothing (2026-09-26 audit, twelfth round).
 		pushCmd,
 		listCmd,
 		psCmd,
