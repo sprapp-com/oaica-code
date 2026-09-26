@@ -420,6 +420,13 @@ func loadUserRemotes() ([]userRemote, error) {
 			warnSkippedRemoteRow(path, i+1, r)
 			continue
 		}
+		if r.modelsPathIsCrossHost() {
+			// Kept, not skipped: the row's chat endpoint is fine and the user's
+			// launches still work — it is the models_path that is ignored
+			// (modelsURL), so the one thing that must not be silent is which
+			// setting was dropped and why (2026-09-26 audit, eleventh round).
+			warnCrossHostModelsPath(path, i+1, r)
+		}
 		out = append(out, r)
 	}
 	seen := make(map[string]bool, len(out))
@@ -467,6 +474,24 @@ func warnSkippedRemoteRow(path string, row int, r userRemote) {
 	fmt.Fprintf(noticeWriter(),
 		"%sWarning: %s %s is skipped: %s — a remote needs both, so nothing this row configures is offered; fix the row or remove it.%s\n",
 		ansiYellow, path, who, reason, ansiReset)
+}
+
+// warnCrossHostModelsPath reports a loaded row whose absolute models_path names
+// a host other than its own base_url. The row itself is kept — its chat endpoint
+// is untouched — but the models_path is ignored (modelsURL), because every
+// consumer of that URL attaches the row's credential to it and a key may only
+// travel to the account it belongs to. Reported through noticeWriter from the
+// loader, the way warnSkippedRemoteRow is, so every path that reads the store
+// says it at least once.
+func warnCrossHostModelsPath(path string, row int, r userRemote) {
+	base, _ := splitRemoteUserinfo(r.BaseURL)
+	who := fmt.Sprintf("row %d", row)
+	if r.Name != "" {
+		who += " (" + printableName(r.Name) + ")"
+	}
+	fmt.Fprintf(noticeWriter(),
+		"%sWarning: %s %s: models_path %s is ignored — it names another host than base_url %s, and this row's API key is sent with every request to it, so oaica falls back to the path derived from base_url.%s\n",
+		ansiYellow, path, who, printableName(r.ModelsPath), printableName(RedactBaseURL(base)), ansiReset)
 }
 
 // findUserRemoteForModel splits a "<remote>/<model>" picker name and returns
@@ -727,6 +752,16 @@ func (r userRemote) openAIBase() string {
 // not serve, and a working provider reads as broken.
 func (r userRemote) modelsURL() string {
 	p := strings.TrimSpace(r.ModelsPath)
+	if r.modelsPathIsCrossHost() {
+		// Ignored, not followed: every consumer of this URL attaches the row's
+		// credential to it (fetchRemoteModels, probeRemote, the context-window
+		// probe, the proxy's client GET /v1/models passthrough), so an
+		// absolute path on ANOTHER host would hand the key for base_url's
+		// account to that host on every sweep. Falling back to the derived
+		// path costs a 404 in the worst case; following it costs the key.
+		// The loader warns about the ignored setting (warnCrossHostModelsPath).
+		p = ""
+	}
 	switch {
 	case p == "":
 		return r.openAIBase() + "/models"
@@ -736,6 +771,33 @@ func (r userRemote) modelsURL() string {
 		base, _ := splitRemoteUserinfo(r.BaseURL)
 		return strings.TrimRight(strings.TrimSpace(base), "/") + "/" + strings.TrimLeft(p, "/")
 	}
+}
+
+// modelsPathIsCrossHost reports whether an ABSOLUTE models_path names a host
+// other than base_url's — the one shape models_path has no legitimate use for:
+// its purpose is a model list versioned differently from the chat endpoint (see
+// modelsURL), which is a path, not another host. Where a row's credential may be
+// SENT is not something the row gets to widen, and remotes.json is a file people
+// copy between machines.
+//
+// Fails closed: a URL that will not parse, or carries no hostname, cannot be
+// shown to be the row's own host, so it is treated as foreign. A relative path
+// is never cross-host — it is resolved against base_url.
+func (r userRemote) modelsPathIsCrossHost() bool {
+	p := strings.TrimSpace(r.ModelsPath)
+	if p == "" || (!strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://")) {
+		return false
+	}
+	pu, err := url.Parse(p)
+	if err != nil || pu.Hostname() == "" {
+		return true
+	}
+	base, _ := splitRemoteUserinfo(r.BaseURL)
+	bu, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || bu.Hostname() == "" {
+		return true
+	}
+	return !strings.EqualFold(pu.Hostname(), bu.Hostname())
 }
 
 // EndpointBase is openAIBase for callers outside this package — the base URL
