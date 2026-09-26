@@ -2268,7 +2268,7 @@ func NewCLI() *cobra.Command {
 	serveCmd.Flags().Int("port", 0, "Port to bind (default: auto-pick a free port)")
 	serveCmd.Flags().Int("ctx-size", 8192, "Context size")
 	serveCmd.Flags().Bool("no-cmoe", false, "Disable CPU-RAM MoE expert offload (needs much more VRAM without it)")
-	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU), overriding -cmoe; tune per model and GPU, as the fastest N is usually not the largest N that fits")
+	serveCmd.Flags().Int("ncmoe", 0, "Keep only the first N layers' MoE experts on CPU (rest fully on GPU) — overrides the -cmoe this command passes to llama-server by default (turn that default off with --no-cmoe); tune per model and GPU, as the fastest N is usually not the largest N that fits")
 	serveCmd.Flags().String("host", "127.0.0.1", "Address to bind the OpenAI-compatible API to. Use 0.0.0.0 to expose it on the network (requires --api-key)")
 	serveCmd.Flags().String("api-key", "", "Bearer token required on every request. Mandatory when --host is not loopback")
 	serveCmd.Flags().Bool("insecure", false, "Allow a non-loopback --host with no --api-key (trusted private networks only)")

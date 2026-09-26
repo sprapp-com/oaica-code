@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/cmd/launch"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/internal/modelref"
 	"github.com/ollama/ollama/readline"
@@ -377,13 +378,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					fmt.Printf("error: %v\n", err)
 					continue
 				}
-				fmt.Println("Available models:")
-				for _, m := range entries {
-					fmt.Printf("  %-28s %s\n", m.ID, starString(m.Stars))
-					if m.Description != "" {
-						fmt.Printf("  %-28s %s\n", "", m.Description)
-					}
-				}
+				oaicaPrintModelList(entries)
 				continue
 			}
 			if _, err := oaicaSwitchActiveModel(args[1], &oaicaActiveModel, &oaicaHistory); err != nil {
@@ -424,7 +419,9 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 						fmt.Printf("Unknown LoRA '%s'. Configured: ", name)
 						names := make([]string, len(loras))
 						for i, l := range loras {
-							names[i] = l.Name
+							// Quoted like /lora list's rows: these names are the
+							// router's, and this line is one line.
+							names[i] = launch.PrintableCell(l.Name)
 						}
 						fmt.Println(strings.Join(names, ", "))
 						unknown = true
@@ -460,10 +457,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					fmt.Println("No LoRA adapters configured.")
 					continue
 				}
-				fmt.Println("Configured LoRA adapters:")
-				for _, l := range loras {
-					fmt.Printf("  %s  (model: %s, slot: %d)\n", l.Name, l.Model, l.ID)
-				}
+				oaicaPrintLoraList(loras)
 			case "add":
 				if len(args) < 3 {
 					fmt.Println("Usage: /lora add <name>")
@@ -601,6 +595,35 @@ func resetConversation(opts *runOptions, history []oaicaChatMessage) []oaicaChat
 //
 // A model the router no longer lists is not an error: a session can outlive a
 // rename, and /show must not be the command that ends it.
+// oaicaPrintModelList writes /model list's rows from the router's answer.
+//
+// Both columns are ROUTER-supplied strings — the id and the "recommended for"
+// description are set once via the router's admin API — so they are no more
+// trustworthy than the catalog ids `model sync` prints, and a newline in either
+// forged a row in this picker: the user reads a list of models, one of which
+// the router never published. launch.PrintableCell is the rule the rest of the
+// toolkit uses for exactly this; see store_cell_forgery_integrity_test.go for
+// the same call at the other listings (2026-09-26 audit, round 13).
+func oaicaPrintModelList(entries []oaicaModelListEntry) {
+	fmt.Println("Available models:")
+	for _, m := range entries {
+		fmt.Printf("  %-28s %s\n", launch.PrintableCell(m.ID), starString(m.Stars))
+		if m.Description != "" {
+			fmt.Printf("  %-28s %s\n", "", launch.PrintableCell(m.Description))
+		}
+	}
+}
+
+// oaicaPrintLoraList writes /lora list's rows. Same argument as
+// oaicaPrintModelList: the name and the backend model come over HTTP from a
+// router the user may not own.
+func oaicaPrintLoraList(loras []oaicaLoraListEntry) {
+	fmt.Println("Configured LoRA adapters:")
+	for _, l := range loras {
+		fmt.Printf("  %s  (model: %s, slot: %d)\n", launch.PrintableCell(l.Name), launch.PrintableCell(l.Model), l.ID)
+	}
+}
+
 func oaicaShowInfo(model string) error {
 	entries, err := oaicaListModelsDetailed()
 	if err != nil {
