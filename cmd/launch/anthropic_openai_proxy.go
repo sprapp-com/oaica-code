@@ -2703,13 +2703,25 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 // is a dead turn the client saw, and so is no body at all, and counting either
 // healthy is the same defect on this path (2026-09-26 audit).
 func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) (int, bool) {
-	// The failed attempts on this leg are logged (request_log.go): a plan row
-	// on the anthropic wire whose upstream refuses connections left no
-	// evidence anywhere, so `oaica usage` reported a clean session for one
-	// where no turn ever succeeded (2026-09-26 audit).
+	// Every outcome on this leg is logged (request_log.go), the way the
+	// translated path logs it. A plan row on the anthropic wire used to write
+	// a row only when its upstream refused the connection, so the leg was
+	// invisible to `oaica usage` in the two states a user opens the report to
+	// see: a session where every turn SUCCEEDED (no rows at all — an
+	// Anthropic-wire remote could serve a whole day of traffic and report
+	// nothing), and one where every turn failed at the upstream with a 5xx,
+	// which returned early and left no evidence either (2026-09-26 audit).
+	//
+	// body here is the REWRITTEN one, so Model is the id the upstream was
+	// asked for rather than the picker spelling the client sent
+	// ("glm-5.3", not "zai-coding-plan/glm-5.3"). That is deliberately left as
+	// it was: it is the model that was spent, it is identical to the client's
+	// spelling on the native claude/* leg (whose UpstreamModel IS the alias
+	// the client sent), and it is the only spelling this function has — the
+	// translated path logs the client's because its body is not rewritten.
 	started := time.Now()
 	lastLen, totalLen := extractLastAndTotalMessageLen(body)
-	failEntry := requestLogEntry{
+	entry := requestLogEntry{
 		Timestamp:        time.Now().UTC().Format(time.RFC3339),
 		Model:            requestLogModelFromBody(body),
 		Path:             r.URL.Path,
@@ -2718,11 +2730,6 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 		TotalMessagesLen: totalLen,
 		HardSignalMatch:  requestLogHardSignalRE.MatchString(string(body)),
 		WouldBeHardByLen: lastLen > requestLogHardLengthThreshold || totalLen > requestLogHardLengthThreshold*3,
-	}
-	logTransportFailure := func(status int) {
-		failEntry.StatusCode = status
-		failEntry.DurationMs = time.Since(started).Milliseconds()
-		appendRequestLog(failEntry)
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
@@ -2773,11 +2780,39 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	// than hanging until the child's own timer.
 	resp, err := proxyUpstreamClient.Do(req)
 	if err != nil {
-		logTransportFailure(http.StatusBadGateway)
+		// The attempt is logged even though it never reached a backend (the
+		// defer below cannot cover this path: it is registered after Do, and
+		// nothing has been written to the client yet for it to read a status
+		// off). A leg that refuses connections is the case an ERR column
+		// exists for, and a transport failure is what the retry budget on the
+		// translated path already gave up on (2026-09-26 audit).
+		entry.StatusCode = http.StatusBadGateway
+		entry.DurationMs = time.Since(started).Milliseconds()
+		appendRequestLog(entry)
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return 0, false
 	}
 	defer resp.Body.Close()
+
+	// Everything from here on writes through rec, and the deferred row reads
+	// the status the CLIENT ended up with — not the upstream's byte before its
+	// body was read, which is the difference the translated path learned to
+	// draw (see its own entry comment). relayed is set where the relay ends,
+	// and the two non-deliveries it cannot see from the status alone are named
+	// explicitly: a client that hung up mid-turn (clientGone), and any leg
+	// whose sub-300 response never became a turn at all.
+	rec := &statusCapturingWriter{ResponseWriter: w}
+	w = rec
+	delivered := false
+	clientGone := false
+	defer func() {
+		entry.StatusCode = rec.status()
+		if !delivered && rec.status() < 300 && !clientGone && r.Context().Err() == nil {
+			entry.StatusCode = http.StatusBadGateway
+		}
+		entry.DurationMs = time.Since(started).Milliseconds()
+		appendRequestLog(entry)
+	}()
 
 	// A FAILING upstream response is the vendor's diagnosis, and it is relayed
 	// the way every other failure path in this file is relayed — redacted, with
@@ -2820,7 +2855,10 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 			relayedBytes += n
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				// The client's own connection failed. This is the caller's
-				// client-gone case, not evidence about the leg.
+				// client-gone case, not evidence about the leg — nor a failed
+				// turn in the log: the leg delivered, this side had nowhere to
+				// put it.
+				clientGone = true
 				return resp.StatusCode, false
 			}
 			if canFlush {
@@ -2842,7 +2880,8 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 			// (handleNonStreamResponse fails to decode it, handleStreamResponse
 			// never sees a frame) — only this one, which does not parse the
 			// wire, had to say so explicitly.
-			return resp.StatusCode, relayedBytes > 0 && errors.Is(readErr, io.EOF)
+			delivered = relayedBytes > 0 && errors.Is(readErr, io.EOF)
+			return resp.StatusCode, delivered
 		}
 	}
 }
