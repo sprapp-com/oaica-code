@@ -86,3 +86,55 @@ func TestRemoteAddRejectsControlCharactersInAName(t *testing.T) {
 		t.Errorf("RemoteAdd rejected the ordinary name \"my box\": %v", err)
 	}
 }
+
+// A control character in the two remaining fields these printers print verbatim
+// — `wire` and `tool_format` — forges a listing row and a `remote show` field
+// line the same way the name and the version did (2026-09-26 audit, fourteenth
+// round). RemoteAdd checks both with oneOf, but add-time validation is not the
+// only defence: remotes.json is hand-edited, and the file on disk is what these
+// printers read.
+func TestRemoteListAndShowDoNotForgeFromWireOrToolFormat(t *testing.T) {
+	remotesPath := withTempRemotesFile(t)
+
+	forgedWire := "openai\nzai-coding-plan  https://evil.example.com  openai  tool_calls  none"
+	forgedTool := "tool_calls\nfake-remote     https://evil.example.com  anthropic  xml  none"
+	// The AUTH column and `remote show`'s api_key line are the same shape: both
+	// print a value derived from the file verbatim ("env:" + the api_key_env
+	// name, or "via:" + auth_via) through authSourceProse's default branch.
+	forgedEnv := "KAT_KEY\nzai-coding-plan  https://evil.example.com  openai  tool_calls  none"
+	body := `{"remotes":[{"name":"mine","base_url":"https://api.example.com","upstream_model":"m1","wire":` +
+		quoteJSON(t, forgedWire) + `,"tool_format":` + quoteJSON(t, forgedTool) + `,"api_key_env":` + quoteJSON(t, forgedEnv) + `}]}`
+	if err := os.WriteFile(remotesPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var list bytes.Buffer
+	if err := WriteRemoteList(&list); err != nil {
+		t.Fatalf("WriteRemoteList: %v", err)
+	}
+	out := list.String()
+	lines := 0
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines++
+		}
+	}
+	if lines != 2 {
+		t.Errorf("`oaica remote list` printed %d line(s) for one configured remote, want 2 (header + row) — a newline in wire or tool_format forged a fabricated remote:\n%s", lines, out)
+	}
+	for _, forged := range []string{"\nzai-coding-plan", "\nfake-remote"} {
+		if strings.Contains(out, forged) {
+			t.Errorf("the forged row is in the listing output:\n%s", out)
+		}
+	}
+
+	var show bytes.Buffer
+	if err := WriteRemoteShow(&show, "mine"); err != nil {
+		t.Fatalf("WriteRemoteShow: %v", err)
+	}
+	for _, field := range []string{"wire:", "tool_format:", "api_key:"} {
+		if n := strings.Count(show.String(), field); n != 1 {
+			t.Errorf("`remote show` printed %d %s line(s), want exactly 1 — the field value forged another:\n%s", n, field, show.String())
+		}
+	}
+}

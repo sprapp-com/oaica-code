@@ -568,7 +568,7 @@ func WriteRemoteList(w io.Writer) error {
 		// redactBaseURL: a remote configured as https://key@host/v1 carries
 		// the credential in the URL's userinfo, and list output lands in
 		// terminals, shell history and tickets. Same fix as doctor's.
-		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", printableName(r.Name), redactBaseURL(r.BaseURL), d.Wire, d.ToolFormat, remoteAuthLabel(r))
+		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", printableName(r.Name), redactBaseURL(r.BaseURL), printableName(d.Wire), printableName(d.ToolFormat), printableName(remoteAuthLabel(r)))
 	}
 	return nil
 }
@@ -609,11 +609,15 @@ func WriteRemoteShow(w io.Writer, name string) error {
 	// output (see validateRemoteVersion — add-time validation is not the only
 	// defence, because this file is hand-edited).
 	fmt.Fprintf(w, "version:       %s\n", orDash(printableName(r.Version)))
-	fmt.Fprintf(w, "wire:          %s\n", d.Wire)
-	fmt.Fprintf(w, "tool_format:   %s\n", d.ToolFormat)
+	fmt.Fprintf(w, "wire:          %s\n", printableName(d.Wire))
+	fmt.Fprintf(w, "tool_format:   %s\n", printableName(d.ToolFormat))
 	fmt.Fprintf(w, "tool_reliable: %t\n", d.ToolReliable)
 	fmt.Fprintf(w, "force_tools:   %t\n", r.ForceTools)
-	fmt.Fprintf(w, "api_key:       %s\n", key)
+	// printableName, like the fields above it: the label is derived from the
+	// file ("env:" + the api_key_env name, "via:" + auth_via, through
+	// authSourceProse's default branch), so a control character in remotes.json
+	// turns it into a second field line (2026-09-26 audit, fourteenth round).
+	fmt.Fprintf(w, "api_key:       %s\n", printableName(key))
 	if r.PriceInputPerM > 0 || r.PriceOutputPerM > 0 {
 		fmt.Fprintf(w, "price_per_m:   in %s / out %s USD\n", floatOrDash(r.PriceInputPerM), floatOrDash(r.PriceOutputPerM))
 	}
