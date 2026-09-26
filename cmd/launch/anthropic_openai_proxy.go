@@ -2152,7 +2152,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		flusher.Flush()
 	}
 
-	flushToolCalls := func() {
+	// truncation is closed over rather than passed in: it is decided by the
+	// finish_reason the stream carried, and it changes what a fragment means.
+	flushToolCalls := func(truncated bool) {
 		// Emit any accumulated tool calls in index order as one ChatResponse.
 		if len(toolAccums) == 0 {
 			return
@@ -2179,6 +2181,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				raw = "{}"
 			}
 			if err := json.Unmarshal([]byte(raw), &args); err != nil {
+				if truncated {
+					// The turn ended at the token limit with argument JSON that
+					// never parsed: this is a fragment the model was still
+					// writing, not a call. Emitting it as {"_raw": …} handed the
+					// agent a complete, executable tool_use whose input is a key
+					// the model never wrote — and mapStopReason then reported
+					// "tool_use" for a turn the upstream had stopped with
+					// finish_reason "length", so the truncation was invisible
+					// too (2026-09-26 audit, round 16). Dropped rather than
+					// fabricated; the done event below then reports max_tokens.
+					continue
+				}
+				// Not a truncation: a model that emits freeform (non-JSON)
+				// arguments. Keep the fragment under _raw as the non-streaming
+				// path deliberately does, so the call is not lost entirely.
 				args = api.NewToolCallFunctionArguments()
 				args.Set("_raw", raw)
 			}
@@ -2187,9 +2204,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				Function: api.ToolCallFunction{Name: a.name, Arguments: args},
 			})
 		}
+		toolAccums = map[int]*toolAccum{}
+		if len(tcs) == 0 {
+			// Every accumulated call was a truncated fragment. Emitting an
+			// empty ToolCalls response would still make the converter say
+			// tool_use (it keys on the message, not the block), which is the
+			// same false claim about a turn that produced nothing runnable.
+			return
+		}
 		chatResp := api.ChatResponse{Model: upstreamModel, Message: api.Message{ToolCalls: tcs}}
 		emit(conv.Process(chatResp))
-		toolAccums = map[int]*toolAccum{}
 	}
 
 	// A stream is COMPLETE only when the upstream said so: a finish_reason on
@@ -2419,8 +2443,11 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	}
 
 	// Flush any pending tool calls before the done event so StreamConverter
-	// emits their content blocks first and sets stop_reason=tool_use.
-	flushToolCalls()
+	// emits their content blocks first and sets stop_reason=tool_use. A turn
+	// the upstream ended at the token limit is passed through as such: the
+	// calls it managed to write COMPLETELY are still runnable, but a fragment
+	// must not be dressed up as one (see flushToolCalls).
+	flushToolCalls(finishReason == "length")
 
 	// Final done event, carrying the stream's real usage (see finalUsage
 	// above). The converter turns Metrics into message_delta.usage; the
@@ -3273,6 +3300,14 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
 	if err != nil {
+		// `entry` exists by now and nothing has been written to the client, so
+		// this return is the one the deferred row cannot cover — logged here
+		// like the translated path's identical branch (2026-09-26 audit, round
+		// 16). Without it a leg whose upstream could not even be built into a
+		// request reported no traffic at all in `oaica usage`.
+		entry.StatusCode = http.StatusInternalServerError
+		entry.DurationMs = time.Since(started).Milliseconds()
+		appendRequestLog(entry)
 		writeAnthropicError(w, http.StatusInternalServerError, "build upstream request: "+redactErr(err).Error())
 		return 0, false
 	}
