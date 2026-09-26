@@ -301,7 +301,18 @@ func TestAuthList_ReportsStatusesAndMasksKeys(t *testing.T) {
 		"stored",
 		"env:" + ollamaCloudEnvKey,
 		"needs key",
-		"run: oaica auth login " + zaiName,
+		// The command a needs-key row points at, named by the row it belongs
+		// to. This used to read "run: oaica auth login zai", which passed only
+		// because the NEXT row down the table, "zai-coding-plan", shares the
+		// prefix — the assertion was satisfied by a different provider's hint
+		// and stopped being satisfied the moment that row's credential moved to
+		// opencode (auth_via), while the row this test is about was marked
+		// "stored" and printed no hint at all (2026-09-27 audit, round 19).
+		"run: oaica auth login anthropic",
+		// And the reuse path, on the row that used to satisfy the assertion by
+		// accident: a row whose credential another CLI owns points at THAT
+		// tool's login, not at oaica's.
+		"run: opencode auth login zai-coding-plan",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("AuthList() output missing %q:\n%s", want, got)
