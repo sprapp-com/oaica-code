@@ -357,23 +357,50 @@ func pullMissingModel(ctx context.Context, client *api.Client, model string) err
 
 // prepareEditorIntegration persists models and applies editor-managed config files.
 func prepareEditorIntegration(name string, editor Editor, models []LaunchModel) error {
-	// The credential has to be on file before the store is written, not after:
+	// Every credential has to be on file before the store is written, not after:
 	// the writers below take a remote's token from the endpoint they resolve
 	// while configuring, so a key prompted for afterwards reached
 	// ~/.oaica/remotes.json while the config that had just been written kept
 	// the empty string, and the launch that used that config went out
 	// unauthenticated. Here is where "before the write" actually is — both
 	// write helpers, so neither path can forget (2026-09-27 audit, round 19).
-	if len(models) > 0 {
-		if err := remoteAPIKeyPrompt(models[0].Name); err != nil {
-			return err
-		}
+	//
+	// Every selected row, not just the first: an editor that holds several
+	// models writes a credential per row, and prompting for models[0] left a
+	// remote further down the selection written with an empty token
+	// (2026-09-27 audit, round 20).
+	if err := promptSelectedRemoteKeys(models); err != nil {
+		return err
 	}
 	if err := editor.Edit(models); err != nil {
 		return fmt.Errorf("setup failed: %w", err)
 	}
 	if err := config.SaveIntegration(name, launchModelNames(models)); err != nil {
 		return fmt.Errorf("failed to save: %w", err)
+	}
+	return nil
+}
+
+// promptSelectedRemoteKeys runs the interactive credential prompt for every
+// selected row that resolves to a user remote with no key on file, once per
+// remote — two models of one remote ask for its key once, not twice. A row that
+// is not such a remote is a no-op (remoteAPIKeyPrompt decides; this only
+// deduplicates the question).
+func promptSelectedRemoteKeys(models []LaunchModel) error {
+	asked := make(map[string]bool, len(models))
+	for _, model := range models {
+		if model.Name == "" {
+			continue
+		}
+		if remote, _, ok := findUserRemoteForModel(model.Name); ok {
+			if asked[remote.Name] {
+				continue
+			}
+			asked[remote.Name] = true
+		}
+		if err := remoteAPIKeyPrompt(model.Name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
