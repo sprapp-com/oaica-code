@@ -13,11 +13,15 @@ type Spinner struct {
 
 	parts []string
 
-	value int
+	// value and stopped are shared with the goroutine NewSpinner starts: it
+	// advances the frame and observes the stop flag while String renders from
+	// the consumer's goroutine, so plain int/time.Time fields are a data race
+	// the moment a pull renders while the spinner ticks (2026-09-26 audit).
+	value   atomic.Int64
+	stopped atomic.Bool
 
 	ticker  *time.Ticker
 	started time.Time
-	stopped time.Time
 }
 
 func NewSpinner(message string) *Spinner {
@@ -53,8 +57,8 @@ func (s *Spinner) String() string {
 		sb.WriteString(" ")
 	}
 
-	if s.stopped.IsZero() {
-		spinner := s.parts[s.value]
+	if !s.stopped.Load() {
+		spinner := s.parts[int(s.value.Load()%int64(len(s.parts)))]
 		sb.WriteString(spinner)
 		sb.WriteString(" ")
 	}
@@ -65,15 +69,13 @@ func (s *Spinner) String() string {
 func (s *Spinner) start() {
 	s.ticker = time.NewTicker(100 * time.Millisecond)
 	for range s.ticker.C {
-		s.value = (s.value + 1) % len(s.parts)
-		if !s.stopped.IsZero() {
+		s.value.Add(1)
+		if s.stopped.Load() {
 			return
 		}
 	}
 }
 
 func (s *Spinner) Stop() {
-	if s.stopped.IsZero() {
-		s.stopped = time.Now()
-	}
+	s.stopped.Store(true)
 }
