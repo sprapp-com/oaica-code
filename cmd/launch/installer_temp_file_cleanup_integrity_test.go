@@ -123,14 +123,35 @@ func TestWindowsInstallerArmsRandomiseAndAlwaysCleanUp(t *testing.T) {
 	}
 }
 
-// The unix claude arm runs the fetched file with bash and removed it only after
+// The unix arms run the fetched file with bash. Claude's removed it only after
 // a successful run, so every failed install left the verified download in the
-// user's temp dir. kimi and qwen both `defer os.Remove(args[0])`; this arm is
-// the one that did not.
-func TestClaudeUnixInstallerRemovesItsTempFileWhenTheInstallFails(t *testing.T) {
+// user's temp dir; kimi and qwen `defer os.Remove(args[0])` and opencode did
+// not remove it at all (2026-09-27 audit, round 18).
+type unixEnsureArm struct {
+	name   string
+	ensure func() (string, error)
+}
+
+func unixEnsureArms() []unixEnsureArm {
+	return []unixEnsureArm{
+		{name: "claude", ensure: ensureClaudeInstalled},
+		{name: "opencode", ensure: ensureOpenCodeInstalled},
+	}
+}
+
+func TestUnixInstallerArmsRemoveTheirTempFileWhenTheInstallFails(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses POSIX shell fake binaries")
 	}
+	for _, arm := range unixEnsureArms() {
+		t.Run(arm.name, func(t *testing.T) {
+			runFailedUnixInstall(t, arm.name, arm.ensure)
+		})
+	}
+}
+
+func runFailedUnixInstall(t *testing.T, name string, ensure func() (string, error)) {
+	t.Helper()
 
 	setTestHome(t, t.TempDir())
 	tmpDir := t.TempDir()
@@ -141,7 +162,7 @@ func TestClaudeUnixInstallerRemovesItsTempFileWhenTheInstallFails(t *testing.T) 
 		t.Fatalf("write fake bash: %v", err)
 	}
 
-	fetched := filepath.Join(t.TempDir(), "claude-install.sh")
+	fetched := filepath.Join(t.TempDir(), name+"-install.sh")
 	if err := os.WriteFile(fetched, []byte("#!/bin/sh\nexit 3\n"), 0o600); err != nil {
 		t.Fatalf("write fetched installer: %v", err)
 	}
@@ -153,7 +174,7 @@ func TestClaudeUnixInstallerRemovesItsTempFileWhenTheInstallFails(t *testing.T) 
 	DefaultConfirmPrompt = func(string, ConfirmOptions) (bool, error) { return true, nil }
 	t.Cleanup(func() { DefaultConfirmPrompt = oldConfirm })
 
-	if _, err := ensureClaudeInstalled(); err == nil {
+	if _, err := ensure(); err == nil {
 		t.Fatalf("expected the failing installer to be reported")
 	}
 	if _, err := os.Stat(fetched); err == nil {

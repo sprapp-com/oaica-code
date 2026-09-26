@@ -414,8 +414,17 @@ func LaunchCmd(checkServerHeartbeat func(cmd *cobra.Command, args []string) erro
 			}
 
 			if name == "" {
-				if cmd.Flags().Changed("model") || cmd.Flags().Changed("config") || cmd.Flags().Changed("yes") || cmd.Flags().Changed("restore") ||
-					cmd.Flags().Changed("plan") || cmd.Flags().Changed("sonnet-model") || cmd.Flags().Changed("haiku-model") || cmd.Flags().Changed("oversize") || cmd.Flags().Changed("route-policy") || cmd.Flags().Changed("wizard") || len(passArgs) > 0 {
+				// The tier flags are asked for by NAME from tierFlagNames instead
+				// of being enumerated here. This guard listed six of them by hand
+				// and `--shard` was missing, so `oaica launch --shard
+				// box/kat-awq:3` exited 0, opened the TUI menu and threw the flag
+				// away — the user is left believing it applied (2026-09-27 audit,
+				// round 18).
+				tierFlag := firstTierFlagPassed(cmd)
+				if tierFlag != "" {
+					return fmt.Errorf("%s requires an integration name, for example: 'oaica launch claude --shard box/kat-awq:3'", tierFlag)
+				}
+				if cmd.Flags().Changed("model") || cmd.Flags().Changed("config") || cmd.Flags().Changed("yes") || cmd.Flags().Changed("restore") || len(passArgs) > 0 {
 					return fmt.Errorf("flags and extra args require an integration name, for example: 'oaica launch claude --model qwen3.5'")
 				}
 				runTUI(cmd)

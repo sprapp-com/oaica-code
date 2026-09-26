@@ -92,6 +92,14 @@ func ensureOpenCodeInstalled() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if openCodeGOOS != "windows" && len(args) > 0 {
+		// The unix plan runs the verified download itself (it is the command's
+		// only argument), so this is the only place it can be removed — claude,
+		// kimi and qwen all do the same. Without it every failed install left
+		// one copy of a downloaded script in the user's temp dir (2026-09-27
+		// audit, round 18).
+		defer os.Remove(args[0])
+	}
 
 	fmt.Fprintf(os.Stderr, "\nInstalling OpenCode...\n")
 	cmd := exec.Command(bin, args...)
