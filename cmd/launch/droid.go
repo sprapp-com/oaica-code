@@ -294,7 +294,20 @@ const droidDaemonKey = "ollama"
 // entry stores the endpoint that picker resolves to.
 func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
 	if apiKey == droidDaemonKey {
-		return model, true
+		// "ollama" is also the apiKey a user types when they point Droid at
+		// their OWN local server — it is what the tool's own docs suggest — so
+		// the daemon marker alone does not make an entry ours. An entry with
+		// that apiKey and an id this file did not write (or that names a
+		// different model than it stores) is the user's, and a launch that does
+		// not select it would otherwise DELETE it from their settings
+		// (2026-09-27 audit, round 19). oaica's own daemon entries always carry
+		// both: the id is "custom:<picker>-<index>" and the model is the picker
+		// itself.
+		picker := droidPickerFromID(id)
+		if picker == "" || model == "" || picker != model {
+			return "", false
+		}
+		return picker, true
 	}
 	picker := droidPickerFromID(id)
 	if picker == "" || model == "" {
