@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -53,14 +54,20 @@ type requestLogEntry struct {
 
 // requestLogProxyPort is the port of the (single, per-process) launch
 // proxy; set once at listener bind time, read by appendRequestLog.
-var requestLogProxyPort int
+//
+// Atomic, not a plain int: the write runs in the goroutine that binds the
+// listener while the read runs in every per-connection goroutine, so a plain
+// int is a data race under -race the moment a request is served concurrently
+// with a bind — which a process running two proxies (a routing proxy and a
+// logging proxy, both of which call setRequestLogProxyPort) does outright.
+var requestLogProxyPort atomic.Int64
 
 // setRequestLogProxyPort records ln's port for requestLogProxyPort
 // attribution. Best-effort: a non-TCP listener just leaves the port at 0
 // (omitted from the JSON).
 func setRequestLogProxyPort(ln net.Listener) {
 	if addr, ok := ln.Addr().(*net.TCPAddr); ok {
-		requestLogProxyPort = addr.Port
+		requestLogProxyPort.Store(int64(addr.Port))
 	}
 }
 
@@ -105,7 +112,7 @@ func boundedModel(model string) string {
 
 func appendRequestLog(entry requestLogEntry) {
 	entry.Model = boundedModel(entry.Model)
-	entry.ProxyPort = requestLogProxyPort
+	entry.ProxyPort = int(requestLogProxyPort.Load())
 	path, err := requestLogPath()
 	if err != nil {
 		return // best-effort — never break a real request over a logging failure
