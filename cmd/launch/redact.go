@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // credentialInURL matches "scheme://userinfo@" wherever it appears — in a bare
@@ -347,6 +348,13 @@ func redactUpstreamDiagnosis(text, secret string) string {
 	return redactSecret(redactCredentials(text), secret)
 }
 
+// RedactDiagnosis is redactUpstreamDiagnosis for callers outside this package
+// (the CLI's own error paths in cmd/oaica_client.go, whose requests carry the
+// same kind of key and get the same kind of vendor refusal). Same behavior, one
+// implementation, so a shape fixed on the proxy side cannot stay broken on the
+// client side.
+func RedactDiagnosis(text, secret string) string { return redactUpstreamDiagnosis(text, secret) }
+
 // redactCredentials replaces every credential a piece of text could carry
 // with REDACTED: the userinfo of a URL (including one url.Parse refuses, whose
 // password may hold a "/" or a newline), a credential-bearing query value, and
@@ -360,6 +368,33 @@ func redactUpstreamDiagnosis(text, secret string) string {
 // two shapes — a key in the query string and a Basic password containing "/" —
 // went through it in the clear (2026-09-26 audit). redactErr is the same work
 // for an error value; redactBaseURL is it plus the single-URL rules.
+// diagnosisMaxMessage bounds upstream-authored text this process hands back to
+// a caller: an upstream's error body is read up to httpbody.DiagnosticMax (64
+// MiB) and this is the string that lands in a terminal, a log and a pasted
+// support ticket. 300 bytes is what cmd/site.go's truncateForError uses for the
+// same job.
+const diagnosisMaxMessage = 300
+
+// boundedDiagnosis is redactUpstreamDiagnosis plus the length bound, for the
+// paths that hand an upstream's body to a user rather than to a log line.
+func boundedDiagnosis(text, secret string) string {
+	return truncateRunes(redactUpstreamDiagnosis(text, secret), diagnosisMaxMessage)
+}
+
+// truncateRunes cuts text to at most max BYTES without splitting a rune, so a
+// truncated message never ends in a broken UTF-8 sequence (a terminal renders
+// that as garbage, or drops the line).
+func truncateRunes(text string, max int) string {
+	if len(text) <= max {
+		return text
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + "…"
+}
+
 func redactCredentials(text string) string {
 	if strings.Contains(text, "@") {
 		text = credentialInURL.ReplaceAllString(text, "${1}REDACTED@")

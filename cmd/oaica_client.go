@@ -62,16 +62,51 @@ func oaicaUserinfoKey() string {
 // a key saved via `oaica signin` (~/.oaica/api_key) when the env var isn't
 // set — the env var always wins if both are present.
 func oaicaAuthorize(req *http.Request) {
-	key := strings.TrimSpace(os.Getenv("OAICA_API_KEY"))
-	if key == "" {
-		key = oaicaSavedAPIKey()
-	}
-	if key == "" {
-		key = oaicaUserinfoKey()
-	}
-	if key != "" {
+	if key := oaicaSentAPIKey(); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
+}
+
+// oaicaSentAPIKey is the credential oaicaAuthorize puts on the wire: the
+// OAICA_API_KEY env var, else the key saved by `oaica signin`, else the one
+// OAICA_HOST carries in its userinfo. oaicaDiagnosis scrubs with this same
+// function, so what gets hidden cannot drift from what was sent.
+func oaicaSentAPIKey() string {
+	if key := strings.TrimSpace(os.Getenv("OAICA_API_KEY")); key != "" {
+		return key
+	}
+	if key := oaicaSavedAPIKey(); key != "" {
+		return key
+	}
+	return oaicaUserinfoKey()
+}
+
+// oaicaDiagnosis sanitizes gateway-authored text on its way into a CLI error.
+// A vendor's refusal routinely quotes the request URL AND names the key it
+// rejected, bare, as ordinary prose ("invalid api key sk-live-…") — a string no
+// pattern can tell from a word, so only the caller that sent it can name it.
+// This is the CLI-side twin of the proxy's redactUpstreamDiagnosis
+// (2026-09-26 audit, tenth round).
+func oaicaDiagnosis(text string) string {
+	secrets := []string{oaicaSentAPIKey()}
+	// The agent sidecar is reached at its own address, which may carry its own
+	// credential in the userinfo — separate from the router key above.
+	if _, tok := launch.SplitUserinfoCredential(oaicaAgentHostRaw()); tok != "" {
+		secrets = append(secrets, tok)
+	}
+	for _, secret := range secrets {
+		text = launch.RedactDiagnosis(text, secret)
+	}
+	return text
+}
+
+// oaicaDiagnosisBody is oaicaDiagnosis for a response body: shape and literal
+// redaction, and a length a person can actually read. The router's answer to a
+// failed request is not bounded by anything this process controls
+// (httpbody.DefaultMax is 64 MiB), and this is the string a user pastes into a
+// support ticket.
+func oaicaDiagnosisBody(body []byte) string {
+	return oaicaDiagnosis(truncateForError(body))
 }
 
 // oaicaAuthHint is appended to every router auth failure so the fix arrives
@@ -209,7 +244,7 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return nil, launch.RedactError(fmt.Errorf("%s rejected the API key (HTTP %d)\n%s", launch.RedactBaseURL(oaicaHost()), resp.StatusCode, oaicaAuthHint))
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	var list oaicaModelList
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
@@ -403,13 +438,13 @@ func oaicaChatComplete(model string, messages []oaicaChatMessage) (string, oaica
 	}
 	var out oaicaChatResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", oaicaChatUsage{}, fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", oaicaChatUsage{}, fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return "", oaicaChatUsage{}, oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
+		return "", oaicaChatUsage{}, oaicaWrapAuthError(resp.StatusCode, oaicaDiagnosis(out.Error.Message))
 	}
 	if len(out.Choices) == 0 {
-		return "", oaicaChatUsage{}, fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", oaicaChatUsage{}, fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	var usage oaicaChatUsage
 	if out.Usage != nil {
@@ -483,7 +518,7 @@ func oaicaListLoras() ([]oaicaLoraListEntry, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body := httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the router error body")
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	var list oaicaLoraList
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
@@ -527,10 +562,10 @@ func oaicaLoraToggle(path, name string) (string, error) {
 	}
 	var out oaicaLoraToggleResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return "", oaicaWrapAuthError(resp.StatusCode, out.Error.Message)
+		return "", oaicaWrapAuthError(resp.StatusCode, oaicaDiagnosis(out.Error.Message))
 	}
 	return out.Model, nil
 }
@@ -606,7 +641,7 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	var list oaicaProviderList
 	if err := json.Unmarshal(body, &list); err != nil {
@@ -665,13 +700,13 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 	}
 	var out oaicaAuthLoginResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, string(body))
+		return fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return fmt.Errorf("%s", out.Error.Message)
+		return fmt.Errorf("%s", oaicaDiagnosis(out.Error.Message))
 	}
 	if !out.OK {
-		return fmt.Errorf("registration failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return fmt.Errorf("registration failed (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	return nil
 }
@@ -716,6 +751,15 @@ func oaicaAuthLogout(name string) error {
 // separate local process that itself calls api.oaica.com as its LLM
 // backend). Override via OAICA_AGENT_HOST for a different sidecar address.
 func oaicaAgentHost() string {
+	clean, _ := launch.SplitUserinfoCredential(oaicaAgentHostRaw())
+	return clean
+}
+
+// oaicaAgentHostRaw is OAICA_AGENT_HOST as configured, userinfo included —
+// the same shape OAICA_HOST may have, and the same reason
+// (launch.SplitUserinfoCredential promotes the key to a bearer token instead of
+// leaving it in the URL that error messages quote).
+func oaicaAgentHostRaw() string {
 	if h := strings.TrimSpace(os.Getenv("OAICA_AGENT_HOST")); h != "" {
 		return strings.TrimRight(h, "/")
 	}
@@ -743,11 +787,17 @@ func oaicaAgentRun(task string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// oaicaAgentHost() drops the userinfo credential from the URL (that is the
+	// point of it), so it has to be re-attached as a bearer or the sidecar's
+	// own key-protected setups silently de-authenticate.
+	if _, token := launch.SplitUserinfoCredential(oaicaAgentHostRaw()); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("couldn't reach agent sidecar at %s (is it running? see OAICA_AGENT_HOST): %w", oaicaAgentHost(), err)
+		return "", launch.RedactError(fmt.Errorf("couldn't reach agent sidecar at %s (is it running? see OAICA_AGENT_HOST): %w", launch.RedactBaseURL(oaicaAgentHost()), err))
 	}
 	defer resp.Body.Close()
 	body, err := httpbody.ReadCapped(resp.Body, httpbody.DefaultMax, "the router response")
@@ -755,7 +805,7 @@ func oaicaAgentRun(task string) (string, error) {
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("agent sidecar HTTP %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("agent sidecar HTTP %d: %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	var out oaicaAgentResponse
 	if err := json.Unmarshal(body, &out); err != nil {

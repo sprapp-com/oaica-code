@@ -529,7 +529,13 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 	}
 	if resp.StatusCode != http.StatusOK {
 		body := httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the router error body")
-		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host, Body: strings.TrimSpace(string(body))}
+		// The router routinely names the key it refused, and this body is
+		// printed by oaicaRouterError.Error() — a bare key in prose is not a
+		// shape any pattern can recognise, so it is redacted with the literal
+		// credential this request carried, and bounded (2026-09-26 audit,
+		// tenth round).
+		return nil, respETag, &oaicaRouterError{Status: resp.StatusCode, Host: host,
+			Body: boundedDiagnosis(strings.TrimSpace(string(body)), oaicaLaunchAPIKeyForEnv())}
 	}
 	var list struct {
 		Data []struct {
