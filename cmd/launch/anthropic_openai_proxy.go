@@ -553,7 +553,7 @@ func parseOpenAIToolCalls(tcs []struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
-}) []api.ToolCall {
+}, truncated bool) []api.ToolCall {
 	if len(tcs) == 0 {
 		return nil
 	}
@@ -576,6 +576,19 @@ func parseOpenAIToolCalls(tcs []struct {
 			raw = "{}"
 		}
 		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+			if truncated {
+				// The turn stopped at the token limit with argument JSON that
+				// never parsed: this is a fragment the model was still writing,
+				// not a call. The `_raw` fallback below is for a model that
+				// emits freeform arguments, and it cannot tell the two apart —
+				// so on a truncated turn it hands the agent a complete,
+				// executable tool_use whose input is a key the model never
+				// wrote, while mapStopReason reports "tool_use" and hides the
+				// "length" the upstream stated. The delta path drops the same
+				// fragment (flushToolCalls); this is that rule for the paths
+				// that never accumulate (2026-09-27 audit, round 17).
+				continue
+			}
 			// Fall back to a single-key map carrying the raw string so we
 			// never drop a tool call entirely.
 			args = api.NewToolCallFunctionArguments()
@@ -641,7 +654,10 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 			Thinking:  reasoningOf(c.Message.ReasoningContent, c.Message.Reasoning),
 			ToolCalls: nil,
 		}
-		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls)
+		// A turn the upstream ended at the token limit (finish_reason "length")
+		// must not have its unfinished argument fragments dressed up as calls;
+		// see parseOpenAIToolCalls.
+		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls, c.FinishReason == "length")
 		chatResp.DoneReason = mapFinishReason(c.FinishReason)
 	}
 	if resp.Usage != nil {
