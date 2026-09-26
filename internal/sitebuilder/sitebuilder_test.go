@@ -346,7 +346,13 @@ func TestAssemble_NavUsesShortLabelAndGridCSSIsSelfSufficient(t *testing.T) {
 		{ID: "hero", Kind: "hero", Title: "Big Hero Heading"},
 		{ID: "services", Kind: "services", Title: "Comprehensive Dental Treatments", Nav: "Services"},
 		{ID: "faq", Kind: "faq", Title: "Questions People Ask Us"},
-	}}, Fragments: map[string]string{}}
+	}}, Fragments: map[string]string{
+		// the nav links only to sections that are actually on the page, so the
+		// fixture needs the fragments a generated site would have
+		"hero":     `<section id="hero" class="sec sec-hero">h</section>`,
+		"services": `<section id="services" class="sec sec-services">s</section>`,
+		"faq":      `<section id="faq" class="sec sec-faq">f</section>`,
+	}}
 	page := Assemble(s)
 	if !strings.Contains(page, `<a href="#services">Services</a>`) || !strings.Contains(page, `<a href="#faq">Questions People Ask Us</a>`) {
 		t.Fatalf("nav labels wrong:\n%s", page)

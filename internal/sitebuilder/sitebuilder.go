@@ -459,6 +459,13 @@ func Assemble(s *Site) string {
 		if sec.Kind == "hero" || n >= 6 {
 			continue
 		}
+		// Only link to a section that is actually on the page. A missing (not
+		// yet generated, or unreadable) fragment otherwise left the header
+		// advertising an anchor with no target — a dead link shipped to the
+		// public site (2026-09-26 audit, fourth round).
+		if frag, ok := s.Fragments[sec.ID]; !ok || strings.TrimSpace(frag) == "" {
+			continue
+		}
 		fmt.Fprintf(&nav, `<a href="#%s">%s</a>`, html.EscapeString(sec.ID), html.EscapeString(sec.navLabel()))
 		n++
 	}
@@ -515,9 +522,74 @@ func fragmentFileName(id string) (string, error) {
 	return id + ".html", nil
 }
 
-// Save writes state and the assembled index.html into dir.
+// writeFileAtomic writes data to path through a temp file in the same
+// directory followed by a rename, so a reader ever sees either the old file or
+// the new one and never a half-written one. Save used plain os.WriteFile, and
+// a torn fragment read back as an empty section that the next Save then
+// rewrote as empty — content lost with no error (2026-09-26 audit, fourth
+// round).
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // no-op once the rename succeeded
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// checkStateDir refuses a state directory that is a symlink, or that is not a
+// directory at all.
+//
+// The state path is a fixed, well-known name, and os.MkdirAll/ReadFile follow
+// it. A site directory that arrived from a backup, a clone or a download can
+// therefore carry ".oaica-site -> /home/you" (or -> ".") and steer `oaica site
+// edit` / `new` into writing site.json and section files outside the site tree
+// — and, when the link points back inside it, into a layout Export no longer
+// recognises as state, so the brief and the whole plan were uploaded to the
+// public host (2026-09-26 audit, fourth round).
+func checkStateDir(st string) error {
+	fi, err := os.Lstat(st)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("the %s directory is a symlink (%s) — refusing to read or write state through it; a site's state must live inside the site directory", StateDir, st)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s exists but is not a directory", st)
+	}
+	return nil
+}
+
+// Save writes the state and the assembled index.html into dir.
+//
+// Every file goes through writeFileAtomic, and the write order is deliberate:
+// the fragments, then index.html, then site.json as the last thing written.
+// index.html is a DERIVATION of the state, so the state is the commit point —
+// a run that dies partway leaves a page that Load re-derives on the next read
+// (see Load's reconciliation step) rather than a state that describes a page
+// nobody has.
 func (s *Site) Save(dir string) error {
 	st := filepath.Join(dir, StateDir)
+	if err := checkStateDir(st); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Join(st, sectionsDir), 0o755); err != nil {
 		return err
 	}
@@ -528,28 +600,37 @@ func (s *Site) Save(dir string) error {
 			_ = os.Remove(filepath.Join(st, sectionsDir, e.Name()))
 		}
 	}
-	for id, frag := range s.Fragments {
+	// A fragment whose id cannot become a file name is refused BEFORE anything
+	// is written, so a bad plan cannot leave a half-updated sections/ behind.
+	names := make(map[string]string, len(s.Fragments))
+	for id := range s.Fragments {
 		name, err := fragmentFileName(id)
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(st, sectionsDir, name), []byte(frag), 0o644); err != nil {
+		names[id] = name
+	}
+	for id, frag := range s.Fragments {
+		if err := writeFileAtomic(filepath.Join(st, sectionsDir, names[id]), []byte(frag), 0o644); err != nil {
 			return err
 		}
+	}
+	if err := writeFileAtomic(filepath.Join(dir, IndexFile), []byte(Assemble(s)), 0o644); err != nil {
+		return err
 	}
 	meta, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(st, siteFile), meta, 0o644); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, IndexFile), []byte(Assemble(s)), 0o644)
+	return writeFileAtomic(filepath.Join(st, siteFile), meta, 0o644)
 }
 
 // Load reads a site previously written by Save.
 func Load(dir string) (*Site, error) {
 	st := filepath.Join(dir, StateDir)
+	if err := checkStateDir(st); err != nil {
+		return nil, err
+	}
 	meta, err := os.ReadFile(filepath.Join(st, siteFile))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -575,11 +656,45 @@ func Load(dir string) (*Site, error) {
 			return nil, fmt.Errorf("%s: %w", siteFile, err)
 		}
 		b, err := os.ReadFile(filepath.Join(st, sectionsDir, name))
-		if err == nil {
+		switch {
+		case err == nil:
 			s.Fragments[sec.ID] = sanitizeStoredFragment(string(b))
+		case errors.Is(err, os.ErrNotExist):
+			// No fragment yet (a plan that has not been generated, or a
+			// section added since). Assemble skips it and the caller
+			// regenerates it; this is not an error.
+		default:
+			// Any OTHER read failure used to be treated as "no fragment",
+			// which is how one unreadable file turned into a silent deletion:
+			// Load returned a Site missing that section, and Save's
+			// stale-fragment cleanup then removed the file it could not read.
+			// The published page lost a section, site.json still listed it,
+			// and the nav kept an anchor with no target (2026-09-26 audit,
+			// fourth round).
+			return nil, fmt.Errorf("cannot read %s/%s: %w", StateDir+"/"+sectionsDir, name, err)
 		}
 	}
+	if err := reconcileIndex(dir, &s); err != nil {
+		return nil, err
+	}
 	return &s, nil
+}
+
+// reconcileIndex makes index.html match the state it is derived from.
+//
+// index.html is what `preview` serves and `deploy` uploads, but it is a pure
+// function of site.json plus the fragments — and it used to be the LAST thing
+// Save wrote, so a run that failed at that write (a read-only file, a full
+// disk) left the state ahead of the page: the user saw "updated" and a deploy
+// published the previous site. Re-deriving it here means every path that reads
+// a site also repairs that divergence.
+func reconcileIndex(dir string, s *Site) error {
+	want := Assemble(s)
+	path := filepath.Join(dir, IndexFile)
+	if cur, err := os.ReadFile(path); err == nil && string(cur) == want {
+		return nil
+	}
+	return writeFileAtomic(path, []byte(want), 0o644)
 }
 
 // sanitizeStoredFragment re-applies the allowlist to a fragment read off
@@ -616,11 +731,28 @@ func sanitizeStoredFragment(b string) string {
 //   - symlinks, because following one can copy a file from outside the site
 //     (a link to ~/.ssh/id_rsa was uploaded under a harmless-looking name).
 func Export(dir, dst string) error {
-	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	// WalkDir lstats the ROOT it is given, so a symlinked root (a "live" link
+	// to the real site dir, which is what shell completion and a symlinked
+	// deploy path produce) is walked as a FILE: no child is ever visited, the
+	// upload is empty, and Export still returned nil — Deploy then printed a
+	// *.pages.dev URL for a site that was never uploaded (2026-09-26 audit,
+	// fourth round).
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	fi, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(dir, path)
+		rel, _ := filepath.Rel(root, path)
 		if rel == "." {
 			return os.MkdirAll(dst, 0o755)
 		}
@@ -643,7 +775,20 @@ func Export(dir, dst string) error {
 
 // privateFileRe matches names that are a credential or a private key whatever
 // directory they sit in.
-var privateFileRe = regexp.MustCompile(`(?i)^(\.env.*|\.dev\.vars.*|\.?npmrc|\.?netrc|\.git-credentials|secrets?\.json|credentials(\.json)?|.*\.(pem|key|p12|pfx|jks)|id_(rsa|dsa|ecdsa|ed25519))$`)
+var privateFileRe = regexp.MustCompile(`(?i)^(` +
+	// dotfile-shaped secrets, in the spelling that has no leading dot too
+	`\.env.*|env\.local|\.dev\.vars.*|\.?npmrc|\.?netrc|\.git-credentials|` +
+	// names that say what they are
+	`secrets?(\.(json|txt|yaml|yml|toml|ini))?|credentials?(\.(json|txt|yaml|yml|toml|ini))?|` +
+	`tokens?(\.(json|txt))?|api[-_.]?keys?(\.(json|txt))?|auth\.json|` +
+	`.*keystore.*|\.?truststore|` +
+	// key material and certificates
+	`.*\.(pem|key|p12|pfx|jks|crt|cer|der|asc|gpg)|id_(rsa|dsa|ecdsa|ed25519)|` +
+	// tooling that carries an account id or a deploy credential
+	`deploy\.sh|wrangler\.(toml|jsonc?)|cloudflare\.(toml|json)|` +
+	// the site's own state file, whatever directory it turned up in
+	`site\.json` +
+	`)$`)
 
 // isPrivateName reports whether a file or directory name must never be
 // uploaded to a public host.

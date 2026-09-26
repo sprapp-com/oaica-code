@@ -66,6 +66,15 @@ func Preview(ctx context.Context, dir string, port int) (string, error) {
 // resolves every symlink in the deepest existing ancestor of the target — and
 // then requiring the resolved location to be inside root and outside root's
 // state directory.
+//
+// The rule is about PATHS, and it says so: a HARDLINK to a state file sits at
+// an ordinary path and resolves there, so it is served like any other file
+// name. That is not a hole in this function but a limit of path-based
+// filtering — the link is created by the same user, on the same filesystem,
+// with the same file permissions as the original, so it confers no access they
+// did not already have (2026-09-26 audit, fourth round: documented rather than
+// changed, because the alternative — inode comparison against every state
+// file, per request — buys nothing an ordinary copy would not also defeat).
 func servableUnder(root, urlPath string) bool {
 	rel := strings.TrimPrefix(urlPath, "/site/")
 	full := filepath.Join(root, filepath.FromSlash(rel))
