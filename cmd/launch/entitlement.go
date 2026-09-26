@@ -17,7 +17,11 @@ package launch
 // remote on, and each is judged by the label that SERVES it: the
 // OpenAI-translated path, the Anthropic-wire remote in the NativePassthrough
 // branch, and both oversize-crossover legs (route_policy.go's oversizeSwap,
-// which re-points the request at a different backend late in the handler).
+// which re-points the request at a different backend late in the handler) —
+// with the same exclusion on the crossover as on the primary path: a native
+// claude/* leg is not gated there either, which the crossover got wrong until
+// the 2026-09-26 audit's ninth round (an armed gate denied an oversize
+// crossover onto the native tier that the primary path would have served).
 // The native claude/* leg is deliberately NOT gated — it is
 // api.anthropic.com under the user's own credential, so it is neither
 // self-hosted nor user-remote, and the rule above is about the requests that

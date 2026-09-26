@@ -1539,9 +1539,20 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						// (2026-09-26 audit — a gate denying the oversize
 						// label let the request through because the
 						// pre-swap label had been allowed).
-						if allowed, reason := checkEntitlement(r, over.Label, over.UpstreamModel); !allowed {
-							refuse(http.StatusForbidden, reason)
-							return
+						//
+						// ... on the classes that rule covers. A native
+						// claude/* leg (no BaseURL) is api.anthropic.com under
+						// the user's own credential and is deliberately NOT
+						// gated — the primary path says so in its own comment
+						// above, and gating the crossover onto it denied a turn
+						// the primary path would have served. The discriminator
+						// is the same one the model rewrite above uses
+						// (2026-09-26 audit, ninth round).
+						if over.BaseURL != "" {
+							if allowed, reason := checkEntitlement(r, over.Label, over.UpstreamModel); !allowed {
+								refuse(http.StatusForbidden, reason)
+								return
+							}
 						}
 						if over.Wire == "anthropic" {
 							upstream, headerName, headerValue, ok := over.anthropicPassthroughTarget()
