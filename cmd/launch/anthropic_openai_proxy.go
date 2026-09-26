@@ -2488,44 +2488,67 @@ func resolveNativeModelAlias(ctx context.Context, model string) string {
 // concurrent request queued behind it. The fetch now runs on the caller's
 // context, so a caller that goes away stops waiting.
 func nativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) {
-	nativeModelCatalogCache.Lock()
-	if time.Now().Before(nativeModelCatalogCache.expiresAt) {
-		entries, err := nativeModelCatalogCache.entries, nativeModelCatalogCache.err
-		nativeModelCatalogCache.Unlock()
-		return entries, err
-	}
-	// A fetch is already running: wait for it, or for this caller to give up.
-	// Reading the result after it closes is safe because the fetch publishes
-	// the entries and the expiry BEFORE closing the channel.
-	if wait := nativeModelCatalogCache.inflight; wait != nil {
-		nativeModelCatalogCache.Unlock()
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	for {
 		nativeModelCatalogCache.Lock()
-		entries, err := nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+		if time.Now().Before(nativeModelCatalogCache.expiresAt) {
+			entries, err := nativeModelCatalogCache.entries, nativeModelCatalogCache.err
+			nativeModelCatalogCache.Unlock()
+			return entries, err
+		}
+		// A fetch is already running: wait for it, or for this caller to give
+		// up. Reading the result after it closes is safe because the fetch
+		// publishes the entries and the expiry BEFORE closing the channel.
+		if wait := nativeModelCatalogCache.inflight; wait != nil {
+			nativeModelCatalogCache.Unlock()
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			// Re-read rather than trusting the fetch's result: a fetch that
+			// ended because ITS caller went away publishes nothing, and this
+			// caller then becomes the one that refetches (2026-09-26 audit,
+			// ninth round). A published result makes the loop's first branch
+			// return immediately, so this is not a spin.
+			continue
+		}
+		done := make(chan struct{})
+		nativeModelCatalogCache.inflight = done
 		nativeModelCatalogCache.Unlock()
+
+		entries, err := fetchNativeModelCatalog(ctx)
+
+		// The caller's context, not the fetch's own deadline: a fetch that
+		// timed out on itself failed the same way for everyone, and the
+		// failure TTL is there so the rest of the launch does not pay that
+		// timeout again. A CALLER's cancellation is not evidence about the
+		// upstream at all — it means one client stopped waiting. Caching it
+		// wrote "the catalog is broken" into a process-wide, 30-second cache on
+		// the strength of one hung-up request, and every other session on this
+		// machine then resolved its tiers through that failure and fell back to
+		// a bare alias the real API rejects (2026-09-26 audit, ninth round).
+		callerGone := ctx.Err() != nil
+
+		nativeModelCatalogCache.Lock()
+		if callerGone {
+			// Publish nothing. expiresAt is already in the past, so the next
+			// live caller refetches.
+			nativeModelCatalogCache.inflight = nil
+			nativeModelCatalogCache.Unlock()
+			close(done)
+			return nil, err
+		}
+		ttl := nativeModelCatalogTTL
+		if err != nil {
+			ttl = nativeModelCatalogFailureTTL
+		}
+		nativeModelCatalogCache.entries, nativeModelCatalogCache.err = entries, err
+		nativeModelCatalogCache.expiresAt = time.Now().Add(ttl)
+		nativeModelCatalogCache.inflight = nil
+		nativeModelCatalogCache.Unlock()
+		close(done)
 		return entries, err
 	}
-	done := make(chan struct{})
-	nativeModelCatalogCache.inflight = done
-	nativeModelCatalogCache.Unlock()
-
-	entries, err := fetchNativeModelCatalog(ctx)
-
-	nativeModelCatalogCache.Lock()
-	ttl := nativeModelCatalogTTL
-	if err != nil {
-		ttl = nativeModelCatalogFailureTTL
-	}
-	nativeModelCatalogCache.entries, nativeModelCatalogCache.err = entries, err
-	nativeModelCatalogCache.expiresAt = time.Now().Add(ttl)
-	nativeModelCatalogCache.inflight = nil
-	nativeModelCatalogCache.Unlock()
-	close(done)
-	return entries, err
 }
 
 func fetchNativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) {
