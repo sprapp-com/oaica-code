@@ -2061,8 +2061,14 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		// accounting moving — see the note at the streaming call site.
 		chatResp.Metrics.PromptEvalCount = estInputTokens
 	}
-	if !oaiResp.Usage.statedCompletionTokens() && oaiResp.Choices[0].Message.Content != "" {
-		chatResp.Metrics.EvalCount = len(oaiResp.Choices[0].Message.Content)/4 + 1
+	// The estimate counts what was relayed to the client, and a reasoning
+	// model's thinking is relayed as thinking deltas and billed as output just
+	// like its answer is — counting the answer alone made a long reasoning turn
+	// look nearly empty (2026-09-27 audit, round 17).
+	if !oaiResp.Usage.statedCompletionTokens() {
+		if produced := len(chatResp.Message.Content) + len(chatResp.Message.Thinking); produced > 0 {
+			chatResp.Metrics.EvalCount = produced/4 + 1
+		}
 	}
 	anthResp := anthropic.ToMessagesResponse(anthropic.GenerateMessageID(), chatResp)
 	anthResp.Usage.CacheReadInputTokens = oaiResp.Usage.cachedTokens()
@@ -2335,8 +2341,11 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		for _, choice := range chunk.Choices {
 			d := choice.Delta
 
-			// Reasoning content → thinking delta.
+			// Reasoning content → thinking delta. It counts toward the output
+			// estimate below like the answer does: it was relayed to the client
+			// and the upstream bills it as output (2026-09-27 audit, round 17).
 			if reasoning := reasoningOf(d.ReasoningContent, d.Reasoning); reasoning != "" {
+				streamedText += len(reasoning)
 				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Thinking: reasoning}}
 				emit(conv.Process(cr))
 			}
