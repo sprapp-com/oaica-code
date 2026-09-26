@@ -2498,6 +2498,13 @@ files or fills in a model_path on a pathless entry.`,
 			for _, s := range rep.Invalid {
 				fmt.Printf("  ! %s\n", s)
 			}
+			// The conflicts are the one scan result the counts cannot convey:
+			// "1 added" over two files reads as success. A file that was found
+			// and deliberately not registered has to be named here, because
+			// nothing else in the toolkit will ever mention it again.
+			for _, s := range rep.Conflicts {
+				fmt.Printf("  ? %s\n", s)
+			}
 			return nil
 		},
 	}
@@ -2997,13 +3004,14 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				return err
 			}
 			if asJSON {
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
 				// LoadUsageStats never returns a nil slice, so an empty
 				// report encodes as [] rather than null — a consumer that
 				// iterates the documented row list broke on null
-				// (2026-09-26 audit, third round).
-				return enc.Encode(rows)
+				// (2026-09-26 audit, third round). Dropped lines are warned
+				// about on stderr: the JSON is a total, and a total that
+				// silently excludes part of the log it summarizes is the
+				// thing a cost report is least able to notice.
+				return launch.WriteUsageStatsJSON(os.Stdout, os.Stderr, rows, unreadable)
 			}
 			if len(rows) == 0 {
 				path, _ := launch.RequestLogPath()

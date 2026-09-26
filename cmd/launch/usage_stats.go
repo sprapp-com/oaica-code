@@ -139,6 +139,25 @@ func LoadUsageStatsCountingUnreadable(filter UsageStatsFilter) ([]UsageStatsRow,
 	return rows, unreadable, nil
 }
 
+// WriteUsageStatsJSON writes rows to w as the JSON array `oaica usage --json`
+// documents, and — when unreadable > 0 — a warning to warn. Both, because a
+// consumer of that JSON gets a total lower than the log it summarizes and has
+// no other way to learn that lines were dropped; the human path warns, and
+// this is the same warning for the machine path. It goes to a second stream,
+// never into the array: stdout has to stay exactly the row list, or the fix
+// breaks every existing consumer (2026-09-26 audit).
+func WriteUsageStatsJSON(w, warn io.Writer, rows []UsageStatsRow, unreadable int) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(rows); err != nil {
+		return err
+	}
+	if unreadable > 0 && warn != nil {
+		fmt.Fprintf(warn, "warning: %d log line(s) could not be read and are NOT included in this report (over-long or corrupt entries).\n", unreadable)
+	}
+	return nil
+}
+
 // maxLogLineBytes caps how much of one line is held in memory. Beyond it the
 // line is truncated and counted as unreadable — a corrupt write cannot make
 // this read unbounded.
@@ -150,6 +169,16 @@ const maxLogLineBytes = 1 << 20
 func readLogLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
 	for {
 		chunk, rerr := r.ReadSlice('\n')
+		if rerr == nil {
+			// The terminator is not part of the line: ReadSlice hands it back
+			// with the data and it is stripped below. Counting it as content
+			// made a line of exactly maxLogLineBytes bytes look one byte too
+			// long, so the reader reported a truncated row for a log with
+			// nothing wrong with it — the one byte "dropped" was the newline
+			// nobody keeps (2026-09-26 audit).
+			chunk = bytes.TrimSuffix(chunk, []byte("\n"))
+			chunk = bytes.TrimSuffix(chunk, []byte("\r"))
+		}
 		if len(line) < maxLogLineBytes {
 			room := maxLogLineBytes - len(line)
 			if len(chunk) > room {

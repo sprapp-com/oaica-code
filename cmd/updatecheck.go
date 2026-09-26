@@ -47,6 +47,12 @@ func updateCheckURLForTest(url string) func() {
 	return func() { updateCheckURL = old }
 }
 
+// updateNoticeOut is where the notice is printed. A package var so a test can
+// capture what the user is actually shown -- the notice is the whole output of
+// this check, and asserting on the cache it leaves behind cannot tell "the
+// user was told" from "the user was told one command later".
+var updateNoticeOut io.Writer = os.Stderr
+
 // updateCheckInterval bounds how often this hits the network at all -- once
 // per invocation would be needless load on oaica.com and a latency tax on
 // every command. A cache file records the last check time; anything more
@@ -214,6 +220,13 @@ func checkForUpdate() {
 			if v != "" {
 				cache.LatestVersion = v
 				cache.LastChecked = time.Now()
+				// What THIS run just learned, not what the cache held before it.
+				// `latest` is read above the refresh, so on an empty cache — a
+				// fresh install, the machine that most needs the notice — it was
+				// "" and the check compared against nothing, storing the answer
+				// and announcing the update only on the next command. A stale
+				// cache paid the same one-command delay (2026-09-26 audit).
+				latest = v
 			}
 			saveUpdateCheckCache(cache)
 		}
@@ -228,7 +241,7 @@ func checkForUpdate() {
 	// oaica.com/install.sh: that copy is published by the same manual Pages
 	// deploy that made this check report a stale version, so following it can
 	// install something older than the notice just announced.
-	fmt.Fprintf(os.Stderr, "\n\033[33m! oaica update available: %s -> %s\033[0m\n  Run: curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash\n\n",
+	fmt.Fprintf(updateNoticeOut, "\n\033[33m! oaica update available: %s -> %s\033[0m\n  Run: curl -fsSL https://github.com/sprapp-com/oaica-code/releases/latest/download/install.sh | bash\n\n",
 		version.Version, latest)
 	cache.Notified = latest
 	saveUpdateCheckCache(cache)

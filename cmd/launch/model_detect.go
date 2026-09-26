@@ -69,11 +69,12 @@ func quantSubmatch(name string) string {
 
 // localScanReport is what ModelScan returns for the caller to print.
 type localScanReport struct {
-	Dirs    []string
-	Added   []string
-	Updated []string // existing entry that gained a ModelPath
-	Ignored []string // file already registered with that path
-	Invalid []string // id: reason
+	Dirs      []string
+	Added     []string
+	Updated   []string // existing entry that gained a ModelPath
+	Ignored   []string // file already registered with that path
+	Invalid   []string // id: reason
+	Conflicts []string // two files claimed one id: which was kept, which was not
 }
 
 // ModelScan walks dirs (empty = localScanDirs) and upserts every .pqm /
@@ -86,6 +87,11 @@ func ModelScan(dirs []string) (localScanReport, error) {
 
 	type found struct{ id, raw, path, ext string }
 	var files []found
+	// Keyed by id AND path: the same file reached through two directories on
+	// the scan list (a directory and a subdirectory of it) is one file.
+	// Collapsing on the id alone threw the second file away with no report,
+	// here, before the upsert loop could say anything about it — see Conflicts
+	// below (2026-09-26 audit).
 	seen := map[string]bool{}
 	for _, dir := range dirs {
 		fi, err := os.Stat(dir)
@@ -111,8 +117,9 @@ func ModelScan(dirs []string) (localScanReport, error) {
 			if id == "" {
 				return nil
 			}
-			if !seen[id] {
-				seen[id] = true
+			key := id + "\x00" + path
+			if !seen[key] {
+				seen[key] = true
 				files = append(files, found{id: id, raw: filepath.Base(path), path: path, ext: ext})
 			}
 			return nil
@@ -121,7 +128,11 @@ func ModelScan(dirs []string) (localScanReport, error) {
 			return report, fmt.Errorf("scan %s: %w", dir, err)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].id < files[j].id })
+	// STABLE: two files with the same id keep discovery order, so the winner of
+	// a path conflict is the directory listed first — the same one every run,
+	// rather than whatever order an unstable sort happened to leave them in
+	// (2026-09-26 audit).
+	sort.SliceStable(files, func(i, j int) bool { return files[i].id < files[j].id })
 
 	// The disk walk happens above, outside the lock: it is the slow part and it
 	// touches no store. Only the load → mutate → save is serialized, so a scan
@@ -171,8 +182,14 @@ func ModelScan(dirs []string) (localScanReport, error) {
 				report.Ignored = append(report.Ignored, f.id)
 			default:
 				// same id, different path: two files claim the id. Keep the
-				// existing entry; the scan never silently repoints a model.
-				report.Ignored = append(report.Ignored, f.id+" (path differs: "+f.path+")")
+				// existing entry; the scan never silently repoints a model —
+				// but the file it refused is unregistered and nothing else in
+				// the toolkit will ever mention it again, so the refusal is
+				// reported rather than counted as "already known"
+				// (2026-09-26 audit).
+				report.Ignored = append(report.Ignored, f.id)
+				report.Conflicts = append(report.Conflicts,
+					fmt.Sprintf("%s: kept %s, did NOT register %s — two files claim this id (rename one, or copy the other to its own name to get it its own entry)", f.id, prev.ModelPath, f.path))
 			}
 		}
 		return len(report.Added)+len(report.Updated) > before, nil
