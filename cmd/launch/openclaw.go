@@ -586,7 +586,12 @@ func patchDeviceScopesLocked(home, path string) {
 	}
 
 	dev, ok := devices[deviceID]
-	if !ok {
+	if !ok || dev == nil {
+		// A member that is JSON `null` EXISTS as a key and reads as a nil map,
+		// and patchScopes writes into the map it is handed: without the nil
+		// check this best-effort helper — the one that is supposed to return
+		// quietly on every failure — took the launch down with "assignment to
+		// entry in nil map" (2026-09-27 audit, round 20).
 		return
 	}
 
@@ -829,11 +834,15 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 		// is the half of the file that happened to come before the syntax
 		// error (2026-09-26 audit). Same stance as muse.go, and as
 		// configureOllamaWebSearch below.
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.UseNumber() // numbers survive the round-trip; float64 does not
-		if derr := dec.Decode(&config); derr != nil {
+		// decodeJSONObject, not a bare Decode: a document that IS `null`
+		// decodes into a nil map, and the write of models.providers below then
+		// panics with it (2026-09-27 audit, round 20 — the same guard the
+		// web-search writer of this file already took in round 19).
+		doc, derr := decodeJSONObject(data)
+		if derr != nil {
 			return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica models only part of that file, so rewriting what it cannot read would delete the rest of your OpenClaw configuration", readPath, derr)
 		}
+		config = doc
 	}
 
 	// Navigate/create: models.providers.ollama (preserving other providers)

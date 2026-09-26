@@ -172,3 +172,31 @@ func TestOpenClawSurvivesANullConfigDocument(t *testing.T) {
 		t.Errorf("the web-search provider entry was not written:\n%v", doc)
 	}
 }
+
+// The OTHER writer of the same document: `oaica launch openclaw` reaches
+// openclawEditConfig, which had its own decoder and therefore its own copy of
+// the nil map (2026-09-27 audit, round 20 — the round above converted the
+// web-search writer and left this one). A `null` openclaw.json made the launch
+// die with "assignment to entry in nil map" at the write of models.providers,
+// after the model list beside it had already been built.
+func TestOpenclawEditSurvivesANullConfigDocument(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	path := filepath.Join(home, ".openclaw", "openclaw.json")
+	writeNullDocument(t, path)
+
+	if err := (&Openclaw{}).Edit(testLaunchModels("model-a")); err != nil {
+		t.Fatalf("Openclaw.Edit of a `null` config: %v", err)
+	}
+
+	doc := readJSONObject(t, path)
+	modelsSection, _ := doc["models"].(map[string]any)
+	providers, _ := modelsSection["providers"].(map[string]any)
+	ollama, _ := providers["ollama"].(map[string]any)
+	if ollama == nil {
+		t.Fatalf("the ollama provider block was not written:\n%v", doc)
+	}
+	if rows, ok := ollama["models"].([]any); !ok || len(rows) != 1 {
+		t.Errorf("the selected model is not in the provider's model list:\n%v", doc)
+	}
+}
