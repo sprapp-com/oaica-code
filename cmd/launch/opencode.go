@@ -349,16 +349,39 @@ func opencodeModelID(m LaunchModel) string {
 }
 
 // opencodeDaemonProviderID is the provider-block id of the local daemon:
-// "ollama", renamed to "ollama-local" when a user remote claims that name —
-// see buildInlineConfig's comment on why two groups under one id must not
-// happen. The config partition and the state file both answer to it.
+// "ollama", renamed when a user remote claims that name — see
+// buildInlineConfig's comment on why two groups under one id must not happen.
+// The config partition and the state file both answer to it.
+//
+// The replacement must itself be unclaimed: "ollama-local" is a legal remote
+// name, and stopping at it re-created the very collision this function exists
+// to avoid — with remotes named both "ollama" and "ollama-local", the daemon
+// adopted the second remote's id, and the two groups merged under one block.
+// Whichever was added first owned it, so either the daemon's models were
+// declared under a third-party base URL with that remote's credential, or the
+// remote's models were pointed at the daemon (2026-09-26 audit, round 16).
+// Iterated instead, so the ordinary config — no remote named "ollama" at all —
+// still gets the unchanged "ollama" and a config with only that one collision
+// still gets "ollama-local".
 func opencodeDaemonProviderID(models []LaunchModel) string {
+	claimed := make(map[string]bool, len(models))
 	for _, m := range models {
-		if ep, ok := resolveRemoteEndpoint(m.Name); ok && ep.Name == "ollama" {
-			return "ollama-local"
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			claimed[ep.Name] = true
 		}
 	}
-	return "ollama"
+	if !claimed["ollama"] {
+		return "ollama"
+	}
+	for i := 1; ; i++ {
+		id := "ollama-local"
+		if i > 1 {
+			id = fmt.Sprintf("ollama-local-%d", i)
+		}
+		if !claimed[id] {
+			return id
+		}
+	}
 }
 
 // opencodeProviderFor reports which provider block declares m and the model id
