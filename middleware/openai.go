@@ -154,9 +154,12 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 	// completion chunk
 	if w.stream {
 		c := openai.ToCompleteChunk(w.id, generateResponse)
-		if w.streamOptions != nil && w.streamOptions.IncludeUsage {
-			c.Usage = &openai.Usage{}
-		}
+		// No usage on an intermediate chunk. This used to attach a zeroed
+		// Usage object to EVERY chunk whenever include_usage was set, and a
+		// client (or a metering intermediary) that reads the first non-null
+		// usage records 0/0 for a turn that really used 7/3 — the chat path in
+		// this file attaches usage only to the final, empty-choices chunk, and
+		// this now agrees with it (2026-09-26 audit, fourth round).
 		d, err := json.Marshal(c)
 		if err != nil {
 			return 0, err

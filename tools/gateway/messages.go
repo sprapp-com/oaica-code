@@ -196,6 +196,77 @@ func systemToMessage(v any) map[string]any {
 	return nil
 }
 
+// firstNonEmpty returns the first non-empty string among the pointers, or
+// "". It exists because a backend's reasoning field has more than one
+// spelling and only one of them is ever populated.
+func firstNonEmpty(vals ...*string) string {
+	for _, v := range vals {
+		if v != nil && *v != "" {
+			return *v
+		}
+	}
+	return ""
+}
+
+// toolResultText flattens a tool_result's content into the single string the
+// OpenAI tool wire carries. Text blocks are joined with newlines; a block of
+// any other type is DESCRIBED in place rather than dropped, so the model can
+// tell "the tool returned an image" from "the tool returned nothing".
+func toolResultText(content any) string {
+	switch c := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return c
+	case []any:
+		parts := make([]string, 0, len(c))
+		for _, cb := range c {
+			bm, ok := cb.(map[string]any)
+			if ok && bm["type"] == "text" {
+				if s, ok := bm["text"].(string); ok {
+					parts = append(parts, s)
+					continue
+				}
+			}
+			parts = append(parts, describeBlock(cb))
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return describeBlock(c)
+	}
+}
+
+// describeBlock renders one non-text tool_result block: an image as its media
+// type and payload size, anything else as its JSON. The base64 of an image is
+// deliberately NOT inlined — a screenshot pasted into a text field is charged
+// against the context window in tokens and every backend tokenizes it as
+// noise, so the size is the useful part.
+func describeBlock(raw any) string {
+	bm, ok := raw.(map[string]any)
+	if !ok {
+		if b, err := json.Marshal(raw); err == nil {
+			return string(b)
+		}
+		return "[tool result block that could not be represented]"
+	}
+	if t, _ := bm["type"].(string); t == "image" {
+		media, size := "unknown", 0
+		if src, ok := bm["source"].(map[string]any); ok {
+			if m, ok := src["media_type"].(string); ok && m != "" {
+				media = m
+			}
+			if d, ok := src["data"].(string); ok {
+				size = len(d)
+			}
+		}
+		return fmt.Sprintf("[image tool result omitted: %s, %d bytes of base64]", media, size)
+	}
+	if b, err := json.Marshal(bm); err == nil {
+		return string(b)
+	}
+	return "[tool result block that could not be represented]"
+}
+
 // contentBlocksToOpenAI converts one Anthropic message's content (string or
 // block array) into one-or-more OpenAI messages: text/images ride the same
 // message, tool_use becomes assistant tool_calls, tool_result becomes a
@@ -211,6 +282,13 @@ func contentBlocksToOpenAI(role string, content any) []map[string]any {
 	var out []map[string]any
 	var parts []map[string]any // text/image parts of THIS message
 	var toolCalls []map[string]any
+	// toolMsg is the index of the assistant message carrying tool_calls, or
+	// -1. Writing back to out[len(out)-1] instead assumed that message was
+	// still last — text between two tool_use blocks flushes a message after
+	// it, so the second call was written onto the text message (as a copy of
+	// the whole list) and the client saw the first call twice, on two
+	// different messages (2026-09-26 audit, fourth round).
+	toolMsg := -1
 	flushText := func() {
 		if len(parts) == 0 {
 			return
@@ -245,9 +323,9 @@ func contentBlocksToOpenAI(role string, content any) []map[string]any {
 			}
 		case "tool_use":
 			flushText()
-			if len(toolCalls) == 0 {
-				out = append(out, map[string]any{"role": role, "content": "", "tool_calls": toolCalls})
-				toolCalls = out[len(out)-1]["tool_calls"].([]map[string]any)
+			if toolMsg < 0 {
+				out = append(out, map[string]any{"role": role, "content": "", "tool_calls": []map[string]any{}})
+				toolMsg = len(out) - 1
 			}
 			id, _ := bm["id"].(string)
 			name, _ := bm["name"].(string)
@@ -260,29 +338,17 @@ func contentBlocksToOpenAI(role string, content any) []map[string]any {
 					"arguments": string(args),
 				},
 			})
-			out[len(out)-1]["tool_calls"] = toolCalls
+			out[toolMsg]["tool_calls"] = toolCalls
 		case "tool_result":
 			flushText()
 			// The tool's answer rides back as a role:"tool" message. The
 			// content may itself be a block array (tool_result allows text
-			// or image blocks); flatten to the string OpenAI expects,
-			// serializing anything else.
-			var txt string
-			switch c := bm["content"].(type) {
-			case string:
-				txt = c
-			case []any:
-				var sb []string
-				for _, cb := range c {
-					if cm, ok := cb.(map[string]any); ok && cm["type"] == "text" {
-						if s, ok := cm["text"].(string); ok {
-							sb = append(sb, s)
-						}
-					}
-				}
-				txt = strings.Join(sb, "\n")
-			}
-			msg := map[string]any{"role": "tool", "content": txt}
+			// or image blocks); flatten it to the single string the OpenAI
+			// tool wire carries (toolResultText). Non-text blocks used to be
+			// dropped, so an image-only result reached the model as
+			// content:"" — indistinguishable from "the tool returned
+			// nothing" (2026-09-26 audit, fourth round).
+			msg := map[string]any{"role": "tool", "content": toolResultText(bm["content"])}
 			if id, ok := bm["tool_use_id"].(string); ok && id != "" {
 				msg["tool_call_id"] = id
 			}
@@ -424,10 +490,12 @@ func (b *anthropicBridge) finalize() {
 	if msg.Content != nil {
 		content = *msg.Content
 	}
-	// Backends that put the answer in "reasoning" (content null) — see the
-	// file header; an empty text reply would be worse than surfacing it.
-	if content == "" && msg.Reasoning != nil {
-		content = *msg.Reasoning
+	// Backends that put the answer in a reasoning field (content null) — see
+	// the file header; an empty text reply would be worse than surfacing it.
+	// Both spellings are honoured: which one a backend uses is not something
+	// the client can see or control.
+	if content == "" {
+		content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent)
 	}
 	respBlocks := []map[string]any{}
 	if strings.TrimSpace(content) != "" {
@@ -503,7 +571,10 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 				Delta struct {
 					Content   *string `json:"content"`
 					Reasoning *string `json:"reasoning"`
-					ToolCalls []struct {
+					// See the non-stream shape: the same field under
+					// DeepSeek's/vLLM's spelling.
+					ReasoningContent *string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index     int    `json:"index"`
 						ID        string `json:"id"`
 						Name      string `json:"name"`
@@ -525,8 +596,8 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			b.sse.outTok = chunk.Usage.CompletionTokens
 		}
 		for _, ch := range chunk.Choices {
-			if ch.Delta.Reasoning != nil && *ch.Delta.Reasoning != "" {
-				b.textDelta(*ch.Delta.Reasoning)
+			if r := firstNonEmpty(ch.Delta.Reasoning, ch.Delta.ReasoningContent); r != "" {
+				b.textDelta(r)
 			}
 			if ch.Delta.Content != nil && *ch.Delta.Content != "" {
 				b.textDelta(*ch.Delta.Content)
@@ -653,7 +724,13 @@ type openAICompletion struct {
 		Message      struct {
 			Content   *string `json:"content"`
 			Reasoning *string `json:"reasoning"`
-			ToolCalls []struct {
+			// reasoning_content is the same field under the spelling
+			// DeepSeek and several vLLM builds use. Unmodelled, it vanished
+			// on the way in, and a backend that puts its whole answer there
+			// produced an empty Anthropic reply (2026-09-26 audit, fourth
+			// round).
+			ReasoningContent *string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Function struct {
 					Name      string `json:"name"`

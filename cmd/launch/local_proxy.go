@@ -51,14 +51,7 @@ func normalizeSystemMessages(pathname string, body []byte) ([]byte, error) {
 			}
 			parsed["messages"] = rest
 		}
-		existingSystem := ""
-		switch s := parsed["system"].(type) {
-		case string:
-			existingSystem = s
-		case []any:
-			b, _ := json.Marshal(s)
-			existingSystem = string(b)
-		}
+		existingSystem := textOfContent(parsed["system"])
 		parts := append([]string{existingSystem}, strayContents...)
 		combined := joinNonEmpty(parts, "\n\n")
 		if combined == "" {
@@ -95,12 +88,56 @@ func normalizeSystemMessages(pathname string, body []byte) ([]byte, error) {
 	return json.Marshal(parsed)
 }
 
+// contentToString renders a message's content as text.
 func contentToString(v any) string {
-	if s, ok := v.(string); ok {
-		return s
+	return textOfContent(v)
+}
+
+// textOfContent renders an Anthropic content value as prose: a string as
+// itself; an array of content blocks by joining the text of each text block;
+// any other block kept as its JSON (so an image or tool_result is not silently
+// dropped); anything else as compact JSON.
+//
+// The array case used to be json.Marshal'd whole, so Claude Code's system
+// prompt — which arrives as an array of text blocks, one of them carrying a
+// cache_control marker — was delivered to the model as escaped JSON with the
+// block metadata inline: `[{\"cache_control\":...,\"text\":\"You are
+// Claude Code.\",\"type\":\"text\"},...]` instead of prose. Every
+// instruction in it was present and unrecognisable (2026-09-26 audit, fourth
+// round). anthropic.FromMessagesRequest already joined these blocks with a
+// blank line; this path now agrees with it.
+func textOfContent(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case []any:
+		parts := make([]string, 0, len(x))
+		for _, b := range x {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			if bm["type"] == "text" {
+				if t, ok := bm["text"].(string); ok && t != "" {
+					parts = append(parts, t)
+				}
+				continue
+			}
+			// Not a text block: keep its content rather than dropping it.
+			if bj, err := json.Marshal(bm); err == nil {
+				parts = append(parts, string(bj))
+			}
+		}
+		return strings.Join(parts, "\n\n")
+	default:
+		b, err := json.Marshal(x)
+		if err != nil {
+			return ""
+		}
+		return string(b)
 	}
-	b, _ := json.Marshal(v)
-	return string(b)
 }
 
 func joinNonEmpty(parts []string, sep string) string {

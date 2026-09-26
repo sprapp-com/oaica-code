@@ -28,6 +28,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -958,10 +959,29 @@ func sessionHandler(pool *backendPool, overflowFactor float64) http.HandlerFunc 
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Session-Id")
 		if key == "" {
-			key = r.RemoteAddr // no session header -> degrade to per-client stickiness
+			// No session header -> degrade to per-CLIENT stickiness. That
+			// means the address, not the address:port: RemoteAddr carries the
+			// ephemeral source port, which is different for every TCP
+			// connection a client opens, so hashing it scattered one
+			// conversation across all six replicas — the exact
+			// cold-prefix-cache case this load balancer exists to avoid, and
+			// a silent no-op of the affinity it claims (2026-09-26 audit,
+			// fourth round).
+			key = clientAddr(r.RemoteAddr)
 		}
 		serveWith(pool, func(bs []*backend, estTokens int) *backend { return hashPick(bs, key, overflowFactor, estTokens) })(w, r)
 	}
+}
+
+// clientAddr reduces a net/http RemoteAddr ("host:port", or a bare host for
+// some transports) to the part that identifies the client. Unparseable input
+// is returned as-is rather than emptied, so the degraded path never collapses
+// every caller onto one bucket.
+func clientAddr(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 func main() {

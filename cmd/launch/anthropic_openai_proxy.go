@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -119,15 +120,21 @@ type openAIToolFunction struct {
 
 // openAIChatRequest is the request body sent to the remote.
 type openAIChatRequest struct {
-	Model         string          `json:"model"`
-	Messages      []openAIMessage `json:"messages"`
-	Stream        bool            `json:"stream,omitempty"`
-	MaxTokens     int             `json:"max_tokens,omitempty"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	Stop          []string        `json:"stop,omitempty"`
-	Tools         []api.Tool      `json:"tools,omitempty"`
-	ToolChoice    any             `json:"tool_choice,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []openAIMessage `json:"messages"`
+	Stream      bool            `json:"stream,omitempty"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	TopP        *float64        `json:"top_p,omitempty"`
+	// TopK is not part of OpenAI's schema, but the upstreams this proxy talks
+	// to (ollama and its forks) accept it, and the client asked for it:
+	// anthropic.FromMessagesRequest folds it into Options and oaica's own
+	// server honours it, so dropping it here made sampling differ by entry
+	// point (2026-09-26 audit, fourth round).
+	TopK          *int       `json:"top_k,omitempty"`
+	Stop          []string   `json:"stop,omitempty"`
+	Tools         []api.Tool `json:"tools,omitempty"`
+	ToolChoice    any        `json:"tool_choice,omitempty"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
@@ -299,6 +306,11 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 			oai.TopP = &f
 		}
 	}
+	if v, ok := chatReq.Options["top_k"]; ok {
+		if n, ok := toInt(v); ok {
+			oai.TopK = &n
+		}
+	}
 	if v, ok := chatReq.Options["stop"]; ok {
 		switch s := v.(type) {
 		case []string:
@@ -425,6 +437,28 @@ func toFloat64(v any) (float64, bool) {
 	case json.Number:
 		f, err := n.Float64()
 		return f, err == nil
+	}
+	return 0, false
+}
+
+// toInt reads an integer-valued option out of the map FromMessagesRequest
+// builds. Values arrive as whatever JSON decoded them into — a top_k is a
+// float64 from an untyped decode and an int from a typed one — so both are
+// accepted, and a non-integral value is refused rather than truncated.
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		if n != math.Trunc(n) {
+			return 0, false
+		}
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return int(i), err == nil
 	}
 	return 0, false
 }

@@ -466,6 +466,14 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		case "text":
 			textBlocks++
 			if block.Text != nil {
+				// Blocks are joined, not concatenated, to match the system
+				// path and anthropic.FromMessagesRequest: narration either
+				// side of a tool call is two blocks, and gluing them turns
+				// "read the file." + "Now run the tests." into one sentence
+				// whenever the first does not end in punctuation.
+				if textContent.Len() > 0 {
+					textContent.WriteString("\n\n")
+				}
 				textContent.WriteString(*block.Text)
 			}
 
@@ -718,7 +726,12 @@ func convertTool(t Tool) (api.Tool, bool, error) {
 
 // ToMessagesResponse converts an Ollama api.ChatResponse to an Anthropic MessagesResponse
 func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
-	var content []ContentBlock
+	// Non-nil from the start: Anthropic's message.content is an ARRAY, and a
+	// nil slice marshals to `"content":null`. A client that iterates it — the
+	// Anthropic SDKs do — has to special-case null for a turn that simply had
+	// no text (a tool-call-only or empty turn). See ToMessagesResponse's
+	// sibling in the stream converter, which always emits a block.
+	content := make([]ContentBlock, 0, 1)
 
 	if r.Message.Thinking != "" {
 		content = append(content, ContentBlock{
@@ -759,22 +772,40 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	}
 }
 
-// mapStopReason converts Ollama done_reason to Anthropic stop_reason
+// mapStopReason converts Ollama done_reason to Anthropic stop_reason.
+//
+// Anthropic's enum is end_turn / max_tokens / stop_sequence / tool_use /
+// pause_turn / refusal, and a response ALWAYS carries one. This used to return
+// "" for an empty reason — and because the field is `omitempty`, the key was
+// absent from the JSON entirely — and "stop_sequence" for anything else it did
+// not recognise, which included this package's own synthetic "load"/"unload"
+// reasons and the "tool_calls" spelling of a tool turn with no calls attached.
+// A client saw a truncation signal, or nothing at all, where the model had
+// simply stopped (2026-09-26 audit, fourth round).
+//
+// "stop_sequence" is deliberately never produced: the stop_sequence field is
+// only meaningful alongside the sequence that matched, and nothing in this
+// pipe records one — claiming it would be worse than saying end_turn.
 func mapStopReason(reason string, hasToolCalls bool) string {
 	if hasToolCalls {
 		return "tool_use"
 	}
 
 	switch reason {
-	case "stop":
+	case "tool_calls", "tool_use", "function_call":
+		// An upstream that stops to call a tool but attaches none (hasToolCalls
+		// is already false here — see the guard above) must not be reported as
+		// tool_use: "tool_use" promises the client a tool_use content block,
+		// and an agent that reads it waits for a call that is not in the
+		// message — a stalled turn the client cannot distinguish from a slow
+		// one. The content was empty, so the turn is over (2026-09-26 audit,
+		// fourth round).
 		return "end_turn"
 	case "length":
 		return "max_tokens"
 	default:
-		if reason != "" {
-			return "stop_sequence"
-		}
-		return ""
+		// "stop", "", "load", "unload" and anything unknown: the turn ended.
+		return "end_turn"
 	}
 }
 

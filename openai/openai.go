@@ -19,6 +19,35 @@ import (
 )
 
 var finishReasonToolCalls = "tool_calls"
+var finishReasonStop = "stop"
+
+// finishReason maps this server's internal done reason onto OpenAI's
+// finish_reason enum. OpenAI's values are "stop", "length", "tool_calls",
+// "function_call" and "content_filter"; anything else is a value a strict
+// client cannot parse.
+//
+// The reason used to be returned VERBATIM, so the server's own "load" and
+// "unload" answers (server/routes.go replies with those for an empty prompt)
+// went out as `"finish_reason":"load"` on all three wires. An empty reason
+// still means "not finished yet" and stays null — that is what a streaming
+// client keys on (2026-09-26 audit, fourth round).
+func finishReason(doneReason string, hasToolCalls bool) *string {
+	if doneReason == "" {
+		return nil
+	}
+	if hasToolCalls {
+		return &finishReasonToolCalls
+	}
+	switch doneReason {
+	case "stop", "length", "content_filter", "tool_calls", "function_call":
+		r := doneReason
+		return &r
+	}
+	// An internal reason with no OpenAI spelling ("load", "unload", a future
+	// one): the turn ended, so say that rather than leak the literal.
+	r := finishReasonStop
+	return &r
+}
 
 type Error struct {
 	Message string  `json:"message"`
@@ -96,11 +125,21 @@ type Reasoning struct {
 }
 
 type ChatCompletionRequest struct {
-	Model            string          `json:"model"`
-	Messages         []Message       `json:"messages"`
-	Stream           bool            `json:"stream"`
-	StreamOptions    *StreamOptions  `json:"stream_options"`
-	MaxTokens        *int            `json:"max_tokens"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options"`
+	MaxTokens     *int           `json:"max_tokens"`
+	// MaxCompletionTokens is the modern spelling of the output cap. A client
+	// that sends only this one used to have its cap silently ignored — no
+	// num_predict reached the runner at all, and the model generated to the
+	// server default (2026-09-26 audit, fourth round).
+	MaxCompletionTokens *int `json:"max_completion_tokens"`
+	// ToolChoice is accepted because a client that sends "none" must not be
+	// handed tool calls. It was absent from the struct entirely, so the field
+	// was dropped on decode and the request behaved as if tools were still in
+	// play.
+	ToolChoice       any             `json:"tool_choice"`
 	Seed             *int            `json:"seed"`
 	Stop             any             `json:"stop"`
 	Temperature      *float64        `json:"temperature"`
@@ -306,18 +345,10 @@ func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
-			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
-				if len(reason) > 0 {
-					if toolCallSent || len(toolCalls) > 0 {
-						return &finishReasonToolCalls
-					}
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
-			Logprobs: logprobs,
+			Index:        0,
+			Delta:        Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			FinishReason: finishReason(r.DoneReason, toolCallSent || len(toolCalls) > 0),
+			Logprobs:     logprobs,
 		}},
 	}
 }
@@ -370,14 +401,9 @@ func ToCompletion(id string, r api.GenerateResponse) Completion {
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []CompleteChunkChoice{{
-			Text:  r.Response,
-			Index: 0,
-			FinishReason: func(reason string) *string {
-				if len(reason) > 0 {
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
+			Text:         r.Response,
+			Index:        0,
+			FinishReason: finishReason(r.DoneReason, false),
 		}},
 		Usage: ToUsageGenerate(r),
 	}
@@ -392,14 +418,9 @@ func ToCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []CompleteChunkChoice{{
-			Text:  r.Response,
-			Index: 0,
-			FinishReason: func(reason string) *string {
-				if len(reason) > 0 {
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
+			Text:         r.Response,
+			Index:        0,
+			FinishReason: finishReason(r.DoneReason, false),
 		}},
 	}
 }
@@ -577,16 +598,28 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	case string:
 		options["stop"] = []string{stop}
 	case []any:
+		// A non-string element is refused, not dropped. Silently keeping the
+		// string ones meant `"stop":[123,"STOP"]` was accepted here while the
+		// same payload on /v1/completions was rejected — and a fully
+		// non-string array left an empty stop list behind, which DISABLES
+		// stopping rather than failing (2026-09-26 audit, fourth round).
 		var stops []string
 		for _, s := range stop {
-			if str, ok := s.(string); ok {
-				stops = append(stops, str)
+			str, ok := s.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid type for 'stop' field: %T", s)
 			}
+			stops = append(stops, str)
 		}
 		options["stop"] = stops
 	}
 
-	if r.MaxTokens != nil {
+	// The output cap, in either spelling. max_completion_tokens is the modern
+	// field and wins when both are sent; a request that carried only it used
+	// to reach the runner with no num_predict at all.
+	if r.MaxCompletionTokens != nil {
+		options["num_predict"] = *r.MaxCompletionTokens
+	} else if r.MaxTokens != nil {
 		options["num_predict"] = *r.MaxTokens
 	}
 
@@ -648,13 +681,24 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 	}
 
+	// tool_choice: "none" means the model must not call a tool, and the only
+	// way to honour that on this wire is to send no tools — leaving them in
+	// place returned 200 and could still answer with tool_calls, which is the
+	// opposite of what the client asked for. "auto"/"required"/a named
+	// function all keep the tools; the difference between them is not
+	// expressible here (2026-09-26 audit, fourth round).
+	tools := r.Tools
+	if tc, ok := r.ToolChoice.(string); ok && strings.EqualFold(strings.TrimSpace(tc), "none") {
+		tools = nil
+	}
+
 	return &api.ChatRequest{
 		Model:           r.Model,
 		Messages:        messages,
 		Format:          format,
 		Options:         options,
 		Stream:          &r.Stream,
-		Tools:           r.Tools,
+		Tools:           tools,
 		Think:           think,
 		Logprobs:        r.Logprobs != nil && *r.Logprobs,
 		TopLogprobs:     r.TopLogprobs,

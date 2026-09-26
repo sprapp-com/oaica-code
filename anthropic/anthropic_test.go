@@ -860,8 +860,21 @@ func TestMapStopReason(t *testing.T) {
 		{"stop", false, "end_turn"},
 		{"length", false, "max_tokens"},
 		{"stop", true, "tool_use"},
-		{"other", false, "stop_sequence"},
-		{"", false, ""},
+		// A reason that says "tool" with NO tool call attached is end_turn:
+		// "tool_use" promises the client a tool_use content block, and an
+		// agent that reads it waits for a call that is not in the message
+		// (2026-09-26 audit, fourth round). With a call attached it is
+		// tool_use, whatever the upstream's own word for it was.
+		{"tool_calls", false, "end_turn"},
+		{"tool_calls", true, "tool_use"},
+		// Anthropic always returns a stop_reason; an unrecognised or empty one
+		// means the turn ended. "" used to be returned and, being omitempty,
+		// left the key out of the JSON entirely.
+		{"other", false, "end_turn"},
+		{"", false, "end_turn"},
+		// the internal reasons the server answers an empty prompt with
+		{"load", false, "end_turn"},
+		{"unload", false, "end_turn"},
 	}
 
 	for _, tt := range tests {

@@ -910,6 +910,13 @@ type ResponsesStreamConverter struct {
 
 	// Tool calls state (for final output)
 	toolCallItems []map[string]any
+	// toolCallCount is how many function_call items have been emitted so far.
+	// output_index must count items in the RESPONSE, but a stream can deliver
+	// tool calls one chunk at a time — indexing by the position within the
+	// current chunk restarts at 0 for each of them, so two calls arriving in
+	// two chunks both claimed output_index 0 and the client's item bookkeeping
+	// collided (2026-09-26 audit, fourth round).
+	toolCallCount int
 }
 
 // newEvent creates a ResponsesStreamEvent with the sequence number included in the data.
@@ -1166,6 +1173,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 
 	for i, tc := range converted {
 		fcItemID := fmt.Sprintf("fc_%d_%d", rand.Intn(999999), i)
+		idx := c.outputIndex + c.toolCallCount + i
 
 		// Store for final output (with status: completed)
 		toolCallItem := map[string]any{
@@ -1180,7 +1188,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 
 		// response.output_item.added for function call
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
-			"output_index": c.outputIndex + i,
+			"output_index": idx,
 			"item": map[string]any{
 				"id":        fcItemID,
 				"type":      "function_call",
@@ -1195,7 +1203,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 		if tc.Function.Arguments != "" {
 			events = append(events, c.newEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id":      fcItemID,
-				"output_index": c.outputIndex + i,
+				"output_index": idx,
 				"delta":        tc.Function.Arguments,
 			}))
 		}
@@ -1203,13 +1211,13 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 		// response.function_call_arguments.done
 		events = append(events, c.newEvent("response.function_call_arguments.done", map[string]any{
 			"item_id":      fcItemID,
-			"output_index": c.outputIndex + i,
+			"output_index": idx,
 			"arguments":    tc.Function.Arguments,
 		}))
 
 		// response.output_item.done for function call
 		events = append(events, c.newEvent("response.output_item.done", map[string]any{
-			"output_index": c.outputIndex + i,
+			"output_index": idx,
 			"item": map[string]any{
 				"id":        fcItemID,
 				"type":      "function_call",
@@ -1220,6 +1228,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 			},
 		}))
 	}
+	c.toolCallCount += len(converted)
 
 	return events
 }
