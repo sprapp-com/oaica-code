@@ -3090,7 +3090,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 			if err := oaicaAuthLogin(name, origin, authHeader, upstreamModel); err != nil {
 				return err
 			}
-			fmt.Printf("Registered '%s' -> %s\n", name, origin)
+			fmt.Printf("Registered '%s' -> %s\n", name, oaicaPrintedOrigin(origin))
 			if authHeader != "" {
 				fmt.Printf("Auth: outbound requests will use the router's %s secret (upload it separately with `wrangler secret put %s` on the router side if not already set).\n", authHeader, authHeader)
 			}
@@ -3119,7 +3119,7 @@ endpoint fix reaches you without upgrading oaica-code itself.`,
 				if e.HasAuth {
 					authState = "auth-configured"
 				}
-				line := fmt.Sprintf("  %-28s %-45s %s", e.Name, e.Origin, authState)
+				line := fmt.Sprintf("  %-28s %-45s %s", e.Name, oaicaPrintedOrigin(e.Origin), authState)
 				if e.UpstreamModel != "" {
 					line += fmt.Sprintf("  (upstream model: %s)", e.UpstreamModel)
 				}

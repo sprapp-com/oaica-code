@@ -571,6 +571,19 @@ type oaicaProviderList struct {
 	Data []oaicaProviderEntry `json:"data"`
 }
 
+// oaicaPrintedOrigin is the ONE place the auth verbs render a provider origin.
+//
+// An origin is a URL this project's convention allows to carry a credential in
+// its userinfo (the same shape a remote's base_url may have), and this text
+// goes to terminals, shell history, CI logs and pasted support reports — which
+// is exactly why launch.redactBaseURL exists. `oaica auth list` printed the
+// raw value in its ORIGIN column and `oaica auth login` echoed it in its
+// confirmation line, so the two commands that exist to tell you WHICH provider
+// you are talking to could also print its key (2026-09-26 audit).
+func oaicaPrintedOrigin(origin string) string {
+	return launch.RedactBaseURL(origin)
+}
+
 // oaicaAuthList fetches the live provider registry (admin-gated). Never
 // returns secret values — the router's GET response only ever includes
 // hasAuth (bool), never the auth header's actual value.
