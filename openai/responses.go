@@ -894,13 +894,18 @@ type ResponsesStreamConverter struct {
 	request    ResponsesRequest
 
 	// State tracking (mutated across Process calls)
-	firstWrite      bool
-	outputIndex     int
-	contentIndex    int
-	contentStarted  bool
-	toolCallsSent   bool
-	accumulatedText string
-	sequenceNumber  int
+	firstWrite     bool
+	outputIndex    int
+	contentIndex   int
+	contentStarted bool
+	// messageItemIndex is the output_index the assistant message item claimed
+	// when it started. Every later event about that item (deltas, the part and
+	// item "done" events) reports the index the item was announced under, which
+	// is no longer outputIndex once the counter has moved past it.
+	messageItemIndex int
+	toolCallsSent    bool
+	accumulatedText  string
+	sequenceNumber   int
 
 	// Reasoning/thinking state
 	accumulatedThinking string
@@ -910,13 +915,6 @@ type ResponsesStreamConverter struct {
 
 	// Tool calls state (for final output)
 	toolCallItems []map[string]any
-	// toolCallCount is how many function_call items have been emitted so far.
-	// output_index must count items in the RESPONSE, but a stream can deliver
-	// tool calls one chunk at a time — indexing by the position within the
-	// current chunk restarts at 0 for each of them, so two calls arriving in
-	// two chunks both claimed output_index 0 and the client's item bookkeeping
-	// collided (2026-09-26 audit, fourth round).
-	toolCallCount int
 }
 
 // newEvent creates a ResponsesStreamEvent with the sequence number included in the data.
@@ -1173,7 +1171,15 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 
 	for i, tc := range converted {
 		fcItemID := fmt.Sprintf("fc_%d_%d", rand.Intn(999999), i)
-		idx := c.outputIndex + c.toolCallCount + i
+		// Each call is an item of the RESPONSE, and outputIndex is the index of
+		// the next one — the same counter the reasoning and message items take
+		// from. Nothing else advances it for a function_call, so a stream that
+		// delivers them one chunk at a time must advance it here, by as many
+		// items as it just emitted; a second counter added to this one instead
+		// (round 16's toolCallCount) left the text and reasoning paths — which
+		// index by outputIndex alone — claiming indexes the calls already owned
+		// (2026-09-27 audit, round 17).
+		idx := c.outputIndex + i
 
 		// Store for final output (with status: completed)
 		toolCallItem := map[string]any{
@@ -1228,7 +1234,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 			},
 		}))
 	}
-	c.toolCallCount += len(converted)
+	c.outputIndex += len(converted)
 
 	return events
 }
@@ -1242,10 +1248,15 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 	// Emit output item and content part for first text content
 	if !c.contentStarted {
 		c.contentStarted = true
+		// The message is an item of the response and claims the next index; the
+		// counter then moves past it so whatever follows does not reuse it
+		// (2026-09-27 audit, round 17).
+		c.messageItemIndex = c.outputIndex
+		c.outputIndex++
 
 		// response.output_item.added
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
-			"output_index": c.outputIndex,
+			"output_index": c.messageItemIndex,
 			"item": map[string]any{
 				"id":      c.itemID,
 				"type":    "message",
@@ -1258,7 +1269,7 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 		// response.content_part.added
 		events = append(events, c.newEvent("response.content_part.added", map[string]any{
 			"item_id":       c.itemID,
-			"output_index":  c.outputIndex,
+			"output_index":  c.messageItemIndex,
 			"content_index": c.contentIndex,
 			"part": map[string]any{
 				"type":        "output_text",
@@ -1275,7 +1286,7 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 	// Emit content delta
 	events = append(events, c.newEvent("response.output_text.delta", map[string]any{
 		"item_id":       c.itemID,
-		"output_index":  c.outputIndex,
+		"output_index":  c.messageItemIndex,
 		"content_index": 0,
 		"delta":         content,
 		"logprobs":      []any{},
@@ -1332,7 +1343,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 		// response.output_text.done
 		events = append(events, c.newEvent("response.output_text.done", map[string]any{
 			"item_id":       c.itemID,
-			"output_index":  c.outputIndex,
+			"output_index":  c.messageItemIndex,
 			"content_index": 0,
 			"text":          c.accumulatedText,
 			"logprobs":      []any{},
@@ -1341,7 +1352,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 		// response.content_part.done
 		events = append(events, c.newEvent("response.content_part.done", map[string]any{
 			"item_id":       c.itemID,
-			"output_index":  c.outputIndex,
+			"output_index":  c.messageItemIndex,
 			"content_index": 0,
 			"part": map[string]any{
 				"type":        "output_text",
@@ -1353,7 +1364,7 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 
 		// response.output_item.done
 		events = append(events, c.newEvent("response.output_item.done", map[string]any{
-			"output_index": c.outputIndex,
+			"output_index": c.messageItemIndex,
 			"item": map[string]any{
 				"id":     c.itemID,
 				"type":   "message",
