@@ -83,7 +83,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 
 	if key == "" {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			return fmt.Errorf("%s needs a key: pass --key (or run `oaica auth login %s` interactively to enter it hidden)", provider, provider)
+			return fmt.Errorf("%s needs a key: pass --key (or run `oaica auth login %s` interactively to enter it hidden)", printableName(provider), printableName(provider))
 		}
 		var err error
 		key, err = promptAuthKey(out, provider, entry, known)
@@ -93,7 +93,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return fmt.Errorf("no key entered — %s unchanged", provider)
+		return fmt.Errorf("no key entered — %s unchanged", printableName(provider))
 	}
 
 	label := ""
@@ -116,7 +116,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	}); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Logged in to %s (%s). The key is stored in %s, mode 0600.\n", provider, maskKey(key), path)
+	fmt.Fprintf(out, "Logged in to %s (%s). The key is stored in %s, mode 0600.\n", printableName(provider), maskKey(key), path)
 	if known && entry.APIKeyEnv != "" {
 		// keyEnvNamesProse, not the raw field: api_key_env may list two
 		// names, and "An A, B set in the environment" names nothing a user
@@ -163,13 +163,13 @@ func AuthLoginVia(out io.Writer, provider, via string) error {
 	// Prove the credential is actually readable through the path oaica will
 	// use, rather than trusting that the delegated command did what we think.
 	if key := externalAuthKey(via, provider); key != "" {
-		fmt.Fprintf(out, "%s now authenticates via %s (%s).\n", provider, via, maskKey(key))
+		fmt.Fprintf(out, "%s now authenticates via %s (%s).\n", printableName(provider), via, maskKey(key))
 		return nil
 	}
 	if cred, ok := externalAuthFor(via, provider); ok && cred.Reason != "" {
-		return fmt.Errorf("%s is still not usable: %s", provider, cred.Reason)
+		return fmt.Errorf("%s is still not usable: %s", printableName(provider), cred.Reason)
 	}
-	return fmt.Errorf("%s finished but no usable credential for %q is readable in %s's store — check the provider id it expects", strings.Join(argv, " "), provider, via)
+	return fmt.Errorf("%s finished but no usable credential for %q is readable in %s's store — check the provider id it expects", strings.Join(argv, " "), printableName(provider), via)
 }
 
 func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, known bool) (string, error) {
@@ -177,7 +177,7 @@ func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, k
 		// The endpoint oaica will actually call, not the catalog's base_url
 		// prefix — a v4 row's BaseURL stops a segment short, so the URL shown
 		// beside "paste your key for this provider" 404s.
-		fmt.Fprintf(out, "%s — %s\n", provider, entry.EndpointBase())
+		fmt.Fprintf(out, "%s — %s\n", printableName(provider), entry.EndpointBase())
 		if entry.PlanLabel != "" {
 			fmt.Fprintf(out, "Plan: %s\n", entry.PlanLabel)
 		}
@@ -185,12 +185,12 @@ func promptAuthKey(out io.Writer, provider string, entry providerCatalogEntry, k
 			fmt.Fprintf(out, "Get a key at %s\n", hyperlink(entry.KeyURL, entry.KeyURL))
 		}
 	} else {
-		fmt.Fprintf(out, "%s (from ~/.oaica/remotes.json)\n", provider)
+		fmt.Fprintf(out, "%s (from ~/.oaica/remotes.json)\n", printableName(provider))
 	}
 	if known && entry.APIKeyEnv != "" {
-		fmt.Fprintf(out, "Enter %s API key (input hidden; or set %s and skip this): ", provider, keyEnvNamesProse(entry.APIKeyEnv))
+		fmt.Fprintf(out, "Enter %s API key (input hidden; or set %s and skip this): ", printableName(provider), keyEnvNamesProse(entry.APIKeyEnv))
 	} else {
-		fmt.Fprintf(out, "Enter %s API key (input hidden): ", provider)
+		fmt.Fprintf(out, "Enter %s API key (input hidden): ", printableName(provider))
 	}
 	key, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(out)
@@ -232,13 +232,13 @@ func AuthLogout(out io.Writer, provider string) error {
 		return err
 	}
 	if !found {
-		fmt.Fprintf(out, "No stored credential for %s — nothing to remove.\n", provider)
+		fmt.Fprintf(out, "No stored credential for %s — nothing to remove.\n", printableName(provider))
 		return nil
 	}
-	fmt.Fprintf(out, "Removed the stored key for %s.\n", provider)
+	fmt.Fprintf(out, "Removed the stored key for %s.\n", printableName(provider))
 	if entry, known := knownAuthProvider(provider); known {
 		if entry.APIKeyEnv != "" {
-			fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", keyEnvNamesProse(entry.APIKeyEnv), provider)
+			fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", keyEnvNamesProse(entry.APIKeyEnv), printableName(provider))
 		}
 		// auth_via: another agent CLI's own login is a SECOND source, and the
 		// env warning above does not cover it. Without this line a user who
@@ -285,8 +285,8 @@ func AuthList(out io.Writer) error {
 	entries := providerCatalog()
 	width := len("PROVIDER")
 	for _, e := range entries {
-		if len(e.Name) > width {
-			width = len(e.Name)
+		if n := len(printableName(e.Name)); n > width {
+			width = n
 		}
 	}
 	// CREDENTIAL is wide enough for the longest actionable value it can hold
@@ -301,7 +301,7 @@ func AuthList(out io.Writer) error {
 	for _, e := range entries {
 		status, cred := "not set", "-"
 		external, hasExternal := externalAuthFor(e.AuthVia, e.Name)
-		externalCmd := externalLoginArgvString(e.AuthVia, e.Name)
+		externalCmd := externalLoginArgvStringQuoted(e.AuthVia, e.Name)
 		switch {
 		case keyEnvNameSet(e.APIKeyEnv) != "":
 			// Name the variable that IS set: api_key_env can list two, and
@@ -309,7 +309,7 @@ func AuthList(out io.Writer) error {
 			// name told the user to export something that does not exist —
 			// while the gate above (raw os.Getenv) reported the row as missing
 			// a key that was in fact exported.
-			status, cred = "ready", "env:"+keyEnvNameSet(e.APIKeyEnv)
+			status, cred = "ready", "env:"+printableName(keyEnvNameSet(e.APIKeyEnv))
 		case stored[e.Name]:
 			status, cred = "ready", "stored"
 		case hasExternal && external.Key != "":
@@ -318,20 +318,20 @@ func AuthList(out io.Writer) error {
 			status, cred = "ready", external.Source
 		case hasExternal && external.Reason != "":
 			status, cred = "needs key", "run: "+externalCmd
-			notes = append(notes, fmt.Sprintf("%s: %s", e.Name, external.Reason))
+			notes = append(notes, fmt.Sprintf("%s: %s", printableName(e.Name), external.Reason))
 		case e.AuthVia != "" && externalStoreExists(e.AuthVia):
 			// Declared as reusable, that tool is installed, but it has no entry
 			// for this provider yet: point at the tool's own login, which is
 			// the whole point of auth_via — one login serves both.
 			status, cred = "needs key", "run: "+externalCmd
 		case e.APIKeyEnv != "":
-			status, cred = "needs key", "run: oaica auth login "+e.Name
+			status, cred = "needs key", "run: oaica auth login "+printableName(e.Name)
 		}
-		plan := e.PlanLabel
+		plan := printableName(e.PlanLabel)
 		if plan == "" {
 			plan = "-"
 		}
-		fmt.Fprintf(out, "%-*s  %-9s  %-*s  %s\n", width, e.Name, status, credWidth, cred, plan)
+		fmt.Fprintf(out, "%-*s  %-9s  %-*s  %s\n", width, printableName(e.Name), status, credWidth, cred, plan)
 	}
 	if len(notes) > 0 {
 		fmt.Fprintln(out, "\nA stored login oaica could not use:")
@@ -353,7 +353,7 @@ func AuthList(out io.Writer) error {
 		sort.Strings(extra)
 		fmt.Fprintln(out, "\nStored credentials outside the catalog:")
 		for _, name := range extra {
-			fmt.Fprintf(out, "  %s  %s\n", name, maskKey(f.Providers[name].Key))
+			fmt.Fprintf(out, "  %s  %s\n", printableName(name), maskKey(f.Providers[name].Key))
 		}
 	}
 

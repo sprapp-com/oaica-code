@@ -173,6 +173,21 @@ func externalLoginArgvString(via, provider string) string {
 	return strings.Join(argv, " ")
 }
 
+// externalLoginArgvStringQuoted is externalLoginArgvString for a PRINT site:
+// the trailing provider argument is rendered with printableName, so a provider
+// id carrying a control character cannot forge a row inside the column that
+// tells the user which command to run. The executable and subcommands are
+// constants; only the id is data.
+func externalLoginArgvStringQuoted(via, provider string) string {
+	argv, ok := externalLoginArgv(via, provider)
+	if !ok {
+		return ""
+	}
+	quoted := append([]string(nil), argv...)
+	quoted[len(quoted)-1] = printableName(provider)
+	return strings.Join(quoted, " ")
+}
+
 // externalAuthSourceNames lists the accepted --via values, for error text.
 func externalAuthSourceNames() []string {
 	var out []string
