@@ -315,16 +315,11 @@ func ToChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 		Choices: []Choice{{
 			Index:   0,
 			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
-			FinishReason: func(reason string) *string {
-				if len(toolCalls) > 0 {
-					reason = "tool_calls"
-				}
-				if len(reason) > 0 {
-					return &reason
-				}
-				return nil
-			}(r.DoneReason),
-			Logprobs: logprobs,
+			// The same helper the streaming chunks use, so one api.ChatResponse
+			// cannot answer "load" here and "stop" there. This call site kept the
+			// verbatim closure finishReason replaced (2026-09-27 audit, round 19).
+			FinishReason: finishReason(r.DoneReason, len(toolCalls) > 0),
+			Logprobs:     logprobs,
 		}}, Usage: ToUsage(r),
 		DebugInfo: r.DebugInfo,
 	}
