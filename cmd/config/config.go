@@ -129,49 +129,76 @@ func save(cfg *config) error {
 	return fileutil.WriteWithBackup(path, data)
 }
 
+// mutate runs fn against the store and writes the result back, all inside the
+// store's cross-process lock. Every mutating entry point in this file goes
+// through here.
+//
+// WriteWithBackup makes each write torn-free but does NOT stop a lost update:
+// this store is load → mutate in memory → write the whole file, so two writers
+// that overlap both read the same snapshot and whichever renames last wins
+// with the other's mutation absent — while both report success. Every sibling
+// store in the tree already locks for this reason (~/.oaica/config.json in
+// launch/user_config.go, the remotes file in launch/remote_cli.go, the alias
+// and model-picks stores); this one did not, so `oaica launch claude --model X`
+// in one terminal and a launcher TUI in another dropped one of the two writes
+// (2026-09-26 audit, round 16).
+//
+// WithFileLock takes its lock on a SIBLING "<path>.lock", so nothing here may
+// take it again around save — flock locks do not nest.
+func mutate(fn func(*config) error) error {
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
+	return fileutil.WithFileLock(path, func() error {
+		cfg, err := load()
+		if err != nil {
+			return err
+		}
+		if err := fn(cfg); err != nil {
+			return err
+		}
+		return save(cfg)
+	})
+}
+
 func SaveIntegration(appName string, models []string) error {
 	if appName == "" {
 		return errors.New("app name cannot be empty")
 	}
 
-	cfg, err := load()
-	if err != nil {
-		return err
-	}
+	return mutate(func(cfg *config) error {
+		key := strings.ToLower(appName)
+		existing := cfg.Integrations[key]
+		var aliases map[string]string
+		var onboarded bool
+		if existing != nil {
+			aliases = existing.Aliases
+			onboarded = existing.Onboarded
+		}
 
-	key := strings.ToLower(appName)
-	existing := cfg.Integrations[key]
-	var aliases map[string]string
-	var onboarded bool
-	if existing != nil {
-		aliases = existing.Aliases
-		onboarded = existing.Onboarded
-	}
+		cfg.Integrations[key] = &integration{
+			Models:    models,
+			Aliases:   aliases,
+			Onboarded: onboarded,
+		}
 
-	cfg.Integrations[key] = &integration{
-		Models:    models,
-		Aliases:   aliases,
-		Onboarded: onboarded,
-	}
-
-	return save(cfg)
+		return nil
+	})
 }
 
 // MarkIntegrationOnboarded marks an integration as onboarded in Ollama's config.
 func MarkIntegrationOnboarded(appName string) error {
-	cfg, err := load()
-	if err != nil {
-		return err
-	}
-
-	key := strings.ToLower(appName)
-	existing := cfg.Integrations[key]
-	if existing == nil {
-		existing = &integration{}
-	}
-	existing.Onboarded = true
-	cfg.Integrations[key] = existing
-	return save(cfg)
+	return mutate(func(cfg *config) error {
+		key := strings.ToLower(appName)
+		existing := cfg.Integrations[key]
+		if existing == nil {
+			existing = &integration{}
+		}
+		existing.Onboarded = true
+		cfg.Integrations[key] = existing
+		return nil
+	})
 }
 
 // IntegrationModel returns the first configured model for an integration, or empty string if not configured.
@@ -203,12 +230,10 @@ func LastModel() string {
 
 // SetLastModel saves the last model that was run.
 func SetLastModel(model string) error {
-	cfg, err := load()
-	if err != nil {
-		return err
-	}
-	cfg.LastModel = model
-	return save(cfg)
+	return mutate(func(cfg *config) error {
+		cfg.LastModel = model
+		return nil
+	})
 }
 
 // LastSelection returns the last menu selection ("run" or integration name), or empty string if none.
@@ -222,12 +247,10 @@ func LastSelection() string {
 
 // SetLastSelection saves the last menu selection ("run" or integration name).
 func SetLastSelection(selection string) error {
-	cfg, err := load()
-	if err != nil {
-		return err
-	}
-	cfg.LastSelection = selection
-	return save(cfg)
+	return mutate(func(cfg *config) error {
+		cfg.LastSelection = selection
+		return nil
+	})
 }
 
 // LoadIntegration returns the saved config for one integration.
@@ -259,22 +282,19 @@ func SaveAliases(appName string, aliases map[string]string) error {
 		return errors.New("app name cannot be empty")
 	}
 
-	cfg, err := load()
-	if err != nil {
-		return err
-	}
+	return mutate(func(cfg *config) error {
+		key := strings.ToLower(appName)
+		existing := cfg.Integrations[key]
+		if existing == nil {
+			existing = &integration{}
+		}
 
-	key := strings.ToLower(appName)
-	existing := cfg.Integrations[key]
-	if existing == nil {
-		existing = &integration{}
-	}
+		// Replace aliases entirely (not merge) so deletions are persisted
+		existing.Aliases = aliases
 
-	// Replace aliases entirely (not merge) so deletions are persisted
-	existing.Aliases = aliases
-
-	cfg.Integrations[key] = existing
-	return save(cfg)
+		cfg.Integrations[key] = existing
+		return nil
+	})
 }
 
 func listIntegrations() ([]integration, error) {
