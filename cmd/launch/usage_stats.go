@@ -119,8 +119,17 @@ func LoadUsageStatsCountingUnreadable(filter UsageStatsFilter) ([]UsageStatsRow,
 				unreadable++
 			case json.Unmarshal(line, &e) != nil:
 				unreadable++
+			case isEmptyLogRow(e):
+				// `{}` and `null` parse into a zero row without error, and a
+				// zero row counted as one request under an empty model and an
+				// empty backend — a phantom ERROR line in the report, invented
+				// by whatever wrote an empty line (2026-09-26 audit, ninth
+				// round). A line with no row in it is unreadable, not a turn.
+				unreadable++
 			default:
-				aggregateUsageRow(agg, &order, filter, e)
+				if aggregateUsageRow(agg, &order, filter, e) == rowUnreadable {
+					unreadable++
+				}
 			}
 		}
 		if rerr != nil {
@@ -202,16 +211,44 @@ func readLogLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
 	return bytes.TrimRight(line, "\r\n"), truncated, nil
 }
 
-// aggregateUsageRow folds one parsed row into the aggregate, reporting whether
-// it counted toward any bucket (false when a filter excluded it).
-func aggregateUsageRow(agg map[usageKey]*UsageStatsRow, order *[]usageKey, filter UsageStatsFilter, e requestLogEntry) bool {
+// isEmptyLogRow reports whether a parsed line carries no row at all. Only `{}`,
+// `null` and whitespace parse into that shape — every row this package writes
+// has at least a timestamp and a backend.
+func isEmptyLogRow(e requestLogEntry) bool {
+	return e.Timestamp == "" && e.Model == "" && e.Path == "" && e.Backend == ""
+}
+
+// rowFold is what folding one parsed row into the aggregate did with it.
+type rowFold int
+
+const (
+	rowCounted    rowFold = iota // folded into a bucket
+	rowFiltered                  // excluded by the filter, as the user asked
+	rowUnreadable                // excluded because its own timestamp cannot be read
+)
+
+// aggregateUsageRow folds one parsed row into the aggregate and reports what it
+// did with it.
+//
+// A row whose timestamp cannot be PARSED is reported as unreadable when a
+// --since filter needs it: it used to return the same "filtered" signal as a
+// row legitimately outside the window, so a log holding rows with corrupt (or
+// absent, as in a version-skewed writer) timestamps produced a report that
+// silently omitted them with no `unreadable` warning — the one place the report
+// promises to say that rows are missing (2026-09-26 audit, ninth round).
+// Without --since the timestamp is not needed to count the row, so it is still
+// counted.
+func aggregateUsageRow(agg map[usageKey]*UsageStatsRow, order *[]usageKey, filter UsageStatsFilter, e requestLogEntry) rowFold {
 	if filter.Model != "" && e.Model != filter.Model {
-		return false
+		return rowFiltered
 	}
 	ts, terr := time.Parse(time.RFC3339, e.Timestamp)
 	if !filter.Since.IsZero() {
-		if terr != nil || ts.Before(filter.Since) {
-			return false
+		if terr != nil {
+			return rowUnreadable
+		}
+		if ts.Before(filter.Since) {
+			return rowFiltered
 		}
 	}
 	k := usageKey{e.Model, e.Backend}
@@ -231,5 +268,5 @@ func aggregateUsageRow(agg map[usageKey]*UsageStatsRow, order *[]usageKey, filte
 	if terr == nil && ts.After(row.LastSeen) {
 		row.LastSeen = ts
 	}
-	return true
+	return rowCounted
 }
