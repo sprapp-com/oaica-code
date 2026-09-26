@@ -846,20 +846,29 @@ func extractFileData(input string) (string, []api.ImageData, error) {
 	return strings.TrimSpace(input), imgs, nil
 }
 
+// resolveEditorCommand is the editor command line and its arguments, from
+// OLLAMA_EDITOR, VISUAL, EDITOR, then the platform default.
+//
+// Each source is judged by what it SPLITS into, not by whether it is empty
+// (2026-09-26 audit): a variable set to a space or a newline is not "", so the
+// old chain passed it through, strings.Fields returned no words, and
+// [0] panicked — Ctrl+G took the interactive session down instead of falling
+// back to the default editor. The returned slice is never empty, which is what
+// the caller indexes.
+func resolveEditorCommand() []string {
+	for _, candidate := range []string{envconfig.Editor(), os.Getenv("VISUAL"), os.Getenv("EDITOR"), defaultEditor} {
+		if fields := strings.Fields(candidate); len(fields) > 0 {
+			return fields
+		}
+	}
+	return strings.Fields(defaultEditor)
+}
+
 func editInExternalEditor(content string) (string, error) {
-	editor := envconfig.Editor()
-	if editor == "" {
-		editor = os.Getenv("VISUAL")
-	}
-	if editor == "" {
-		editor = os.Getenv("EDITOR")
-	}
-	if editor == "" {
-		editor = defaultEditor
-	}
+	editor := resolveEditorCommand()
 
 	// Check that the editor binary exists
-	name := strings.Fields(editor)[0]
+	name := editor[0]
 	if _, err := exec.LookPath(name); err != nil {
 		return "", fmt.Errorf("editor %q not found, set OLLAMA_EDITOR to the path of your preferred editor", name)
 	}
@@ -878,8 +887,7 @@ func editInExternalEditor(content string) (string, error) {
 	}
 	tmpFile.Close()
 
-	args := strings.Fields(editor)
-	args = append(args, tmpFile.Name())
+	args := append(editor, tmpFile.Name())
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

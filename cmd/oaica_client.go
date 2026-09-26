@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -595,8 +596,17 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 }
 
 // oaicaAuthLogout removes a provider from the router's live registry.
+//
+// The name is escaped into the path (2026-09-26 audit): it comes from the
+// command line, and interpolated raw a name containing "/" or "?" stops being
+// one segment — the DELETE then addresses whatever that string spells on the
+// operator's router, which is not the deletion the user asked for.
 func oaicaAuthLogout(name string) error {
-	req, err := launch.NewRedactedRequest(http.MethodDelete, oaicaHost()+"/v1/admin/providers/"+name, nil)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("no provider name given — nothing to log out of")
+	}
+	req, err := launch.NewRedactedRequest(http.MethodDelete, oaicaHost()+"/v1/admin/providers/"+url.PathEscape(name), nil)
 	if err != nil {
 		return err
 	}
