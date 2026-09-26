@@ -2573,6 +2573,7 @@ instead (see cmd/launch/model_manifest.go).`,
 				Name: args[0], BaseURL: baseURL, APIKey: apiKey,
 				APIKeyEnv: apiKeyEnv, Wire: wire, ToolFormat: toolFormat,
 				Version: apiVersion, VersionSet: cmd.Flags().Changed("api-version"),
+				KeySet: cmd.Flags().Changed("api-key") || cmd.Flags().Changed("api-key-env"),
 			})
 			if err != nil {
 				return err

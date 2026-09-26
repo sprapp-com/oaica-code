@@ -44,6 +44,18 @@ type RemoteAddOptions struct {
 	// confirmation line that did not say so. Every other flag here describes
 	// the entry's value; this one also describes the absence of an intent.
 	VersionSet bool
+	// KeySet reports that the caller passed --api-key or --api-key-env at all,
+	// including passing one empty. An ABSENT credential flag preserves what the
+	// entry already had; an explicitly empty one clears it.
+	//
+	// The usual "absent means cleared" rule is wrong here for the same reason
+	// it is wrong for Version, only worse: the credential's default is not a
+	// setting, it is a missing key. `oaica remote add box --base-url https://new`
+	// — a repoint with nothing to say about credentials — deleted a stored
+	// secret that existed nowhere else, and the confirmation line named only
+	// the new URL (2026-09-26 audit). Clearing is a typed intent precisely
+	// because it cannot be undone from anything oaica holds.
+	KeySet bool
 }
 
 // loadUserRemotesFileRaw reads remotes.json WITHOUT merging builtinRemotes():
@@ -256,6 +268,15 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 				existing := f.Remotes[i]
 				if !opts.VersionSet {
 					r.Version = existing.Version
+				}
+				// The credential is preserved unless the caller said something
+				// about it (KeySet) — see RemoteAddOptions.KeySet. Passing one
+				// of the two flags replaces BOTH fields, because the pair is
+				// mutually exclusive by this command's own rule: switching a row
+				// to --api-key-env has to drop the literal it was using.
+				if !opts.KeySet {
+					r.APIKey = existing.APIKey
+					r.APIKeyEnv = existing.APIKeyEnv
 				}
 				r.ToolReliable = existing.ToolReliable
 				r.ForceTools = existing.ForceTools
