@@ -309,6 +309,9 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	if len(models) == 0 {
 		return nil
 	}
+	if err := museRejectRemoteModels(models); err != nil {
+		return err
+	}
 
 	settingsPath, err := museSettingsPath()
 	if err != nil {
@@ -325,6 +328,31 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	return fileutil.WithFileLock(settingsPath, func() error {
 		return writeMuseSettingsFileLocked(settingsPath, models, backup)
 	})
+}
+
+// museRejectRemoteModels refuses a selection muse's settings cannot express.
+//
+// Every other integration in this package translates a user-remote row to the
+// remote's own endpoint and model id. Muse cannot: endpoint_transport is ONE
+// global provider switch for the whole file (see the Muse doc comment above),
+// so a selection that mixes a daemon model with a remote one has no
+// representation at all, and a remote's credential has no field oaica can
+// write — the schema is not published and muse is not installed here to read it
+// off. Writing the picker name (what this did before) is worse than refusing:
+// muse posts "box/big-model" to the local daemon, which does not resolve
+// namespaced remotes, so every request fails model-not-found after the user has
+// already answered the key prompt.
+//
+// Refusing here keeps the failure at the point the user can act on it. Lift
+// this when muse's credential field is verifiable.
+func museRejectRemoteModels(models []LaunchModel) error {
+	for _, model := range models {
+		if !model.Remote {
+			continue
+		}
+		return fmt.Errorf("muse cannot be pointed at the remote model %q: muse's settings carry a single endpoint for every catalog row, and it has no credential field oaica can write. Add the remote to muse directly, or launch a daemon-backed model", model.Name)
+	}
+	return nil
 }
 
 // writeMuseSettingsFileLocked is the load-mutate-save half of
