@@ -315,7 +315,7 @@ func applyDeepSeekHarnessSettings(document *yaml.Node, primary string, models []
 		"apiKeyEnv":   deepSeekHarnessAPIKeyEnv,
 		"api":         "openai-completions",
 		"baseURL":     deepSeekHarnessBaseURL(),
-		"models":      deepSeekHarnessModelConfigs(primary, singleEndpointModels(models)),
+		"models":      deepSeekHarnessModelConfigs(primary, singleEndpointModels(primary, models)),
 	} {
 		if err := yamlSetValue(provider, key, value); err != nil {
 			return err

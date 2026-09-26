@@ -32,15 +32,22 @@ func menuWithARemoteRow(t *testing.T) []LaunchModel {
 	setTestHome(t, t.TempDir())
 	t.Setenv("OLLAMA_HOST", "http://127.0.0.1:9999")
 	withTempRemotesFile(t)
-	writeRemotes(t, `{"remotes":[{"name":"box","base_url":"https://box.example/v1","api_key":"sk-box-SECRET","tool_format":"tool_calls"}]}`)
-	if _, ok := resolveRemoteEndpoint("box/big-model"); !ok {
-		t.Fatal("premise: the box/big-model row does not resolve, so it would never be treated as a remote at all")
+	writeRemotes(t, `{"remotes":[
+		{"name":"box","base_url":"https://box.example/v1","api_key":"sk-box-SECRET","tool_format":"tool_calls"},
+		{"name":"zai","base_url":"https://zai.example/v1","api_key":"sk-zai-SECRET","tool_format":"tool_calls"}]}`)
+	for _, name := range []string{"box/big-model", "zai/glm-4.6"} {
+		if _, ok := resolveRemoteEndpoint(name); !ok {
+			t.Fatalf("premise: the %s row does not resolve, so it would never be treated as a remote at all", name)
+		}
 	}
 
 	menu := launchModelsFromNames([]string{"llama3.2"})
 	menu = append(menu,
 		LaunchModel{Name: "box/big-model", Remote: true, Upstream: "big-model"},
-		LaunchModel{Name: "deepseek/deepseek-flash", Remote: true, Upstream: "deepseek-flash"},
+		LaunchModel{Name: "zai/glm-4.6", Remote: true, Upstream: "glm-4.6"},
+		// The control: an ollama-cloud row is proxied BY the daemon, so it is
+		// on this endpoint and must not be filtered out with the remotes.
+		LaunchModel{Name: "glm-5.1:cloud", Remote: true, Upstream: "glm-5.1:cloud"},
 	)
 	return menu
 }
@@ -60,11 +67,14 @@ func TestChatGPTLaunchesADaemonModelWhenTheMenuCarriesRemoteRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read catalog: %v", err)
 	}
-	if strings.Contains(string(data), "box/big-model") || strings.Contains(string(data), "deepseek/deepseek-flash") {
+	if strings.Contains(string(data), "box/big-model") || strings.Contains(string(data), "zai/glm-4.6") {
 		t.Errorf("the ChatGPT catalogue advertises rows its single daemon endpoint cannot serve:\n%s", data)
 	}
 	if !strings.Contains(string(data), "llama3.2") {
 		t.Errorf("the selected daemon model is missing from the catalogue:\n%s", data)
+	}
+	if !strings.Contains(string(data), "glm-5.1:cloud") {
+		t.Errorf("an ollama-cloud row was dropped even though the daemon serves it:\n%s", data)
 	}
 }
 
@@ -83,11 +93,14 @@ func TestDeepSeekHarnessLaunchesADaemonModelWhenTheMenuCarriesRemoteRows(t *test
 	if err != nil {
 		t.Fatalf("read settings: %v", err)
 	}
-	if strings.Contains(string(data), "box/big-model") || strings.Contains(string(data), "deepseek/deepseek-flash") {
+	if strings.Contains(string(data), "box/big-model") || strings.Contains(string(data), "zai/glm-4.6") {
 		t.Errorf("the harness settings advertise models its single daemon endpoint cannot serve:\n%s", data)
 	}
 	if !strings.Contains(string(data), "llama3.2") {
 		t.Errorf("the selected daemon model is missing from the settings:\n%s", data)
+	}
+	if !strings.Contains(string(data), "glm-5.1:cloud") {
+		t.Errorf("an ollama-cloud row was dropped even though the daemon serves it:\n%s", data)
 	}
 
 	patchPath, perr := deepSeekHarnessPatchPath()

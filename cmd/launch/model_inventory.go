@@ -884,22 +884,48 @@ func launchModelsFromNames(names []string) []LaunchModel {
 	return models
 }
 
-// singleEndpointModels keeps the rows a store that names ONE endpoint can serve
-// — the daemon-backed integrations that write a whole model list (chatgpt, dsh)
-// beside that one endpoint.
+// launchModelEndpointKey names the endpoint a picker row is routed to. Stores
+// that can express exactly ONE endpoint — one base URL, one wire, one
+// credential — need this to tell which rows belong in that store at all.
 //
-// The list they are handed is not the user's selection: managedSingleConfigure
-// Models hands the launch target plus every row the picker offers, with the
-// remote rows flagged. Writing those rows into the store advertises models the
-// configured endpoint does not serve, which is the failure round 18 fixed for
-// the harness — but refusing the whole launch because ONE such row exists in the
-// menu refused launches of perfectly ordinary local models (2026-09-27 audit,
-// round 19). The row that decides the endpoint is the primary, and it is refused
-// separately by each store's own primary check; everything else is filtered here.
-func singleEndpointModels(models []LaunchModel) []LaunchModel {
+// The Remote flag is not the endpoint: an ollama-cloud row ("glm-5.1:cloud")
+// carries Remote=true and is still served BY the local daemon, which proxies
+// it. A `oaica serve` row ("<model>:local") is reached at its own origin, which
+// no single-endpoint store can name from the row alone, so it is its own key.
+func launchModelEndpointKey(model LaunchModel) string {
+	if model.LiveSource == liveSourceLocal {
+		return "serve:" + model.Name
+	}
+	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
+		return "remote:" + strings.TrimRight(ep.BaseURL, "/")
+	}
+	return "daemon"
+}
+
+// singleEndpointModels keeps the rows a store that names ONE endpoint can
+// serve: the ones routed to the same endpoint as the primary, which is the row
+// that decides that store's base URL, wire and credential.
+//
+// The list these writers are handed is not the user's selection:
+// managedSingleConfigureModels hands the launch target plus every row the
+// picker offers, with the remote rows flagged. Writing the rest of the menu
+// into the store advertises models the configured endpoint does not serve, so
+// they are offered, selected, and posted to the wrong host — for the ChatGPT
+// app's catalogue, the harness settings and OMP's models.yml alike. Refusing
+// the launch instead was worse: one row in the menu that the user never picked
+// refused an ordinary local launch (2026-09-27 audit, round 19). The primary is
+// what each store checks for a selection it cannot express at all; everything
+// else is filtered to its endpoint here.
+func singleEndpointModels(primary string, models []LaunchModel) []LaunchModel {
+	primaryRow, ok := findLaunchModel(models, primary)
+	if !ok {
+		primaryRow = fallbackLaunchModel(primary)
+	}
+	want := launchModelEndpointKey(primaryRow)
+
 	servable := make([]LaunchModel, 0, len(models))
 	for _, model := range models {
-		if model.Remote {
+		if model.Name == "" || launchModelEndpointKey(model) != want {
 			continue
 		}
 		servable = append(servable, model)

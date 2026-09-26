@@ -347,7 +347,7 @@ func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) erro
 
 	provider := ensureOMPProvider(cfg, primary)
 	existingByID := ompModelEntriesByID(provider)
-	ordered := append([]LaunchModel(nil), models...)
+	ordered := append([]LaunchModel(nil), singleEndpointModels(primary, models)...)
 	if model, ok := findLaunchModel(ordered, primary); ok {
 		ordered = append([]LaunchModel{model}, removeLaunchModel(ordered, primary)...)
 	} else {

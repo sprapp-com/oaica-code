@@ -102,7 +102,7 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 		if err != nil {
 			return err
 		}
-		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, singleEndpointModels(models))); err != nil {
+		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, singleEndpointModels(primary, models))); err != nil {
 			return err
 		}
 		return writeCodexAppConfig(configPath, primary, catalogPath)
