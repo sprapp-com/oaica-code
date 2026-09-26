@@ -1290,6 +1290,21 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 
+		// A body that is not a JSON object is not an Anthropic Messages
+		// request, and the decode below will not say so: json.Unmarshal
+		// ACCEPTS a literal `null` into a struct as a documented no-op that
+		// reports no error. Downstream that became a nil map, and assigning
+		// the rewritten model into it panicked the handler on every
+		// Anthropic-wire remote leg. net/http recovers the panic per
+		// connection, so the client saw a dropped connection rather than an
+		// error, and the panic ran before the request-log defer was
+		// registered — so nothing, anywhere, recorded the failure
+		// (2026-09-26 audit, thirteenth round).
+		if !jsonObjectBody(body) {
+			refuse(http.StatusBadRequest, "invalid Anthropic request: the body is not a JSON object")
+			return
+		}
+
 		var anthReq anthropic.MessagesRequest
 		if err := json.Unmarshal(body, &anthReq); err != nil {
 			refuse(http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
@@ -2729,12 +2744,36 @@ func rewriteAnthropicRequestModel(body []byte, newModel string) ([]byte, error) 
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, err
 	}
+	if m == nil {
+		// json.Unmarshal reports no error for a body that is not a JSON
+		// object — `null` decodes into a nil map — and the assignment below
+		// would panic on it. The caller's own shape check catches this
+		// first, but a function that marshals a map must not panic whatever
+		// it is handed (2026-09-26 audit, thirteenth round).
+		return nil, fmt.Errorf("request body is not a JSON object")
+	}
 	encoded, err := json.Marshal(newModel)
 	if err != nil {
 		return nil, err
 	}
 	m["model"] = encoded
 	return json.Marshal(m)
+}
+
+// jsonObjectBody reports whether body is a JSON object, ignoring leading
+// whitespace. Deliberately a byte test rather than a second decode: the body
+// can be a megabyte (httpbody.DefaultMax) and the only question being asked is
+// whether the decode that follows will populate a struct or silently do
+// nothing, which is exactly what a leading '{' answers.
+func jsonObjectBody(body []byte) bool {
+	for _, b := range body {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		}
+		return b == '{'
+	}
+	return false
 }
 
 // nativeAnthropicPassthrough forwards an Anthropic-wire request straight to
