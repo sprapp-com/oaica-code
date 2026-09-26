@@ -80,6 +80,11 @@ func (c *ClaudeDesktop) ConfigureAutodiscovery() error {
 		return err
 	}
 
+	restore, err := loadClaudeDesktopRestoreState()
+	if err != nil {
+		return err
+	}
+
 	for _, path := range targets.normalConfigs {
 		if err := writeClaudeDesktopDeploymentMode(path, "3p"); err != nil {
 			return err
@@ -92,11 +97,15 @@ func (c *ClaudeDesktop) ConfigureAutodiscovery() error {
 		if err := writeClaudeDesktopMeta(target.meta, claudeDesktopProfileID, claudeDesktopProfileName); err != nil {
 			return err
 		}
+		// Before overwriting the profile's credential, remember what was there.
+		if err := recordClaudeDesktopGatewayKeyInjection(&restore, target.profile, key); err != nil {
+			return err
+		}
 		if err := writeClaudeDesktopGatewayProfile(target.profile, key, true); err != nil {
 			return err
 		}
 	}
-	return nil
+	return writeClaudeDesktopRestoreState(restore)
 }
 
 func (c *ClaudeDesktop) RestoreHint() string {
@@ -144,6 +153,11 @@ func (c *ClaudeDesktop) Restore() error {
 		return err
 	}
 
+	restore, err := loadClaudeDesktopRestoreState()
+	if err != nil {
+		return err
+	}
+
 	for _, path := range targets.normalConfigs {
 		if err := writeClaudeDesktopDeploymentMode(path, "1p"); err != nil {
 			return err
@@ -156,9 +170,14 @@ func (c *ClaudeDesktop) Restore() error {
 		if err := restoreClaudeDesktopMeta(target.meta); err != nil {
 			return err
 		}
-		if err := restoreClaudeDesktopOllamaProfile(target.profile); err != nil {
+		prior, recorded := restore.Profiles[target.profile]
+		if err := restoreClaudeDesktopOllamaProfile(target.profile, prior, recorded); err != nil {
 			return err
 		}
+		delete(restore.Profiles, target.profile)
+	}
+	if err := writeClaudeDesktopRestoreState(restore); err != nil {
+		return err
 	}
 	return claudeDesktopLaunchOrRestart("Restart Claude Desktop to use the usual Claude profile?")
 }
@@ -654,7 +673,7 @@ func restoreClaudeDesktopMeta(path string) error {
 	return writeClaudeDesktopJSON(path, meta)
 }
 
-func restoreClaudeDesktopOllamaProfile(path string) error {
+func restoreClaudeDesktopOllamaProfile(path string, prior claudeDesktopProfileRestoreState, recorded bool) error {
 	cfg, err := readClaudeDesktopJSONAllowMissing(path)
 	if err != nil {
 		return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
@@ -667,7 +686,111 @@ func restoreClaudeDesktopOllamaProfile(path string) error {
 	delete(cfg, "inferenceGatewayBaseUrl")
 	delete(cfg, "inferenceGatewayAuthScheme")
 	delete(cfg, "inferenceModels")
+	// The gateway credential is a secret oaica wrote, so restore removes it —
+	// but only where oaica wrote one. A profile oaica never put a key into
+	// (no record) keeps the key its owner configured; a profile whose own key
+	// oaica replaced gets that value back; a profile whose own key oaica
+	// reused keeps it where it is (2026-09-26 audit).
+	switch {
+	case !recorded || prior.HadKey && prior.Replaced == "":
+	case prior.HadKey:
+		cfg["inferenceGatewayApiKey"] = prior.Replaced
+	default:
+		delete(cfg, "inferenceGatewayApiKey")
+	}
 	return writeClaudeDesktopJSON(path, cfg)
+}
+
+// claudeDesktopRestoreState records what each Ollama third-party profile held
+// before oaica wrote its gateway credential into it, so `--restore` can take
+// back exactly what oaica added. Without it restore has only the file to go on,
+// where a key oaica injected and a key the user configured themselves look
+// identical — leaving a secret oaica wrote on disk, or deleting the user's
+// (2026-09-26 audit). It is the same shape as the Codex app's restore state,
+// for the same reason; the file is oaica's own, so nothing oaica keeps here is
+// read by Claude Desktop.
+type claudeDesktopRestoreState struct {
+	// Profiles is keyed by profile path: macOS has one third-party profile
+	// root and Windows two, and they do not have to hold the same credential.
+	Profiles map[string]claudeDesktopProfileRestoreState `json:"profiles,omitempty"`
+}
+
+type claudeDesktopProfileRestoreState struct {
+	// HadKey is whether the profile already held a gateway API key before
+	// oaica configured it.
+	HadKey bool `json:"had_key"`
+	// Replaced is the user's key that oaica overwrote, recorded only when it
+	// differed from the one oaica wrote: restoring a key that was never lost
+	// would copy the user's credential into a second file for nothing. Empty
+	// with HadKey true means the key still in the profile is the user's own.
+	Replaced string `json:"replaced,omitempty"`
+}
+
+func claudeDesktopRestoreStatePath() string {
+	home, err := claudeDesktopUserHome()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "ollama-claude-desktop-restore.json")
+	}
+	return filepath.Join(home, ".ollama", "launch", "claude-desktop-restore.json")
+}
+
+func loadClaudeDesktopRestoreState() (claudeDesktopRestoreState, error) {
+	state := claudeDesktopRestoreState{}
+	data, err := os.ReadFile(claudeDesktopRestoreStatePath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, err
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return claudeDesktopRestoreState{}, fmt.Errorf("parse Claude Desktop restore state: %w", err)
+	}
+	return state, nil
+}
+
+func writeClaudeDesktopRestoreState(state claudeDesktopRestoreState) error {
+	path := claudeDesktopRestoreStatePath()
+	if len(state.Profiles) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return fileutil.WriteWithBackup(path, data)
+}
+
+// recordClaudeDesktopGatewayKeyInjection saves the credential a profile holds
+// before oaica overwrites it. A record already present is left alone: after the
+// first configure the key in that file is oaica's, and recording it as the
+// user's would make restore keep oaica's secret — the bug this exists to fix.
+func recordClaudeDesktopGatewayKeyInjection(state *claudeDesktopRestoreState, profilePath, injectedKey string) error {
+	if _, ok := state.Profiles[profilePath]; ok {
+		return nil
+	}
+	cfg, err := readClaudeDesktopJSONAllowMissing(profilePath)
+	if err != nil {
+		return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
+	}
+	existing, _ := cfg["inferenceGatewayApiKey"].(string)
+	existing = strings.TrimSpace(existing)
+	prior := claudeDesktopProfileRestoreState{HadKey: existing != ""}
+	if existing != "" && existing != strings.TrimSpace(injectedKey) {
+		prior.Replaced = existing
+	}
+	if state.Profiles == nil {
+		state.Profiles = make(map[string]claudeDesktopProfileRestoreState)
+	}
+	state.Profiles[profilePath] = prior
+	return nil
 }
 
 func readClaudeDesktopAppliedID(path string) string {
