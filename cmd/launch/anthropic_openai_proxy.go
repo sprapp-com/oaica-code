@@ -1251,7 +1251,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// the SAME anthReq.Model lookup every other tier uses, so opusplan
 		// mixing a native primary with a native secondary still lands each
 		// request on the right upstream model.
-		if route, reqModel, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
+		// The upstream model selectRoute resolves is deliberately NOT bound
+		// here: every leg inside this block names the model it sends
+		// explicitly (route.UpstreamModel — see the gate below), and the
+		// translated path that does need it resolves it again for its own
+		// scope.
+		if route, _, _ := table.selectRoute(anthReq.Model); route.NativePassthrough {
 			// Set BEFORE either branch returns. A passthrough leg is answered
 			// here and never reaches the assignment below, so the header was
 			// missing on exactly the legs a silent swap is hardest to see —
@@ -1267,7 +1272,20 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// audit). The native claude/* leg below stays ungated: it is
 				// api.anthropic.com under the user's own credential, neither
 				// self-hosted nor user-remote.
-				if allowed, reason := checkEntitlement(r, route.Label, reqModel); !allowed {
+				//
+				// route.UpstreamModel, not reqModel: this branch REWRITES the
+				// body to the leg's own model on the next line, so for any
+				// spelling selectRoute does not recognise the two differ and
+				// the gate judged what the client typed while the upstream was
+				// sent — and the user billed for — something else. A policy
+				// keyed on the model was bypassed by asking for
+				// "vendor/glm-5.3-not-this", which lands on the same leg and
+				// goes out as glm-5.3 (2026-09-26 audit). The translated path
+				// passes reqModel because reqModel IS what it writes upstream,
+				// and the crossover passes route.UpstreamModel for this same
+				// reason — the gate must be asked about the model that is
+				// SPENT, whichever spelling produced it.
+				if allowed, reason := checkEntitlement(r, route.Label, route.UpstreamModel); !allowed {
 					writeAnthropicError(w, http.StatusForbidden, reason)
 					return
 				}
