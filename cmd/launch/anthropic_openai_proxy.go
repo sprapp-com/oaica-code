@@ -564,6 +564,16 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 		Done:  true,
 	}
 	if len(resp.Choices) > 0 {
+		// A reasoning-only completion (content empty, reasoning set) becomes a
+		// thinking block and no text — deliberately, because that is exactly
+		// what the streaming path produces for the same model: the converter
+		// turns thinking deltas into a thinking block and never invents text
+		// for content it did not receive. tools/gateway/messages.go surfaces
+		// reasoning AS text when content is empty, but that is a different
+		// surface with its own client; inventing an answer out of a model's
+		// reasoning here would make the two proxy paths disagree about the
+		// same upstream body (2026-09-26 audit, thirteenth round — reported
+		// and deliberately not changed).
 		c := resp.Choices[0]
 		chatResp.Message = api.Message{
 			Role:      c.Message.Role,
