@@ -79,10 +79,23 @@ func (h *hangBackend) waitAccepted(t *testing.T) {
 	}
 }
 
+// upstreamReleaseBudget is how long the backend waits to see its connection
+// closed after the client gives up. The property under test is that the socket
+// is released AT ALL — the defect this pins held it until the process exited —
+// not that a cancellation propagates inside 3 seconds, which is what it used to
+// assert. That budget is wall-clock on a loopback round trip plus the proxy's
+// own goroutine being scheduled, and under the full suite's load it was missed
+// once in ten runs (2026-09-26, 3.01s elapsed — the run that reported
+// "still open 3s after the client gave up" with nothing wrong). A leaked
+// connection is still caught: it never closes.
+const upstreamReleaseBudget = 10 * time.Second
+
 func (h *hangBackend) waitClosed(t *testing.T, within time.Duration) {
 	t.Helper()
+	started := time.Now()
 	select {
 	case <-h.closed:
+		t.Logf("the upstream was released after %s", time.Since(started).Round(time.Millisecond))
 	case <-time.After(within):
 		t.Errorf("the backend's connection was still open %s after the client gave up — the proxy forwards without the caller's context, so an upstream that accepted and never answered holds the socket (and this process's file descriptor) until oaica exits", within)
 	}
@@ -135,7 +148,7 @@ func TestTheLoggingProxyReleasesAnUpstreamThatNeverAnswers(t *testing.T) {
 
 	backend.waitAccepted(t)
 	cancel()
-	backend.waitClosed(t, 3*time.Second)
+	backend.waitClosed(t, upstreamReleaseBudget)
 
 	select {
 	case <-done:
@@ -175,7 +188,7 @@ func TestTheNormalizingProxyReleasesAnUpstreamThatNeverAnswers(t *testing.T) {
 
 	backend.waitAccepted(t)
 	cancel()
-	backend.waitClosed(t, 3*time.Second)
+	backend.waitClosed(t, upstreamReleaseBudget)
 
 	select {
 	case <-done:
