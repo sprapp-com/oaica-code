@@ -210,12 +210,12 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 		case scanner.Pasting:
 			fmt.Fprintln(&sb, line)
 			continue
-		case strings.HasPrefix(line, "/list"):
+		case isSlashCommand(line, "/list"):
 			args := strings.Fields(line)
 			if err := ListHandler(cmd, args[1:]); err != nil {
 				return err
 			}
-		case strings.HasPrefix(line, "/load"):
+		case isSlashCommand(line, "/load"):
 			args := strings.Fields(line)
 			if len(args) != 2 {
 				fmt.Println("Usage:\n  /load <modelname>")
@@ -260,7 +260,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				return err
 			}
 			continue
-		case strings.HasPrefix(line, "/save"):
+		case isSlashCommand(line, "/save"):
 			args := strings.Fields(line)
 			if len(args) != 2 {
 				fmt.Println("Usage:\n  /save <modelname>")
@@ -285,11 +285,11 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			}
 			fmt.Printf("Created new model '%s'\n", args[1])
 			continue
-		case strings.HasPrefix(line, "/clear"):
+		case isSlashCommand(line, "/clear"):
 			oaicaHistory = resetConversation(&opts, oaicaHistory)
 			fmt.Println("Cleared session context")
 			continue
-		case strings.HasPrefix(line, "/set"):
+		case isSlashCommand(line, "/set"):
 			args := strings.Fields(line)
 			if len(args) > 1 {
 				switch args[1] {
@@ -409,7 +409,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			} else {
 				usageSet()
 			}
-		case strings.HasPrefix(line, "/show"):
+		case isSlashCommand(line, "/show"):
 			args := strings.Fields(line)
 			if len(args) > 1 {
 				client, err := api.ClientFromEnvironment()
@@ -477,7 +477,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			} else {
 				usageShow()
 			}
-		case strings.HasPrefix(line, "/help"), strings.HasPrefix(line, "/?"):
+		case isSlashCommand(line, "/help") || isSlashCommand(line, "/?"):
 			args := strings.Fields(line)
 			if len(args) > 1 {
 				switch args[1] {
@@ -491,7 +491,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			} else {
 				usage()
 			}
-		case strings.HasPrefix(line, "/model"):
+		case isSlashCommand(line, "/model"):
 			args := strings.Fields(line)
 			if len(args) < 2 {
 				fmt.Println("Usage:\n  /model <name>\n  /model list")
@@ -532,7 +532,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			oaicaHistory = nil
 			fmt.Printf("Switched to model '%s'\n", oaicaActiveModel)
 			continue
-		case strings.HasPrefix(line, "/lora"):
+		case isSlashCommand(line, "/lora"):
 			args := strings.Fields(line)
 			if len(args) < 2 {
 				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name> [name2 ...]\n  /lora stack <name>\n  /lora off")
@@ -632,7 +632,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off")
 			}
 			continue
-		case strings.HasPrefix(line, "/agent"):
+		case isSlashCommand(line, "/agent"):
 			args := strings.SplitN(line, " ", 2)
 			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
 				fmt.Println("Usage:\n  /agent <task>\n\nRuns a tool-using ReAct agent (NeMo Agent Toolkit) instead of a plain\nchat turn — use for tasks that need a real tool call (e.g. current time),\nnot for ordinary conversation.")
@@ -645,7 +645,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			}
 			fmt.Println(result)
 			continue
-		case strings.HasPrefix(line, "/exit"), strings.HasPrefix(line, "/bye"):
+		case isSlashCommand(line, "/exit"), isSlashCommand(line, "/bye"):
 			return nil
 		case strings.HasPrefix(line, "/"):
 			args := strings.Fields(line)
@@ -661,8 +661,10 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 			}
 
 			if !isFile {
-				fmt.Printf("Unknown command '%s'. Type /? for help\n", args[0])
-				continue
+				if slashLineDisposition(line) == slashUnknownCommand {
+					fmt.Printf("Unknown command '%s'. Type /? for help\n", args[0])
+					continue
+				}
 			}
 
 			sb.WriteString(line)

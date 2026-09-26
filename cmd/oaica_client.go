@@ -766,6 +766,50 @@ func stdinLinesOrArgPrompt(stdinRaw, joinedPrompt string) []string {
 	return nil
 }
 
+// isSlashCommand reports whether line invokes the command name: the line is
+// exactly the name, or the name followed by whitespace and arguments.
+//
+// A plain prefix match is not enough, and the difference is not cosmetic. The
+// one-shot path walks PIPED input line by line and sends every line that is
+// not a command to the model, so this match decides whether a prompt reaches
+// the model at all: `printf '/models are slow today\n' | oaica run kat-awq`
+// ran `/model` with the argument "are", printed "Unknown model 'are'", and
+// exited 0 with the user's line consumed and no request logged. In the REPL
+// the same match turned any sentence beginning with those letters into a
+// command. A command is therefore a line whose FIRST TOKEN is exactly the
+// command word — the boundary has to be checked, because a prefix is
+// something prose can share (2026-09-26 audit).
+func isSlashCommand(line, name string) bool {
+	rest, ok := strings.CutPrefix(line, name)
+	if !ok {
+		return false
+	}
+	return rest == "" || rest[0] == ' ' || rest[0] == '\t'
+}
+
+// slashLineDisposition decides what the REPL does with a line that starts
+// with "/" and that no command claimed.
+//
+// A slash line is not automatically a command. A line with more than one
+// token is prose that happens to start with a slash — "a sentence beginning
+// with /models" — and the one-shot path sends exactly that line to the model,
+// so the REPL has to as well, or typing the line and piping it behave
+// differently. A single unknown token keeps the typo guard this branch was
+// written for ("/modl" gets told, rather than being answered by the model).
+func slashLineDisposition(line string) slashDisposition {
+	if len(strings.Fields(line)) > 1 {
+		return slashProse
+	}
+	return slashUnknownCommand
+}
+
+type slashDisposition int
+
+const (
+	slashProse slashDisposition = iota
+	slashUnknownCommand
+)
+
 // oaicaDispatchLine mirrors generateInteractive's (cmd/interactive.go)
 // /model and /lora handling for the non-TTY one-shot path — same commands,
 // same underlying client calls, just without the readline/spinner UI.
@@ -773,7 +817,7 @@ func stdinLinesOrArgPrompt(stdinRaw, joinedPrompt string) []string {
 // (_, false, nil) if it's plain chat text the caller should send itself.
 func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 	switch {
-	case strings.HasPrefix(line, "/model"):
+	case isSlashCommand(line, "/model"):
 		args := strings.Fields(line)
 		if len(args) < 2 {
 			return fmt.Sprintf("Usage:\n  /model <name>\n  /model list\nActive OAICA model: %s", *activeModel), true, nil
@@ -803,7 +847,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 		*activeModel = requested
 		return fmt.Sprintf("Switched to model '%s'", *activeModel), true, nil
 
-	case strings.HasPrefix(line, "/lora"):
+	case isSlashCommand(line, "/lora"):
 		args := strings.Fields(line)
 		if len(args) < 2 {
 			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name> [name2 ...]\n  /lora stack <name>\n  /lora off", true, nil
@@ -887,7 +931,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off", true, nil
 		}
 
-	case strings.HasPrefix(line, "/agent"):
+	case isSlashCommand(line, "/agent"):
 		task := strings.TrimSpace(strings.TrimPrefix(line, "/agent"))
 		if task == "" {
 			return "Usage:\n  /agent <task>", true, nil
