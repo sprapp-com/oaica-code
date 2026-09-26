@@ -238,6 +238,21 @@ func (u *openAIUsage) cachedTokens() int {
 	return c
 }
 
+// statesACount reports whether the usage object actually STATES a token
+// count. The presence of the object is not a statement: a build that always
+// emits it, populated only when it has something to say, sends
+// {"prompt_tokens":0,"completion_tokens":0} — an empty statement, not a
+// measurement of zero. Gating the no-usage fallbacks on the pointer read that
+// as fact, so the client was told input_tokens=0 for a turn whose prompt was
+// real: a session that never appears to grow, so auto-compaction never fires,
+// until the request hits the context wall — the 2026-08-30 failure reached
+// through a different door (2026-09-26 audit, twelfth round). Callers fall
+// back per FIELD on the value; this is the "did it state anything at all"
+// form for the non-streaming path, which has a single fallback to place.
+func (u *openAIUsage) statesACount() bool {
+	return u != nil && (u.PromptTokens > 0 || u.CompletionTokens > 0)
+}
+
 // openAIStreamChunk is one SSE data: payload from a streaming response.
 type openAIStreamChunk struct {
 	Choices []struct {
@@ -1891,7 +1906,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		onUsage(oaiResp.Usage.PromptTokens)
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
-	if oaiResp.Usage == nil && estInputTokens > 0 {
+	if !oaiResp.Usage.statesACount() && estInputTokens > 0 {
 		// No usage object to report. An estimate is the only honest number
 		// available, and it keeps the client's context accounting moving —
 		// see the note at the streaming call site (2026-09-26 audit).
@@ -2197,23 +2212,36 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		DoneReason: mapFinishReason(finishReason),
 	}
 	cached := 0
+	// Each field is taken only when the upstream STATED it. A usage chunk
+	// that states nothing (see statesACount) otherwise suppressed both
+	// fallbacks at once by being present, which is strictly worse than the
+	// no-usage-chunk shape the fallbacks were added for (2026-09-26 audit,
+	// twelfth round). "Stated" is not "non-zero": a fully-cached turn reports
+	// prompt_tokens>0 with every one of them cached, so its uncached count is
+	// legitimately 0 and must not be replaced by the estimate.
+	statedPrompt := finalUsage != nil && finalUsage.PromptTokens > 0
+	statedCompletion := finalUsage != nil && finalUsage.CompletionTokens > 0
 	if finalUsage != nil {
 		cached = finalUsage.cachedTokens()
+	}
+	if statedPrompt {
 		doneResp.Metrics.PromptEvalCount = finalUsage.PromptTokens - cached
+	}
+	if statedCompletion {
 		doneResp.Metrics.EvalCount = finalUsage.CompletionTokens
-	} else {
-		// No usage chunk: report the prompt estimate the converter was
-		// seeded with and what was actually streamed, rather than a hard
-		// "input_tokens":0/output_tokens:0 the client believes — a session
-		// that really did grow then looks flat, and auto-compaction never
-		// fires (2026-09-26 audit).
+	}
+	if !statedPrompt && estInputTokens > 0 {
+		// Nothing stated for this field: report the prompt estimate the
+		// converter was seeded with rather than a hard "input_tokens":0 the
+		// client believes — a session that really did grow then looks flat,
+		// and auto-compaction never fires (2026-09-26 audit).
 		doneResp.Metrics.PromptEvalCount = estInputTokens
-		if streamedText > 0 {
-			doneResp.Metrics.EvalCount = streamedText/4 + 1
-		}
+	}
+	if !statedCompletion && streamedText > 0 {
+		doneResp.Metrics.EvalCount = streamedText/4 + 1
 	}
 	events := conv.Process(doneResp)
-	if finalUsage != nil {
+	if finalUsage != nil && finalUsage.PromptTokens > 0 {
 		// The converter only overwrites message_start's seeded estimate when
 		// PromptEvalCount > 0, which is right for a done event that states
 		// nothing — but here the upstream DID state usage, and an upstream
