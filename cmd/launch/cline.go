@@ -96,6 +96,24 @@ func (c *Cline) Paths() []string {
 	return paths
 }
 
+// NarrowToStoredModels implements narrowingEditor. Cline's provider settings
+// hold ONE model — settings.model beside the baseUrl it belongs to — and both
+// of its stores are rewritten from that single value, so a multi-model
+// selection is narrowed to the first before anything is written or recorded.
+// Edit still writes models[0].Name (pinned by cline_test.go's "uses first model
+// as primary"); this is the other half of that contract, and without it the
+// integration state recorded every selected name while the store held one, so
+// liveConfigMatches was false forever and each launch rewrote the file it had
+// just read (2026-09-26 audit, fifteenth round).
+func (c *Cline) NarrowToStoredModels(models []string) ([]string, []string) {
+	if len(models) <= 1 {
+		return models, nil
+	}
+	dropped := make([]string, 0, len(models)-1)
+	dropped = append(dropped, models[1:]...)
+	return models[:1], dropped
+}
+
 func (c *Cline) Edit(models []LaunchModel) error {
 	if len(models) == 0 {
 		return nil

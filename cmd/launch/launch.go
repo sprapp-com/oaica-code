@@ -151,6 +151,30 @@ type Editor interface {
 	Models() []string
 }
 
+// narrowingEditor is implemented by an Editor whose own store holds FEWER
+// models than the picker can hand back — Cline's provider settings carry one
+// model beside its base URL. It lets such an editor say so before anything is
+// written, so the write, the integration state and the live-config comparison
+// all describe the same store (see editorStoredModels).
+type narrowingEditor interface {
+	NarrowToStoredModels(models []string) (stored []string, dropped []string)
+}
+
+// editorStoredModels is the selection as the editor's own store will hold it.
+// prepareEditorIntegration records every name it is handed as the integration's
+// state while the editor writes whatever it can hold, so for a narrowing editor
+// the recorded state was a list the store never contains: savedMatchesModels
+// and liveConfigMatches (slices.Equal(editor.Models(), models), below) were both
+// false on every launch, each run rewrote the config it had just read and
+// reprinted the configured block, and the extra selections were dropped without
+// a word (2026-09-26 audit, fifteenth round).
+func editorStoredModels(editor Editor, models []string) (stored []string, dropped []string) {
+	if narrowing, ok := editor.(narrowingEditor); ok {
+		return narrowing.NarrowToStoredModels(models)
+	}
+	return models, nil
+}
+
 // ManagedSingleModel is the narrow launch-owned config path for integrations
 // like Hermes that have one primary model selected by launcher, need launcher
 // to persist minimal config, and still keep their own model discovery and
@@ -977,6 +1001,17 @@ func (c *launcherClient) launchEditorIntegration(ctx context.Context, name strin
 	if len(models) == 0 {
 		return nil
 	}
+
+	// What the editor can actually store, not what the picker returned: an
+	// editor that holds one model narrows the selection here, so the write and
+	// the recorded state agree and the next launch converges (editorStoredModels
+	// above). The names it cannot hold are said out loud, not dropped in silence.
+	stored, dropped := editorStoredModels(editor, models)
+	if len(dropped) > 0 && len(stored) > 0 {
+		fmt.Fprintf(os.Stderr, "Note: %s keeps a single model in its own settings, so only %s was written. Left out: %s. Pick it in %s's own model picker to use it there.\n",
+			name, stored[0], strings.Join(dropped, ", "), runner.String())
+	}
+	models = stored
 
 	var launchModels []LaunchModel
 	liveConfigMatches := slices.Equal(editor.Models(), models)
