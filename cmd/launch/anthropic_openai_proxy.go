@@ -1436,10 +1436,9 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// tokens-per-byte for THIS session instead (context_calibration.go).
 		// table.SessionID is the same value we send upstream as X-Session-Id
 		// just below, so client and server calibrate on the same key.
-		calibKey := table.SessionID
-		if calibKey == "" {
-			calibKey = route.Label
-		}
+		// Per leg as well as per session: see legCalibrationKey — one leg's
+		// measured sample must never set another leg's margin.
+		calibKey := legCalibrationKey(table.SessionID, route)
 		if route.ContextWindow > 0 {
 			// contextFitMarginRatio is NOT a flat token count -- a real
 			// 2026-08-29 recurrence (same incident class, 22x in one
@@ -1571,6 +1570,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						return
 					}
 					route = over
+					// The leg changed under this request, so the slot the
+					// calibration is read from and written to changes with
+					// it: the response about to be measured belongs to `over`,
+					// not to the leg that could not hold the request.
+					calibKey = legCalibrationKey(table.SessionID, route)
 					// The crossover serves a leg on another host, so this
 					// request's result is not evidence about the leg
 					// selectRoute chose. The breaker below/above still records

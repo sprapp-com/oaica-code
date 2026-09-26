@@ -165,6 +165,34 @@ func (c *promptCalibrator) estimate(key string, bodyBytes int) (est, sampleBytes
 	return est, s.bodyBytes, true
 }
 
+// legCalibrationKey names the calibration slot for ONE leg of one session.
+//
+// The sample a calibration holds is one successful response's real
+// prompt_tokens for one body size, measured on one leg — its tokenizer, its
+// prompt-building, its own upstream. Keyed on the session alone, a plan whose
+// tiers sit on different base URLs shared a single sample, so a 600 KB turn on
+// a 262k-window leg set the margin for every later turn on a 32k leg ("prompt
+// is too long: 10017 tokens > 32752 maximum" — a message that cannot be true,
+// with no in-session escape, since compaction only shrinks the body while the
+// margin stayed anchored to the other leg's 600 KB). See
+// context_calibration_leg_isolation_integrity_test.go (2026-09-26 audit).
+//
+// The leg's identity is its base URL, falling back to its label for a leg
+// with no URL of its own (the native passthrough). sessionID keeps two
+// concurrent launches apart; a launcher that set none falls back to the label
+// for that too.
+func legCalibrationKey(sessionID string, r proxyRoute) string {
+	key := sessionID
+	if key == "" {
+		key = r.Label
+	}
+	leg := r.BaseURL
+	if leg == "" {
+		leg = r.Label
+	}
+	return key + "\x00" + leg
+}
+
 // contextFitPlan returns the prompt-token estimate and the safety margin to
 // use for one request: measured-and-tight when the session has a
 // calibration, coarse-and-generous (the pre-2026-08-30 behaviour, byte for
