@@ -326,7 +326,31 @@ func codexNamedProfileConfigPathForConfig(configPath, profileName string) string
 	return filepath.Join(filepath.Dir(configPath), profileName+".config.toml")
 }
 
+// cleanupCodexLegacyProfileConfig rewrites Codex's own config.toml, so the whole
+// load-mutate-save runs under the store's lock (foreignStoreLockBase: the file
+// is Codex's, so the lock is oaica's and no stray .lock appears in ~/.codex).
+//
+// The edit is deterministic — one legacy key and one legacy table are removed —
+// but the WRITE is the whole document, so it publishes a snapshot of everything
+// else Codex's file holds: a key the user added, or one `oaica launch chatgpt`
+// wrote into the same root (codex_app.go writes model, model_provider and
+// model_catalog_json there), was deleted by a command that only meant to remove
+// its own legacy profile. The read is inside the lock, which is what makes it a
+// load of the newest document rather than of the one this process saw on the way
+// in (2026-09-26 audit, twelfth round).
+//
+// The other two files this integration writes — the profile file
+// (~/.codex/ollama-launch.config.toml) and the model catalog
+// (~/.codex/model.json) — are fresh documents oaica owns end to end, with no
+// read-back of anyone else's data: an atomic write is the whole of what they
+// need and they take no lock.
 func cleanupCodexLegacyProfileConfig(configPath string) error {
+	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
+		return cleanupCodexLegacyProfileConfigLocked(configPath)
+	})
+}
+
+func cleanupCodexLegacyProfileConfigLocked(configPath string) error {
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
