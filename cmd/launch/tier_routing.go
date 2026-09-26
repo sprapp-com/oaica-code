@@ -237,6 +237,16 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 				if m.ID == routerBase {
 					return launchEndpoint{Source: sourceRouter, RemoteEndpoint: RemoteEndpoint{
 						Name: "oaica", BaseURL: oaicaLaunchHost() + "/v1", Token: oaicaLaunchAPIKeyForEnv(),
+						// TokenEnv, so the scrubber knows this leg's credential is a REAL one
+						// (childEnv removes it from the agent's environment — see
+						// credentialEnvNames). Without it OAICA_API_KEY was the single
+						// credential a router launch spends that still reached the child, where
+						// the agent's Bash tool reads it and spends the user's account
+						// (2026-09-26 audit). oaicaLaunchAPIKeyForEnv also falls back to
+						// ~/.oaica/api_key and to the OAICA_HOST userinfo, neither of which is an
+						// environment variable — those never enter a child's environment to
+						// begin with, so the env name is the whole set.
+						TokenEnv:      "OAICA_API_KEY",
 						UpstreamModel: base, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
 					}}, nil
 				}
