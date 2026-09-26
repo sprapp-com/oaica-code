@@ -66,6 +66,13 @@ jobs:
       - name: go test
         run: go test ./cmd/... ./anthropic/... ./tools/...
 
+      # The upstream-sync tooling decides what to merge and which fork fixes are
+      # at stake in a conflict, so a broken `report` is a silent risk of losing
+      # audit work at the next sync. Its test builds real repositories in a temp
+      # dir and needs no network.
+      - name: sync-upstream tests
+        run: scripts/tests/upstream_sync_test.sh
+
   modules:
     runs-on: ubuntu-latest
     strategy:

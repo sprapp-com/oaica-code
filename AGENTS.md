@@ -24,3 +24,20 @@ binary is built with `scripts/build_oaica.sh` (it writes
 
 See `docs/development.md` for prerequisites, platform notes, GPU backends, and
 the full development workflow.
+
+## Pulling in upstream Ollama
+
+This is a fork of `github.com/ollama/ollama` (the `upstream` remote) that
+carries real fixes on files upstream also owns, so syncing is a merge with a
+known conflict surface. Run the report before merging — it lists, per
+conflicting file, which fork commits are at stake:
+
+```sh
+scripts/sync-upstream.sh report   # what is waiting, and what it will cost
+scripts/sync-upstream.sh merge    # merge it, stopping at the first conflict
+scripts/sync-upstream.sh verify   # the same gate CI runs
+```
+
+Policy — merge never rebase, never `git checkout --theirs` a shared file — and
+the per-path resolution recipes are in `docs/UPSTREAM_SYNC.md`. The script's
+tests are `scripts/tests/upstream_sync_test.sh`.
