@@ -71,29 +71,33 @@ func TestClaudeWindowsInstallerRunsTheVerifiedDownload(t *testing.T) {
 	}
 }
 
-// TestClaudeInstallerCleansUpOnlyWhatItLeftBehind: the Windows arm's
-// PowerShell removes both the verified download and its .ps1 copy, so the Go
-// caller must not try to delete the last argv element — on Windows that is the
-// -Command script text, not a path.
+// TestClaudeInstallerCleansUpOnlyWhatItLeftBehind: the Go caller removes the
+// verified download on the unix arm, where it is the command's single argument,
+// and must not try to delete anything on the Windows arm — there the last argv
+// element is the -Command script text, not a path, and the arm removes its own
+// two files from inside its finally.
 func TestClaudeInstallerCleansUpOnlyWhatItLeftBehind(t *testing.T) {
 	oldFetch := fetchInstallerScriptFn
 	fetchInstallerScriptFn = func(string) (string, error) { return stubInstallerPath, nil }
 	t.Cleanup(func() { fetchInstallerScriptFn = oldFetch })
 
-	_, winArgs, err := claudeInstallerCommand("windows")
+	winBin, winArgs, err := claudeInstallerCommand("windows")
 	if err != nil {
 		t.Fatalf("claudeInstallerCommand(windows) error = %v", err)
 	}
-	if got := claudeInstallerTempFile("windows", winArgs); got != "" {
-		t.Errorf("claudeInstallerTempFile(windows) = %q, want \"\" — the Windows command removes its own files, and the last argument is the -Command script, so deleting it would remove the wrong (or no) path", got)
+	if winBin != "powershell" {
+		t.Fatalf("bin = %q, want powershell", winBin)
+	}
+	if last := winArgs[len(winArgs)-1]; last == stubInstallerPath {
+		t.Errorf("the Windows command's last argument IS the fetched installer path, which the caller's unix-only removal would delete while the PowerShell also deletes it — the two must not both own the same file")
 	}
 
-	_, unixArgs, err := claudeInstallerCommand("linux")
+	unixBin, unixArgs, err := claudeInstallerCommand("linux")
 	if err != nil {
 		t.Fatalf("claudeInstallerCommand(linux) error = %v", err)
 	}
-	if got := claudeInstallerTempFile("linux", unixArgs); got != stubInstallerPath {
-		t.Errorf("claudeInstallerTempFile(linux) = %q, want the fetched installer path %q", got, stubInstallerPath)
+	if unixBin != "bash" || len(unixArgs) != 1 || unixArgs[0] != stubInstallerPath {
+		t.Errorf("claudeInstallerCommand(linux) = %q %v, want bash with exactly the fetched installer path %q as its argument — the caller's `defer os.Remove(args[0])` removes whatever is there", unixBin, unixArgs, stubInstallerPath)
 	}
 }
 

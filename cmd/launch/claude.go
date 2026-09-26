@@ -152,6 +152,17 @@ func ensureClaudeInstalled() (string, error) {
 		return "", err
 	}
 
+	if runtime.GOOS != "windows" && len(args) > 0 {
+		// The unix plan runs the verified download's temp file itself (it is
+		// the command's only argument), so this is the only place it can be
+		// removed — kimi and qwen do the same. Removing it after a successful
+		// run instead left one copy of a downloaded script in the user's temp
+		// dir for every install that failed (2026-09-27 audit, round 17). On
+		// Windows the plan copies it into %TEMP% and runs that copy, and the
+		// arm removes both files from inside its own finally.
+		defer os.Remove(args[0])
+	}
+
 	fmt.Fprintf(os.Stderr, "\nInstalling Claude Code...\n")
 	cmd := exec.Command(bin, args...)
 	cmd.Stdin = os.Stdin
@@ -159,9 +170,6 @@ func ensureClaudeInstalled() (string, error) {
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to install claude: %w", err)
-	}
-	if tmp := claudeInstallerTempFile(runtime.GOOS, args); tmp != "" {
-		os.Remove(tmp) // fetched installer temp file
 	}
 
 	path, err := (&Claude{}).findPath()
@@ -194,19 +202,6 @@ func checkClaudeInstallerDependencies() error {
 	return nil
 }
 
-// claudeInstallerTempFile is the path the installer command left behind for
-// this process to delete. The Windows arm's PowerShell removes both the
-// verified download and the .ps1 copy it made, so there is nothing left for Go
-// to remove — and its last argv element is the -Command script text, not a
-// path, so returning it would have this process try to delete the script
-// string. Only the unix arm's last argument is a file.
-func claudeInstallerTempFile(goos string, args []string) string {
-	if goos == "windows" || len(args) == 0 {
-		return ""
-	}
-	return args[len(args)-1]
-}
-
 func claudeInstallerCommand(goos string) (string, []string, error) {
 	switch goos {
 	case "windows":
@@ -225,13 +220,17 @@ func claudeInstallerCommand(goos string) (string, []string, error) {
 			return "", nil, err
 		}
 		// The download is shared code and writes a .sh name, which PowerShell
-		// will not execute as a script, so copy it to a .ps1 first.
+		// will not execute as a script, so copy it to a .ps1 first. Both
+		// properties of that copy matter — the random name and the finally —
+		// and the reasoning is spelled out where the pattern was first written
+		// (qwenInstallerCommand); this arm and kimi's and hermes's are the ones
+		// that did not get it (2026-09-27 audit, round 17).
 		return "powershell", []string{
 			"-NoProfile",
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-claude.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP ('install-claude-' + [System.IO.Path]::GetRandomFileName() + '.ps1'); try { Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer } finally { Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue }",
 		}, nil
 	case "darwin", "linux":
 		// Verified-download flow (audit L3): fetch to a temp file, check any

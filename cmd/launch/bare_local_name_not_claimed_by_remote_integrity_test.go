@@ -39,7 +39,7 @@ func TestABareNameTheLocalDaemonServesIsNotClaimedByARemote(t *testing.T) {
 		{Name: "box/box-only-model"},
 	}, nil)
 	stubLocalDaemonIDs(t, map[string]bool{
-		"shared-model":    true,
+		"shared-model":        true,
 		"shared-model:latest": true,
 	})
 

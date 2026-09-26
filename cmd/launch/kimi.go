@@ -453,7 +453,12 @@ func kimiInstallerCommand(goos string) (string, []string, error) {
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-kimi.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
+			// The copy's name is randomised and both files are removed in a
+			// finally — the pattern qwenInstallerCommand documents in full; a
+			// fixed name in %TEMP% is pre-creatable, and a bare trailing
+			// Remove-Item does not run when the installer fails part way
+			// (2026-09-27 audit, round 17).
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP ('install-kimi-' + [System.IO.Path]::GetRandomFileName() + '.ps1'); try { Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer } finally { Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue }",
 		}, nil
 	case "darwin", "linux":
 		return "bash", []string{path}, nil

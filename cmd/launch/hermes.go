@@ -539,14 +539,15 @@ func hermesWindowsInstallerCommand() (string, []string, error) {
 		return "", nil, err
 	}
 	// The download is shared code and writes a .sh name, which PowerShell will
-	// not execute as a script, so copy it to a .ps1 first. Both files are
-	// removed after the run.
+	// not execute as a script, so copy it to a .ps1 first — to a randomised
+	// name, with both files removed in a finally, which is the pattern
+	// qwenInstallerCommand documents in full (2026-09-27 audit, round 17).
 	return "powershell.exe", []string{
 		"-NoProfile",
 		"-ExecutionPolicy",
 		"Bypass",
 		"-Command",
-		"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-hermes.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer -SkipSetup; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
+		"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP ('install-hermes-' + [System.IO.Path]::GetRandomFileName() + '.ps1'); try { Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer -SkipSetup } finally { Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue }",
 	}, nil
 }
 
