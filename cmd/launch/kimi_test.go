@@ -688,11 +688,12 @@ exit 0
 
 func TestKimiInstallerCommand(t *testing.T) {
 	tests := []struct {
-		name      string
-		goos      string
-		wantBin   string
-		wantParts []string
-		wantErr   bool
+		name       string
+		goos       string
+		wantBin    string
+		wantParts  []string
+		wantAbsent []string
+		wantErr    bool
 	}{
 		{
 			name:      "linux",
@@ -710,7 +711,10 @@ func TestKimiInstallerCommand(t *testing.T) {
 			name:      "windows",
 			goos:      "windows",
 			wantBin:   "powershell",
-			wantParts: []string{"-Command", "install.ps1"},
+			wantParts: []string{"-Command", "Copy-Item", stubInstallerPath, "& $installer"},
+			// PowerShell no longer downloads the script itself — a download it
+			// made was one installer_dl.go never saw.
+			wantAbsent: []string{"Invoke-RestMethod", "Invoke-Expression", "-OutFile"},
 		},
 		{
 			name:    "unsupported",
@@ -740,6 +744,11 @@ func TestKimiInstallerCommand(t *testing.T) {
 			for _, part := range tt.wantParts {
 				if !strings.Contains(joined, part) {
 					t.Fatalf("args %q missing %q", joined, part)
+				}
+			}
+			for _, part := range tt.wantAbsent {
+				if strings.Contains(joined, part) {
+					t.Fatalf("args %q still contains %q — the installer must not fetch or re-pipe the script itself", joined, part)
 				}
 			}
 		})

@@ -353,6 +353,13 @@ func ensureKimiInstalled() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if kimiGOOS != "windows" && len(args) > 0 {
+		// The unix plan runs the verified download's temp file itself
+		// (kimiInstallerCommand's single argument), so this is the only place
+		// it can be removed. On Windows the plan copies it into %TEMP%, runs
+		// that copy, and removes both from inside the PowerShell command.
+		defer os.Remove(args[0])
+	}
 
 	fmt.Fprintf(os.Stderr, "\nInstalling Kimi...\n")
 	cmd := exec.Command(bin, args...)
@@ -362,7 +369,6 @@ func ensureKimiInstalled() (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("failed to install kimi: %w", err)
 	}
-	os.Remove(args[len(args)-1]) // fetched installer temp file
 
 	path, err := findKimiBinary()
 	if err != nil {
@@ -404,7 +410,42 @@ const (
 	kimiInstallScriptURLPS = "https://code.kimi.com/kimi-code/install.ps1"
 )
 
+// kimiInstallerScript downloads this platform's installer through
+// installer_dl.go's verified download — the same gate the unix arm already used
+// — and returns the temp file it wrote. The bytes are hashed and a SHA-256 pin
+// (built-in, or OAICA_INSTALL_SHA256_<URL>) is enforced before anything is
+// allowed to run them.
+func kimiInstallerScript(goos string) (string, error) {
+	switch goos {
+	case "windows":
+		return fetchInstallerScriptFn(kimiInstallScriptURLPS)
+	case "darwin", "linux":
+		return fetchInstallerScriptFn(kimiInstallScriptURL)
+	default:
+		return "", fmt.Errorf("unsupported platform for kimi install: %s", goos)
+	}
+}
+
+// kimiInstallerCommand is the command that runs the installer for a platform.
+// Both arms run exactly one thing: the file installer_dl.go verified.
+//
+// The Windows arm used to be
+//
+//	powershell -Command "Invoke-RestMethod <url> | Invoke-Expression"
+//
+// which downloaded the script itself and evaluated it inline — no temp file, no
+// hash, no pin, no unpinned warning. Whatever the network answered ran with the
+// user's privileges: a compromised CDN, a DNS hijack or a MITM executed
+// attacker code, and there was no bytes-to-review step at all. It now asks for
+// the same verified download the unix arm does and runs the file it handed back
+// — copied to a .ps1 name first, because the download is shared code and writes
+// a .sh, which PowerShell will not execute as a script. Both the copy and the
+// verified temp file are removed after the run (2026-09-26 audit, tenth round).
 func kimiInstallerCommand(goos string) (string, []string, error) {
+	path, err := kimiInstallerScript(goos)
+	if err != nil {
+		return "", nil, err
+	}
 	switch goos {
 	case "windows":
 		return "powershell", []string{
@@ -412,13 +453,9 @@ func kimiInstallerCommand(goos string) (string, []string, error) {
 			"-ExecutionPolicy",
 			"Bypass",
 			"-Command",
-			"Invoke-RestMethod " + kimiInstallScriptURLPS + " | Invoke-Expression",
+			"$verified = " + psQuote(path) + "; $installer = Join-Path $env:TEMP 'install-kimi.ps1'; Copy-Item -LiteralPath $verified -Destination $installer -Force; & $installer; Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $verified -Force -ErrorAction SilentlyContinue",
 		}, nil
 	case "darwin", "linux":
-		path, err := fetchInstallerScriptFn(kimiInstallScriptURL)
-		if err != nil {
-			return "", nil, err
-		}
 		return "bash", []string{path}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported platform for kimi install: %s", goos)
