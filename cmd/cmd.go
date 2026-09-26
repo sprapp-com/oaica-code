@@ -2436,17 +2436,25 @@ they were sync-sourced and --prune is set.`,
 			}
 			fmt.Printf("synced from %s (%s): %d added, %d updated, %d pruned, %d skipped\n",
 				rep.URL, src, len(rep.Added), len(rep.Updated), len(rep.Pruned), len(rep.Skipped))
+			// launch.PrintableCell on every row: these ids are the CATALOG's
+			// bytes — a fetched document, not something this machine wrote or
+			// validated — and the report is a one-line-per-id diff the user
+			// reads to find out what was installed. A catalog key carrying a
+			// newline ("evil\n  + anthropic/claude-4.9-opus") painted two `+`
+			// rows, and the "skipped" line is built from the same bytes (id
+			// plus the validation error) (2026-09-26 audit, round 13). Same
+			// rule as the store listings above — not a second one.
 			for _, id := range rep.Added {
-				fmt.Printf("  + %s\n", id)
+				fmt.Printf("  + %s\n", launch.PrintableCell(id))
 			}
 			for _, id := range rep.Updated {
-				fmt.Printf("  ~ %s\n", id)
+				fmt.Printf("  ~ %s\n", launch.PrintableCell(id))
 			}
 			for _, id := range rep.Pruned {
-				fmt.Printf("  - %s\n", id)
+				fmt.Printf("  - %s\n", launch.PrintableCell(id))
 			}
 			for _, s := range rep.Skipped {
-				fmt.Printf("  ! %s\n", s)
+				fmt.Printf("  ! %s\n", launch.PrintableCell(s))
 			}
 			return nil
 		},
@@ -2472,20 +2480,24 @@ files or fills in a model_path on a pathless entry.`,
 			fmt.Printf("scanned %d dir(s): %d added, %d updated, %d already known\n",
 				len(rep.Dirs), len(rep.Added), len(rep.Updated), len(rep.Ignored))
 			for _, id := range rep.Added {
-				fmt.Printf("  + %s\n", id)
+				fmt.Printf("  + %s\n", launch.PrintableCell(id))
 			}
 			for _, id := range rep.Updated {
-				fmt.Printf("  ~ %s\n", id)
+				fmt.Printf("  ~ %s\n", launch.PrintableCell(id))
 			}
 			for _, s := range rep.Invalid {
-				fmt.Printf("  ! %s\n", s)
+				fmt.Printf("  ! %s\n", launch.PrintableCell(s))
 			}
 			// The conflicts are the one scan result the counts cannot convey:
 			// "1 added" over two files reads as success. A file that was found
 			// and deliberately not registered has to be named here, because
-			// nothing else in the toolkit will ever mention it again.
+			// nothing else in the toolkit will ever mention it again. Quoted
+			// for the same reason as the rows above, and more so: this message
+			// names two raw FILESYSTEM PATHS, which no sanitiser bounds — a
+			// directory with a newline in its name painted a second `?` row
+			// (2026-09-26 audit, round 13).
 			for _, s := range rep.Conflicts {
-				fmt.Printf("  ? %s\n", s)
+				fmt.Printf("  ? %s\n", launch.PrintableCell(s))
 			}
 			return nil
 		},
