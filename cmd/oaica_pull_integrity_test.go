@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -322,10 +323,11 @@ func TestPullTransportErrorsAreRedacted(t *testing.T) {
 		// manifest, and the SECOND one is the byte stream: it dies without
 		// responding, the shape that makes net/http build its error text out
 		// of the whole URL, credential included.
-		var n int
+		// Counted from the server goroutine, read from this one — atomic, or
+		// the count itself is a data race under -race.
+		var n atomic.Int64
 		router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			n++
-			if n == 1 {
+			if n.Add(1) == 1 {
 				_ = jsonEncode(w, map[string]any{"model": "m", "size_bytes": 4, "pull_url": "/v1/pull/m", "source": "file"})
 				return
 			}
@@ -344,8 +346,8 @@ func TestPullTransportErrorsAreRedacted(t *testing.T) {
 		if err == nil {
 			t.Fatal("premise: a connection that dies mid-request should fail the pull")
 		}
-		if n < 2 {
-			t.Fatalf("only %d request(s) reached the router, so the byte-stream leg was never exercised: %v", n, err)
+		if n.Load() < 2 {
+			t.Fatalf("only %d request(s) reached the router, so the byte-stream leg was never exercised: %v", n.Load(), err)
 		}
 		if strings.Contains(err.Error(), "sk-live-QUERYSECRET") {
 			t.Errorf("the pull leg printed the host's credential: %v", err)
