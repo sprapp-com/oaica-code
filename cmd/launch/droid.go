@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 	"github.com/ollama/ollama/envconfig"
@@ -105,16 +106,21 @@ func (d *Droid) Edit(models []LaunchModel) error {
 }
 
 func updateDroidSettings(settingsMap map[string]any, settings droidSettings, models []LaunchModel) map[string]any {
-	// Keep only non-Ollama models from the raw map (preserves extra fields)
-	// Rebuild Ollama models
-	var nonOllamaModels []any
+	// Keep only the models this integration did NOT write — the user's own
+	// entries, extra fields intact. Everything oaica wrote is rebuilt below, so
+	// a re-launch REPLACES the entry it owns instead of appending a second copy
+	// of it (2026-09-26 audit, tenth round).
+	var foreignModels []any
 	if rawModels, ok := settingsMap["customModels"].([]any); ok {
 		for _, raw := range rawModels {
-			if m, ok := raw.(map[string]any); ok {
-				if m["apiKey"] != "ollama" {
-					nonOllamaModels = append(nonOllamaModels, raw)
-				}
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue // malformed entry: nothing to preserve or rebuild
 			}
+			if _, owned := droidOwnedEntry(droidString(m["apiKey"]), droidString(m["id"]), droidString(m["model"]), droidString(m["baseUrl"])); owned {
+				continue
+			}
+			foreignModels = append(foreignModels, raw)
 		}
 	}
 
@@ -132,7 +138,7 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 			Model:           model.Name,
 			DisplayName:     model.Name,
 			BaseURL:         envconfig.Host().String() + "/v1",
-			APIKey:          "ollama",
+			APIKey:          droidDaemonKey,
 			Provider:        "generic-chat-completion-api",
 			MaxOutputTokens: maxOutput,
 			SupportsImages:  model.HasCapability("vision"),
@@ -151,7 +157,7 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 		}
 	}
 
-	settingsMap["customModels"] = append(newModels, nonOllamaModels...)
+	settingsMap["customModels"] = append(newModels, foreignModels...)
 
 	// Update session default settings (preserve unknown fields in the nested object)
 	sessionSettings, ok := settingsMap["sessionDefaultSettings"].(map[string]any)
@@ -184,13 +190,117 @@ func (d *Droid) Models() []string {
 		return nil
 	}
 
+	// Report the picker names of the entries this integration wrote — the names
+	// the launcher saves and compares the live config against. The stored
+	// "model" is only that name for a daemon entry: a user-remote entry stores
+	// the bare upstream id, so reporting it verbatim would answer with a name
+	// nothing in the launcher recognises, and every launch would look like an
+	// unconfigured one.
 	var result []string
 	for _, m := range settings.CustomModels {
-		if m.APIKey == "ollama" {
-			result = append(result, m.Model)
+		if picker, owned := droidOwnedEntry(m.APIKey, m.ID, m.Model, m.BaseURL); owned && picker != "" {
+			result = append(result, picker)
 		}
 	}
 	return result
+}
+
+// droidDaemonKey is the apiKey this file writes for a model served by the local
+// daemon. Droid sends apiKey as the request's bearer, so it is only a marker as
+// long as nothing has to replace it — the daemon is unauthenticated, and a user
+// remote is not.
+const droidDaemonKey = "ollama"
+
+// droidOwnedEntry reports whether an existing customModels entry was written by
+// this integration (and may therefore be rebuilt), plus the picker name it was
+// written for. An entry it does not recognise is the user's: it is preserved
+// untouched, extra fields included.
+//
+// The daemon shape is recognised by its apiKey. A user-remote entry cannot be:
+// it holds the remote's token, which Droid sends as the bearer, and a token is
+// not a marker — it is replaced whenever it rotates, and an entry holding the
+// PREVIOUS token would read as a foreign one and be kept beside the new copy.
+// The pair above the credential identifies it instead: the id this file writes
+// ("custom:<picker name>-<index>", the index deliberately ignored so a model
+// keeps its identity when the list around it changes) names a picker, and the
+// entry stores the endpoint that picker resolves to.
+func droidOwnedEntry(apiKey, id, model, baseURL string) (string, bool) {
+	if apiKey == droidDaemonKey {
+		return model, true
+	}
+	picker := droidPickerFromID(id)
+	if picker == "" || model == "" {
+		return "", false
+	}
+	// The endpoint is matched against the configured remotes directly, NOT via
+	// resolveRemoteEndpoint: a launch saved under a bare remote id
+	// ("deepseek-chat") would send that resolver through its bare-id sweep of
+	// every configured remote — once per stored entry, inside a config merge.
+	remote, ok := droidRemoteForBase(baseURL)
+	if !ok {
+		return "", false
+	}
+	// The picker has to name that remote's model, in either spelling a launch
+	// can save: "<remote>/<upstream>" for a namespaced picker, or the bare
+	// upstream id itself.
+	if prefix, bare, namespaced := strings.Cut(picker, "/"); namespaced {
+		if prefix != remote.Name || bare != model {
+			return "", false
+		}
+	} else if picker != model {
+		return "", false
+	}
+	return picker, true
+}
+
+// droidPickerFromID reverses the id this file writes for a launched model —
+// "custom:<picker name>-<index>" — and returns "" for an id it did not write.
+// Only the final "-<digits>" is stripped, so a name that ends in a number, or
+// carries ":"/"-"/"/" of its own, round-trips.
+func droidPickerFromID(id string) string {
+	rest, ok := strings.CutPrefix(id, "custom:")
+	if !ok {
+		return ""
+	}
+	dash := strings.LastIndex(rest, "-")
+	if dash <= 0 || dash == len(rest)-1 {
+		return ""
+	}
+	for _, r := range rest[dash+1:] {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return rest[:dash]
+}
+
+// droidRemoteForBase returns the configured remote serving baseURL — the
+// endpoint a stored entry names.
+func droidRemoteForBase(baseURL string) (userRemote, bool) {
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return userRemote{}, false
+	}
+	for _, r := range remotes {
+		if droidSameURL(r.openAIBase(), baseURL) {
+			return r, true
+		}
+	}
+	return userRemote{}, false
+}
+
+// droidSameURL compares two endpoint URLs, ignoring a trailing "/" — the one
+// difference a hand-edited base_url picks up for free (loadUserRemotes trims
+// the stored value; openAIBase appends a version segment to it).
+func droidSameURL(a, b string) bool {
+	return strings.TrimRight(strings.TrimSpace(a), "/") == strings.TrimRight(strings.TrimSpace(b), "/")
+}
+
+// droidString is the string value of a field read back from settings.json, or
+// "" for a missing/other-typed one.
+func droidString(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 var validReasoningEfforts = []string{"high", "medium", "low", "none"}
