@@ -2275,10 +2275,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// upstream's real answer (or its tool calls) was discarded, and the
 		// leg was recorded healthy (2026-09-26 audit, fifteenth round). Route
 		// the frame through the same adoption the unframed body uses, so the
-		// two shapes cannot disagree. The substring guard keeps the parse off
-		// the ordinary delta frames an answer is made of, and `!started`
-		// keeps a mid-stream whole message from being adopted as the turn.
-		if !started && len(toolAccums) == 0 && strings.Contains(payload, `"message"`) {
+		// two shapes cannot disagree. `!started` keeps a mid-stream whole
+		// message from being adopted as the turn.
+		//
+		// The gate is a SHAPE test, not a substring of the bytes: the first
+		// version looked for the characters "message" anywhere in the frame,
+		// and a delta frame carrying JSON — {"message": …} written by the model,
+		// a `Write` argument naming that key — matched it. That frame was then
+		// adopted as a whole completion with an EMPTY message, the rest of the
+		// stream was discarded, and the client got 200 with no answer and a
+		// healthy leg (2026-09-26 audit, sixteenth round).
+		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
 			if adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText) {
 				completed = true
 				break
@@ -2475,6 +2482,31 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	}
 	emit(events)
 	return true
+}
+
+// frameCarriesWholeCompletion reports whether an SSE payload is a whole
+// non-SSE completion rather than one delta frame.
+//
+// It is the gate for adopting a completion that arrived inside a frame, and it
+// is deliberately structural: the payload must parse, must have a choice, and
+// that choice's `message` object must actually be populated. A byte-substring
+// test for "message" is not enough — a DELTA frame whose content happens to
+// contain that word (a model writing JSON, a tool argument naming the key)
+// matches it, and adopting such a frame emits an empty message, ends the turn,
+// and throws the rest of the stream away, leaving the client with 200 and no
+// answer on a leg recorded healthy (2026-09-26 audit, sixteenth round).
+func frameCarriesWholeCompletion(payload string) bool {
+	var resp openAIChatResponse
+	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
+		return false
+	}
+	if len(resp.Choices) == 0 {
+		return false
+	}
+	m := resp.Choices[0].Message
+	// Only fields the non-delta shape carries: a bare {"role":"assistant"}
+	// frame is not an answer either, so require some content.
+	return m.Role != "" || m.Content != "" || m.ReasoningContent != "" || m.Reasoning != "" || len(m.ToolCalls) > 0
 }
 
 // adoptNonSSECompletion handles a stream request the upstream answered with a
