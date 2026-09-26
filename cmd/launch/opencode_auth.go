@@ -2,6 +2,7 @@ package launch
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,39 @@ import (
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
+
+// foreignStoreLockBase maps a store oaica does not own onto a lock file it DOES
+// own, for fileutil.WithFileLock: opencode's auth.json, opencode's model.json,
+// VS Code's chatLanguageModels.json.
+//
+// WithFileLock takes its lock on "<path>.lock", so handing it opencode's
+// ~/.local/share/opencode/auth.json would leave a lock file inside another
+// program's data directory. oaica writes one entry into that store and nothing
+// else of it; a stray file beside the user's logins is not part of that deal.
+// The lock is therefore keyed under oaica's own state directory, named after
+// the store's file name plus a hash of its resolved path, so two oaica
+// processes that resolve the same store always meet on the same lock and a
+// store at another path never shares one by accident.
+//
+// What that buys is oaica-against-oaica exclusion, which is the whole of it:
+// the lock is advisory and taken on a file the other program knows nothing
+// about, so a concurrent write by opencode or by VS Code itself is not
+// serialised and oaica's snapshot can still land on top of it. The lock closes
+// the case this package can close — two oaica commands whose writers overlap
+// (2026-09-26 audit, eleventh round; the same lost update the ~/.oaica stores
+// fixed in the fourth, lock.go).
+//
+// A home that cannot be resolved returns "", which WithFileLock reads as "run
+// fn unlocked": saving a credential must not be refused because its lock could
+// not be placed.
+func foreignStoreLockBase(storePath string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(storePath))
+	return filepath.Join(home, ".oaica", "locks", fmt.Sprintf("%s-%x", filepath.Base(storePath), sum[:6]))
+}
 
 // opencodeAuthEntry is one provider credential in opencode's auth.json
 // (~/.local/share/opencode/auth.json — XDG_DATA_HOME/opencode on Linux,
@@ -188,6 +222,19 @@ func OpencodeKnownProviders() []string {
 // carries a refresh token and an expiry that this command cannot re-mint — the
 // overwrite left the user with a store that looked signed in and was not, and
 // only `opencode auth login <provider>` could put it back (2026-09-26 audit).
+//
+// The whole load-mutate-save runs under oaica's own lock for the store
+// (foreignStoreLockBase). Two `oaica signin opencode:<provider>` commands — a
+// provisioning script, the same shape that once left one credential out of
+// eleven `oaica auth login` — used to read the same snapshot, each set its own
+// provider, and the rename that landed last published a document with the
+// other provider deleted, while BOTH printed "Saved API key for opencode
+// provider ...". An OAuth entry lost that way is the expensive one: oaica does
+// not re-mint refresh tokens (auth_external.go is read-only on OAuth), so the
+// user has to redo the browser flow (2026-09-26 audit, eleventh round).
+//
+// The lock is oaica's, not opencode's: a concurrent write by opencode itself is
+// not serialised by it and can still be overwritten by the snapshot read here.
 func SaveOpencodeAPIKey(provider, key string) error {
 	path, err := opencodeStorePath()
 	if err != nil {
@@ -196,36 +243,41 @@ func SaveOpencodeAPIKey(provider, key string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	// The store is read and written as the raw JSON document it is, not
-	// through opencodeAuthEntry: that struct carries five of the members a
-	// provider entry can have, and marshalling it back over the file deleted
-	// every other one — for every provider in the file, so adding a key for
-	// one provider silently signed the user out of another whose entry type
-	// oaica does not model (2026-09-26 audit). UseNumber is the same rule's
-	// other half: a number this package cannot represent must survive the
-	// round-trip rather than come back as a float.
-	doc, err := opencodeAuthReadDocument(path)
-	if err != nil {
-		return err
-	}
-	entry := doc[provider]
-	if entry == nil {
-		entry = map[string]any{}
-	}
-	if existing, _ := entry["type"].(string); existing != "" {
-		if t := strings.ToLower(strings.TrimSpace(existing)); t != "api" && t != "api_key" {
-			return fmt.Errorf("opencode already has a %q credential for %s (access token, refresh token and expiry) that an API key cannot replace — run `opencode auth login %s`, or remove that entry by hand first", existing, provider, provider)
+	return fileutil.WithFileLock(foreignStoreLockBase(path), func() error {
+		// The store is read and written as the raw JSON document it is, not
+		// through opencodeAuthEntry: that struct carries five of the members a
+		// provider entry can have, and marshalling it back over the file deleted
+		// every other one — for every provider in the file, so adding a key for
+		// one provider silently signed the user out of another whose entry type
+		// oaica does not model (2026-09-26 audit). UseNumber is the same rule's
+		// other half: a number this package cannot represent must survive the
+		// round-trip rather than come back as a float.
+		//
+		// The read is INSIDE the lock, which is what makes it a load of the
+		// newest document rather than of the one this process saw on the way in.
+		doc, err := opencodeAuthReadDocument(path)
+		if err != nil {
+			return err
 		}
-	}
-	entry["type"] = "api"
-	entry["key"] = key
-	doc[provider] = entry
+		entry := doc[provider]
+		if entry == nil {
+			entry = map[string]any{}
+		}
+		if existing, _ := entry["type"].(string); existing != "" {
+			if t := strings.ToLower(strings.TrimSpace(existing)); t != "api" && t != "api_key" {
+				return fmt.Errorf("opencode already has a %q credential for %s (access token, refresh token and expiry) that an API key cannot replace — run `opencode auth login %s`, or remove that entry by hand first", existing, provider, provider)
+			}
+		}
+		entry["type"] = "api"
+		entry["key"] = key
+		doc[provider] = entry
 
-	data, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
-	}
-	return fileutil.WriteWithBackup(path, data, "opencode")
+		data, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return err
+		}
+		return fileutil.WriteWithBackup(path, data, "opencode")
+	})
 }
 
 // opencodeAuthReadDocument reads opencode's auth.json as the document it is:

@@ -257,43 +257,61 @@ func (v *VSCode) Edit(models []LaunchModel) error {
 		return err
 	}
 
-	var entries []map[string]any
-	if data, err := os.ReadFile(clmPath); err == nil {
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.UseNumber()
-		if err := dec.Decode(&entries); err != nil {
-			// This file lists every vendor in the chat model picker and Edit
-			// removes only the ollama entry, so a document it cannot read is
-			// one it cannot preserve: writing the ollama entry alone over it
-			// would delete every other vendor the user configured.
-			return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica replaces only the ollama vendor entry, so rewriting a file it cannot read would delete every other provider listed there", clmPath, err)
+	// The read-modify-write of a store oaica does not own, under oaica's own
+	// lock (foreignStoreLockBase), for the same reason the ~/.oaica stores take
+	// one: an atomic rename stops a READER from seeing half a document, but it
+	// does not stop two writers from publishing snapshots of the same file
+	// (2026-09-26 audit, eleventh round).
+	//
+	// What the lock covers here is narrower than at the other two stores, and
+	// the difference is worth stating: Edit writes exactly one deterministic
+	// `ollama` row and removes only that row, so two oaica processes cannot drop
+	// each other's entries today — what they can do is publish concurrently.
+	// What CAN be lost is a vendor row written by VS Code itself between this
+	// read and the rename below, and no lock of oaica's excludes VS Code: the
+	// read sitting inside the lock only shortens the window it is exposed to.
+	if err := fileutil.WithFileLock(foreignStoreLockBase(clmPath), func() error {
+		var entries []map[string]any
+		if data, err := os.ReadFile(clmPath); err == nil {
+			dec := json.NewDecoder(bytes.NewReader(data))
+			dec.UseNumber()
+			if err := dec.Decode(&entries); err != nil {
+				// This file lists every vendor in the chat model picker and Edit
+				// removes only the ollama entry, so a document it cannot read is
+				// one it cannot preserve: writing the ollama entry alone over it
+				// would delete every other vendor the user configured.
+				return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica replaces only the ollama vendor entry, so rewriting a file it cannot read would delete every other provider listed there", clmPath, err)
+			}
 		}
-	}
 
-	// Remove any existing Ollama entries, preserve others
-	filtered := make([]map[string]any, 0, len(entries))
-	for _, entry := range entries {
-		if vendor, _ := entry["vendor"].(string); vendor != "ollama" {
-			filtered = append(filtered, entry)
+		// Remove any existing Ollama entries, preserve others
+		filtered := make([]map[string]any, 0, len(entries))
+		for _, entry := range entries {
+			if vendor, _ := entry["vendor"].(string); vendor != "ollama" {
+				filtered = append(filtered, entry)
+			}
 		}
-	}
 
-	// Add new Ollama entry
-	filtered = append(filtered, map[string]any{
-		"vendor": "ollama",
-		"name":   "Ollama",
-		"url":    envconfig.Host().String(),
-	})
+		// Add new Ollama entry
+		filtered = append(filtered, map[string]any{
+			"vendor": "ollama",
+			"name":   "Ollama",
+			"url":    envconfig.Host().String(),
+		})
 
-	data, err := json.MarshalIndent(filtered, "", "  ")
-	if err != nil {
+		data, err := json.MarshalIndent(filtered, "", "  ")
+		if err != nil {
+			return err
+		}
+		return fileutil.WriteWithBackup(clmPath, data, "vscode")
+	}); err != nil {
 		return err
 	}
-	if err := fileutil.WriteWithBackup(clmPath, data, "vscode"); err != nil {
-		return err
-	}
 
-	// Clean up legacy settings from older Ollama integrations
+	// Clean up legacy settings from older Ollama integrations. Outside the lock
+	// above and unlocked itself: it is a different file (settings.json), whose
+	// read-modify-write has the same shape but no two-oaica failure today — the
+	// two keys it deletes are the same two for every oaica process.
 	v.updateSettings()
 
 	return nil

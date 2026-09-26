@@ -259,67 +259,78 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 		return err
 	}
 
-	state := map[string]any{
-		"recent":   []any{},
-		"favorite": []any{},
-		"variant":  map[string]any{},
-	}
-	if data, err := os.ReadFile(statePath); err == nil {
-		// The defaults above are the shape of an absent file, not a licence to
-		// overwrite an unreadable one: oaica writes `recent` only, and would
-		// drop `favorite`/`variant` along with anything else it does not model.
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.UseNumber()
-		if err := dec.Decode(&state); err != nil {
-			return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica rewrites only the recent-models list, so rewriting a file it cannot read would delete the rest of your picker state", statePath, err)
+	// Load-mutate-save over a store oaica does not own, under oaica's own lock
+	// (foreignStoreLockBase): two `oaica launch opencode` commands that overlap
+	// each read this state, prepend the models of their own launch and write the
+	// whole document, so the rename that lands last publishes its list over the
+	// other's and that launch's models are gone from opencode's picker while
+	// both launches look fine (2026-09-26 audit, eleventh round). The read sits
+	// inside the lock, so it is a load of the newest document rather than of the
+	// one this process saw on the way in. The lock is oaica's: opencode's own
+	// writes to this file are not serialised by it.
+	return fileutil.WithFileLock(foreignStoreLockBase(statePath), func() error {
+		state := map[string]any{
+			"recent":   []any{},
+			"favorite": []any{},
+			"variant":  map[string]any{},
 		}
-	}
+		if data, err := os.ReadFile(statePath); err == nil {
+			// The defaults above are the shape of an absent file, not a licence to
+			// overwrite an unreadable one: oaica writes `recent` only, and would
+			// drop `favorite`/`variant` along with anything else it does not model.
+			dec := json.NewDecoder(bytes.NewReader(data))
+			dec.UseNumber()
+			if err := dec.Decode(&state); err != nil {
+				return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica rewrites only the recent-models list, so rewriting a file it cannot read would delete the rest of your picker state", statePath, err)
+			}
+		}
 
-	recent, _ := state["recent"].([]any)
+		recent, _ := state["recent"].([]any)
 
-	modelSet := make(map[string]bool)
-	for _, m := range modelList {
-		modelSet[m] = true
-	}
+		modelSet := make(map[string]bool)
+		for _, m := range modelList {
+			modelSet[m] = true
+		}
 
-	// Filter out the models we're about to re-add: the exact pairs below, plus
-	// any entry naming a daemon block (either spelling) by one of these
-	// models' picker names — the shape an earlier config wrote before the
-	// daemon id was renamed.
-	newRecent := slices.DeleteFunc(slices.Clone(recent), func(entry any) bool {
-		e, ok := entry.(map[string]any)
-		if !ok {
+		// Filter out the models we're about to re-add: the exact pairs below, plus
+		// any entry naming a daemon block (either spelling) by one of these
+		// models' picker names — the shape an earlier config wrote before the
+		// daemon id was renamed.
+		newRecent := slices.DeleteFunc(slices.Clone(recent), func(entry any) bool {
+			e, ok := entry.(map[string]any)
+			if !ok {
+				return false
+			}
+			pid, _ := e["providerID"].(string)
+			modelID, _ := e["modelID"].(string)
+			if pairSet[[2]string{pid, modelID}] {
+				return true
+			}
+			if pid == "ollama" || pid == "ollama-local" {
+				return modelSet[modelID]
+			}
 			return false
+		})
+
+		// Prepend models in reverse order so first model ends up first
+		for i := len(pairs) - 1; i >= 0; i-- {
+			newRecent = slices.Insert(newRecent, 0, any(map[string]any{
+				"providerID": pairs[i][0],
+				"modelID":    pairs[i][1],
+			}))
 		}
-		pid, _ := e["providerID"].(string)
-		modelID, _ := e["modelID"].(string)
-		if pairSet[[2]string{pid, modelID}] {
-			return true
+
+		const maxRecentModels = 10
+		newRecent = newRecent[:min(len(newRecent), maxRecentModels)]
+
+		state["recent"] = newRecent
+
+		stateData, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			return err
 		}
-		if pid == "ollama" || pid == "ollama-local" {
-			return modelSet[modelID]
-		}
-		return false
+		return fileutil.WriteWithBackup(statePath, stateData, "opencode")
 	})
-
-	// Prepend models in reverse order so first model ends up first
-	for i := len(pairs) - 1; i >= 0; i-- {
-		newRecent = slices.Insert(newRecent, 0, any(map[string]any{
-			"providerID": pairs[i][0],
-			"modelID":    pairs[i][1],
-		}))
-	}
-
-	const maxRecentModels = 10
-	newRecent = newRecent[:min(len(newRecent), maxRecentModels)]
-
-	state["recent"] = newRecent
-
-	stateData, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return fileutil.WriteWithBackup(statePath, stateData, "opencode")
 }
 
 func (o *OpenCode) Models() []string {
