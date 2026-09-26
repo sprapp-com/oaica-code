@@ -444,7 +444,11 @@ func findUserRemoteForModel(name string) (userRemote, string, bool) {
 	bare := name[idx+1:]
 	remotes, err := loadUserRemotes()
 	if err != nil {
-		return userRemote{}, "", false
+		// A file that cannot be read as a whole must not take the built-in
+		// providers with it: they need no file, and a corrupt store is the
+		// one case where the user most needs what still works
+		// (2026-09-26 audit, tenth round).
+		remotes = builtinRemotes()
 	}
 	for _, r := range remotes {
 		if r.Name == prefix {
@@ -956,9 +960,9 @@ func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]Laun
 }
 
 func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
-	remotes, err := loadUserRemotes()
-	if err != nil {
-		return nil, []error{err}
+	remotes, errs := launchSweepRemotes()
+	if len(remotes) == 0 {
+		return nil, errs
 	}
 
 	type result struct {
@@ -982,10 +986,7 @@ func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 	}
 	wg.Wait()
 
-	var (
-		models []LaunchModel
-		errs   []error
-	)
+	var models []LaunchModel
 	for _, res := range results {
 		if res.err != nil {
 			errs = append(errs, res.err)
@@ -994,4 +995,33 @@ func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 		models = append(models, res.models...)
 	}
 	return models, errs
+}
+
+// launchSweepRemotes decides which remotes a launch should sweep and what to
+// report about the ones it could not read.
+//
+// One unreadable byte in remotes.json used to drop EVERY row, including the
+// built-in providers, which need no file at all — and the picker
+// (model_inventory.go) collected the error and never read it, so
+// `oaica launch` simply showed a smaller menu with no reason given
+// (2026-09-26 audit, tenth round). The error is still reported, and the
+// built-ins are still swept.
+func launchSweepRemotes() ([]userRemote, []error) {
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		return warnUnreadableRemotesFile(err), []error{err}
+	}
+	return remotes, nil
+}
+
+// warnUnreadableRemotesFile reports a remotes.json that could not be read as a
+// remote store at all, and returns what the launch should sweep instead: the
+// built-in providers, which are keyed on an environment variable or a stored
+// login and need no file. Called once per launch, so a broken file is visible
+// on every launch until it is fixed.
+func warnUnreadableRemotesFile(err error) []userRemote {
+	fmt.Fprintf(noticeWriter(),
+		"%sWarning: %s is not readable as a remote store (%v) — remotes you configured there are hidden until it is fixed; the built-in providers are unaffected.%s\n",
+		ansiYellow, userRemotesPath(), err, ansiReset)
+	return builtinRemotes()
 }
