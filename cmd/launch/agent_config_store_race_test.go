@@ -234,10 +234,12 @@ func runAgentStoreExclusion(t *testing.T, c agentStoreCase) {
 		t.Fatal(err)
 	}
 
-	// The lock the writer must meet us on. For a store another program owns
-	// this is a mirror of foreignStoreLockBase; the identity of the lock is part
-	// of the contract, so a change to the naming is meant to break these tests.
-	lockPath := store + ".lock"
+	// The lock the writer must meet us on. WithFileLock locks "<path>.lock", so
+	// the path handed to it is the store itself when oaica owns the store, and
+	// the mirror of foreignStoreLockBase when another program does; the identity
+	// of the lock is part of the contract, so a change to the naming is meant to
+	// break these tests.
+	lockPath := store
 	if c.foreign {
 		lockPath = foreignStoreLockPathFor(t, home, store)
 	}
