@@ -1274,7 +1274,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					status, relayed, r.Context().Err() != nil)
 				return
 			}
-			status, relayed := nativeAnthropicPassthrough(w, r, body, table.SessionID)
+			// attempted is not folded into clientGone here: the two mean
+			// different things (the client left / this side never sent), and
+			// the first is what the feed's clientGone documents. A wrapper
+			// that refused locally reports passthroughNotAttempted, which the
+			// feed handles on its own.
+			status, relayed, _ := nativeAnthropicPassthrough(w, r, body, table.SessionID)
 			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
 				status, relayed, r.Context().Err() != nil)
 			return
@@ -1451,7 +1456,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 								status, relayed, r.Context().Err() != nil)
 							return
 						}
-						status, relayed := nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID)
+						status, relayed, _ := nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID)
 						feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 							status, relayed, r.Context().Err() != nil)
 						return
@@ -2385,6 +2390,10 @@ func rewriteAnthropicRequestModel(body []byte, newModel string) ([]byte, error) 
 // Streaming responses are relayed as they arrive (Flush after every write)
 // rather than buffered — Claude Code's own SSE parsing depends on timely
 // chunk delivery, not just eventual byte-for-byte correctness.
+//
+// The third return says whether the request was ATTEMPTED at all: a request
+// this side refuses for want of a credential never reached an upstream, so its
+// caller must not feed the leg's health from it (2026-09-26 audit).
 // passthroughBreakerKey is the breaker identity a passthrough leg must be
 // filed under: the SAME string selectRoute and oversizeSwap read, or the feed
 // writes to a key nobody consults and the leg reads healthy forever.
@@ -2443,6 +2452,14 @@ func passthroughBreakerKey(route proxyRoute, oversize bool) string {
 // audit).
 func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int, relayed, clientGone bool) {
 	switch {
+	case status == passthroughNotAttempted:
+		// This side answered without contacting the leg — no credential to
+		// send, so there is no upstream result to classify. Status 0 (below)
+		// is a leg that DID not answer, and the two are opposite conclusions
+		// from the same symptom: recording a local configuration problem as a
+		// dead backend opened the circuit on a leg that was healthy, moved the
+		// session to a fallback the missing credential cannot serve either,
+		// and changed what the user was billed for (2026-09-26 audit).
 	case status == 0 && clientGone:
 		// The client left before the leg answered. Says nothing about the leg.
 	case status == 0 || status >= 500:
@@ -2462,14 +2479,24 @@ func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, session
 	}
 }
 
-func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, sessionID string) (int, bool) {
+// passthroughNotAttempted is the status a passthrough wrapper returns when the
+// request never left this process — no credential to send. It is a NEGATIVE
+// number so it cannot collide with an HTTP status or with 0 ("the upstream did
+// not answer"), which is what makes it distinguishable at the health feed:
+// only one of the two is evidence about the leg.
+const passthroughNotAttempted = -1
+
+func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, sessionID string) (int, bool, bool) {
 	auth, ok := resolveNativeAnthropicAuth()
 	if !ok {
 		writeAnthropicError(w, http.StatusUnauthorized,
 			"no Anthropic credential found — run `claude /login` or set ANTHROPIC_API_KEY")
-		return 0, false
+		// passthroughNotAttempted, not 0: nothing was sent, so this says
+		// nothing about the leg's health (see the feed's switch).
+		return passthroughNotAttempted, false, false
 	}
-	return anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value, sessionID)
+	status, relayed := anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value, sessionID)
+	return status, relayed, true
 }
 
 // anthropicPassthrough forwards an Anthropic-wire request to an
