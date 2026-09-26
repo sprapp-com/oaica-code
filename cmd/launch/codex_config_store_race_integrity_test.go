@@ -13,7 +13,8 @@ package launch
 // concurrent edit to any other part of it is silently gone.
 //
 // The write to the profile file (~/.codex/ollama-launch.config.toml) and the
-// model catalog (~/.codex/model.json) is untouched by this: those are fresh
+// model catalog (~/.codex/ollama-launch-cli-models.json) is untouched by this:
+// those carry oaica's own names
 // documents oaica owns end to end, with no read-back of anyone else's data, so
 // an atomic write is the whole of what they need.
 //

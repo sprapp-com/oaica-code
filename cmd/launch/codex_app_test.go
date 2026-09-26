@@ -402,7 +402,7 @@ func TestCodexCLIConfigRefreshLeavesCodexAppConfigActive(t *testing.T) {
 	if got := codexSectionStringValue(content, codexProviderHeaderFor(codexAppProfileName), "base_url"); got != "http://127.0.0.1:9999/v1/" {
 		t.Fatalf("app provider base URL = %q", got)
 	}
-	cliCatalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+	cliCatalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 	if strings.Contains(content, codexProfileHeader()) {
 		t.Fatalf("CLI legacy profile section should not be generated, got:\n%s", content)
 	}

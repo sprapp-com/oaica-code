@@ -180,6 +180,12 @@ func removeCodexProfileConfig() error {
 	return removeCodexFile(profilePath)
 }
 
+// removeCodexModelCatalogIfUnused removes the CLI's model catalog, unless
+// config.toml still points Codex at it. It removes the file at oaica's OWN
+// catalog path and nothing else: under the old generic name the same rule
+// deleted a "~/.codex/model.json" the user may have written themselves, on the
+// strength of a string compare against one key of a file that may not even
+// exist (2026-09-27 audit, round 21, F8).
 func removeCodexModelCatalogIfUnused(configPath string) error {
 	catalogPath := codexModelCatalogPathForConfig(configPath)
 	data, err := os.ReadFile(configPath)
@@ -306,8 +312,24 @@ func codexModelCatalogPath() (string, error) {
 	return codexModelCatalogPathForConfig(configPath), nil
 }
 
+// codexLaunchModelCatalogFilename is the CLI's model catalog, and it carries
+// oaica's own name for the same reason the ChatGPT app's catalog does
+// (codexAppModelCatalogFilename): ~/.codex holds the user's files too, and a
+// generic "model.json" is a name they may already have. This file used to be
+// ~/.codex/model.json — overwritten without a backup on every CLI launch, and
+// DELETED by restore whenever config.toml's model_catalog_json named some other
+// path, which is exactly what it does when the user has a catalog of their own
+// (2026-09-27 audit, round 21, F8). Nothing outside oaica's own files ever named
+// that path: the CLI hands it to codex as -c model_catalog_json=… and writes it
+// into its own profile file (ollama-launch.config.toml).
+//
+// A "model.json" left behind by an earlier version is deliberately NOT cleaned
+// up: it cannot be shown to be ours, and removing a user's catalog to tidy up
+// after ourselves is the failure this change exists to stop.
+const codexLaunchModelCatalogFilename = "ollama-launch-cli-models.json"
+
 func codexModelCatalogPathForConfig(configPath string) string {
-	return filepath.Join(filepath.Dir(configPath), "model.json")
+	return filepath.Join(filepath.Dir(configPath), codexLaunchModelCatalogFilename)
 }
 
 func codexProfileConfigPath() (string, error) {
@@ -341,9 +363,9 @@ func codexNamedProfileConfigPathForConfig(configPath, profileName string) string
 //
 // The other two files this integration writes — the profile file
 // (~/.codex/ollama-launch.config.toml) and the model catalog
-// (~/.codex/model.json) — are fresh documents oaica owns end to end, with no
-// read-back of anyone else's data: an atomic write is the whole of what they
-// need and they take no lock.
+// (~/.codex/ollama-launch-cli-models.json) — are documents oaica owns end to
+// end under names of its own, with no read-back of anyone else's data: a write
+// with a backup is the whole of what they need and they take no lock.
 func cleanupCodexLegacyProfileConfig(configPath string) error {
 	return fileutil.WithFileLock(foreignStoreLockBase(configPath), func() error {
 		return cleanupCodexLegacyProfileConfigLocked(configPath)
@@ -831,8 +853,15 @@ func writeCodexModelCatalog(catalogPath string, model LaunchModel) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(catalogPath), 0o755); err != nil {
+		return err
+	}
 
-	return fileutil.WriteFileAtomic(catalogPath, data, 0o644)
+	// WithBackup, like the ChatGPT app's catalog: the path carries oaica's name
+	// rather than a generic one, but an overwrite is still an overwrite, and a
+	// file at that path is one a user may have put there (2026-09-27 audit,
+	// round 21, F8).
+	return fileutil.WriteWithBackup(catalogPath, data, "codex")
 }
 
 func buildCodexModelEntry(launchModel LaunchModel) map[string]any {

@@ -232,7 +232,7 @@ func TestEnsureCodexConfig(t *testing.T) {
 		if got := codexRootStringValue(content, "model_provider"); got != codexProfileName {
 			t.Fatalf("profile model_provider = %q, want %q in:\n%s", got, codexProfileName, content)
 		}
-		catalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+		catalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 		if got := codexRootStringValue(content, "model_catalog_json"); got != catalogPath {
 			t.Fatalf("profile model_catalog_json = %q, want %q in:\n%s", got, catalogPath, content)
 		}
@@ -242,7 +242,7 @@ func TestEnsureCodexConfig(t *testing.T) {
 
 		data, err = os.ReadFile(catalogPath)
 		if err != nil {
-			t.Fatalf("model.json not created: %v", err)
+			t.Fatalf("CLI model catalog not created: %v", err)
 		}
 		if !strings.Contains(string(data), `"slug": "llama3.2"`) {
 			t.Error("missing model catalog entry for selected model")
@@ -260,10 +260,10 @@ func TestEnsureCodexConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		catalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+		catalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 		data, err := os.ReadFile(catalogPath)
 		if err != nil {
-			t.Fatalf("model.json not created: %v", err)
+			t.Fatalf("CLI model catalog not created: %v", err)
 		}
 
 		var catalog struct {
@@ -399,7 +399,7 @@ func TestCodexRestoreRemovesCLIProfileAndCatalogWithoutChangingUserRootConfig(t 
 	if _, err := os.Stat(profilePath); !os.IsNotExist(err) {
 		t.Fatalf("CLI profile should be removed, got err=%v", err)
 	}
-	catalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+	catalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 	if _, err := os.Stat(catalogPath); !os.IsNotExist(err) {
 		t.Fatalf("CLI catalog should be removed, got err=%v", err)
 	}
@@ -417,7 +417,7 @@ func TestCodexRestoreDoesNotRewriteRootConfig(t *testing.T) {
 	setTestHome(t, tmpDir)
 
 	configPath := filepath.Join(tmpDir, ".codex", "config.toml")
-	catalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+	catalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 	profilePath := filepath.Join(tmpDir, ".codex", "ollama-launch.config.toml")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		t.Fatal(err)
@@ -469,7 +469,7 @@ func TestCodexRestoreDoesNotTouchCodexAppConfig(t *testing.T) {
 	setTestHome(t, tmpDir)
 
 	configPath := filepath.Join(tmpDir, ".codex", "config.toml")
-	cliCatalogPath := filepath.Join(tmpDir, ".codex", "model.json")
+	cliCatalogPath := filepath.Join(tmpDir, ".codex", codexLaunchModelCatalogFilename)
 	appCatalogPath := filepath.Join(tmpDir, ".codex", codexAppModelCatalogFilename)
 	cliProfilePath := filepath.Join(tmpDir, ".codex", "ollama-launch.config.toml")
 	appProfilePath := filepath.Join(tmpDir, ".codex", codexAppProfileName+".config.toml")
