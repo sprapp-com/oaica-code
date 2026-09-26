@@ -46,6 +46,12 @@ func NewError(code int, message string) ErrorResponse {
 		etype = "permission_error"
 	case http.StatusNotFound:
 		etype = "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		// Anthropic's enum has a name for exactly this: the body was too big.
+		// api_error told the client the server broke, so a client-side size
+		// violation read as a server fault and was retried as one
+		// (2026-09-26 audit, sixteenth round).
+		etype = "request_too_large"
 	case http.StatusTooManyRequests:
 		etype = "rate_limit_error"
 	case http.StatusServiceUnavailable, 529:
@@ -386,7 +392,25 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		}
 	}
 
+	// tool_choice: "none" means the model must not call a tool. This wire has
+	// no field to carry that, so the faithful translation is to send no tools
+	// at all — the same rule the OpenAI wire in this repo applies
+	// (openai/openai.go). Decoded and unused, the request still carried its
+	// tools and the model could answer with a call the caller had forbidden: an
+	// agent that reads tool_use and then runs a side-effecting tool
+	// (2026-09-26 audit, sixteenth round). "any" and {"type":"tool",…} ask for
+	// the opposite — a call is required or forced — and have no representation
+	// here either, but dropping the tools would INVERT the caller's
+	// instruction, so they leave the tools in place.
+	dropTools := r.ToolChoice != nil && strings.EqualFold(strings.TrimSpace(r.ToolChoice.Type), "none")
+	if dropTools && len(r.Tools) > 0 {
+		logutil.Trace("anthropic: tool_choice none — sending the request without tools", "tools", len(r.Tools))
+	}
+
 	for _, t := range r.Tools {
+		if dropTools {
+			break
+		}
 		// Anthropic built-in web_search maps to Ollama function name "web_search".
 		// If a user-defined tool also uses that name in the same request, drop the
 		// user-defined one to avoid ambiguous tool-call routing.
@@ -527,7 +551,17 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		case "thinking":
 			thinkingBlocks++
 			if block.Thinking != nil {
-				thinking = *block.Thinking
+				// Joined, not overwritten: an assistant turn this fork itself
+				// emits carries one thinking block per reasoning run (the
+				// streaming converter opens a new block when reasoning resumes
+				// after text, round 15), so keeping only the last silently
+				// dropped every earlier run from the prompt the client echoed
+				// back. The text blocks beside it are joined for the same
+				// reason (2026-09-26 audit, sixteenth round).
+				if thinking != "" {
+					thinking += "\n\n"
+				}
+				thinking += *block.Thinking
 			}
 
 		case "redacted_thinking":
@@ -551,6 +585,15 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 			documentBlocks++
 			if block.Source != nil {
 				if block.Source.Type == "text" && block.Source.Data != "" {
+					// The leading separator matters as much as the trailing
+					// one: a trailing newline alone left the PREVIOUS block's
+					// last sentence glued to this one's first ("read the
+					// file." + "Now run the tests.\n" = "read the file.Now run
+					// the tests."), which is the failure the text-block branch
+					// above documents (2026-09-26 audit, sixteenth round).
+					if textContent.Len() > 0 {
+						textContent.WriteString("\n\n")
+					}
 					textContent.WriteString(block.Source.Data)
 					if !strings.HasSuffix(block.Source.Data, "\n") {
 						textContent.WriteString("\n")
@@ -748,9 +791,23 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	}
 
 	for _, tc := range r.Message.ToolCalls {
+		id := tc.ID
+		if id == "" {
+			// The upstream sent no id (several OpenAI-compatible GGUF backends,
+			// and the Go parsers). ContentBlock.ID is omitempty, so passing it
+			// through emitted a tool_use block with NO "id" key at all — one
+			// the client cannot name back, and whose tool_result then arrives
+			// with tool_use_id "". The streaming converter and the proxy's
+			// non-streaming parser both synthesize this id already; this path
+			// was the third translation site and the only one that did not, so
+			// one upstream turn produced two different blocks depending on
+			// `stream` (2026-09-26 audit, sixteenth round).
+			key, _ := json.Marshal(tc.Function.Arguments)
+			id = ToolCallIDFor(tc.Function.Name, string(key))
+		}
 		content = append(content, ContentBlock{
 			Type:  "tool_use",
-			ID:    tc.ID,
+			ID:    id,
 			Name:  tc.Function.Name,
 			Input: tc.Function.Arguments,
 		})
@@ -1194,6 +1251,14 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 			switch cbMap["type"] {
 			case "text":
 				if t, ok := cbMap["text"].(string); ok {
+					// Joined like every other text segment in this file;
+					// concatenating turned two sentences into one whenever the
+					// first did not end in punctuation — "first line" +
+					// "second line" = "first linesecond line" (2026-09-26
+					// audit, sixteenth round).
+					if text.Len() > 0 {
+						text.WriteString("\n\n")
+					}
 					text.WriteString(t)
 				}
 			case "image":
