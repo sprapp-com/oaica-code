@@ -65,6 +65,16 @@ func TestPiStillConfiguresASingleEndpointSelection(t *testing.T) {
 	  {"name":"box","base_url":"http://third-party.invalid/v1","api_key":"KEY_BOX","tool_format":"tool_calls"}
 	]}`)
 
+	// Both seams are stubbed, and the box is made to advertise one of the local
+	// names. Without this the "all local" case below passed vacuously: every
+	// bare name resolved local only because the sweep against
+	// third-party.invalid failed, so the case asserted nothing about a local
+	// name a remote also serves — which is exactly the collision round 17
+	// fixed (2026-09-27 audit; see
+	// bare_local_name_not_claimed_by_remote_integrity_test.go).
+	stubUserRemoteModels(t, []LaunchModel{{Name: "box/qwen3:8b"}}, nil)
+	stubLocalDaemonIDs(t, map[string]bool{"llama3.2": true, "qwen3:8b": true})
+
 	for _, tc := range []struct {
 		name   string
 		models []LaunchModel

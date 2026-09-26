@@ -49,6 +49,7 @@ package launch
 // is asleep should cost you its own entry, not the whole menu.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -63,6 +64,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
@@ -544,12 +546,51 @@ var bareRemoteModelIndex = func() map[string][]string {
 	return idx
 }
 
+// localDaemonModelIDs reports the ids the LOCAL daemon serves, keyed bare (and
+// with the ":latest" suffix also stripped, so a caller's "llama3.2" matches a
+// daemon entry named "llama3.2:latest"). ok=false means the daemon did not
+// answer — a self-hosted user may have no daemon at all, and a hosted user's
+// may be down — in which case resolution proceeds as if it served nothing.
+// Overridable in tests (stubLocalDaemonIDs).
+var localDaemonModelIDs = func() (map[string]bool, bool) {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	lst, err := client.List(ctx)
+	if err != nil || lst == nil {
+		return nil, false
+	}
+	ids := make(map[string]bool, len(lst.Models)*2)
+	for _, m := range lst.Models {
+		if m.Name == "" {
+			continue
+		}
+		ids[m.Name] = true
+		ids[strings.TrimSuffix(m.Name, ":latest")] = true
+	}
+	return ids, true
+}
+
 // resolveBareRemoteModel maps a bare model name (no "/") to the ONE remote
 // that serves it. This is the fix for the "Download <model>?" trap: a user
 // typing `--model kat-awq` -- the exact id shown by their own kat-awq box --
 // was routed to the Ollama-registry pull path because only "<remote>/<id>"
 // was recognised as remote. Now, if exactly one configured remote serves
 // that bare id, it resolves as if the user had typed the full form.
+//
+// The local daemon wins a bare name, and the check is first because a bare id
+// is a LOCAL model's name: ollama names local models bare, and the picker names
+// a remote row "<remote>/<id>". Without it, exactly one remote advertising an id
+// the user also has pulled claimed the local row — the editors wrote that
+// remote's base URL AND its bearer token into the integration's config (so the
+// model the user pulled silently ran on another machine), and pi/openclaw's
+// mixed-endpoint refusals aborted a selection of two local models while naming
+// a remote the user never chose (2026-09-27 audit, round 17). A daemon that does
+// not answer decides nothing: the mapping below still runs, which is what keeps
+// `--model <a remote's own id>` working for a user with no local daemon.
 //
 // Ambiguity is deliberately NOT resolved: if two remotes both serve
 // "deepseek-chat", picking one silently would send traffic to the wrong
@@ -558,6 +599,9 @@ var bareRemoteModelIndex = func() map[string][]string {
 func resolveBareRemoteModel(bare string) (userRemote, string, bool) {
 	bare = strings.TrimSpace(bare)
 	if bare == "" || strings.Contains(bare, "/") {
+		return userRemote{}, "", false
+	}
+	if local, ok := localDaemonModelIDs(); ok && local[bare] {
 		return userRemote{}, "", false
 	}
 	full := bareRemoteModelIndex()[bare]

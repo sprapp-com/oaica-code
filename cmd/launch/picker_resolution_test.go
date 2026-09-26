@@ -17,6 +17,18 @@ func stubBareIndex(t *testing.T, idx map[string][]string) {
 	t.Cleanup(func() { bareRemoteModelIndex = old })
 }
 
+// stubLocalDaemonIDs replaces the local daemon's model list for a test and
+// restores it on cleanup. The production probe is a real /api/tags against the
+// configured daemon — hermetic tests point OAICA_HOST at a dead port, which
+// answers "no daemon" — so a test that needs the daemon to have a model must
+// say so here rather than depending on whatever is listening on the box.
+func stubLocalDaemonIDs(t *testing.T, ids map[string]bool) {
+	t.Helper()
+	old := localDaemonModelIDs
+	localDaemonModelIDs = func() (map[string]bool, bool) { return ids, true }
+	t.Cleanup(func() { localDaemonModelIDs = old })
+}
+
 // stubUserRemoteModels replaces the per-remote /v1/models sweep for a test and
 // restores it on cleanup. This is the seam BELOW stubBareIndex: it also feeds
 // modelInventory.load, so a test that exercises the inventory (ResolveAgentModel,
