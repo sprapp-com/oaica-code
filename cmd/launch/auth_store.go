@@ -168,6 +168,15 @@ func hasStoredAuth(provider string) bool {
 
 // maskKey renders a key for display without printing it: enough to tell two
 // keys apart in `oaica auth list`, not enough to use.
+//
+// How much may be shown at each end scales with the key. A fixed four-and-four
+// discloses EIGHT characters, and these outputs are documented as pasteable
+// into a bug report — for the short keys some gateways issue ("sk-1a2b3c4d5",
+// nine characters) that is the key: every character but one, in
+// `oaica auth login`, `oaica auth list` and `oaica signin` (2026-09-26 audit,
+// fifth round). At most a fifth of the key is shown from each end, so the
+// hidden part is always the larger part, and the cap stays 4 for long keys so
+// the familiar "sk-a********1234" shape is unchanged.
 func maskKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -176,7 +185,11 @@ func maskKey(key string) string {
 	if len(key) <= 8 {
 		return strings.Repeat("*", len(key))
 	}
-	return key[:4] + strings.Repeat("*", 8) + key[len(key)-4:]
+	n := len(key) / 5
+	if n > 4 {
+		n = 4
+	}
+	return key[:n] + strings.Repeat("*", 8) + key[len(key)-n:]
 }
 
 func sortedAuthProviders(f authStoreFile) []string {

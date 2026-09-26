@@ -27,7 +27,7 @@ func TestLicenseGateAcceptsTheDocumentedEnvVar(t *testing.T) {
 		t.Fatalf("premise: %s already exists, so this test cannot tell the env path from the file path", licensePath)
 	}
 
-	t.Setenv("OAICA_LICENSE_KEY", testLicenseKey)
+	t.Setenv("OAICA_LICENSE_KEY", withDevTestKey(t))
 	if err := requireLicenseLive(nil, nil); err != nil {
 		t.Errorf("with OAICA_LICENSE_KEY set to a valid key and no license.json, the launch gate refused: %v\n— README documents the env var as the alternative to `oaica activate`, and this is that sentence made executable", err)
 	}

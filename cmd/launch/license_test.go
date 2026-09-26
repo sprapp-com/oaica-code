@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+// devTestKey is the string the `devtest` build tag registers (see
+// license_devkey_dev.go). A _test file may name it: test files are never
+// compiled into the shipped binary, which is exactly where the key must not be.
+const devTestKey = "OAICA-TEST-DEV-FREE"
+
+// withDevTestKey registers that key as locally-honoured for the duration of the
+// test and returns it.
+//
+// A test cannot inherit it from the build any more: the default (release-shaped)
+// build has an empty list, which is the property
+// TestReleaseBuildDoesNotHonourADevTestKey pins. A test that wants the dev-key
+// path opts in, so the behaviour stays covered in the build `go test` actually
+// runs.
+func withDevTestKey(t *testing.T) string {
+	t.Helper()
+	prev := devTestLicenseKeys
+	devTestLicenseKeys = []string{devTestKey}
+	t.Cleanup(func() { devTestLicenseKeys = prev })
+	return devTestKey
+}
+
 // stubLemonSqueezy starts an httptest server implementing just enough of
 // the /activate and /validate endpoints for these tests, and points
 // lemonSqueezyLicenseAPI at it for the duration of the test.
@@ -78,32 +99,34 @@ func TestActivateLicenseLive_EmptyKey(t *testing.T) {
 }
 
 func TestActivateLicenseLive_TestKeyNeverHitsNetwork(t *testing.T) {
+	key := withDevTestKey(t)
 	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("testLicenseKey must not call the license server")
+		t.Fatal("a dev/test key must not call the license server")
 	})
 
-	f, err := activateLicenseLive(testLicenseKey, "")
+	f, err := activateLicenseLive(key, "")
 	if err != nil {
-		t.Fatalf("activateLicenseLive(testLicenseKey): %v", err)
+		t.Fatalf("activateLicenseLive(dev test key): %v", err)
 	}
-	if f.Key != testLicenseKey || f.ValidatedAt.IsZero() || f.ActivatedAt.IsZero() {
+	if f.Key != key || f.ValidatedAt.IsZero() || f.ActivatedAt.IsZero() {
 		t.Errorf("got %+v", f)
 	}
 }
 
 func TestRequireLicenseLive_TestKeyNeverRevalidates(t *testing.T) {
+	key := withDevTestKey(t)
 	setLaunchTestHome(t, t.TempDir())
 	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("testLicenseKey must not call the license server, even on a stale cache")
+		t.Fatal("a dev/test key must not call the license server, even on a stale cache")
 	})
 
 	stale := time.Now().Add(-licenseRevalidateTTL - time.Hour)
-	if err := saveLicenseFile(licenseFile{Key: testLicenseKey, InstanceID: "test", ValidatedAt: stale}); err != nil {
+	if err := saveLicenseFile(licenseFile{Key: key, InstanceID: "test", ValidatedAt: stale}); err != nil {
 		t.Fatalf("saveLicenseFile: %v", err)
 	}
 
 	if err := requireLicenseLive(nil, nil); err != nil {
-		t.Errorf("testLicenseKey should always pass requireLicenseLive: %v", err)
+		t.Errorf("a dev/test key should always pass requireLicenseLive: %v", err)
 	}
 }
 

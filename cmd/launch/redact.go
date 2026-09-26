@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // credentialInURL matches "scheme://userinfo@" wherever it appears — in a bare
@@ -91,16 +92,90 @@ var invalidPortFragment = regexp.MustCompile(`invalid port ":[^0-9][^"]*"`)
 // it failed on — so the value reaches the same four places, and the pre-print
 // leak scan did not know to look for it.
 //
-// Anchored (^…$) and matched case-insensitively against the DECODED parameter
-// name, so `?api_key=`, `?API-KEY=`, `?token=` and `?access_token=` are covered
-// without a substring match turning "?monkey=" into a credential.
+// The predicate is now a WORD test rather than an anchored list of full names.
+// The list was the defect: it named the spellings its author thought of
+// (`api_key`, `key`, `token`, `auth`, …), so a gateway that takes
+// `?client_secret=` — OAuth 2.0's own parameter name — or `?api_token=`,
+// `?X-Api-Key=`, `?sig=` was neither hidden at any print site NOR known to the
+// pre-print leak scan, which shares this predicate: `oaica doctor --report`
+// printed the key and then printed its own footer promising the report holds no
+// credential values (2026-09-26 audit, fourth round). A name list can never
+// catch the spelling nobody thought of; a word test catches the class.
 //
-// "auth" is its own alternative, not just the "auth_token"/"auth-token" shapes:
-// a gateway that takes `?auth=<key>` is a real pattern, and the report printed
-// it in the clear under the old regex because the name was not on the list —
-// the leak scan could not see a value it was never told about (2026-09-26
-// audit, third round).
-var credentialQueryParam = regexp.MustCompile(`(?i)^(?:api[_-]?key|key|token|access[_-]?token|auth[_-]?token|apikey|secret|password|auth)$`)
+// The name is split on separators and camelCase ("X-Api-Key" → x, api, key;
+// "clientSecret" → client, secret) and every word is matched against the
+// credential vocabulary, plus a suffix test for compounds written without a
+// separator ("apikey", "authtoken", "clientsecret"). The suffix test
+// deliberately over-redacts names that merely end in one of those words
+// ("monkey", "hockey"): a parameter value hidden in a printed URL costs a
+// diagnostic line, while a missed credential is a key in a pasted ticket.
+func looksLikeCredentialParam(raw string) bool {
+	name, err := url.QueryUnescape(raw)
+	if err != nil {
+		name = raw
+	}
+	words := splitParamWords(name)
+	for _, w := range words {
+		if credentialParamWords[strings.ToLower(w)] {
+			return true
+		}
+	}
+	joined := strings.ToLower(strings.Join(words, ""))
+	for _, suffix := range credentialParamSuffixes {
+		if strings.HasSuffix(joined, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialParamWords is the vocabulary a single word of a parameter name is
+// compared against, matched exactly after lowercasing.
+var credentialParamWords = map[string]bool{
+	"key": true, "keys": true, "token": true, "tokens": true,
+	"secret": true, "secrets": true, "password": true, "passwd": true, "pwd": true,
+	"auth": true, "authorization": true, "bearer": true,
+	"credential": true, "credentials": true, "creds": true,
+	"sig": true, "signature": true, "session": true, "cookie": true,
+	"license": true, "licence": true, "sas": true, "jwt": true,
+}
+
+// credentialParamSuffixes covers compounds written with no separator at all.
+var credentialParamSuffixes = []string{
+	"apikey", "apikeys", "token", "tokens", "secret", "secrets",
+	"password", "passwd", "pwd", "authkey", "auth", "sig", "signature",
+	"credential", "credentials", "bearer", "session", "cookie", "license", "sas", "jwt",
+}
+
+// splitParamWords splits a parameter name into its words: on every separator
+// (-, _, ., space, +) and at each camelCase boundary.
+func splitParamWords(name string) []string {
+	var words []string
+	var cur strings.Builder
+	var prevLower bool
+	flush := func() {
+		if cur.Len() > 0 {
+			words = append(words, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range name {
+		switch {
+		case r == '-' || r == '_' || r == '.' || r == ' ' || r == '+':
+			flush()
+			prevLower = false
+		case unicode.IsUpper(r) && prevLower:
+			flush()
+			cur.WriteRune(r)
+			prevLower = false
+		default:
+			cur.WriteRune(r)
+			prevLower = unicode.IsLower(r) || unicode.IsDigit(r)
+		}
+	}
+	flush()
+	return words
+}
 
 // queryCredentialValue finds one credential-looking query parameter anywhere in
 // text and captures its value, so both the redactor and the leak scan can agree
@@ -135,7 +210,7 @@ func querySecrets(text string) []string {
 		if err != nil {
 			name = m[1]
 		}
-		if !credentialQueryParam.MatchString(name) {
+		if !looksLikeCredentialParam(name) {
 			continue
 		}
 		value, err := url.QueryUnescape(m[2])
@@ -170,7 +245,7 @@ func redactQueryMatches(re *regexp.Regexp, text string) string {
 		if err != nil {
 			name = sub[1]
 		}
-		if !credentialQueryParam.MatchString(name) || strings.TrimSpace(sub[2]) == "" {
+		if !looksLikeCredentialParam(name) || strings.TrimSpace(sub[2]) == "" {
 			return m
 		}
 		return m[:len(m)-len(sub[2])] + "REDACTED"

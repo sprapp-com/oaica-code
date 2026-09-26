@@ -1624,7 +1624,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int) {
 	respBody, err := io.ReadAll(body)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "read upstream body: "+redactErr(err).Error())
 		return
 	}
 	// An upstream can answer a JSON error object over HTTP 200 (vLLM and this
@@ -1640,7 +1640,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	}
 	var oaiResp openAIChatResponse
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "decode upstream response: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "decode upstream response: "+redactErr(err).Error())
 		return
 	}
 	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
@@ -1890,7 +1890,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		msg := upstreamErr
 		if msg == "" {
 			if err := scanner.Err(); err != nil {
-				msg = "upstream stream failed: " + err.Error()
+				msg = "upstream stream failed: " + redactErr(err).Error()
 			} else {
 				msg = "upstream stream ended before the response was complete"
 			}
@@ -1976,6 +1976,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 // choice (vLLM and the fleet's own gateway do), and can answer with a JSON
 // error body over HTTP 200 with no SSE frames at all. Both used to be read as
 // "nothing to do on this line" (2026-09-26 audit).
+//
+// The message is returned REDACTED, and redaction lives here rather than at
+// the call sites because every caller renders the result to the launched
+// client: the non-streaming body (:1637), the two streaming recognition sites
+// (:1801, :1816) and the two emit sites fed from them (:1901, :1912). Only the
+// non-200 branch sanitized, through writeUpstreamError's redactCredentials —
+// so an upstream answering an error object over HTTP 200 handed the client the
+// credential its message quoted back (a request URL carrying userinfo or a
+// query key), into an LLM's context window and the transcript the user pastes
+// into a ticket (2026-09-26 audit, fifth round).
 func upstreamErrorMessage(s string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "{") {
@@ -1991,10 +2001,10 @@ func upstreamErrorMessage(s string) string {
 		return ""
 	}
 	if m := strings.TrimSpace(probe.Error.Message); m != "" {
-		return m
+		return redactCredentials(m)
 	}
 	if t := strings.TrimSpace(probe.Error.Type); t != "" {
-		return "upstream reported " + t
+		return "upstream reported " + redactCredentials(t)
 	}
 	return "upstream reported an error"
 }

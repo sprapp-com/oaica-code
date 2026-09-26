@@ -79,7 +79,7 @@ func TestEnvLicenseKeyWinsOverAStoredActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("OAICA_LICENSE_KEY", testLicenseKey)
+	t.Setenv("OAICA_LICENSE_KEY", withDevTestKey(t))
 	if err := requireLicenseLive(nil, nil); err != nil {
 		t.Errorf("with OAICA_LICENSE_KEY set and a stale ~/.oaica/license.json on disk, the launch gate refused: %v\n— the file was read first and shadowed the injected key", err)
 	}

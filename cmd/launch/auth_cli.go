@@ -235,8 +235,23 @@ func AuthLogout(out io.Writer, provider string) error {
 		return nil
 	}
 	fmt.Fprintf(out, "Removed the stored key for %s.\n", provider)
-	if entry, known := knownAuthProvider(provider); known && entry.APIKeyEnv != "" {
-		fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", keyEnvNamesProse(entry.APIKeyEnv), provider)
+	if entry, known := knownAuthProvider(provider); known {
+		if entry.APIKeyEnv != "" {
+			fmt.Fprintf(out, "If %s is set in this shell, %s keeps working without it.\n", keyEnvNamesProse(entry.APIKeyEnv), provider)
+		}
+		// auth_via: another agent CLI's own login is a SECOND source, and the
+		// env warning above does not cover it. Without this line a user who
+		// logged in and logged out reads a confirmation, sees the provider
+		// come back "ready" in `oaica auth list` and in the picker, and has no
+		// way to tell that a store they never touched is what still
+		// authenticates it (2026-09-26 audit, fifth round). The credential is
+		// not ours to delete — the tool that owns the store removes it.
+		if entry.AuthVia != "" {
+			if cred, ok := externalAuthFor(entry.AuthVia, provider); ok && cred.Key != "" {
+				fmt.Fprintf(out, "%s keeps working: %s's own login still holds a credential for it, and `oaica auth logout` removed only oaica's copy.\n",
+					provider, cred.Source)
+			}
+		}
 	}
 	return nil
 }

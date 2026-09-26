@@ -55,16 +55,47 @@ var lemonSqueezyLicenseAPI = "https://api.lemonsqueezy.com/v1/licenses"
 // the one place to update.
 const oaicaPurchaseURL = "https://oaica.lemonsqueezy.com/buy/oaica-code"
 
-// testLicenseKey is a dev/test-only key that activates and revalidates
-// entirely locally, with no Lemon Squeezy network call — for verifying the
-// launch/license flow on a machine without spending a real purchase (e.g.
-// a one-off install test on a public/cybercafe PC). Not a secret: it is
-// visible in source, matching this project's own stated stance (see the
-// package doc comment above) that the license gate is a convenience paywall
-// on the prebuilt binary, not DRM. Anyone building from source could add
-// their own bypass anyway; this just gives the maintainer one without
-// touching real Lemon Squeezy activation state.
-const testLicenseKey = "OAICA-TEST-DEV-FREE"
+// devTestLicenseKeys holds keys that activate and revalidate entirely locally,
+// with no Lemon Squeezy network call — for verifying the launch/license flow on
+// a machine without spending a real purchase (e.g. a one-off install test on a
+// public/cybercafe PC).
+//
+// It is EMPTY in a normal build. The list is populated by
+// license_devkey_dev.go, which is compiled only under `-tags devtest`, because
+// a key compiled into the shipped artifact is a key every user of that
+// artifact can type: `oaica activate <the published key>` produced a perpetual
+// licence with no network call and no purchase, so the paywall on the prebuilt
+// binary — the thing the licence gate exists to be — was open to anyone who
+// read the repository. The gate is a convenience paywall rather than DRM, and
+// anyone building from source can bypass it; that is not a reason to also hand
+// the bypass to every user of the binary (2026-09-26 audit, fifth round).
+//
+// Keeping it a variable rather than a const also keeps the MECHANISM testable
+// in a release-shaped build: a test registers its own throwaway key here, and
+// the behaviour of all three honouring paths is exercised without the tag.
+var devTestLicenseKeys []string
+
+// devTestKeyBuildTagged reports whether those keys came from the `devtest`
+// build tag rather than being compiled into this build unconditionally. A test
+// uses it to tell "the tag is doing its job" from "the key is back in the
+// shipped binary".
+var devTestKeyBuildTagged bool
+
+// isTestLicenseKey reports whether key is a locally-honoured dev/test key.
+//
+// A predicate and not a string comparison against a sentinel: a release build
+// that zeroed a constant would compare every stored and injected key against
+// "", and a licence file holding `"key": ""` — or an empty OAICA_LICENSE_KEY
+// that some upstream layer turned into a set-but-empty variable — would have
+// been read as the dev key and let straight through the gate.
+func isTestLicenseKey(key string) bool {
+	for _, d := range devTestLicenseKeys {
+		if d != "" && key == d {
+			return true
+		}
+	}
+	return false
+}
 
 const (
 	// licenseRevalidateTTL: how long a successful validate is trusted
@@ -182,7 +213,7 @@ func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 	if key == "" {
 		return licenseFile{}, errors.New("empty license key")
 	}
-	if key == testLicenseKey {
+	if isTestLicenseKey(key) {
 		now := time.Now()
 		return licenseFile{Key: key, ActivatedAt: now, ValidatedAt: now, InstanceName: "test", InstanceID: "test"}, nil
 	}
@@ -266,7 +297,7 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	if f.Key == testLicenseKey {
+	if isTestLicenseKey(f.Key) {
 		return nil // dev/test key — never revalidates over the network
 	}
 
@@ -312,7 +343,7 @@ func requireLicenseLive(cmd *cobra.Command, args []string) error {
 // of the key and the time it was last validated, never the secret itself, so a
 // key injected from a secret manager stays in the secret manager.
 func requireLicenseFromEnv(key string) error {
-	if key == testLicenseKey {
+	if isTestLicenseKey(key) {
 		return nil // dev/test key — never revalidates over the network
 	}
 
