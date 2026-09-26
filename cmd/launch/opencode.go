@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -264,7 +265,14 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 		"variant":  map[string]any{},
 	}
 	if data, err := os.ReadFile(statePath); err == nil {
-		_ = json.Unmarshal(data, &state) // Ignore parse errors; use defaults
+		// The defaults above are the shape of an absent file, not a licence to
+		// overwrite an unreadable one: oaica writes `recent` only, and would
+		// drop `favorite`/`variant` along with anything else it does not model.
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&state); err != nil {
+			return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica rewrites only the recent-models list, so rewriting a file it cannot read would delete the rest of your picker state", statePath, err)
+		}
 	}
 
 	recent, _ := state["recent"].([]any)

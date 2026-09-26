@@ -1,9 +1,12 @@
 package launch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -585,6 +588,28 @@ func (p *Pi) Paths() []string {
 	return paths
 }
 
+// readPiJSONDocument reads one of Pi's JSON documents, of which oaica models
+// only a few members. A document that cannot be read is returned as an error
+// rather than treated as an empty one: the caller writes its map back whole,
+// so an unparseable file would come back as the handful of keys oaica knows.
+// Numbers decode as json.Number, which survives a value past 2^53 intact.
+func readPiJSONDocument(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return map[string]any{}, nil
+		}
+		return nil, err
+	}
+	doc := map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return nil, fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica models only part of that file, so rewriting what it cannot read would delete the rest of your configuration", path, err)
+	}
+	return doc, nil
+}
+
 func (p *Pi) Edit(models []LaunchModel) error {
 	if len(models) == 0 {
 		return nil
@@ -606,9 +631,18 @@ func (p *Pi) Edit(models []LaunchModel) error {
 		return err
 	}
 
-	config := make(map[string]any)
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &config)
+	config, err := readPiJSONDocument(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Both documents are read before either is written: a refusal on the
+	// second must not leave the first already rewritten, so the pair either
+	// updates together or the files stay exactly as the user wrote them.
+	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
+	settings, err := readPiJSONDocument(settingsPath)
+	if err != nil {
+		return err
 	}
 
 	providers, ok := config["providers"].(map[string]any)
@@ -683,12 +717,6 @@ func (p *Pi) Edit(models []LaunchModel) error {
 	}
 
 	// Update settings.json with default provider and model
-	settingsPath := filepath.Join(home, ".pi", "agent", "settings.json")
-	settings := make(map[string]any)
-	if data, err := os.ReadFile(settingsPath); err == nil {
-		_ = json.Unmarshal(data, &settings)
-	}
-
 	settings["defaultProvider"] = "ollama"
 	settings["defaultModel"] = piModelIDFor(models[0])
 

@@ -1,7 +1,9 @@
 package launch
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -296,8 +298,16 @@ func writeOMPModelsConfig(primary string, models []LaunchModel) error {
 	}
 
 	cfg := make(map[string]any)
-	if existing, err := readOMPModelsConfig(); err == nil {
+	switch existing, readErr := readOMPModelsConfig(); {
+	case readErr == nil:
 		cfg = existing
+	case errors.Is(readErr, fs.ErrNotExist):
+		// Nothing on disk yet — the empty map above is the whole document.
+	default:
+		// A document this function cannot parse is one it cannot preserve:
+		// oaica models exactly one provider in that file, so writing the
+		// parsed half back would delete every other provider the user has.
+		return fmt.Errorf("refusing to update %s: %v — oaica writes only the ollama provider in that file, so rewriting a document it cannot read would delete your other providers", path, readErr)
 	}
 
 	provider := ensureOMPProvider(cfg, primary)

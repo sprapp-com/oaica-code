@@ -1,6 +1,7 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1263,35 +1264,30 @@ func TestPiEdit(t *testing.T) {
 		}
 	})
 
-	t.Run("handles corrupt config gracefully", func(t *testing.T) {
+	t.Run("corrupt config is refused, not rewritten", func(t *testing.T) {
 		cleanup()
 		os.MkdirAll(configDir, 0o755)
 
-		if err := os.WriteFile(configPath, []byte("{invalid json}"), 0o644); err != nil {
+		// The old contract read "handles corrupt config gracefully" and
+		// asserted Edit() succeeded — it did, by rewriting the half-decoded
+		// document. Refusing is the contract now: an unparseable models.json
+		// is one whose other providers oaica cannot preserve.
+		corrupt := []byte("{invalid json}")
+		if err := os.WriteFile(configPath, corrupt, 0o644); err != nil {
 			t.Fatal(err)
 		}
 
 		models := []string{"test-model"}
-		if err := pi.Edit(launchModelsFromNames(models)); err != nil {
-			t.Fatalf("Edit() should not fail with corrupt config, got %v", err)
+		if err := pi.Edit(launchModelsFromNames(models)); err == nil {
+			t.Errorf("Edit() should fail rather than rewrite a config it cannot parse")
 		}
 
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			t.Fatalf("Failed to read config: %v", err)
 		}
-
-		var cfg map[string]any
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			t.Fatalf("Config should be valid after Edit, got parse error: %v", err)
-		}
-
-		providers := cfg["providers"].(map[string]any)
-		ollama := providers["ollama"].(map[string]any)
-		modelsArray := ollama["models"].([]any)
-
-		if len(modelsArray) != 1 {
-			t.Errorf("Expected 1 model, got %d", len(modelsArray))
+		if !bytes.Equal(data, corrupt) {
+			t.Errorf("the unreadable config was overwritten:\n%s\nwant:\n%s", data, corrupt)
 		}
 	})
 
@@ -1443,36 +1439,30 @@ func TestPiEdit(t *testing.T) {
 		}
 	})
 
-	t.Run("handles corrupt settings.json gracefully", func(t *testing.T) {
+	t.Run("corrupt settings.json is refused, not rewritten", func(t *testing.T) {
 		cleanup()
 		os.MkdirAll(configDir, 0o755)
 
-		// Create corrupt settings
+		// Same contract as the models.json case above: the old assertion was
+		// that Edit() succeeded over an unparseable file — it did so by
+		// discarding every setting oaica does not write.
 		settingsPath := filepath.Join(configDir, "settings.json")
-		if err := os.WriteFile(settingsPath, []byte("{invalid"), 0o644); err != nil {
+		corrupt := []byte("{invalid")
+		if err := os.WriteFile(settingsPath, corrupt, 0o644); err != nil {
 			t.Fatal(err)
 		}
 
 		models := []string{"test-model"}
-		if err := pi.Edit(launchModelsFromNames(models)); err != nil {
-			t.Fatalf("Edit() should not fail with corrupt settings, got %v", err)
+		if err := pi.Edit(launchModelsFromNames(models)); err == nil {
+			t.Errorf("Edit() should fail rather than rewrite settings it cannot parse")
 		}
 
 		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			t.Fatalf("Failed to read settings: %v", err)
 		}
-
-		var settings map[string]any
-		if err := json.Unmarshal(data, &settings); err != nil {
-			t.Fatalf("settings.json should be valid after Edit, got parse error: %v", err)
-		}
-
-		if settings["defaultProvider"] != "ollama" {
-			t.Errorf("defaultProvider = %v, want ollama", settings["defaultProvider"])
-		}
-		if settings["defaultModel"] != "test-model" {
-			t.Errorf("defaultModel = %v, want test-model", settings["defaultModel"])
+		if !bytes.Equal(data, corrupt) {
+			t.Errorf("the unreadable settings were overwritten:\n%s\nwant:\n%s", data, corrupt)
 		}
 	})
 }

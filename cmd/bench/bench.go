@@ -257,6 +257,16 @@ func OutputMetrics(w io.Writer, format string, metrics []Metrics, verbose bool) 
 	}
 }
 
+// benchOutputWriter opens the -output destination, TRUNCATING whatever is
+// there. Without O_TRUNC the file is written from offset 0 and keeps its old
+// length, so a shorter run left the tail of a previous, longer run in place —
+// a `-epochs 2` re-run over a 10-epoch report produced a results file whose
+// last eight rows were measurements from a different run, silently, with exit
+// 0 and no way for a reader (or a CSV import) to tell (2026-09-26 audit).
+func benchOutputWriter(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+}
+
 func BenchmarkModel(fOpt flagOptions) error {
 	models := strings.Split(*fOpt.models, ",")
 
@@ -282,7 +292,7 @@ func BenchmarkModel(fOpt flagOptions) error {
 
 	var out io.Writer = os.Stdout
 	if fOpt.outputFile != nil && *fOpt.outputFile != "" {
-		f, err := os.OpenFile(*fOpt.outputFile, os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := benchOutputWriter(*fOpt.outputFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: cannot open output file %s: %v\n", *fOpt.outputFile, err)
 			return err

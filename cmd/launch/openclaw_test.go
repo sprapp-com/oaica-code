@@ -721,19 +721,25 @@ func TestOpenclawEdit(t *testing.T) {
 		}
 	})
 
-	t.Run("corrupted JSON treated as empty", func(t *testing.T) {
+	// This subtest used to be called "corrupted JSON treated as empty" and
+	// asserted that Edit SUCCEEDED, leaving a valid-JSON file behind. That was
+	// the bug written down as a contract: "treated as empty" here means the
+	// daemon's gateway token, channels and wizard marker were deleted, because
+	// the write marshals only the keys oaica knows about
+	// (openclaw_edit_corrupt_config_integrity_test.go, 2026-09-26 audit).
+	t.Run("corrupted JSON is refused, not rewritten", func(t *testing.T) {
 		cleanup()
 		os.MkdirAll(configDir, 0o755)
-		os.WriteFile(configPath, []byte(`{corrupted`), 0o644)
+		corrupt := []byte(`{corrupted`)
+		os.WriteFile(configPath, corrupt, 0o644)
 
-		if err := c.Edit(testLaunchModels("llama3.2")); err != nil {
-			t.Fatal(err)
+		if err := c.Edit(testLaunchModels("llama3.2")); err == nil {
+			t.Error("Edit accepted a config it could not parse and rewrote the file from a half-decoded map")
 		}
 
 		data, _ := os.ReadFile(configPath)
-		var cfg map[string]any
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			t.Error("result should be valid JSON")
+		if string(data) != string(corrupt) {
+			t.Errorf("the unparseable config was overwritten: %s", data)
 		}
 	})
 

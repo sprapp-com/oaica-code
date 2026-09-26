@@ -41,6 +41,7 @@ func TestVSCodeEdit(t *testing.T) {
 		name     string
 		setup    string // initial chatLanguageModels.json content, empty means no file
 		models   []string
+		wantErr  bool // setup is unreadable: Edit must refuse and leave it alone
 		validate func(t *testing.T, data []byte)
 	}{
 		{
@@ -92,15 +93,16 @@ func TestVSCodeEdit(t *testing.T) {
 			},
 		},
 		{
-			name:   "corrupted JSON treated as empty",
-			setup:  `{corrupted json`,
-			models: []string{"llama3.2"},
-			validate: func(t *testing.T, data []byte) {
-				var entries []map[string]any
-				if err := json.Unmarshal(data, &entries); err != nil {
-					t.Errorf("result is not valid JSON: %v", err)
-				}
-			},
+			// This case used to read "corrupted JSON treated as empty" and
+			// asserted only that the result parsed — which it did, as a file
+			// holding the ollama entry and nothing else. Refusing is the
+			// contract now: Edit removes the ollama entry and re-adds it, so a
+			// document it cannot parse is one whose other vendors it would
+			// delete.
+			name:    "corrupted JSON is refused, not rewritten",
+			setup:   `{corrupted json`,
+			models:  []string{"llama3.2"},
+			wantErr: true,
 		},
 	}
 
@@ -113,7 +115,18 @@ func TestVSCodeEdit(t *testing.T) {
 				os.WriteFile(clmPath, []byte(tt.setup), 0o644)
 			}
 
-			if err := v.Edit(launchModelsFromNames(tt.models)); err != nil {
+			err := v.Edit(launchModelsFromNames(tt.models))
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("Edit() = nil for unreadable setup %s, want a refusal", tt.setup)
+				}
+				data, _ := os.ReadFile(clmPath)
+				if string(data) != tt.setup {
+					t.Errorf("the unreadable file was overwritten:\n%s\nwant it left byte-identical at:\n%s", data, tt.setup)
+				}
+				return
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
 

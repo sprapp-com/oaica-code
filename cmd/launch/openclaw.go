@@ -675,10 +675,28 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 
 	// Read into map[string]any to preserve unknown fields
 	config := make(map[string]any)
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &config)
-	} else if data, err := os.ReadFile(legacyPath); err == nil {
-		_ = json.Unmarshal(data, &config)
+	readPath := configPath
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		readPath = legacyPath
+		data, err = os.ReadFile(legacyPath)
+	}
+	if err == nil && len(bytes.TrimSpace(data)) > 0 {
+		// A decode failure must STOP the write, not be treated as "empty". The
+		// file belongs to OpenClaw and oaica models only a part of it, so
+		// writing over a document it could not read deletes everything it
+		// could not parse — the gateway token, channels, plugins, the wizard
+		// marker (whose loss makes the next launch re-run onboarding over a
+		// config the user already had). A partially-decoded map is worse than
+		// an empty one: Go inserts keys as it goes, so what gets written back
+		// is the half of the file that happened to come before the syntax
+		// error (2026-09-26 audit). Same stance as muse.go, and as
+		// configureOllamaWebSearch below.
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber() // numbers survive the round-trip; float64 does not
+		if derr := dec.Decode(&config); derr != nil {
+			return fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica models only part of that file, so rewriting what it cannot read would delete the rest of your OpenClaw configuration", readPath, derr)
+		}
 	}
 
 	// Navigate/create: models.providers.ollama (preserving other providers)
@@ -748,11 +766,11 @@ func (c *Openclaw) Edit(models []LaunchModel) error {
 	agents["defaults"] = defaults
 	config["agents"] = agents
 
-	data, err := json.MarshalIndent(config, "", "  ")
+	out, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := fileutil.WriteWithBackup(configPath, data, "openclaw"); err != nil {
+	if err := fileutil.WriteWithBackup(configPath, out, "openclaw"); err != nil {
 		return err
 	}
 
