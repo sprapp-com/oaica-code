@@ -134,14 +134,28 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 	// entries, extra fields intact. Everything oaica wrote is rebuilt below, so
 	// a re-launch REPLACES the entry it owns instead of appending a second copy
 	// of it (2026-09-26 audit, tenth round).
+	//
+	// An owned entry's own extra fields are kept too, under its picker name:
+	// the rebuild below writes a fixed struct, so a model oaica registered and
+	// the user then tuned in Droid's UI came back with every field Droid had
+	// added to that entry — temperature, reasoning effort, whatever the app
+	// writes — silently gone, on a re-launch the user did not ask to change
+	// anything (2026-09-26 audit, round 16). This is what writeDroidSettings'
+	// comment ("map preserves unknown fields for writing back (including extra
+	// fields in model entries)") already claimed and only the foreign path did.
 	var foreignModels []any
+	ownedByPicker := make(map[string]map[string]any)
 	if rawModels, ok := settingsMap["customModels"].([]any); ok {
 		for _, raw := range rawModels {
 			m, ok := raw.(map[string]any)
 			if !ok {
 				continue // malformed entry: nothing to preserve or rebuild
 			}
-			if _, owned := droidOwnedEntry(droidString(m["apiKey"]), droidString(m["id"]), droidString(m["model"]), droidString(m["baseUrl"])); owned {
+			picker, owned := droidOwnedEntry(droidString(m["apiKey"]), droidString(m["id"]), droidString(m["model"]), droidString(m["baseUrl"]))
+			if owned {
+				if picker != "" {
+					ownedByPicker[picker] = m
+				}
 				continue
 			}
 			foreignModels = append(foreignModels, raw)
@@ -175,7 +189,16 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 			entry.BaseURL = ep.BaseURL
 			entry.APIKey = ep.Token
 		}
-		newModels = append(newModels, entry)
+		// Fields this file does not model, from the entry it is replacing: the
+		// rebuild owns the fields above, and everything else the app put in
+		// that entry stays.
+		entryMap := droidEntryMap(entry)
+		for k, v := range ownedByPicker[model.Name] {
+			if _, isOurs := entryMap[k]; !isOurs {
+				entryMap[k] = v
+			}
+		}
+		newModels = append(newModels, entryMap)
 		if i == 0 {
 			defaultModelID = modelID
 		}
@@ -227,6 +250,24 @@ func (d *Droid) Models() []string {
 		}
 	}
 	return result
+}
+
+// droidEntryMap renders a built entry as a map, so fields this file does not
+// model can be merged over it without a second copy of modelEntry's JSON
+// shape. UseNumber, like writeDroidSettings' read: the round-trip must not turn
+// an integer into a float64.
+func droidEntryMap(entry modelEntry) map[string]any {
+	m := make(map[string]any, 9)
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return m
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return map[string]any{}
+	}
+	return m
 }
 
 // droidDaemonKey is the apiKey this file writes for a model served by the local

@@ -127,45 +127,45 @@ func (c *Cline) Edit(models []LaunchModel) error {
 	providersPath := clineProvidersPath(home)
 	legacyPath := clineLegacyGlobalStatePath(home)
 
-	// Both documents are parsed before either is written, so a malformed one is
-	// an error the user sees before oaica has already rewritten the other file.
-	// This pass is validation only: the documents that actually get written are
-	// read again inside their own locks below, which is what orders the writers.
-	if _, err := readClineConfig(providersPath); err != nil {
-		return err
-	}
-	if _, err := readClineConfig(legacyPath); err != nil {
-		return err
-	}
-
 	// Each of the two documents is rewritten whole from a snapshot of itself, so
 	// each store's load-mutate-save runs under that store's own lock and the read
 	// happens INSIDE it. Read outside and the lock orders only the publishes: two
 	// `oaica launch cline` commands whose writes overlap each publish a snapshot
 	// taken before the other's entry landed, and the launch that renames last
-	// decides the file while both report success. The two stores are separate
-	// files, so they take separate locks (taken in this order by every caller, so
-	// two commands cannot deadlock against each other). Both files live in
-	// Cline's own data directory, so the locks are keyed under ~/.oaica/locks
-	// (foreignStoreLockBase) rather than dropped inside ~/.cline — oaica writes
-	// two entries into that tree and a stray lock file beside the user's settings
-	// is not part of that deal (2026-09-26 audit, thirteenth round).
-	if err := fileutil.WithFileLock(foreignStoreLockBase(providersPath), func() error {
-		providersConfig, err := readClineConfig(providersPath)
-		if err != nil {
-			return err
-		}
-		return writeClineProvidersConfig(providersPath, providersConfig, models[0].Name)
-	}); err != nil {
-		return err
-	}
-
-	return fileutil.WithFileLock(foreignStoreLockBase(legacyPath), func() error {
-		legacyConfig, err := readClineConfig(legacyPath)
-		if err != nil {
-			return err
-		}
-		return writeClineLegacyGlobalState(legacyPath, legacyConfig, models[0].Name)
+	// decides the file while both report success (2026-09-26 audit, thirteenth
+	// round). Both files live in Cline's own data directory, so the locks are
+	// keyed under ~/.oaica/locks (foreignStoreLockBase) rather than dropped
+	// inside ~/.cline — oaica writes two entries into that tree and a stray lock
+	// file beside the user's settings is not part of that deal.
+	//
+	// BOTH locks are held across BOTH writes, in this order (providers, then
+	// legacy) by every caller, so two commands cannot deadlock against each
+	// other. Holding only the lock of the file being written — each lock
+	// released before the next was taken, as this did until the sixteenth round
+	// — orders writers of each file and leaves the PAIR unordered: two
+	// overlapping launches can publish A's providers.json beside B's
+	// globalState.json and neither document then describes a launch that
+	// happened, while both commands report success. These two documents are one
+	// selection's two halves, so they are published together or not at all.
+	//
+	// Both documents are also read before either is written: a malformed second
+	// one must be an error the user sees before oaica has already rewritten the
+	// first (pi's Edit, same reason).
+	return fileutil.WithFileLock(foreignStoreLockBase(providersPath), func() error {
+		return fileutil.WithFileLock(foreignStoreLockBase(legacyPath), func() error {
+			providersConfig, err := readClineConfig(providersPath)
+			if err != nil {
+				return err
+			}
+			legacyConfig, err := readClineConfig(legacyPath)
+			if err != nil {
+				return err
+			}
+			if err := writeClineProvidersConfig(providersPath, providersConfig, models[0].Name); err != nil {
+				return err
+			}
+			return writeClineLegacyGlobalState(legacyPath, legacyConfig, models[0].Name)
+		})
 	})
 }
 
