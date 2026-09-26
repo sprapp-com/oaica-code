@@ -301,6 +301,19 @@ func writeOMPModelsConfig(primary string, models []LaunchModel) error {
 	if err != nil {
 		return err
 	}
+	// models.yml is OMP's own document, and oaica writes one provider in it and
+	// publishes the whole file: the read, the merge and the write run under the
+	// store's lock (keyed under ~/.oaica/locks, foreignStoreLockBase, because
+	// this is another program's data directory). Without it two oaica commands
+	// whose writes overlap each publish a snapshot taken before the other's
+	// models landed, and the launch that renamed last decides the file
+	// (2026-09-26 audit, twelfth round).
+	return fileutil.WithFileLock(foreignStoreLockBase(path), func() error {
+		return writeOMPModelsConfigLocked(path, primary, models)
+	})
+}
+
+func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -371,6 +384,16 @@ func writeOMPAgentConfig() error {
 	if err != nil {
 		return err
 	}
+	// Same shape over OMP's config.yml, and the same lock: it is read, one key is
+	// set, and the whole document is published back, so a concurrent writer's
+	// keys are deleted by whichever publish lands last unless the read happens
+	// under the lock too (2026-09-26 audit, twelfth round).
+	return fileutil.WithFileLock(foreignStoreLockBase(path), func() error {
+		return writeOMPAgentConfigLocked(path)
+	})
+}
+
+func writeOMPAgentConfigLocked(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
