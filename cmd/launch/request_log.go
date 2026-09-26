@@ -15,7 +15,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/ollama/ollama/cmd/internal/httpbody"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -197,7 +196,8 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		flushResponse(w)
+		_ = relayFlushing(w, resp.Body)
 
 		if r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions") && len(body) > 0 {
 			var modelField struct {

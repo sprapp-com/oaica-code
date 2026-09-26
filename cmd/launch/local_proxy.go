@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/ollama/ollama/cmd/internal/httpbody"
 	"io"
@@ -30,6 +31,52 @@ import (
 	"net/http"
 	"strings"
 )
+
+// flushResponse pushes the status line and headers out now rather than when
+// the handler's buffer happens to drain. A client should see its response
+// begin before the backend's first body byte — with a long prompt and a slow
+// prefill that can be many seconds.
+func flushResponse(w http.ResponseWriter) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// relayFlushing copies src to the response, flushing after every write.
+//
+// A bare io.Copy does NOT stream here. net/http buffers a handler's writes in
+// a 2048-byte bufio.Writer that drains only when it fills, when the handler
+// returns, or on an explicit Flush — so a relay that never flushes hands the
+// client the backend's frames in 2 KiB gulps and holds anything shorter than
+// that until the turn ends. For a client parsing SSE that is indistinguishable
+// from not streaming at all, and it is what both of these proxies did until
+// the 2026-09-26 audit (the Anthropic-wire passthrough has always flushed, and
+// says why in its own copy loop).
+//
+// A write error means the client is gone; the read error is reported to the
+// caller only so it can log, not so it can be turned into a status (the status
+// line is long since sent).
+func relayFlushing(w http.ResponseWriter, src io.Reader) error {
+	flusher, canFlush := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, err := w.Write(buf[:n]); err != nil {
+				return err
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
 
 func normalizeSystemMessages(pathname string, body []byte) ([]byte, error) {
 	var parsed map[string]any
@@ -224,7 +271,8 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		flushResponse(w)
+		_ = relayFlushing(w, resp.Body)
 	})
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, listenPort))

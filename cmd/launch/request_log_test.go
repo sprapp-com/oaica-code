@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalLoggingProxy_RedactsCredentialInTarget(t *testing.T) {
@@ -56,9 +57,21 @@ func TestLocalLoggingProxy_RedactsCredentialInTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	// The row is appended after the relay finishes, and the relay now flushes
+	// as it goes (proxy_stream_flush_integrity_test.go): the client can have
+	// read its whole response while the handler is still on its way to the
+	// log. Poll rather than assume the old buffering's ordering.
+	var raw []byte
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err = os.ReadFile(path)
+		if err == nil && strings.Contains(string(raw), `"backend"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no row appeared in %s: %v (%q)", path, err, raw)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if strings.Contains(string(raw), redactKey) {
 		t.Fatalf("requests.log leaked the key:\n%s", raw)
