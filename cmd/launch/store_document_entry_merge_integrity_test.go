@@ -15,6 +15,7 @@ package launch
 // members must not re-attach an entry the caller removed on purpose.
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,7 +49,7 @@ func TestASavedAuthEntryKeepsMembersTheStructDoesNotModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := updateAuthStore(func(f *authStoreFile) error {
+	if err := updateAuthStore(io.Discard, func(f *authStoreFile) error {
 		c := f.Providers["zai"]
 		c.Type = "api_key"
 		c.Key = "sk-new"
@@ -89,7 +90,7 @@ func TestLoggingOutOfAProviderDoesNotResurrectIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := updateAuthStore(func(f *authStoreFile) error {
+	if err := updateAuthStore(io.Discard, func(f *authStoreFile) error {
 		delete(f.Providers, "zai")
 		return nil
 	}); err != nil {

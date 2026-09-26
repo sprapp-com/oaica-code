@@ -25,7 +25,9 @@ package launch
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -72,6 +74,12 @@ func authStorePath() string {
 	return filepath.Join(home, ".oaica", "auth.json")
 }
 
+// errAuthStoreUnparseable marks a store whose bytes are not the JSON this
+// version understands. It is distinguished from "could not read it at all"
+// because the write path may quarantine the former (the bytes are all there,
+// they just need a human) and must not touch the latter.
+var errAuthStoreUnparseable = errors.New("not valid JSON")
+
 // loadAuthStore reads the store. A missing or unreadable file is an empty
 // store, not an error: losing credentials downgrades a provider to "needs a
 // key again" and must never break an unrelated launch.
@@ -90,7 +98,7 @@ func loadAuthStore() (authStoreFile, string, error) {
 	}
 	var onDisk authStoreFile
 	if err := json.Unmarshal(b, &onDisk); err != nil {
-		return authStoreFile{Version: authStoreVersion, Providers: map[string]authCredential{}}, path, fmt.Errorf("%s: %w", path, err)
+		return authStoreFile{Version: authStoreVersion, Providers: map[string]authCredential{}}, path, fmt.Errorf("%s is %w: %w", path, errAuthStoreUnparseable, err)
 	}
 	if onDisk.Providers != nil {
 		f.Providers = onDisk.Providers
@@ -127,7 +135,20 @@ func saveAuthStore(f authStoreFile, path string) error {
 // snapshot and have the last write silently drop the other's credential.
 // Eleven concurrent logins used to leave one key (2026-09-26 audit, fourth
 // round). Read-only callers keep using loadAuthStore directly.
-func updateAuthStore(mutate func(*authStoreFile) error) error {
+//
+// A store that cannot be PARSED does not block the write. It is moved aside —
+// same directory, same mode, a name that says what it is — and the mutation
+// starts from an empty store, with a notice on warn naming both files. Refusing
+// instead meant one stray byte (a truncated file, a hand-edit, JSON from another
+// tool) made every `oaica auth login` fail forever with a parse error, and the
+// only way out was deleting credentials the user could not read: worse than the
+// file being unreadable, and the same reasoning that keeps a corrupt plans.json
+// from blocking every launch (2026-09-26 audit).
+//
+// A store that cannot be READ (permissions, a device error) is still an error.
+// Its bytes are not necessarily recoverable by hand, and moving it would be
+// guessing at a file that might be a mount the user cares about.
+func updateAuthStore(warn io.Writer, mutate func(*authStoreFile) error) error {
 	path := authStorePath()
 	if path == "" {
 		return fmt.Errorf("cannot locate ~/.oaica/auth.json (no home directory) — set OAICA_AUTH_FILE")
@@ -135,7 +156,16 @@ func updateAuthStore(mutate func(*authStoreFile) error) error {
 	return fileutil.WithFileLock(path, func() error {
 		f, _, err := loadAuthStore()
 		if err != nil {
-			return err
+			if !errors.Is(err, errAuthStoreUnparseable) {
+				return err
+			}
+			moved, qerr := quarantineAuthStore(path)
+			if qerr != nil {
+				return fmt.Errorf("%w, and it could not be moved aside either: %v", err, qerr)
+			}
+			fmt.Fprintf(warn, "warning: %v.\n", err)
+			fmt.Fprintf(warn, "warning: it has been kept as %s and a new store written. Any credentials it held are in that file, which nothing has deleted.\n", moved)
+			f = authStoreFile{Version: authStoreVersion, Providers: map[string]authCredential{}}
 		}
 		snapshot := storeDocumentSnapshot(f)
 		if err := mutate(&f); err != nil {
@@ -150,6 +180,18 @@ func updateAuthStore(mutate func(*authStoreFile) error) error {
 		}
 		return saveAuthStore(f, path)
 	})
+}
+
+// quarantineAuthStore moves an unreadable store aside and returns where it
+// went. The name carries the time, so two runs cannot overwrite each other's
+// evidence: the file may hold credentials the user paid for, and the point is
+// that it is still there afterwards.
+func quarantineAuthStore(path string) (string, error) {
+	dest := fmt.Sprintf("%s.unreadable-%s", path, time.Now().UTC().Format("20060102-150405"))
+	if err := os.Rename(path, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 // storedAuthKey returns the API key saved for provider, or "".

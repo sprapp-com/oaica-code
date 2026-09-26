@@ -12,6 +12,7 @@ package launch
 // logging into before pasting a key.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -104,7 +105,7 @@ func AuthLogin(out io.Writer, provider, key string) error {
 	// print eleven successes and leave one key (2026-09-26 audit, fourth
 	// round).
 	path := authStorePath()
-	if err := updateAuthStore(func(f *authStoreFile) error {
+	if err := updateAuthStore(out, func(f *authStoreFile) error {
 		f.Providers[provider] = authCredential{
 			Type:    authCredentialTypeAPIKey,
 			Key:     key,
@@ -210,7 +211,7 @@ func AuthLogout(out io.Writer, provider string) error {
 	// Resolved inside the lock: a login landing between this read and the
 	// delete would otherwise be removed by a logout that never saw it.
 	found := false
-	if err := updateAuthStore(func(f *authStoreFile) error {
+	if err := updateAuthStore(out, func(f *authStoreFile) error {
 		if _, ok := f.Providers[provider]; !ok {
 			// Case-insensitive fallback: `oaica auth logout ZAI` should work.
 			for name := range f.Providers {
@@ -267,6 +268,13 @@ func AuthLogout(out io.Writer, provider string) error {
 func AuthList(out io.Writer) error {
 	f, _, err := loadAuthStore()
 	if err != nil {
+		if errors.Is(err, errAuthStoreUnparseable) {
+			// The write path moves such a file aside and starts a new store
+			// (updateAuthStore), and that is not something this read-only
+			// command may do on its own — but it is the answer to "what now",
+			// and leaving it unsaid makes the file look bricked.
+			return fmt.Errorf("%w\nNo credential can be read from it until it is rewritten: `oaica auth login <provider> --key …` keeps it as <file>.unreadable-<timestamp> and starts a new store, or repair the file by hand.", err)
+		}
 		return err
 	}
 	stored := map[string]bool{}
