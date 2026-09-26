@@ -2650,14 +2650,15 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 // ledger, streaming relayed as it arrives.
 //
 // It returns the upstream status it relayed (0 when it never got one) and
-// whether the body was relayed to its END. Those are the caller's signal for
-// the circuit breaker and the `auto` escalation: this path returns from the
-// handler BEFORE the OpenAI path's breaker switch, so without it a passthrough
-// leg's breaker read healthy forever and a dead primary was never failed over
-// — the promise docs/CLAUDE_TIERS.md's failover section makes for every leg.
-// The second value is why the caller does not use the status alone: a body that
-// dies after a 200 is a dead turn the client saw, and counting it healthy is
-// the same defect on this path (2026-09-26 audit).
+// whether a turn was relayed at all — the body reached its END, and there was a
+// body. Those are the caller's signal for the circuit breaker and the `auto`
+// escalation: this path returns from the handler BEFORE the OpenAI path's
+// breaker switch, so without it a passthrough leg's breaker read healthy
+// forever and a dead primary was never failed over — the promise
+// docs/CLAUDE_TIERS.md's failover section makes for every leg. The second value
+// is why the caller does not use the status alone: a body that dies after a 200
+// is a dead turn the client saw, and so is no body at all, and counting either
+// healthy is the same defect on this path (2026-09-26 audit).
 func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) (int, bool) {
 	// The failed attempts on this leg are logged (request_log.go): a plan row
 	// on the anthropic wire whose upstream refuses connections left no
@@ -2744,9 +2745,11 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
+	relayedBytes := 0
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			relayedBytes += n
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				// The client's own connection failed. This is the caller's
 				// client-gone case, not evidence about the leg.
@@ -2761,7 +2764,17 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 			// the whole answer; anything else (a body cut short, a read timed
 			// out, the transport giving up) is a turn the client never
 			// received in full.
-			return resp.StatusCode, errors.Is(readErr, io.EOF)
+			//
+			// relayedBytes > 0 is the other half of that evidence, and it is
+			// not implied by EOF: an upstream that answers 200 and closes
+			// without a byte reaches EOF on its first read, so an EMPTY 200
+			// was reported as a body relayed to its end (2026-09-26 audit).
+			// A Messages response with no bytes is not a turn any client can
+			// use, and the two translated paths already refuse the shape
+			// (handleNonStreamResponse fails to decode it, handleStreamResponse
+			// never sees a frame) — only this one, which does not parse the
+			// wire, had to say so explicitly.
+			return resp.StatusCode, relayedBytes > 0 && errors.Is(readErr, io.EOF)
 		}
 	}
 }
