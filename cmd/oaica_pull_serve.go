@@ -380,6 +380,32 @@ func oaicaPullURL(host, pullURL string) (string, error) {
 	return base.String() + pullURL, nil
 }
 
+// manifestDigest is the digest a manifest states for its model file, or "" when
+// it states none (the two call sites that compare digests read it through this
+// so they cannot disagree about which field is the truth).
+func manifestDigest(m *oaicaManifest) string {
+	if m == nil || m.SHA256 == nil {
+		return ""
+	}
+	return strings.TrimSpace(*m.SHA256)
+}
+
+// fileSHA256Hex digests a file on disk, for the "is what is installed the
+// artifact the manifest describes" check. Streamed, not read into memory: a
+// model file is gigabytes (2026-09-26 audit).
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func oaicaPullModel(model string) (string, error) {
 	manifest, err := oaicaFetchManifest(model)
 	if err != nil {
@@ -391,8 +417,24 @@ func oaicaPullModel(model string) (string, error) {
 		return "", err
 	}
 	if fi, err := os.Stat(destPath); err == nil && fi.Size() == manifest.SizeBytes {
-		fmt.Fprintf(os.Stderr, "%s already downloaded (%s), skipping\n", model, humanBytes(manifest.SizeBytes))
-		return destPath, nil
+		// The length is not the check. A file of the right size and the wrong
+		// content — a download that was truncated and padded, a corrupted
+		// disk, any other writer — used to be accepted here and skipped
+		// forever, so the command succeeded, the model was broken, and
+		// re-running the pull never repaired it because this shortcut is what
+		// runs first. When the manifest states a digest, that digest decides
+		// (2026-09-26 audit). A digest oaica cannot compute — an unreadable
+		// file — is not a match either: re-download.
+		if want := manifestDigest(manifest); want != "" {
+			if got, herr := fileSHA256Hex(destPath); herr == nil && strings.EqualFold(got, want) {
+				fmt.Fprintf(os.Stderr, "%s already downloaded (%s), skipping\n", model, humanBytes(manifest.SizeBytes))
+				return destPath, nil
+			}
+			fmt.Fprintf(os.Stderr, "%s is on disk at the declared size but does not match the manifest's sha256 — re-downloading\n", model)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s already downloaded (%s), skipping\n", model, humanBytes(manifest.SizeBytes))
+			return destPath, nil
+		}
 	}
 
 	if manifest.Source == "hf" {
@@ -454,11 +496,11 @@ func oaicaPullModel(model string) (string, error) {
 	// The HF plaintext path checks this digest; so must this one. Without it a
 	// manifest's size is the only thing between the router and the installed
 	// model, and size_bytes: 0 removes even that.
-	if manifest.SHA256 != nil && strings.TrimSpace(*manifest.SHA256) != "" {
+	if want := manifestDigest(manifest); want != "" {
 		got := hex.EncodeToString(hasher.Sum(nil))
-		if !strings.EqualFold(got, strings.TrimSpace(*manifest.SHA256)) {
+		if !strings.EqualFold(got, want) {
 			os.Remove(tmpPath)
-			return "", fmt.Errorf("sha256 mismatch: got %s, expected %s", got, strings.TrimSpace(*manifest.SHA256))
+			return "", fmt.Errorf("sha256 mismatch: got %s, expected %s", got, want)
 		}
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
