@@ -202,6 +202,39 @@ func clineModelIDFor(model string) string {
 	return model
 }
 
+// clineEndpointWasOurs reports whether a base URL recorded in Cline's ollama
+// provider is one oaica writes: the local daemon's, or a configured remote's.
+//
+// "ollama" is Cline's own provider id as well as the key oaica writes under, so
+// an entry there may be the USER's own Ollama provider (their LAN server, their
+// key, or ollama.com). Taking that entry over rewrites its base URL and deletes
+// its API key, which destroys a working configuration to serve the launch
+// (2026-09-27 audit, round 21). An entry naming an endpoint oaica itself writes
+// is the same provider by another name and is configured as before; anything
+// else is refused, out loud, before the file is touched.
+func clineEndpointWasOurs(recorded string) bool {
+	recorded = strings.TrimRight(strings.TrimSpace(recorded), "/")
+	if recorded == "" {
+		// No endpoint recorded: Cline's own default, which is the daemon.
+		return true
+	}
+	if recorded == strings.TrimRight(clineProviderBaseURL(), "/") || recorded == strings.TrimRight(clineOllamaRootURL(), "/") {
+		return true
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		// The rule findUserRemoteForModel uses: a corrupt store must not take
+		// the built-in providers with it.
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == recorded || strings.TrimRight(remoteBaseURL(r), "/") == recorded {
+			return true
+		}
+	}
+	return false
+}
+
 // clineLegacyBaseURLFor is the server root the legacy global state records for
 // a model: the remote's own root for a user-remote model, otherwise the
 // daemon's (unchanged). The legacy state carries a root — the daemon value has
@@ -266,6 +299,14 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 	previousModel, _ := settings["model"].(string)
 	previousBaseURL, _ := settings["baseUrl"].(string)
 	previousTokenSource, _ := provider["tokenSource"].(string)
+
+	// Before anything is mutated: the entry under this key may be the user's own
+	// Ollama provider, and the write below would repoint it at the daemon and
+	// delete its key (2026-09-27 audit, round 21). Redacted, because the value
+	// is file-derived and may carry credentials in its userinfo or query.
+	if !clineEndpointWasOurs(previousBaseURL) {
+		return fmt.Errorf("Cline's %q provider is configured with an endpoint oaica did not write (%s), so it is yours: Cline has one provider under that name, and pointing it at the local daemon would rewrite its base URL and delete its API key. Remove or rename that provider in Cline's own settings, or launch a different integration", clineLaunchProvider, redactBaseURL(previousBaseURL))
+	}
 
 	settings["provider"] = clineLaunchProvider
 	settings["model"] = modelID
