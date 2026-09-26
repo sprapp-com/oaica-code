@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+	"unicode/utf8"
 )
 
 // Mirrors prism-api-router/src/index.ts's HARD_SIGNAL_RE /
@@ -79,7 +80,31 @@ func requestLogPath() (string, error) {
 	return filepath.Join(dir, "requests.log"), nil
 }
 
+// maxLoggedModelBytes bounds the model id a row carries. The model comes from
+// the CLIENT's request body, which may be megabytes, and a row whose JSON line
+// exceeds maxLogLineBytes (1 MiB) is dropped by the reader as unreadable: the
+// turn then disappears from `oaica usage` entirely — not merely with a wrong
+// model name — and the report warns about a truncated row on a log that is
+// perfectly healthy. Bounded here, at the single point every row goes through,
+// so a future row builder cannot bypass it (2026-09-26 audit, ninth round).
+const maxLoggedModelBytes = 256
+
+// boundedModel truncates a client-supplied model id to maxLoggedModelBytes on a
+// rune boundary, marking the cut so a truncated name is never mistaken for the
+// real one.
+func boundedModel(model string) string {
+	if len(model) <= maxLoggedModelBytes {
+		return model
+	}
+	cut := model[:maxLoggedModelBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…"
+}
+
 func appendRequestLog(entry requestLogEntry) {
+	entry.Model = boundedModel(entry.Model)
 	entry.ProxyPort = requestLogProxyPort
 	path, err := requestLogPath()
 	if err != nil {
