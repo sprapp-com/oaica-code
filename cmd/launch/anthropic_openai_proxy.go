@@ -583,7 +583,7 @@ func RunAnthropicOpenAIProxy(ln net.Listener, remote userRemote, upstreamModel s
 func singleRemoteRouteTable(remote userRemote, upstreamModel, token string) proxyRouteTable {
 	return proxyRouteTable{
 		ClientToken: token,
-		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
+		Default: proxyRoute{BaseURL: remote.openAIBase(), Key: remote.key(), KeyEnv: remote.keyEnvName(), APIKeyEnv: remote.APIKeyEnv, ModelsURL: remote.modelsURL(), UpstreamModel: upstreamModel, Label: "remote:" + remote.Name, Wire: remote.Descriptor().Wire,
 			// An anthropic-wire remote is forwarded untranslated to its own
 			// /messages (see routeFor's doc for why); a single-leg launch of
 			// one takes exactly the same path as a tier-planned one.
@@ -615,6 +615,12 @@ type proxyRoute struct {
 	// doc for why a one-time-resolved credential is wrong for a long-lived
 	// proxy process.
 	KeyEnv string
+	// APIKeyEnv is the WHOLE api_key_env spec behind KeyEnv, for
+	// tierPlan.credentialEnvNames — the child-environment scrubber must
+	// remove every name the row can read a credential from, and KeyEnv holds
+	// only the one name that was set (RemoteEndpoint.TokenEnv's doc). See
+	// RemoteEndpoint.APIKeyEnv.
+	APIKeyEnv string
 	// ModelsURL is where this route's model list lives when it is not
 	// BaseURL+"/models" (the version prefix is per-surface — see
 	// RemoteEndpoint.ModelsURL). The context-window probe uses it.

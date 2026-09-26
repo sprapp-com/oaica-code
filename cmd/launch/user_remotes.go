@@ -573,6 +573,19 @@ type RemoteEndpoint struct {
 	//
 	// A single name, not the row's raw api_key_env string: see keyEnvName.
 	TokenEnv string
+	// APIKeyEnv is the row's raw api_key_env spec (r.APIKeyEnv, comma-joined
+	// when it lists more than one), for the callers that must know EVERY
+	// variable the row reads a credential from — the child-environment
+	// scrubber (tierPlan.credentialEnvNames) removes credentials from the
+	// agent's environment, and scrubbing only TokenEnv left a second name a
+	// row listed ("BOX_KEY_A,BOX_KEY_B") in place, still holding a real key
+	// for the same account (2026-09-26 audit, eleventh round).
+	//
+	// Not for os.Getenv: that is TokenEnv, and handing it a comma-joined list
+	// is the stale-credential bug keyEnvName exists to prevent. A string, not
+	// a []string, so this struct stays comparable for the exact-endpoint
+	// assertions the tier tests make.
+	APIKeyEnv string
 	// ModelsURL is r.modelsURL() — where THIS remote's model list actually
 	// lives, resolved once. The version prefix is per-surface, not per-host
 	// (perplexity serves chat unversioned and lists models under /v1/models),
@@ -610,6 +623,7 @@ func resolveRemoteEndpoint(model string) (RemoteEndpoint, bool) {
 		BaseURL:         remote.openAIBase(),
 		Token:           remote.key(),
 		TokenEnv:        remote.keyEnvName(),
+		APIKeyEnv:       remote.APIKeyEnv,
 		ModelsURL:       remote.modelsURL(),
 		UpstreamModel:   bare,
 		Wire:            d.Wire,

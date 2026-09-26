@@ -349,7 +349,7 @@ func routeFor(ep launchEndpoint) proxyRoute {
 	// endpoint and the vendor answers 404 ("502 upstream HTTP 404" in Claude
 	// Code) — the failure that shipped as zai-coding-plan, 2026-09-25.
 	return proxyRoute{
-		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, ModelsURL: ep.ModelsURL, UpstreamModel: ep.UpstreamModel,
+		BaseURL: ep.BaseURL, Key: ep.Token, KeyEnv: ep.TokenEnv, APIKeyEnv: ep.APIKeyEnv, ModelsURL: ep.ModelsURL, UpstreamModel: ep.UpstreamModel,
 		Label:             string(ep.Source) + ":" + ep.Name,
 		Wire:              ep.Wire,
 		NativePassthrough: ep.Source == sourceNativeAnthropic || ep.Wire == "anthropic",
@@ -964,7 +964,18 @@ func (p tierPlan) credentialEnvNames() []string {
 	add(p.Primary.TokenEnv)
 	add(p.Secondary.TokenEnv)
 	add(p.Haiku.TokenEnv)
-	addRoute := func(r proxyRoute) { add(r.KeyEnv) }
+	// ...and every OTHER name those rows accept: TokenEnv holds only the one
+	// name that happened to be set (keyEnvName), so a row listing
+	// "BOX_KEY_A,BOX_KEY_B" otherwise left its sibling in the child's
+	// environment, still holding a real key for the same account. add()
+	// splits the comma-joined spec itself.
+	add(p.Primary.APIKeyEnv)
+	add(p.Secondary.APIKeyEnv)
+	add(p.Haiku.APIKeyEnv)
+	addRoute := func(r proxyRoute) {
+		add(r.KeyEnv)
+		add(r.APIKeyEnv)
+	}
 	addRoute(p.Routes.Default)
 	addRoute(p.Routes.Oversize)
 	for _, r := range p.Routes.ByModel {
