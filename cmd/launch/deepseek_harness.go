@@ -183,7 +183,7 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 		models = []LaunchModel{fallbackLaunchModel(primary)}
 	}
 	if selected, ok := findLaunchModel(models, primary); ok {
-		primary = selected.Name
+		primary = deepSeekHarnessModelIDFor(selected)
 	}
 	if err := deepSeekHarnessRejectNonDaemonModels(primary, models); err != nil {
 		return err
@@ -350,6 +350,23 @@ func applyDeepSeekHarnessSettings(document *yaml.Node, primary string, models []
 	return nil
 }
 
+// deepSeekHarnessModelIDFor is the id the harness must name for a row: the
+// daemon-side name of an ollama-cloud catalogue row (LaunchModel.Upstream —
+// "gpt-oss:cloud"), not the row's picker name. findLaunchModel has already
+// stripped the "ollama/" display prefix by the time a writer sees the row, and
+// the stripped bare id is the name of the LOCAL model: writing it asked the
+// daemon for a local model, which either does not exist (a multi-GB pull offer
+// in the harness's error) or — worse — is a different model of the same name,
+// while the cloud alias documented on the row itself launched fine (the same
+// defect model_inventory.go's launchNameForPickerName and
+// launchModelEndpointKey describe, 2026-09-26 and round-21 audits).
+func deepSeekHarnessModelIDFor(model LaunchModel) string {
+	if model.Upstream != "" {
+		return model.Upstream
+	}
+	return model.Name
+}
+
 func deepSeekHarnessModelConfigs(primary string, models []LaunchModel) []any {
 	ordered := append([]LaunchModel(nil), models...)
 	if selected, ok := findLaunchModel(ordered, primary); ok {
@@ -361,13 +378,14 @@ func deepSeekHarnessModelConfigs(primary string, models []LaunchModel) []any {
 	configs := make([]any, 0, len(ordered))
 	seen := make(map[string]bool, len(ordered))
 	for _, item := range ordered {
-		if item.Name == "" || seen[item.Name] {
+		id := deepSeekHarnessModelIDFor(item)
+		if id == "" || seen[id] {
 			continue
 		}
-		seen[item.Name] = true
+		seen[id] = true
 		entry := map[string]any{
-			"id":    item.Name,
-			"name":  item.Name,
+			"id":    id,
+			"name":  id,
 			"input": []string{"text"},
 		}
 		if slices.Contains(item.Capabilities, model.CapabilityVision) {

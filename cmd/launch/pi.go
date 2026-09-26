@@ -739,12 +739,23 @@ func piEditDocuments(configPath, settingsPath string, models []LaunchModel) erro
 		// tenth round).
 		//
 		// A user who hand-configured this slot for their own endpoint is told,
-		// not silently rewritten.
-		// Only a slot THIS package wrote is repointed: piProviderAPI is the
-		// value it sets on creation, and an entry carrying anything else was
-		// configured by the user — their endpoint, their key, their choice (the
-		// case TestPiEdit pins).
-		if api, _ := ollama["api"].(string); api == piProviderAPI {
+		// not silently rewritten: leaving it alone still adds this launch's
+		// models to the slot's list, so a launch that cannot repoint says so.
+		//
+		// Only a slot THIS package wrote is repointed. piProviderAPI alone does
+		// NOT show that: "openai-completions" is Pi's OWN value for every
+		// OpenAI-compatible provider, so a slot the user configured for their
+		// own server carries it too — the api value alone repointed such a slot
+		// at oaica's endpoint and wrote oaica's credential over theirs. What the
+		// writer emits is the pair: this api value AND a base URL oaica writes
+		// (the daemon's /v1, or a configured remote's base). An endpoint that
+		// cannot be shown to be one of those is the user's — their endpoint,
+		// their key, their choice — so it is left exactly as they wrote it
+		// (2026-09-27 audit, round 21). TestPiEdit's "preserving ollama provider
+		// settings" case pins the same contract for a foreign api value.
+		slotAPI, _ := ollama["api"].(string)
+		slotBase, _ := ollama["baseUrl"].(string)
+		if slotAPI == piProviderAPI && piEndpointWasOurs(slotBase) {
 			wantBase, wantKey := piProviderBaseURL(models), piProviderKey(models)
 			if oldBase, _ := ollama["baseUrl"].(string); strings.TrimRight(oldBase, "/") != strings.TrimRight(wantBase, "/") {
 				fmt.Fprintf(noticeWriter(), "%s  Warning: repointing Pi's ollama provider from %s to %s — Pi serves every oaica-registered model from this one provider, and this launch's models resolve there%s\n",
@@ -752,6 +763,12 @@ func piEditDocuments(configPath, settingsPath string, models []LaunchModel) erro
 			}
 			ollama["baseUrl"] = wantBase
 			ollama["apiKey"] = wantKey
+		} else if slotAPI == piProviderAPI {
+			// Not ours to move, but written in this package's own shape: name
+			// the endpoint left in place, so a launch whose models landed in a
+			// provider pointed somewhere else is visible rather than silent.
+			fmt.Fprintf(noticeWriter(), "%s  Warning: Pi's ollama provider is set to %s, which this launch did not configure — leaving your endpoint and key as they are, and adding this launch's models to that provider%s\n",
+				ansiYellow, piPrintableBaseURL(slotBase), ansiReset)
 		}
 	}
 
@@ -972,6 +989,44 @@ const piProviderAPI = "openai-completions"
 // redactBaseURL), because a provider base URL is a shape this project allows to
 // carry a credential in its userinfo and this line goes to the terminal.
 func piPrintableBaseURL(baseURL string) string { return redactBaseURL(baseURL) }
+
+// piEndpointWasOurs reports whether a provider base URL is one this package
+// writes into Pi's single provider slot: the daemon's /v1, the daemon's
+// documented default addresses, or a configured remote's base. It is the
+// endpoint half of the ownership test — see Pi.Edit for why the api value
+// cannot carry that meaning on its own.
+//
+// An empty base URL is NOT ours: this package always writes a base URL, so an
+// empty one means the user removed it, and a slot that cannot be shown to be
+// ours is preserved rather than repointed. A store that cannot be read falls
+// back to the built-in remotes, the rule findUserRemoteForModel uses — a
+// corrupt store must not take a remote's own endpoint away from it.
+func piEndpointWasOurs(baseURL string) bool {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return false
+	}
+	if base == strings.TrimRight(piDaemonProviderBaseURL(), "/") {
+		return true
+	}
+	// The daemon's default address: an earlier oaica wrote it even when
+	// OLLAMA_HOST has since moved this machine's daemon elsewhere.
+	for _, host := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
+		if base == host || base == host+"/v1" {
+			return true
+		}
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == base || strings.TrimRight(remoteBaseURL(r), "/") == base {
+			return true
+		}
+	}
+	return false
+}
 
 // piProviderBaseURL is the base URL Pi's single provider should use: the first
 // user-remote model's endpoint, otherwise the daemon's /v1.
