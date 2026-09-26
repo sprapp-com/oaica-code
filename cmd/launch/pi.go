@@ -714,10 +714,16 @@ func piEditDocuments(configPath, settingsPath string, models []LaunchModel) erro
 		existingModels = make([]any, 0)
 	}
 
-	// Build set of selected models to track which need to be added
+	// Build set of selected models to track which need to be added. Keyed by
+	// the id these entries are STORED under (piModelIDFor — the bare upstream
+	// id for a user-remote model), not by the picker name: an entry on disk
+	// carries the stored id, so a set keyed on picker names never matched a
+	// remote model's entry, and every launch dropped and rebuilt it from
+	// scratch — losing every member oaica does not model (2026-09-26 audit,
+	// thirteenth round).
 	selectedSet := make(map[string]bool, len(models))
 	for _, m := range models {
-		selectedSet[m.Name] = true
+		selectedSet[piModelIDFor(m)] = true
 	}
 
 	// Build new models list:
@@ -749,7 +755,8 @@ func piEditDocuments(configPath, settingsPath string, models []LaunchModel) erro
 
 	// Add newly selected models that weren't already in the list
 	for _, model := range models {
-		if selectedSet[model.Name] {
+		if id := piModelIDFor(model); selectedSet[id] {
+			selectedSet[id] = false
 			newModels = append(newModels, createConfig(model))
 		}
 	}
@@ -792,11 +799,21 @@ func (p *Pi) Models() []string {
 	providers, _ := config["providers"].(map[string]any)
 	ollama, _ := providers["ollama"].(map[string]any)
 	models, _ := ollama["models"].([]any)
+	baseURL, _ := ollama["baseUrl"].(string)
 
+	// Report the picker names — the names the launcher saves and compares the
+	// live config against — not the stored ids verbatim (piPickerNameFor).
 	var result []string
 	for _, m := range models {
 		if modelObj, ok := m.(map[string]any); ok {
 			if id, ok := modelObj["id"].(string); ok {
+				// Only entries this package wrote are translated: an entry
+				// without the _launch marker is Pi's or the user's, and
+				// prefacing its id with a remote name would report a model
+				// nothing saved.
+				if isPiOllamaModel(modelObj) {
+					id = piPickerNameFor(id, baseURL)
+				}
 				result = append(result, id)
 			}
 		}
@@ -804,6 +821,50 @@ func (p *Pi) Models() []string {
 	slices.Sort(result)
 	return result
 }
+
+// piPickerNameFor is the inverse of piModelIDFor for an entry on disk: the
+// picker name that entry was written for.
+//
+// Pi keeps ONE provider with a single base URL (piProviderBaseURL), so the
+// provider's base URL says which endpoint the entries came from: on a
+// user-remote endpoint a stored id is the bare upstream id (piModelIDFor wrote
+// it), and on the daemon's own /v1 it is already the picker name. Reporting a
+// bare id verbatim answers with a name the launcher never saved, so
+// liveConfigMatches is false on every run and each launch rewrites the config
+// it just read (2026-09-26 audit, thirteenth round — the same fix droid and
+// hermes carry).
+func piPickerNameFor(id, providerBaseURL string) string {
+	if id == "" || providerBaseURL == "" {
+		return id
+	}
+	want := strings.TrimRight(providerBaseURL, "/")
+	if want == strings.TrimRight(piDaemonProviderBaseURL(), "/") {
+		// The daemon's endpoint: every entry here is a picker name already.
+		return id
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		// Same rule findUserRemoteForModel uses: a corrupt store must not take
+		// the built-in providers with it.
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") != want {
+			continue
+		}
+		// Only a name that resolves back to the same model is that model's
+		// picker name; anything else is left as it was found.
+		candidate := r.Name + "/" + id
+		if ep, ok := resolveRemoteEndpoint(candidate); ok && ep.UpstreamModel == id {
+			return candidate
+		}
+	}
+	return id
+}
+
+// piDaemonProviderBaseURL is the base URL piProviderBaseURL falls back to: the
+// local daemon's OpenAI-compatible endpoint.
+func piDaemonProviderBaseURL() string { return envconfig.Host().String() + "/v1" }
 
 // isPiOllamaModel reports whether a model config entry is managed by oaica launch
 func isPiOllamaModel(cfg map[string]any) bool {
