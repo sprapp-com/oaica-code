@@ -293,6 +293,13 @@ func opencodeAuthReadDocument(path string) (map[string]map[string]any, error) {
 		}
 		return nil, err
 	}
+	// An EMPTY file is not a corrupt one: Decode reports io.EOF for it, which
+	// read as "not valid JSON" and refused `oaica signin opencode:<provider>`
+	// outright, while every other store in this package treats emptiness as
+	// "nothing to preserve" (2026-09-27 audit, round 22).
+	if len(bytes.TrimSpace(data)) == 0 {
+		return map[string]map[string]any{}, nil
+	}
 	doc := map[string]map[string]any{}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()

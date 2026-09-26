@@ -49,6 +49,9 @@ func (c *Copilot) Run(model string, _ []LaunchModel, args []string) error {
 	if err := gateOpenAITools(model, forceTools); err != nil {
 		return err
 	}
+	if err := refuseManagedModelFlag("copilot", args); err != nil {
+		return err
+	}
 
 	copilotPath, err := c.findPath()
 	if err != nil {
@@ -68,7 +71,7 @@ func (c *Copilot) Run(model string, _ []LaunchModel, args []string) error {
 // copilotBaseURLFor is the provider base URL Copilot should use: the remote's
 // direct base for a user-remote model, otherwise the daemon's /v1.
 func copilotBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return envconfig.ConnectableHost().String() + "/v1"
@@ -77,16 +80,13 @@ func copilotBaseURLFor(model string) string {
 // copilotModelIDFor is the model id Copilot should use: the bare upstream id
 // for a user-remote model, otherwise the picker name.
 func copilotModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // copilotKeyFor is the provider API key: the remote's token for a user-remote
 // model, otherwise empty (the daemon is unauthenticated).
 func copilotKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return ""
@@ -96,7 +96,7 @@ func copilotKeyFor(model string) string {
 // remotes only speak /v1/chat/completions, not /v1/responses), "responses" for
 // the daemon — unchanged from before.
 func copilotWireFor(model string) string {
-	if _, ok := resolveRemoteEndpoint(model); ok {
+	if _, ok := resolveLaunchTargetEndpoint(model); ok {
 		return "chat"
 	}
 	return "responses"

@@ -108,7 +108,7 @@ func (o *OMP) args(model string, extra []string) []string {
 }
 
 func ompModelName(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.UpstreamModel
 	}
 	if strings.HasPrefix(model, "ollama/") {
@@ -366,7 +366,7 @@ func writeOMPModelsConfigLocked(path, primary string, models []LaunchModel) erro
 		// wrote last time and preserves its unmodeled fields instead of
 		// rebuilding it from scratch and leaving the old copy behind as a
 		// duplicate (2026-09-26 audit, twelfth round).
-		id := ompModelID(model.Name)
+		id := ompLaunchModelID(model)
 		if seen[id] {
 			// Two picker names resolving to one upstream id are ONE row in
 			// this file, which is keyed by id; keep the first.
@@ -461,7 +461,7 @@ func ensureOMPProvider(cfg map[string]any, model string) map[string]any {
 		providers[ompProviderName] = provider
 	}
 
-	ep, isRemote := resolveRemoteEndpoint(model)
+	ep, isRemote := resolveLaunchTargetEndpoint(model)
 	if !isRemote {
 		// The daemon: omp talks to 127.0.0.1, which is genuinely
 		// unauthenticated, and it serves the Responses API.
@@ -623,8 +623,22 @@ func ompModelID(modelName string) string {
 	return modelName
 }
 
+// ompLaunchModelID is ompModelID for a picker ROW, whose Name may be a
+// display-only id: an ollama-cloud catalogue row arrives as the bare "gpt-oss"
+// with the id the daemon knows in LaunchModel.Upstream ("gpt-oss:cloud"). The
+// name alone named the LOCAL model of that name — OMP offers a multi-GB pull,
+// or silently runs a different model — while the Run half (ompModelName) asked
+// for "ollama/gpt-oss:cloud", so file and run disagreed about the launch.
+// Same rule as deepSeekHarnessModelIDFor (2026-09-27 audit, round 22).
+func ompLaunchModelID(model LaunchModel) string {
+	if model.Upstream != "" {
+		return model.Upstream
+	}
+	return ompModelID(model.Name)
+}
+
 func ompModelConfig(modelInfo LaunchModel) map[string]any {
-	id := ompModelID(modelInfo.Name)
+	id := ompLaunchModelID(modelInfo)
 	entry := map[string]any{
 		"id":   id,
 		"name": id,

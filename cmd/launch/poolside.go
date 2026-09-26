@@ -33,25 +33,21 @@ func (p *Poolside) args(model string, extra []string) []string {
 // poolsideBaseURLFor is the standalone base URL Poolside should use: the
 // remote's direct base for a user-remote model, otherwise the daemon's /v1.
 func poolsideBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return envconfig.ConnectableHost().String() + "/v1"
 }
 
-// poolsideModelIDFor is the model id Poolside should use: the bare upstream id
-// for a user-remote model, otherwise the picker name.
+// poolsideModelIDFor is the model id Poolside should use: see childModelIDFor.
 func poolsideModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // poolsideKeyFor is the API key Poolside should use: the remote's token for a
 // user-remote model, "ollama" for the daemon.
 func poolsideKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return "ollama"
@@ -60,6 +56,10 @@ func poolsideKeyFor(model string) string {
 func (p *Poolside) Run(model string, _ []LaunchModel, args []string) error {
 	forceTools, args := extractForceTools(args)
 	if err := gateOpenAITools(model, forceTools); err != nil {
+		return err
+	}
+
+	if err := refuseManagedModelFlag("pool", args); err != nil {
 		return err
 	}
 

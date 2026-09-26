@@ -1009,8 +1009,14 @@ func piEndpointWasOurs(baseURL string) bool {
 	if base == strings.TrimRight(piDaemonProviderBaseURL(), "/") {
 		return true
 	}
-	// The daemon's default address: an earlier oaica wrote it even when
-	// OLLAMA_HOST has since moved this machine's daemon elsewhere.
+	// The daemon's DOCUMENTED DEFAULT address: an earlier oaica wrote it even
+	// when OLLAMA_HOST has since moved this machine's daemon elsewhere. That
+	// default is the whole set this predicate can recognise — a value an earlier
+	// oaica wrote under a custom OLLAMA_HOST is that host's address, which this
+	// launch cannot derive from anything it holds, and taking a LAN address as
+	// ours on a suffix alone would rewrite the user's own provider on that host.
+	// Such a value is treated as the user's: the warning below says so and
+	// leaves the endpoint and key alone (2026-09-27 audit, round 22).
 	for _, host := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
 		if base == host || base == host+"/v1" {
 			return true

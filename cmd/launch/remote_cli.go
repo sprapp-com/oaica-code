@@ -456,7 +456,11 @@ func savePromptedRemoteKey(name, key string) error {
 		return err
 	}
 	if missing {
-		return fmt.Errorf("remote %q is not in %s — cannot save its API key", name, path)
+		// A built-in provider has no row in that file, so a key typed at the
+		// prompt had nowhere to go and the launch aborted after the user typed
+		// it. Name the path that does work, the same one key() reads
+		// (auth_store's storedAuthKey) (2026-09-27 audit, round 22).
+		return fmt.Errorf("remote %q is not in %s — cannot save its API key; a built-in provider takes its key from `oaica auth login %s`", name, path, name)
 	}
 	return nil
 }

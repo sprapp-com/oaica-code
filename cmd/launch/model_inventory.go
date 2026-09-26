@@ -913,11 +913,21 @@ func launchModelEndpointKey(model LaunchModel) string {
 	// serves — the ids collide by design, the shipped catalogues and ollama.com
 	// use the same names — and the refusals then rejected the cloud model with a
 	// reason that was false for it (2026-09-27 audit, round 21).
-	if isCloudModelName(model.Upstream) || (model.Upstream == "" && isCloudModelName(model.Name)) {
+	if isCloudModelName(model.Upstream) {
 		return "daemon"
 	}
+	// The remote arm runs before the name-shaped cloud check, because the ROUTER
+	// resolves user remotes first (resolveLaunchEndpoint): a remote's own model
+	// named "<id>:cloud" — an ollama box with a cloud model pulled serves exactly
+	// those ids — was keyed to the daemon, so the refusals stayed silent and the
+	// store was written with a namespaced name the daemon does not serve. Only
+	// the Upstream arm above outranks the remote, because it is the picker row's
+	// identity rather than a spelling (2026-09-27 audit, round 22).
 	if ep, ok := resolveRemoteEndpoint(model.Name); ok {
 		return "remote:" + strings.TrimRight(ep.BaseURL, "/")
+	}
+	if isCloudModelName(model.Name) {
+		return "daemon"
 	}
 	return "daemon"
 }

@@ -131,7 +131,15 @@ func findKimiBinary() (string, error) {
 		return path, nil
 	}
 
-	home, _ := os.UserHomeDir()
+	// The error is not optional: with HOME unset (cron, systemd, env -i) the
+	// home-relative candidates below collapse to CWD-relative paths, so a file
+	// planted beside the working directory would be executed with
+	// KIMI_MODEL_API_KEY — this launch's remote token — in its environment.
+	// copilot's findPath propagates the same error (2026-09-27 audit, round 22).
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not determine the home directory to look for kimi in: %w", err)
+	}
 
 	var candidates []string
 	switch kimiGOOS {
@@ -216,37 +224,31 @@ func validateKimiPassthroughArgs(args []string) error {
 			return fmt.Errorf("conflicting extra argument %q: oaica launch kimi manages --config", arg)
 		case arg == "--config-file", strings.HasPrefix(arg, "--config-file="):
 			return fmt.Errorf("conflicting extra argument %q: oaica launch kimi manages --config-file", arg)
-		case arg == "--model", strings.HasPrefix(arg, "--model="):
-			return fmt.Errorf("conflicting extra argument %q: oaica launch kimi manages --model", arg)
-		case arg == "-m", strings.HasPrefix(arg, "-m="):
-			return fmt.Errorf("conflicting extra argument %q: oaica launch kimi manages -m/--model", arg)
 		}
 	}
-	return nil
+	// Shared with copilot and poolside, which forward the trailing arguments to
+	// their own CLI: the model flag is oaica's (see refuseManagedModelFlag).
+	return refuseManagedModelFlag("kimi", args)
 }
 
 // kimiBaseURLFor is the provider base URL Kimi should use: the remote's direct
 // base for a user-remote model, otherwise the daemon's /v1.
 func kimiBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return envconfig.ConnectableHost().String() + "/v1"
 }
 
-// kimiModelIDFor is the model id Kimi should use: the bare upstream id for a
-// user-remote model, otherwise the picker name.
+// kimiModelIDFor is the model id Kimi should use: see childModelIDFor.
 func kimiModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // kimiKeyFor is the provider API key: the remote's token for a user-remote
 // model, otherwise "ollama".
 func kimiKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return "ollama"

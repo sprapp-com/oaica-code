@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,5 +65,37 @@ func TestOpenclawKeepsModelRowsItDidNotWrite(t *testing.T) {
 	}
 	if !ids["llama3.2"] {
 		t.Errorf("the launched model is not in the provider's list: %v", ids)
+	}
+}
+
+// TestOpenclawKeepsARowWithNoID pins the second half of the same carry-over,
+// which the code contradicted (2026-09-27 audit, round 22): a row carrying no
+// id — openclaw's own display rows can be shaped that way — cannot be matched
+// to a launched model, and the comment says it is "kept whole". It was dropped
+// by the same test that skips an id this launch wrote.
+func TestOpenclawKeepsARowWithNoID(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	dir := filepath.Join(home, ".openclaw")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "openclaw.json")
+	seed := `{"models":{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:11434","apiKey":"ollama-local","api":"ollama","models":[{"name":"My Local Model","contextWindow":32768}]}}}}`
+	if err := os.WriteFile(configPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := openclawEditConfig(configPath, filepath.Join(home, ".clawdbot", "clawdbot.json"), []LaunchModel{fallbackLaunchModel("llama3.2")}); err != nil {
+		t.Fatalf("openclawEditConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "My Local Model") {
+		t.Errorf("the id-less row was dropped although the carry-over promises to keep it whole:\n%s", data)
 	}
 }

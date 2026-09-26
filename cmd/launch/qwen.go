@@ -438,7 +438,7 @@ func applyQwenOllamaConfig(cfg map[string]any, model string) {
 // launch outright.
 func applyQwenOllamaKey(envCfg map[string]any, model string) {
 	key := qwenKeyFor(model)
-	if _, isRemote := resolveRemoteEndpoint(model); isRemote {
+	if _, isRemote := resolveLaunchTargetEndpoint(model); isRemote {
 		if strings.TrimSpace(key) == "" {
 			if !qwenEndpointIsLoopback(model) {
 				envCfg[qwenOllamaEnvKey] = ""
@@ -458,7 +458,7 @@ func applyQwenOllamaKey(envCfg map[string]any, model string) {
 // reached on this machine — where a value left in OLLAMA_API_KEY cannot leave
 // the box. An endpoint that does not parse as a URL is not loopback.
 func qwenEndpointIsLoopback(model string) bool {
-	ep, ok := resolveRemoteEndpoint(model)
+	ep, ok := resolveLaunchTargetEndpoint(model)
 	if !ok {
 		return false
 	}
@@ -521,7 +521,36 @@ func qwenIsOurProvider(value any, targetBaseURL string) bool {
 	}
 	baseURL, _ := provider["baseUrl"].(string)
 	baseURL = strings.TrimRight(baseURL, "/")
-	return baseURL == strings.TrimRight(targetBaseURL, "/") || baseURL == qwenBaseURL()
+	// The suffix and the env key above are the writer's own marker, so an entry
+	// carrying both that names ANY configured remote is one a previous launch
+	// wrote — for that remote. Matching only the base URL being configured now
+	// (or the daemon's) left one dead entry per distinct remote in the file, all
+	// with envKey OLLAMA_API_KEY, and the next launch sets that variable to the
+	// new endpoint's key: the stale entry then hands that key to the host it
+	// names on any later qwen run (2026-09-27 audit, round 22).
+	return baseURL == strings.TrimRight(targetBaseURL, "/") || baseURL == qwenBaseURL() || qwenBaseURLIsAConfiguredRemote(baseURL)
+}
+
+// qwenBaseURLIsAConfiguredRemote reports whether baseURL is a configured
+// remote's endpoint — a value only qwenProvider (with the suffix and env key
+// checked by the caller) writes.
+func qwenBaseURLIsAConfiguredRemote(baseURL string) bool {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return false
+	}
+	remotes, err := loadUserRemotes()
+	if err != nil {
+		// The rule findUserRemoteForModel uses: a corrupt store must not take
+		// the built-in providers with it.
+		remotes = builtinRemotes()
+	}
+	for _, r := range remotes {
+		if strings.TrimRight(r.openAIBase(), "/") == base || strings.TrimRight(remoteBaseURL(r), "/") == base {
+			return true
+		}
+	}
+	return false
 }
 
 func qwenProviderList(value any) []any {
@@ -539,9 +568,23 @@ func qwenProviderList(value any) []any {
 	}
 }
 
+// qwenIsOllamaProvider reports whether value is the entry oaica's own provider
+// list would collide with: ours by marker (" (Ollama)" name plus the env key)
+// and naming the daemon.
+//
+// The suffix is required, as the merge rule's doc says and as this did not
+// check: envKey plus the daemon's base URL alone also describes a provider the
+// USER wrote by hand for their own daemon, and an unrelated launch deleted it.
+// Every entry this package has ever written carries the suffix (qwenProvider,
+// and the original writer in 4e807fded), so requiring it loses no oaica entry
+// (2026-09-27 audit, round 22).
 func qwenIsOllamaProvider(value any) bool {
 	provider, ok := value.(map[string]any)
 	if !ok {
+		return false
+	}
+	name, _ := provider["name"].(string)
+	if !strings.HasSuffix(name, qwenProviderNameSuffix) {
 		return false
 	}
 	envKey, _ := provider["envKey"].(string)
@@ -605,17 +648,34 @@ func qwenManagedBaseURL(cfg map[string]any) string {
 // qwenConfiguredRemoteForBase returns the configured remote a Qwen endpoint
 // belongs to, if any. Reads the remote store only — no network — so it is safe
 // on every picker-state read.
+//
+// Exactly one remote must answer for the base URL: two accounts on one host are
+// indistinguishable from a base URL alone, and returning the first one in the
+// file named the other account — its picker name was written back as the model
+// the launch had configured. Ambiguity is refused elsewhere in this package
+// (resolveBareRemoteModel); here the caller is a read-back, so the answer is
+// "no configured remote", which leaves the name as the config states it
+// (2026-09-27 audit, round 22).
 func qwenConfiguredRemoteForBase(baseURL string) (userRemote, bool) {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return userRemote{}, false
+	}
 	remotes, err := loadUserRemotes()
 	if err != nil {
 		return userRemote{}, false
 	}
+	var found userRemote
+	matches := 0
 	for _, r := range remotes {
-		if strings.TrimRight(r.openAIBase(), "/") == strings.TrimRight(baseURL, "/") {
-			return r, true
+		if strings.TrimRight(r.openAIBase(), "/") == base {
+			found, matches = r, matches+1
 		}
 	}
-	return userRemote{}, false
+	if matches != 1 {
+		return userRemote{}, false
+	}
+	return found, true
 }
 
 // qwenRemotePickerName maps a configured Qwen endpoint plus the upstream id
@@ -713,7 +773,7 @@ func qwenBaseURL() string {
 // qwenBaseURLFor is the provider base URL Qwen should use: the remote's direct
 // base for a user-remote model, otherwise the daemon's /v1.
 func qwenBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return qwenBaseURL()
@@ -722,7 +782,7 @@ func qwenBaseURLFor(model string) string {
 // qwenModelIDFor is the model id Qwen should use: the bare upstream id for a
 // user-remote model, otherwise the picker name.
 func qwenModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.UpstreamModel
 	}
 	return model
@@ -731,7 +791,7 @@ func qwenModelIDFor(model string) string {
 // qwenKeyFor is the API key Qwen should use: the remote's token for a
 // user-remote model, "ollama" for the daemon.
 func qwenKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return "ollama"

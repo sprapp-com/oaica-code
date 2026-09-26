@@ -414,7 +414,13 @@ func prepareManagedSingleIntegration(name string, managed ManagedSingleModel, mo
 	// for a remote that already has one, so the launch path's own hook in
 	// launchAfterConfiguration stays a backstop for the integrations that write
 	// nothing and configure inside Run.
-	if err := rejectServedModels(name, models); err != nil {
+	// The rows this store can actually hold, not the whole menu: models is the
+	// launch target PLUS every row the picker offers (managedSingleConfigureModels),
+	// so refusing on the raw list meant one `oaica serve` anywhere in the menu
+	// refused an ordinary daemon-model launch — what singleEndpointModels exists
+	// to prevent. A serve row the user SELECTED survives the filter (its key is
+	// its own name) and is still refused (2026-09-27 audit, round 22).
+	if err := rejectServedModels(name, singleEndpointModels(model, models)); err != nil {
 		return err
 	}
 	if err := remoteAPIKeyPrompt(model); err != nil {

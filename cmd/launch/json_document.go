@@ -24,6 +24,15 @@ import (
 // package cannot represent must survive the round trip), and never returns a
 // nil map.
 func decodeJSONObject(data []byte) (map[string]any, error) {
+	// An EMPTY document is not a corrupt one: `Decode` reports io.EOF for a
+	// zero-byte (or whitespace-only) store, which read as "not valid JSON" and
+	// failed the launch, while storeDocumentMergeValue and every other writer
+	// here treat emptiness as "nothing to preserve". No oaica writer produces
+	// one (writes are atomic), so the trigger is another tool or an interrupted
+	// editor (2026-09-27 audit, round 22).
+	if len(bytes.TrimSpace(data)) == 0 {
+		return map[string]any{}, nil
+	}
 	doc := map[string]any{}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()

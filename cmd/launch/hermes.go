@@ -727,7 +727,7 @@ func hermesBaseURL() string {
 // hermesBaseURLFor is the provider endpoint Hermes should talk to: the remote's
 // direct base for a user-remote model, otherwise the daemon's /v1.
 func hermesBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return hermesBaseURL()
@@ -736,7 +736,7 @@ func hermesBaseURLFor(model string) string {
 // hermesModelIDFor is the default model Hermes should select: the bare upstream
 // id for a user-remote model, otherwise the picker name.
 func hermesModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.UpstreamModel
 	}
 	return model
@@ -745,7 +745,7 @@ func hermesModelIDFor(model string) string {
 // hermesKeyFor is the provider API key: the remote's token for a user-remote
 // model, otherwise the placeholder Hermes uses for the daemon.
 func hermesKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return hermesPlaceholderKey

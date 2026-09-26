@@ -40,7 +40,7 @@ func (c *Openclaw) Run(model string, _ []LaunchModel, args []string) error {
 	// OpenClaw drives the Ollama native API (/api/chat) through the daemon,
 	// which the thin-client fork does not serve for user remotes — refuse early
 	// with a clear message instead of a confusing daemon 404.
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return openclawRemoteRefusal(model, ep.Name)
 	}
 
@@ -897,7 +897,10 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 	// one of them on an otherwise ordinary launch (2026-09-27 audit, round 21).
 	// openclawModelConfig always writes a "cost" object; an entry without one
 	// was not written by oaica, so it is carried over as it stands. An entry
-	// with no id cannot be matched to a launched model and is kept whole.
+	// with no id cannot be matched to a launched model and is kept whole — it
+	// used to be dropped by the same test that skips an id this launch wrote,
+	// which deleted rows the comment here promised to keep (2026-09-27 audit,
+	// round 22).
 	for _, raw := range existingModels {
 		entry, ok := raw.(map[string]any)
 		if !ok {
@@ -905,7 +908,11 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 			continue
 		}
 		id, _ := entry["id"].(string)
-		if id == "" || written[id] {
+		if id == "" {
+			newModels = append(newModels, entry)
+			continue
+		}
+		if written[id] {
 			continue
 		}
 		if _, ours := entry["cost"]; ours {

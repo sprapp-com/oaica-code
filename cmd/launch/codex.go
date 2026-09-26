@@ -450,18 +450,19 @@ func codexBaseURL() string {
 // codexModelIDFor is the model id codex should send: the bare upstream id for a
 // user-remote model (the remote knows it as that, not the namespaced picker
 // name), otherwise the picker name (local/cloud, sent to the daemon as-is).
+// codexModelIDFor is the model id codex should use: see childModelIDFor. Codex
+// carries the same raw-`--model` hole the other standalone CLIs had — the
+// catalog and the profile were written with the picker spelling, so codex asked
+// the daemon for a model it does not know (2026-09-27 audit, round 22).
 func codexModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
-		return ep.UpstreamModel
-	}
-	return model
+	return childModelIDFor(model)
 }
 
 // codexBaseURLFor is the provider base_url codex should use: the remote's
 // direct base (with a trailing "/") for a user-remote model, otherwise the
 // daemon's /v1 (byte-identical to codexBaseURL()).
 func codexBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/") + "/"
 	}
 	return codexBaseURL()
@@ -471,7 +472,7 @@ func codexBaseURLFor(model string) string {
 // remotes only speak /v1/chat/completions, not /v1/responses), "responses" for
 // the daemon — unchanged from before.
 func codexWireFor(model string) string {
-	if _, ok := resolveRemoteEndpoint(model); ok {
+	if _, ok := resolveLaunchTargetEndpoint(model); ok {
 		return "chat"
 	}
 	return "responses"
@@ -480,7 +481,7 @@ func codexWireFor(model string) string {
 // codexAPIKeyFor is the OPENAI_API_KEY codex should use: the remote's token for
 // a user-remote model, "ollama" for the daemon (unchanged).
 func codexAPIKeyFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.Token
 	}
 	return "ollama"

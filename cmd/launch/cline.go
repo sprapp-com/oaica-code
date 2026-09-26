@@ -187,7 +187,7 @@ func clineProviderBaseURL() string {
 // clineProviderBaseURLFor is the provider base URL Cline should use: the
 // remote's direct base for a user-remote model, otherwise the daemon's /v1.
 func clineProviderBaseURLFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return strings.TrimRight(ep.BaseURL, "/")
 	}
 	return clineProviderBaseURL()
@@ -196,7 +196,7 @@ func clineProviderBaseURLFor(model string) string {
 // clineModelIDFor is the model id Cline should use: the bare upstream id for a
 // user-remote model, otherwise the picker name.
 func clineModelIDFor(model string) string {
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		return ep.UpstreamModel
 	}
 	return model
@@ -220,6 +220,16 @@ func clineEndpointWasOurs(recorded string) bool {
 	}
 	if recorded == strings.TrimRight(clineProviderBaseURL(), "/") || recorded == strings.TrimRight(clineOllamaRootURL(), "/") {
 		return true
+	}
+	// The daemon's documented default address: a launch under a since-moved
+	// OLLAMA_HOST wrote it and left it recorded here, and a later launch from a
+	// shell without that export (an interactive .bashrc export is invisible to a
+	// non-interactive invocation) read its own value back as the user's and
+	// refused. Same rule as hermesEndpointWasOurs (2026-09-27 audit, round 22).
+	for _, base := range []string{"http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"} {
+		if recorded == base || recorded == base+"/v1" {
+			return true
+		}
 	}
 	remotes, err := loadUserRemotes()
 	if err != nil {
@@ -311,7 +321,7 @@ func writeClineProvidersConfig(configPath string, config map[string]any, model s
 	settings["provider"] = clineLaunchProvider
 	settings["model"] = modelID
 	settings["baseUrl"] = baseURL
-	if ep, ok := resolveRemoteEndpoint(model); ok {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
 		settings["apiKey"] = ep.Token
 	} else {
 		delete(settings, "apiKey")
