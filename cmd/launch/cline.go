@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -225,11 +224,14 @@ func readClineConfig(configPath string) (map[string]any, error) {
 		// makes every number in it a float64, so an integer larger than 2^53
 		// comes back as a different number and 1.0 comes back as 1 — a config
 		// changed by a command that only meant to add a key (2026-09-26 audit).
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.UseNumber()
-		if err := dec.Decode(&config); err != nil {
-			return nil, fmt.Errorf("failed to parse config: %w, at: %s", err, configPath)
+		// decodeJSONObject, not a bare Decode: a document that IS `null`
+		// decodes into a nil map, which the write below then panics on
+		// (2026-09-27 audit, round 19).
+		doc, derr := decodeJSONObject(data)
+		if derr != nil {
+			return nil, fmt.Errorf("failed to parse config: %w, at: %s", derr, configPath)
 		}
+		config = doc
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}

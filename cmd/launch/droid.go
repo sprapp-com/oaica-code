@@ -112,11 +112,14 @@ func writeDroidSettings(settingsPath string, models []LaunchModel) error {
 		// map[string]any makes every number in it a float64, so an integer
 		// above 2^53 comes back as a different number and 1.0 comes back as 1
 		// (2026-09-26 audit, tenth round).
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.UseNumber()
-		if err := dec.Decode(&settingsMap); err != nil {
-			return fmt.Errorf("failed to parse settings file: %w, at: %s", err, settingsPath)
+		// decodeJSONObject, not a bare Decode: a document that IS `null`
+		// decodes into a nil map, which the write below then panics on
+		// (2026-09-27 audit, round 19).
+		doc, derr := decodeJSONObject(data)
+		if derr != nil {
+			return fmt.Errorf("failed to parse settings file: %w, at: %s", derr, settingsPath)
 		}
+		settingsMap = doc
 		json.Unmarshal(data, &settings) // ignore error, zero values are fine
 	}
 

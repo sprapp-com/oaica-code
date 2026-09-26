@@ -1010,11 +1010,14 @@ func configureOllamaWebSearchLocked(configPath string) {
 	// integer larger than 2^53 came back with a different value, silently
 	// changed by a command that meant to touch one plugin entry
 	// (2026-09-26 audit).
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if dec.Decode(&config) != nil {
+	// decodeJSONObject, not a bare Decode: a document that IS `null` decodes
+	// into a nil map, and this function finishes by writing config["plugins"]
+	// and config["tools"] into it (2026-09-27 audit, round 19).
+	doc, derr := decodeJSONObject(data)
+	if derr != nil {
 		return
 	}
+	config = doc
 
 	stalePluginConfigured := false
 

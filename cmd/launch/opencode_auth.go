@@ -299,5 +299,11 @@ func opencodeAuthReadDocument(path string) (map[string]map[string]any, error) {
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica writes only the one provider entry it was asked for, so rewriting a file it cannot read would delete every other login in it", path, err)
 	}
+	if doc == nil {
+		// A document that IS `null` decodes into a nil map, and
+		// SaveOpencodeAPIKey writes doc[provider] into it (2026-09-27 audit,
+		// round 19).
+		doc = map[string]map[string]any{}
+	}
 	return doc, nil
 }

@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -601,10 +600,11 @@ func readPiJSONDocument(path string) (map[string]any, error) {
 		}
 		return nil, err
 	}
-	doc := map[string]any{}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&doc); err != nil {
+	// decodeJSONObject also covers the document that IS `null`: it decodes
+	// into a nil map, which every caller below writes into (2026-09-27 audit,
+	// round 19).
+	doc, err := decodeJSONObject(data)
+	if err != nil {
 		return nil, fmt.Errorf("refusing to update %s: it is not valid JSON (%v) — oaica models only part of that file, so rewriting what it cannot read would delete the rest of your configuration", path, err)
 	}
 	return doc, nil

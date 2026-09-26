@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -646,20 +645,17 @@ func (q *Qwen) readConfig() (map[string]any, error) {
 		return nil, err
 	}
 
-	cfg := map[string]any{}
-	// UseNumber: Configure writes this document back whole, and it is the
-	// user's file — qwen keeps its own keys in it. Decoding into
-	// map[string]any makes every number in it a float64, so an integer above
-	// 2^53 comes back as a different number and 1.0 comes back as 1 — a config
-	// changed by a launch that only meant to add a provider entry
-	// (2026-09-26 audit, tenth round).
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse qwen config: %w", err)
+	// decodeJSONObject, not a bare Decode: Configure writes this document back
+	// whole and qwen keeps its own keys in it, so numbers have to survive the
+	// round trip as json.Number (2026-09-26 audit, tenth round) — and a
+	// document that IS `null` decodes into a nil map, which Configure then
+	// writes into (2026-09-27 audit, round 19).
+	doc, derr := decodeJSONObject(data)
+	if derr != nil {
+		return nil, fmt.Errorf("parse qwen config: %w", derr)
 	}
 
-	return cfg, nil
+	return doc, nil
 }
 
 func qwenBaseURL() string {
