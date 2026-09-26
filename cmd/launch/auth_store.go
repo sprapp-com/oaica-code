@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -182,12 +183,37 @@ func updateAuthStore(warn io.Writer, mutate func(*authStoreFile) error) error {
 	})
 }
 
+// quarantineStamp is the timestamp in a quarantined store's name. A seam so a
+// test can pin it and exercise two quarantines landing on the same name — the
+// case that used to destroy the first one.
+var quarantineStamp = func() string { return time.Now().UTC().Format("20060102-150405") }
+
 // quarantineAuthStore moves an unreadable store aside and returns where it
 // went. The name carries the time, so two runs cannot overwrite each other's
 // evidence: the file may hold credentials the user paid for, and the point is
 // that it is still there afterwards.
+//
+// The timestamp is only to the second, and os.Rename REPLACES an existing
+// destination, so the name alone is not the guarantee — two quarantines inside
+// one second (a provisioning script writing the store twice, a repair that
+// corrupts it again immediately) left one file and destroyed the credentials in
+// the other, exactly what the notice above it promises did not happen. The
+// destination is therefore claimed by finding a free name first. Only caller is
+// updateAuthStore, which holds the store's cross-process lock, so no other
+// oaica can be claiming a name in this directory at the same time.
 func quarantineAuthStore(path string) (string, error) {
-	dest := fmt.Sprintf("%s.unreadable-%s", path, time.Now().UTC().Format("20060102-150405"))
+	base := fmt.Sprintf("%s.unreadable-%s", path, quarantineStamp())
+	dest := base
+	for n := 2; ; n++ {
+		_, err := os.Lstat(dest)
+		if errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		dest = fmt.Sprintf("%s-%d", base, n)
+	}
 	if err := os.Rename(path, dest); err != nil {
 		return "", err
 	}
