@@ -41,6 +41,7 @@ import (
 	"context"
 	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -137,7 +138,14 @@ func (p routePolicy) preferred() string {
 // enough (a "remote:" source can still be a LAN box), so this is decided on
 // the actual endpoint, same rule the gateway's large-context admission uses.
 func routeLocality(baseURL string) string {
-	if h := hostOf(baseURL); h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]" {
+	h := hostOf(baseURL)
+	if h == "localhost" {
+		return "local"
+	}
+	// By ADDRESS, not by string: 127.0.0.1, ::1 and their spelled-out forms
+	// (0:0:0:0:0:0:0:1) are all this machine, and only net.ParseIP knows that
+	// (2026-09-26 audit).
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
 		return "local"
 	}
 	return "remote"
@@ -153,6 +161,16 @@ func hostOf(baseURL string) string {
 	}
 	if i := strings.LastIndex(s, "@"); i >= 0 {
 		s = s[i+1:]
+	}
+	// A bracketed IPv6 literal: its colons are the ADDRESS, not a port
+	// separator, so cutting at the first ":" here returned "[" and made
+	// routeLocality call loopback remote (2026-09-26 audit). Return the
+	// address without its brackets, the form routeLocality also accepts.
+	if strings.HasPrefix(s, "[") {
+		if i := strings.Index(s, "]"); i >= 0 {
+			return s[1:i]
+		}
+		return s
 	}
 	if i := strings.Index(s, ":"); i >= 0 {
 		s = s[:i]
@@ -285,6 +303,7 @@ type routeEscalation struct {
 	mu             sync.Mutex
 	leg            string
 	fails          int
+	escalatedLeg   string
 	escalatedUntil atomic.Int64
 }
 
@@ -305,6 +324,7 @@ func (e *routeEscalation) recordFail(baseURL string) {
 	}
 	e.fails++
 	if e.fails >= autoEscalateAfterFails {
+		e.escalatedLeg = baseURL
 		e.escalatedUntil.Store(time.Now().Add(autoEscalateHoldFor).UnixNano())
 	}
 }
@@ -316,10 +336,30 @@ func (e *routeEscalation) recordOK(baseURL string) {
 		return
 	}
 	e.fails = 0
+	if e.escalatedLeg == baseURL {
+		// The leg we were escalating away from served a request: nothing left
+		// to escalate from.
+		e.escalatedLeg = ""
+		e.escalatedUntil.Store(0)
+	}
 }
 
 func (e *routeEscalation) escalated() bool {
-	return time.Now().UnixNano() < e.escalatedUntil.Load()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.escalatedLeg != "" && time.Now().UnixNano() < e.escalatedUntil.Load()
+}
+
+// escalatedFor reports whether this session is currently escalated AWAY FROM
+// baseURL. The leg matters: escalation exists to move a session off a leg that
+// is failing, and applying it to every tier of the session sent requests that
+// resolved to a healthy secondary onto the flapping primary — a request whose
+// own leg has never failed must be left where it resolved
+// (2026-09-26 audit).
+func (e *routeEscalation) escalatedFor(baseURL string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.escalatedLeg != "" && e.escalatedLeg == baseURL && time.Now().UnixNano() < e.escalatedUntil.Load()
 }
 
 // routeEscalations maps a SessionID to its escalation state, keyed by
@@ -374,6 +414,18 @@ func (re *routeEscalations) escalated(sessionID string) bool {
 	e := re.m[sessionID]
 	re.mu.Unlock()
 	return e != nil && e.escalated()
+}
+
+// escalatedFor reports whether this session is escalated away from baseURL —
+// the only form of escalation the router acts on.
+func (re *routeEscalations) escalatedFor(sessionID, baseURL string) bool {
+	if re == nil {
+		return false
+	}
+	re.mu.Lock()
+	e := re.m[sessionID]
+	re.mu.Unlock()
+	return e != nil && e.escalatedFor(baseURL)
 }
 
 // escalationTarget picks the escalated-to leg: among the fallbacks plus the
@@ -504,7 +556,7 @@ func (t proxyRouteTable) resolveRoute(requested string) (proxyRoute, string, boo
 	// leg immediately (the breaker only speaks up at 3, and only for its own
 	// per-leg signal). Degrades to the normal path when no secondary
 	// qualifies.
-	if t.Policy == RouteAuto && t.escalations.escalated(t.SessionID) {
+	if t.Policy == RouteAuto && t.escalations.escalatedFor(t.SessionID, base.BaseURL) {
 		if r, ok := t.escalationTarget(base); ok {
 			return r, r.UpstreamModel, true
 		}

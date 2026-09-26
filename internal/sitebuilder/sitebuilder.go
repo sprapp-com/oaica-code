@@ -528,6 +528,16 @@ func fragmentFileName(id string) (string, error) {
 // a torn fragment read back as an empty section that the next Save then
 // rewrote as empty — content lost with no error (2026-09-26 audit, fourth
 // round).
+//
+// The rename REPLACES a symlinked destination rather than writing through it,
+// which is deliberate and is the opposite of the write-through policy the
+// store writers in cmd/internal/fileutil follow — those write files the user
+// owns and may have linked into a git-managed directory. A site directory is
+// not that: it can arrive from a backup, a clone or a download, and every
+// other path here treats a symlink inside it as hostile (checkStateDir refuses
+// a symlinked state dir, Export skips symlinks). Writing through one would let
+// a site directory name any path on the machine and have `oaica site edit`
+// update it. TestSaveWritesThroughARename pins this.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")

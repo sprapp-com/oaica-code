@@ -28,6 +28,11 @@ import (
 
 const siteDefaultModel = "kat-awq"
 
+// maxChatResponseBytes bounds the chat response body. The endpoint is
+// whatever OAICA_HOST names, and a response with no end would otherwise be
+// read into memory until the machine gave out (2026-09-26 audit).
+const maxChatResponseBytes = 16 << 20
+
 // routerLLM sends sitebuilder requests to the OAICA router (or OAICA_HOST).
 type routerLLM struct {
 	model string
@@ -75,10 +80,15 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 			}
 			continue
 		}
-		raw, err := io.ReadAll(resp.Body)
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxChatResponseBytes+1))
 		resp.Body.Close()
 		if err != nil {
 			return "", err
+		}
+		if len(raw) > maxChatResponseBytes {
+			// Named explicitly: letting the cap truncate would turn this into
+			// a JSON parse error that says nothing about why.
+			return "", fmt.Errorf("the response from %s is larger than %d bytes; refusing to read it", launch.RedactBaseURL(oaicaHost()), maxChatResponseBytes)
 		}
 		var out oaicaChatResponse
 		if err := json.Unmarshal(raw, &out); err != nil {

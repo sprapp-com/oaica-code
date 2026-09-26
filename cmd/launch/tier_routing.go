@@ -1360,69 +1360,10 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 		return fmt.Errorf("route_policy %q (remotes.json or --route-policy) is not one of local-first, remote-first, auto, local-only, remote-only, weighted", policyArg)
 	}
 	plan.Routes.Policy = policy
-	// --shard <model>:<weight>: resolve each named model to its BaseURL and
-	// stamp that Weight onto every existing route (Default/Fallbacks) on
-	// that base URL. Applied AFTER Fallbacks are built (buildTierPlan,
-	// above) so this only ever weights legs the plan already has — it
-	// cannot introduce a new leg on its own, matching --oversize's model
-	// (resolve, don't invent). An id that doesn't resolve to any existing
-	// leg is silently a no-op: --route-policy weighted's own doc already
-	// covers "fewer than 2 weighted legs" degrading to plain failover, so a
-	// typo'd --shard target just leaves you in that same safe state rather
-	// than failing the launch.
-	for shardModel, weight := range shardWeights {
-		ep, err := resolveLaunchEndpoint(shardModel)
-		if err != nil || ep.BaseURL == "" {
-			continue
-		}
-		if plan.Routes.Default.BaseURL == ep.BaseURL {
-			plan.Routes.Default.Weight = weight
-		}
-		for i := range plan.Routes.Fallbacks {
-			if plan.Routes.Fallbacks[i].BaseURL == ep.BaseURL {
-				plan.Routes.Fallbacks[i].Weight = weight
-			}
-		}
-	}
-	if oversizeModel != "" {
-		over, err := resolveLaunchEndpoint(oversizeModel)
-		if err != nil {
-			return fmt.Errorf("--oversize: %w", err)
-		}
-		// Two native-passthrough endpoints (both BaseURL=="") would compare
-		// equal here even when they're genuinely different tiers -- e.g.
-		// --oversize claude/fable alongside a native claude/fable PRIMARY
-		// is exactly the intended setup (2026-09-02: swap the OAICA
-		// sonnet/haiku leg to the native primary's own real 1M+ window when
-		// it overflows), not a same-backend error. Only reject the
-		// same-backend case for two ORDINARY (non-native) endpoints, where
-		// an identical BaseURL really does mean "no larger leg exists."
-		if over.Source != sourceNativeAnthropic && over.BaseURL == plan.Primary.BaseURL {
-			// redactBaseURL: resolveRemoteEndpoint deliberately keeps a
-			// Basic userinfo (user:password@) in the URL it returns, and
-			// this text goes out through cobra.CheckErr to stderr — a
-			// password printed for a routing mistake (2026-09-26 audit).
-			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, redactBaseURL(over.BaseURL))
-		}
-		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
-			return fmt.Errorf("--oversize: %w", err)
-		}
-		plan.Routes.Oversize = routeFor(over)
-		if oversizeSource := over.Source; oversizeSource != sourceNativeAnthropic {
-			// The oversize leg is a full route leg: it can also serve as the
-			// breaker fallback for the other legs (and it gets
-			// health-probed). A native leg has no BaseURL to probe/dedup on
-			// this way — nativeOversizeBreakerKey (route_policy.go) is its
-			// own separate breaker identity, checked directly in
-			// oversizeSwap instead.
-			urlSeen := map[string]bool{}
-			for _, f := range plan.Routes.Fallbacks {
-				urlSeen[f.BaseURL] = true
-			}
-			if !urlSeen[plan.Routes.Oversize.BaseURL] {
-				plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, plan.Routes.Oversize)
-			}
-		}
+	// The --oversize and --shard flags rewrite the plan's legs in place; see
+	// applyRouteOverrides for why the oversize leg is resolved FIRST.
+	if err := applyRouteOverrides(&plan, oversizeModel, shardWeights, forceTools); err != nil {
+		return err
 	}
 	// Real context window from the upstreams' /models metadata (claude.go's
 	// cloud-alias map covers :cloud; this covers user remotes and the
@@ -1553,6 +1494,90 @@ func (c *Claude) Run(model string, models []LaunchModel, args []string) error {
 	if err := cmd.Run(); err != nil {
 		claudeResumeHint(err, args)
 		return err
+	}
+	return nil
+}
+
+// applyRouteOverrides applies the two flags that rewrite the plan's legs in
+// place: --oversize (resolve the named model and install it as the plan's
+// oversize leg, appending it as a fallback too) and --shard (stamp a Weight
+// onto every leg on a named model's base URL).
+//
+// Order matters (2026-09-26 audit): --shard runs AFTER --oversize, because the
+// oversize leg is a leg of this launch. Stamping first meant `--shard X:7
+// --oversize X` found no route on X's base URL yet — X's leg was appended to
+// the fallbacks a few lines later — so the weight was silently dropped and the
+// leg kept whatever remotes.json's `weight` (0 by default) gave it, while
+// docs/CLAUDE_TIERS.md promises --shard "overrides weight for a single launch
+// without editing the file". The loop below stamps the Oversize leg as well as
+// Default and Fallbacks for the same reason.
+func applyRouteOverrides(plan *tierPlan, oversizeModel string, shardWeights map[string]int, forceTools bool) error {
+	if oversizeModel != "" {
+		over, err := resolveLaunchEndpoint(oversizeModel)
+		if err != nil {
+			return fmt.Errorf("--oversize: %w", err)
+		}
+		// Two native-passthrough endpoints (both BaseURL=="") would compare
+		// equal here even when they're genuinely different tiers -- e.g.
+		// --oversize claude/fable alongside a native claude/fable PRIMARY
+		// is exactly the intended setup (2026-09-02: swap the OAICA
+		// sonnet/haiku leg to the native primary's own real 1M+ window when
+		// it overflows), not a same-backend error. Only reject the
+		// same-backend case for two ORDINARY (non-native) endpoints, where
+		// an identical BaseURL really does mean "no larger leg exists."
+		if over.Source != sourceNativeAnthropic && over.BaseURL == plan.Primary.BaseURL {
+			// redactBaseURL: resolveRemoteEndpoint deliberately keeps a
+			// Basic userinfo (user:password@) in the URL it returns, and
+			// this text goes out through cobra.CheckErr to stderr — a
+			// password printed for a routing mistake (2026-09-26 audit).
+			return fmt.Errorf("--oversize %q resolves to the same backend as the primary (%s): the oversize leg exists to serve requests the primary cannot hold, so it must be a different base URL (a larger-context remote)", oversizeModel, redactBaseURL(over.BaseURL))
+		}
+		if err := gateRemoteToolsEndpoint(over.RemoteEndpoint, toolWireAnthropic, forceTools); err != nil {
+			return fmt.Errorf("--oversize: %w", err)
+		}
+		plan.Routes.Oversize = routeFor(over)
+		if oversizeSource := over.Source; oversizeSource != sourceNativeAnthropic {
+			// The oversize leg is a full route leg: it can also serve as the
+			// breaker fallback for the other legs (and it gets
+			// health-probed). A native leg has no BaseURL to probe/dedup on
+			// this way — nativeOversizeBreakerKey (route_policy.go) is its
+			// own separate breaker identity, checked directly in
+			// oversizeSwap instead.
+			urlSeen := map[string]bool{}
+			for _, f := range plan.Routes.Fallbacks {
+				urlSeen[f.BaseURL] = true
+			}
+			if !urlSeen[plan.Routes.Oversize.BaseURL] {
+				plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, plan.Routes.Oversize)
+			}
+		}
+	}
+	// --shard <model>:<weight>: resolve each named model to its BaseURL and
+	// stamp that Weight onto every existing route (Default/Fallbacks/Oversize)
+	// on that base URL. Applied AFTER Fallbacks are built (buildTierPlan) and
+	// after the oversize block above, so this only ever weights legs the plan
+	// already has — it cannot introduce a new leg on its own, matching
+	// --oversize's model (resolve, don't invent). An id that doesn't resolve to
+	// any existing leg is silently a no-op: --route-policy weighted's own doc
+	// already covers "fewer than 2 weighted legs" degrading to plain failover,
+	// so a typo'd --shard target just leaves you in that same safe state rather
+	// than failing the launch.
+	for shardModel, weight := range shardWeights {
+		ep, err := resolveLaunchEndpoint(shardModel)
+		if err != nil || ep.BaseURL == "" {
+			continue
+		}
+		if plan.Routes.Default.BaseURL == ep.BaseURL {
+			plan.Routes.Default.Weight = weight
+		}
+		for i := range plan.Routes.Fallbacks {
+			if plan.Routes.Fallbacks[i].BaseURL == ep.BaseURL {
+				plan.Routes.Fallbacks[i].Weight = weight
+			}
+		}
+		if plan.Routes.Oversize.BaseURL == ep.BaseURL {
+			plan.Routes.Oversize.Weight = weight
+		}
 	}
 	return nil
 }

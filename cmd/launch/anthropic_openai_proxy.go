@@ -1265,11 +1265,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					return
 				}
 				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
-					anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID))
+					anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID),
+					r.Context().Err() != nil)
 				return
 			}
 			feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false),
-				nativeAnthropicPassthrough(w, r, body, table.SessionID))
+				nativeAnthropicPassthrough(w, r, body, table.SessionID),
+				r.Context().Err() != nil)
 			return
 		}
 
@@ -1440,11 +1442,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 								return
 							}
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-								anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID))
+								anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID),
+								r.Context().Err() != nil)
 							return
 						}
 						feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
-							nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID))
+							nativeAnthropicPassthrough(w, r, nativeBody, table.SessionID),
+							r.Context().Err() != nil)
 						return
 					}
 					route = over
@@ -1526,11 +1530,22 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		if err != nil {
 			// Retries exhausted against a transport failure: feed the circuit
 			// breaker so later requests skip this leg immediately.
-			table.breakers.recordFail(route.BaseURL)
-			// Same signal feeds the `auto` policy's per-session escalation
-			// (route_policy.go): consecutive failures escalate the session to
-			// the stronger secondary leg.
-			table.escalations.recordFail(table.SessionID, route.BaseURL)
+			//
+			// Unless the CALLER hung up: the upstream request is built on
+			// r.Context(), so a client that cancels mid-flight (Ctrl-C on a
+			// slow turn, any client with a deadline) surfaces here as the
+			// same transport error a dead leg produces. proxyUpstreamRetryDo
+			// already draws that line ("that is not an upstream failure");
+			// the health feeds must too, or three abandoned turns take a
+			// healthy leg's circuit out for breakerOpenFor and, at two under
+			// `auto`, send the session to another tier (2026-09-26 audit).
+			if r.Context().Err() == nil {
+				// Same signal feeds the `auto` policy's per-session escalation
+				// (route_policy.go): consecutive failures escalate the session to
+				// the stronger secondary leg.
+				table.breakers.recordFail(route.BaseURL)
+				table.escalations.recordFail(table.SessionID, route.BaseURL)
+			}
 			// The attempt is logged even though it never reached a backend:
 			// a leg that refuses connections is the case an ERR column exists
 			// for, and the one it used to miss (2026-09-26 audit).
@@ -2330,8 +2345,17 @@ func passthroughBreakerKey(route proxyRoute, oversize bool) string {
 // The classification deliberately matches the translated path's: 5xx-class and
 // transport failures count against the leg, sub-300 proves recovery, and 4xx /
 // 429 are the leg WORKING (bad request, shedding) and must not open it.
-func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int) {
+//
+// clientGone says the request was built on a context the CALLER has since
+// cancelled. Status 0 means "no response", which covers both a dead leg and a
+// caller who hung up mid-flight — and those are opposite conclusions, so the
+// caller passes the context's state rather than this reading a 0 as a failure.
+// A cancelled request records NOTHING: it must not fail the leg, and it must
+// not clear an existing failure streak either (2026-09-26 audit).
+func feedPassthroughRouteHealth(table proxyRouteTable, route proxyRoute, sessionID, breakerKey string, status int, clientGone bool) {
 	switch {
+	case status == 0 && clientGone:
+		// The client left. Says nothing about the leg.
 	case status == 0 || status >= 500:
 		table.breakers.recordFail(breakerKey)
 		table.escalations.recordFail(sessionID, route.BaseURL)
