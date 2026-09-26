@@ -468,7 +468,10 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					fmt.Printf("error: %v\n", err)
 					continue
 				}
-				fmt.Printf("LoRA '%s' activated on model '%s'\n", args[2], model)
+				// The model is the router's answer: quoted, like every other
+				// router-supplied field in this file (2026-09-26 audit,
+				// sixteenth round).
+				fmt.Printf("LoRA '%s' activated on model '%s'\n", args[2], launch.PrintableCell(model))
 			case "remove":
 				if len(args) < 3 {
 					fmt.Println("Usage: /lora remove <name>")
@@ -479,7 +482,7 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 					fmt.Printf("error: %v\n", err)
 					continue
 				}
-				fmt.Printf("LoRA '%s' deactivated on model '%s'\n", args[2], model)
+				fmt.Printf("LoRA '%s' deactivated on model '%s'\n", args[2], launch.PrintableCell(model))
 			default:
 				fmt.Println("Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off")
 			}

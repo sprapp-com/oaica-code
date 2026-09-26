@@ -95,7 +95,13 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 			return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, truncateForError(raw))
 		}
 		if out.Error != nil {
-			return "", fmt.Errorf("%s (HTTP %d)", out.Error.Message, resp.StatusCode)
+			// Bounded and redacted like the two sibling branches above: the
+			// body is the ROUTER's, so an unbounded message flushed an
+			// arbitrarily large — and possibly credential-bearing — string into
+			// the terminal and into whatever log or ticket the user pastes it
+			// into, while the branches either side of it capped theirs at 300
+			// bytes (2026-09-26 audit, sixteenth round).
+			return "", fmt.Errorf("%s (HTTP %d)", truncateForError([]byte(oaicaDiagnosis(out.Error.Message))), resp.StatusCode)
 		}
 		if len(out.Choices) == 0 {
 			return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, truncateForError(raw))
@@ -125,7 +131,12 @@ func siteLLMForModel(model string) (sitebuilder.LLM, error) {
 		return nil, fmt.Errorf("couldn't reach OAICA API: %w", err)
 	}
 	if !ok {
-		return nil, fmt.Errorf("unknown model %q; available: %s", model, strings.Join(names, ", "))
+		// The available list is the router's; a control character in one of its
+		// ids forged an extra row in the corrective list shown right after a
+		// typo — the moment a user is most likely to copy a name verbatim.
+		// Every sibling listing in this package quotes through the same helper
+		// (2026-09-26 audit, sixteenth round).
+		return nil, fmt.Errorf("unknown model %q; available: %s", model, strings.Join(launch.PrintableCells(names), ", "))
 	}
 	return routerLLM{model: model}, nil
 }

@@ -89,6 +89,13 @@ func oaicaSentAPIKey() string {
 // (2026-09-26 audit, tenth round).
 func oaicaDiagnosis(text string) string {
 	secrets := []string{oaicaSentAPIKey()}
+	// The weights-distribution licence is a credential too, and it travels as
+	// a bearer on the manifest request — the one request that carries it — so
+	// an error body echoing the Authorization header would print it in full
+	// (2026-09-26 audit, sixteenth round).
+	if license := oaicaLicenseKey(); license != "" {
+		secrets = append(secrets, license)
+	}
 	// The agent sidecar is reached at its own address, which may carry its own
 	// credential in the userinfo — separate from the router key above.
 	if _, tok := launch.SplitUserinfoCredential(oaicaAgentHostRaw()); tok != "" {
@@ -831,7 +838,19 @@ func oaicaAgentRun(task string) (string, error) {
 // (e.g. `oaica run <model> "some prompt"` with no pipe).
 func stdinLinesOrArgPrompt(stdinRaw, joinedPrompt string) []string {
 	if stdinRaw != "" {
-		return strings.Split(stdinRaw, "\n")
+		lines := strings.Split(stdinRaw, "\n")
+		// The prompt given as an argument is NOT dropped for having piped
+		// stdin: `oaica run m "summarise this" < file` used to send only the
+		// file's lines, so the question the user typed was never asked and
+		// nothing said so (2026-09-26 audit, sixteenth round). The piped lines
+		// stay first, in order, because they are "type these at the prompt" —
+		// the same ordering cmd.go uses when it prepends stdin to the prompts —
+		// and the argument goes last, after any command line in the pipe has
+		// run.
+		if joinedPrompt != "" {
+			lines = append(lines, joinedPrompt)
+		}
+		return lines
 	}
 	if joinedPrompt != "" {
 		return []string{joinedPrompt}
@@ -990,7 +1009,10 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			if err != nil {
 				return "", true, err
 			}
-			return fmt.Sprintf("LoRA '%s' activated on model '%s'", args[2], model), true, nil
+			// The model is the ROUTER's answer, not the user's text: a control
+			// character in it forged a status line of its own in the reply
+			// (2026-09-26 audit, sixteenth round).
+			return fmt.Sprintf("LoRA '%s' activated on model '%s'", args[2], launch.PrintableCell(model)), true, nil
 		case "remove":
 			if len(args) < 3 {
 				return "Usage: /lora remove <name>", true, nil
@@ -999,7 +1021,7 @@ func oaicaDispatchLine(line string, activeModel *string) (string, bool, error) {
 			if err != nil {
 				return "", true, err
 			}
-			return fmt.Sprintf("LoRA '%s' deactivated on model '%s'", args[2], model), true, nil
+			return fmt.Sprintf("LoRA '%s' deactivated on model '%s'", args[2], launch.PrintableCell(model)), true, nil
 		default:
 			return "Usage:\n  /lora add <name>\n  /lora remove <name>\n  /lora list\n  /lora use <name>\n  /lora off", true, nil
 		}

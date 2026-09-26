@@ -352,10 +352,17 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 			} `json:"error"`
 		}
 		if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
+			// Bounded and redacted: this is the request that carries the
+			// distribution licence as a bearer, so an upstream that echoes the
+			// Authorization header put the key in the error — and the message
+			// itself was unbounded, up to the 8 MiB body cap, while the same
+			// file's other readers cap at 4 KiB (2026-09-26 audit, sixteenth
+			// round).
+			msg := truncateForError([]byte(oaicaDiagnosis(e.Error.Message)))
 			if e.Error.Type == "license_required" || e.Error.Type == "license_invalid" {
-				return nil, fmt.Errorf("%s\n\nSet a license key: OAICA_LICENSE_KEY=<key> or save one to ~/.oaica/license_key", e.Error.Message)
+				return nil, fmt.Errorf("%s\n\nSet a license key: OAICA_LICENSE_KEY=<key> or save one to ~/.oaica/license_key", msg)
 			}
-			return nil, fmt.Errorf("%s", e.Error.Message)
+			return nil, fmt.Errorf("%s", msg)
 		}
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, launch.RedactBaseURL(oaicaHost()))
 	}

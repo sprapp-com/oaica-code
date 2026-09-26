@@ -204,6 +204,20 @@ func nvidiaComputeAppsMemory() map[int]int {
 	return m
 }
 
+// stripControlRunes folds every control rune (and DEL) to '?' and trims
+// surrounding whitespace. Used on a process's own argv before it is printed in
+// a table row an operator reads before deciding what to kill: the process wrote
+// that text, and a newline in it renders as an extra row (2026-09-26 audit,
+// sixteenth round).
+func stripControlRunes(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, s))
+}
+
 // procInfo reads PPID and the full command line for pid from /proc.
 // Returns ok=false if the process has already exited.
 func procInfo(pid int) (ppid int, cmdLine string, ok bool) {
@@ -232,7 +246,13 @@ func procInfo(pid int) (ppid int, cmdLine string, ok bool) {
 	if err != nil {
 		return 0, "", false
 	}
-	cmdLine = strings.TrimSpace(strings.ReplaceAll(string(cmdData), "\x00", " "))
+	// Control characters are folded to '?' before this reaches a table row. A
+	// process's argv is its OWN text — it can put a newline in argv[0] — and
+	// `oaica gpu ps`/`gpu clean` are the operator's pre-kill confirmation, so a
+	// newline rendered a forged second row impersonating another holder of GPU
+	// memory (2026-09-26 audit, sixteenth round). The NUL fold is for the
+	// separator; this one is for what the process wrote.
+	cmdLine = stripControlRunes(strings.ReplaceAll(string(cmdData), "\x00", " "))
 	if cmdLine == "" {
 		// Kernel threads / some worker processes have an empty cmdline;
 		// fall back to comm from /proc/PID/stat's parenthesized field.
