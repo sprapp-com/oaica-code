@@ -243,6 +243,17 @@ func RemoteAdd(opts RemoteAddOptions) (userRemote, error) {
 	if strings.Contains(name, "/") {
 		return userRemote{}, fmt.Errorf("remote name %q must not contain '/' — the picker uses \"<remote>/<model>\"", name)
 	}
+	// A control character in a name forges output wherever the name is printed
+	// as a table cell or a field line: `remote list` grew an extra, entirely
+	// fabricated row and `remote show` an extra `base_url:`-looking line, both
+	// of which a reader takes as real. Only "/" was rejected here, so
+	// `remote add $'mine\nzai-coding-plan/base_url: evil'` was accepted
+	// (2026-09-26 audit, ninth round). The printers quote such a name too —
+	// remotes.json is hand-editable, so add-time validation cannot be the only
+	// line of defence.
+	if strings.ContainsFunc(name, isControlRune) {
+		return userRemote{}, fmt.Errorf("remote name %q contains a control character (a newline, tab or escape) — the name is printed in `oaica remote list`/`show` and would forge lines there", name)
+	}
 	if baseURL == "" {
 		return userRemote{}, fmt.Errorf("--base-url is required (e.g. --base-url https://api.example.com)")
 	}
@@ -416,6 +427,23 @@ func RemoteRemove(name string) (bool, error) {
 	return true, nil
 }
 
+// isControlRune reports whether r is a control character — the class that, in
+// a printed name, moves the cursor or starts a new line.
+func isControlRune(r rune) bool { return r < 0x20 || r == 0x7f }
+
+// printableName renders a remote name for a one-line report: an ordinary name
+// as-is, one carrying control characters in Go-quoted form. remotes.json is
+// edited by hand and written by older versions, so a name that reached the file
+// before add-time validation existed still must not forge rows in
+// `oaica remote list` or a second field line in `remote show` (2026-09-26
+// audit, ninth round).
+func printableName(name string) string {
+	if strings.ContainsFunc(name, isControlRune) {
+		return strconv.Quote(name)
+	}
+	return name
+}
+
 // remoteAuthLabel describes how a remote authenticates without ever revealing
 // the secret itself. It defers to userRemote.authSource so the listing and
 // `remote show` agree with key() about where the credential actually comes
@@ -448,7 +476,7 @@ func WriteRemoteList(w io.Writer) error {
 		// redactBaseURL: a remote configured as https://key@host/v1 carries
 		// the credential in the URL's userinfo, and list output lands in
 		// terminals, shell history and tickets. Same fix as doctor's.
-		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", r.Name, redactBaseURL(r.BaseURL), d.Wire, d.ToolFormat, remoteAuthLabel(r))
+		fmt.Fprintf(w, "%-16s %-42s %-10s %-12s %s\n", printableName(r.Name), redactBaseURL(r.BaseURL), d.Wire, d.ToolFormat, remoteAuthLabel(r))
 	}
 	return nil
 }
@@ -482,7 +510,7 @@ func WriteRemoteShow(w io.Writer, name string) error {
 	// field answered "none" for a remote whose credential came from a stored
 	// login, from `auth_via`, or from base_url's userinfo (2026-09-26 audit).
 	key := authSourceProse(r.authSource())
-	fmt.Fprintf(w, "name:          %s\n", r.Name)
+	fmt.Fprintf(w, "name:          %s\n", printableName(r.Name))
 	fmt.Fprintf(w, "base_url:      %s\n", redactBaseURL(r.BaseURL))
 	fmt.Fprintf(w, "version:       %s\n", orDash(r.Version))
 	fmt.Fprintf(w, "wire:          %s\n", d.Wire)
