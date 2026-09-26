@@ -16,6 +16,11 @@ import (
 
 const openCodeInstallScript = "curl -fsSL https://opencode.ai/install | bash"
 
+// openCodeMaxRecentModels is how many entries opencode's `recent` list keeps:
+// Edit prepends this integration's pairs and truncates the whole list to this
+// length, so it is exactly the number of selected models the store can hold.
+const openCodeMaxRecentModels = 10
+
 var openCodeGOOS = runtime.GOOS
 
 // OpenCode implements Runner and Editor for OpenCode integration.
@@ -208,6 +213,21 @@ func hasLaunchModel(models []LaunchModel, name string) bool {
 	return false
 }
 
+// NarrowToStoredModels implements narrowingEditor. opencode's state keeps at
+// most openCodeMaxRecentModels entries in `recent` — Edit truncates the list
+// after prepending this launch's pairs — so a longer selection can never be
+// declared: the declaration asked for every one of them at the head of the
+// list, read the store as drift forever, and the models past the tenth were
+// absent from opencode's picker without a word (2026-09-27 audit, round 29,
+// A-F3). The truncation keeps the first of the pairs, so what the store holds
+// is the first openCodeMaxRecentModels of the selection.
+func (o *OpenCode) NarrowToStoredModels(models []string) ([]string, []string) {
+	if len(models) <= openCodeMaxRecentModels {
+		return models, nil
+	}
+	return models[:openCodeMaxRecentModels], append([]string(nil), models[openCodeMaxRecentModels:]...)
+}
+
 func (o *OpenCode) Paths() []string {
 	sp, err := openCodeStatePath()
 	if err != nil {
@@ -330,8 +350,7 @@ func (o *OpenCode) Edit(models []LaunchModel) error {
 			}))
 		}
 
-		const maxRecentModels = 10
-		newRecent = newRecent[:min(len(newRecent), maxRecentModels)]
+		newRecent = newRecent[:min(len(newRecent), openCodeMaxRecentModels)]
 
 		state["recent"] = newRecent
 

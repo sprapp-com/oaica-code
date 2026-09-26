@@ -912,7 +912,11 @@ func (g *gateway) apply(cfg gwConfig) error {
 		// What cannot be requeued (the new reporter is itself behind, or
 		// metering was switched off by this reload) is SAID, not lost quietly:
 		// the local ledger still has these records, so this is a delay in the
-		// aggregated view, and the operator is the one who can act on it.
+		// aggregated view, and the operator is the one who can act on it. This
+		// counts only what was still QUEUED: a report the retired reporter had
+		// already taken off the channel and was retrying is reported by the
+		// reporter itself, which names its request id (round 29, B2) — the two
+		// lines together account for every record.
 		log.Printf("oaica-gateway: reload dropped %d queued usage report(s) that the reporter it replaced had not delivered (the local ledger still has them)", n)
 	}
 
@@ -1004,7 +1008,6 @@ var meterReporterBackoff = func(attempt int) time.Duration { return time.Duratio
 // reload comment there for why ch is not the stop signal.
 func runMeterReporter(ch <-chan usageReport, done <-chan struct{}, addr, token string, backoff func(int) time.Duration) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	const maxAttempts = 3
 	for {
 		var rep usageReport
 		var ok bool
@@ -1018,29 +1021,64 @@ func runMeterReporter(ch <-chan usageReport, done <-chan struct{}, addr, token s
 		}
 		body, err := json.Marshal(rep)
 		if err != nil {
+			// The record is in the local ledger either way; this is the one
+			// failure that would otherwise leave no trace at all here.
+			log.Printf("oaica-gateway: could not encode the meterhub report for %s (%v); it stays in the local ledger", rep.RequestID, err)
 			continue
 		}
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			req, err := http.NewRequest(http.MethodPost, strings.TrimRight(addr, "/")+"/ingest", bytes.NewReader(body))
-			if err != nil {
-				break
-			}
-			req.Header.Set("Content-Type", "application/json")
-			if token != "" {
-				req.Header.Set("Authorization", "Bearer "+token)
-			}
-			resp, err := client.Do(req)
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-					break // delivered
-				}
-			}
-			if attempt < maxAttempts {
-				time.Sleep(backoff(attempt))
-			}
+		if err := deliverMeterReport(client, done, addr, token, body, backoff); err != nil {
+			// Giving up used to be silent: the retry loop exhausted its attempts
+			// and moved on, so a meterhub outage longer than the backoff left a
+			// record in the local ledger and NOTHING else — the aggregate at
+			// meterhub was short of it and no line said so, which is the silence
+			// round 27 removed from the reload path (2026-09-27 audit, round 29,
+			// B2). The ledger still has it, so this is a delay in the aggregate
+			// view and the operator is the one who can act on it.
+			log.Printf("oaica-gateway: gave up on the meterhub report for %s: %v (it stays in the local ledger, so only the aggregate view is without it)", rep.RequestID, err)
 		}
 	}
+}
+
+// deliverMeterReport POSTs one already-encoded report to meterhub, retrying a
+// bounded number of times with backoff, and returns the reason it was not
+// delivered (nil when it was).
+//
+// Retrying stops promptly when done fires: the reporter is retired by a reload
+// that has already replaced the config it was built from, so sleeping out the
+// rest of the backoff only delays the line the caller writes about it. The
+// record itself is not lost — the local ledger has it.
+func deliverMeterReport(client *http.Client, done <-chan struct{}, addr, token string, body []byte, backoff func(int) time.Duration) error {
+	const maxAttempts = 3
+	lastErr := errors.New("no attempt was made")
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, strings.TrimRight(addr, "/")+"/ingest", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			lastErr = fmt.Errorf("meterhub answered %s", resp.Status)
+		} else {
+			lastErr = err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		select {
+		case <-done:
+			return fmt.Errorf("%w; the gateway reloaded while it was being retried", lastErr)
+		case <-time.After(backoff(attempt)):
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // drainMeterChannel takes every report currently queued on ch, in order, and
@@ -1098,18 +1136,30 @@ func requeueMeterReports(ch chan usageReport, reports []usageReport) int {
 // round 27 set out to remove (2026-09-27 audit, round 28, B-F1). The send is a
 // non-blocking select, so the read lock is held for a bounded time.
 func (g *gateway) reportUsage(e ledgerEntry) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	ch := g.meterCh
-	if ch == nil {
-		return
-	}
-	if meterReportSendHook != nil {
-		meterReportSendHook()
-	}
-	select {
-	case ch <- usageReport{ledgerEntry: e, Region: g.cfg.Region}:
-	default:
+	// The read of g.meterCh, the send, and the reading of g.cfg.Region are ONE
+	// critical section, and the log line is NOT: a log write is an unbounded
+	// write to whatever sink stderr is pointed at, and holding the read lock
+	// across it — which the line below used to be written under — let a slow
+	// sink stall every completion on the box for as long as the write took
+	// (2026-09-27 audit, round 29, B1).
+	queued, hasReporter := func() (bool, bool) {
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		ch := g.meterCh
+		if ch == nil {
+			return false, false
+		}
+		if meterReportSendHook != nil {
+			meterReportSendHook()
+		}
+		select {
+		case ch <- usageReport{ledgerEntry: e, Region: g.cfg.Region}:
+			return true, true
+		default:
+			return false, true
+		}
+	}()
+	if !queued && hasReporter {
 		log.Printf("oaica-gateway: meterhub report channel full, dropping report for %s (local ledger still has it)", e.RequestID)
 	}
 }

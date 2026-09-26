@@ -514,6 +514,32 @@ func clineStoreKey(modelID, baseURL string) string {
 	return modelID + "\x00" + strings.TrimRight(baseURL, "/")
 }
 
+// clineProviderStoreKey is clineStoreKey for the providers.json half, which
+// carries one field the legacy half does not: settings.apiKey, the credential
+// the write sets from the live remote token (and deletes when the model has
+// none). The declaration read the id and the endpoint only, so a store holding
+// the key a REMOTE had before it was rotated away read as current — the launch
+// skipped the write that would have replaced it, and Cline went on calling the
+// remote with the old credential. Cline passes neither a key nor an endpoint to
+// its child, so that file is the only credential it has for this remote
+// (2026-09-27 audit, round 29, A-F1). Joined with NUL for the same reason as
+// clineStoreKey: no id, endpoint or token contains one, so two different
+// entries cannot build one key.
+func clineProviderStoreKey(modelID, baseURL, apiKey string) string {
+	return clineStoreKey(modelID, baseURL) + "\x00" + apiKey
+}
+
+// clineProviderTokenFor is the credential a write of this model leaves in
+// settings.apiKey: the resolved remote's token, or "" (the field is deleted)
+// for a model the daemon serves. The writer's own source, so the two cannot
+// drift.
+func clineProviderTokenFor(model string) string {
+	if ep, ok := resolveLaunchTargetEndpoint(model); ok {
+		return ep.Token
+	}
+	return ""
+}
+
 // clineHeldStoreKeys is the key of each half of Cline's pair as the documents
 // hold it now, in the order Edit publishes them (providers.json, then
 // globalState.json). A half that is absent, that names another provider, or
@@ -529,8 +555,9 @@ func clineHeldStoreKeys(home string) []string {
 			settings, _ := provider["settings"].(map[string]any)
 			modelID, _ := settings["model"].(string)
 			baseURL, _ := settings["baseUrl"].(string)
+			apiKey, _ := settings["apiKey"].(string)
 			if modelID != "" {
-				keys = append(keys, clineStoreKey(modelID, baseURL))
+				keys = append(keys, clineProviderStoreKey(modelID, baseURL, apiKey))
 			}
 		}
 	}
@@ -558,7 +585,8 @@ func clineHeldStoreKeys(home string) []string {
 // of that name and would write "gpt-oss:cloud", used to read as current — the
 // launch left Cline asking the daemon for a model this launch did not choose
 // (2026-09-27 audit, round 27, F2), and a half holding a remote's id beside the
-// daemon's URL did the same for a remote model (F4).
+// daemon's URL did the same for a remote model (F4). The providers half carries
+// the credential as well (round 29, A-F1).
 func (c *Cline) DeclaresSelection(models []LaunchModel) bool {
 	if len(models) != 1 {
 		// Cline's stores hold one model; anything else is not a state they can
@@ -573,7 +601,11 @@ func (c *Cline) DeclaresSelection(models []LaunchModel) bool {
 	row := models[0]
 	id := clineWriteModelID(row)
 	want := []string{
-		clineStoreKey(id, clineProviderBaseURLFor(row.Name)),
+		// The providers half carries the credential the write would leave there
+		// (clineProviderStoreKey), so a store holding another one — a remote key
+		// rotated away, or a key the write would delete — is drift. The legacy
+		// half states no credential at all.
+		clineProviderStoreKey(id, clineProviderBaseURLFor(row.Name), clineProviderTokenFor(row.Name)),
 		clineStoreKey(id, clineLegacyBaseURLFor(row.Name)),
 	}
 	held := clineHeldStoreKeys(home)

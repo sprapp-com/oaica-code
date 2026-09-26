@@ -14,6 +14,14 @@ func resetProbes(t *testing.T) {
 	t.Helper()
 	upstreamProbes.Lock()
 	upstreamProbes.m = nil
+	// The flights too. They are per-test state: a ticket left over from a
+	// previous test in the same binary makes the next one JOIN a probe that has
+	// already landed instead of starting its own, so the test reads a result it
+	// did not cause. The landing goroutine's `delete` and its `close` are both
+	// safe against this — delete on a nil map is a no-op and it closes the
+	// ticket it created — so clearing the map cannot disturb a probe in flight
+	// (2026-09-27 audit, round 29, B3).
+	upstreamProbes.flights = nil
 	upstreamProbes.Unlock()
 }
 

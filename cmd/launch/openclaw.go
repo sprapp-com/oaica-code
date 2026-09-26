@@ -19,6 +19,18 @@ import (
 
 const defaultGatewayPort = 18789
 
+// The two fields openclawEditConfig sets on the ollama provider besides its
+// address. They are written on every write, so they are part of what a write
+// LEAVES, and the declaration has to read them: a config the user (or another
+// tool) repointed at the OpenAI wire, or gave a key of their own, read as
+// current and the launch skipped the write that would have set them back
+// (2026-09-27 audit, round 29, A-F2). Named once, so the writer and the
+// declaration cannot drift.
+const (
+	openclawProviderAPI    = "ollama"
+	openclawProviderAPIKey = "ollama-local"
+)
+
 // openclawFreshInstall is set to true when ensureOpenclawInstalled performs an install
 var openclawFreshInstall bool
 
@@ -861,8 +873,8 @@ func openclawEditConfig(configPath, legacyPath string, models []LaunchModel) err
 
 	ollama["baseUrl"] = envconfig.ConnectableHost().String()
 	// needed to register provider
-	ollama["apiKey"] = "ollama-local"
-	ollama["api"] = "ollama"
+	ollama["apiKey"] = openclawProviderAPIKey
+	ollama["api"] = openclawProviderAPI
 
 	// Build map of existing models to preserve user customizations. Keyed by the
 	// entry's "id", which openclawModelID writes — the same value the merge and
@@ -1353,6 +1365,21 @@ func openclawProviderBaseURL(config map[string]any) string {
 	return baseURL
 }
 
+// openclawProviderIsOurs reports whether the ollama provider block carries the
+// two fields openclawEditConfig writes beside baseUrl: the wire ("api") and the
+// placeholder key ("apiKey"). Both are set on every write, so a block holding
+// anything else — a user's own key, another wire — is not a block this launch
+// would leave, and the launch has to write. Read from the same constants the
+// writer sets, so a rename cannot silently make one of them drift.
+func openclawProviderIsOurs(config map[string]any) bool {
+	modelsSection, _ := config["models"].(map[string]any)
+	providers, _ := modelsSection["providers"].(map[string]any)
+	ollama, _ := providers["ollama"].(map[string]any)
+	api, _ := ollama["api"].(string)
+	apiKey, _ := ollama["apiKey"].(string)
+	return api == openclawProviderAPI && apiKey == openclawProviderAPIKey
+}
+
 // openclawStoredRows is the selection as a write leaves it at the head of
 // OpenClaw's provider: the rows in order, each id once. Two rows that name the
 // same backend — a catalogue row and the daemon row of the id it is served as —
@@ -1462,6 +1489,12 @@ func (c *Openclaw) DeclaresSelection(models []LaunchModel) bool {
 	// (2026-09-27 audit, round 28, F1). Compared against the writer's own
 	// source, so the two cannot drift.
 	if openclawProviderBaseURL(config) != envconfig.ConnectableHost().String() {
+		return false
+	}
+	// The provider block's other two fields, for the same reason: the write sets
+	// them on every launch, so a block holding a user's key or another wire is
+	// one the write would change (2026-09-27 audit, round 29, A-F2).
+	if !openclawProviderIsOurs(config) {
 		return false
 	}
 	if !declaresPrefix(openclawProviderModelIDs(config), want) {

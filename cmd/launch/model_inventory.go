@@ -975,7 +975,8 @@ func launchModelWriteIDs(models []LaunchModel) []string {
 // the inventory row for each name (findLaunchModel's own resolution, alias hop
 // included), or a bare row carrying the name itself when the inventory has no
 // such row — the shape a store holds for a model it resolves directly. The
-// order of the names is preserved, and so is the length: one row per name.
+// order of the names is preserved, and names that resolve to ONE row contribute
+// that row once, which is what the writer keeps (see the dedupe below).
 //
 // It replaces the ids-only form that stood here. An empty name cannot be an id,
 // so that form DROPPED it and returned a shorter list, which a store holding
@@ -985,12 +986,24 @@ func launchModelWriteIDs(models []LaunchModel) []string {
 // the editor to apply its own rule (2026-09-27 audit, round 27).
 func selectionRows(inventory []LaunchModel, names []string) []LaunchModel {
 	rows := make([]LaunchModel, 0, len(names))
+	seen := make(map[string]bool, len(names))
 	for _, name := range names {
-		if row, ok := findLaunchModel(inventory, name); ok {
-			rows = append(rows, row)
+		row, ok := findLaunchModel(inventory, name)
+		if !ok {
+			row = LaunchModel{Name: name}
+		}
+		// Two spellings of one model — the prefixed picker name beside the bare
+		// override — resolve to the SAME row, and the writer they are compared
+		// against keeps one entry per resolved row (resolveLaunchModels' own
+		// seen-by-name rule). Asked about both, a store holding the one entry
+		// read as drift forever and every launch took the configure path for a
+		// configuration it had already written (2026-09-27 audit, round 29,
+		// A-F4).
+		if seen[row.Name] {
 			continue
 		}
-		rows = append(rows, LaunchModel{Name: name})
+		seen[row.Name] = true
+		rows = append(rows, row)
 	}
 	return rows
 }

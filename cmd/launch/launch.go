@@ -1151,13 +1151,16 @@ func (c *launcherClient) launchEditorIntegration(ctx context.Context, name strin
 	}
 
 	// What the editor can actually store, not what the picker returned: an
-	// editor that holds one model narrows the selection here, so the write and
-	// the recorded state agree and the next launch converges (editorStoredModels
-	// above). The names it cannot hold are said out loud, not dropped in silence.
+	// editor that holds a bounded list narrows the selection here, so the write
+	// and the recorded state agree and the next launch converges
+	// (editorStoredModels above). The names it cannot hold are said out loud,
+	// not dropped in silence. The bound differs — Cline's provider settings hold
+	// one model, opencode's recent-models list holds ten — so the note names how
+	// many were kept rather than assuming one (2026-09-27 audit, round 29, A-F3).
 	stored, dropped := editorStoredModels(editor, models)
 	if len(dropped) > 0 && len(stored) > 0 {
-		fmt.Fprintf(os.Stderr, "Note: %s keeps a single model in its own settings, so only %s was written. Left out: %s. Pick it in %s's own model picker to use it there.\n",
-			name, stored[0], strings.Join(dropped, ", "), runner.String())
+		fmt.Fprintf(os.Stderr, "Note: %s keeps only %d of the selected models in its own settings, so %s was written. Left out: %s. Pick it in %s's own model picker to use it there.\n",
+			name, len(stored), strings.Join(stored, ", "), strings.Join(dropped, ", "), runner.String())
 	}
 	models = stored
 
