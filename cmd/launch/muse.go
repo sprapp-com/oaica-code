@@ -314,6 +314,22 @@ func writeMuseSettingsFile(models []LaunchModel, backup bool) error {
 	if err != nil {
 		return err
 	}
+	// The store is oaica's OWN (~/.ollama/launch/muse-config is the config root
+	// launch hands muse as XDG_CONFIG_HOME), so unlike the stores of another
+	// program the lock goes beside it, as the other oaica-owned launch stores do
+	// (dsh). It has to cover the read as well as the publish: museBaseSettings
+	// is read a frame down, and two overlapping writers that read before taking
+	// the lock each publish a snapshot taken before the other's settings landed
+	// — the launch that renames last decides the file while both report success
+	// (2026-09-26 audit, thirteenth round).
+	return fileutil.WithFileLock(settingsPath, func() error {
+		return writeMuseSettingsFileLocked(settingsPath, models, backup)
+	})
+}
+
+// writeMuseSettingsFileLocked is the load-mutate-save half of
+// writeMuseSettingsFile, run under the settings store's lock.
+func writeMuseSettingsFileLocked(settingsPath string, models []LaunchModel, backup bool) error {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		return err
 	}

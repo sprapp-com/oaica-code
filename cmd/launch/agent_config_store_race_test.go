@@ -64,6 +64,15 @@ const (
 	agentStoreHermes                 = "hermes"
 	agentStoreOmpModels              = "omp-models"
 	agentStoreOmpAgent               = "omp-agent"
+	agentStoreClineEdit              = "cline-edit"
+	agentStoreDroidEdit              = "droid-edit"
+	agentStoreMuseEdit               = "muse-edit"
+	agentStoreClaudeDesktopMeta      = "claude-desktop-meta"
+	agentStoreClaudeDesktopRestMeta  = "claude-desktop-restore-meta"
+	agentStoreClaudeDesktopProfile   = "claude-desktop-profile"
+	agentStoreClaudeDesktopRestProf  = "claude-desktop-restore-profile"
+	agentStoreClaudeDesktopMode      = "claude-desktop-deployment-mode"
+	agentStoreClaudeDesktopRestState = "claude-desktop-restore-state"
 )
 
 // TestAgentConfigStoreWriterChildHelper is not a test of its own: the parent
@@ -97,6 +106,9 @@ func TestAgentConfigStoreWriterChildHelper(t *testing.T) {
 	os.Setenv("HERMES_HOME", "")
 	os.Setenv("PI_CONFIG_DIR", "")
 	os.Setenv("PI_CODING_AGENT_DIR", "")
+	// Muse resolves its own ~/.config/muse/settings.json from this before HOME
+	// falls back, so an ambient value would let a writer read a real install.
+	os.Setenv("XDG_CONFIG_HOME", "")
 
 	waitForAgentStoreRelease(t, release)
 	if err := runAgentStoreWriter(kind, id); err != nil {
@@ -144,6 +156,24 @@ func runAgentStoreWriter(kind, id string) error {
 		return writeOMPModelsConfig(id, []LaunchModel{fallbackLaunchModel(id)})
 	case agentStoreOmpAgent:
 		return writeOMPAgentConfig()
+	case agentStoreClineEdit:
+		return (&Cline{}).Edit([]LaunchModel{{Name: id}})
+	case agentStoreDroidEdit:
+		return (&Droid{}).Edit([]LaunchModel{{Name: id}})
+	case agentStoreMuseEdit:
+		return (&Muse{}).Edit([]LaunchModel{{Name: id}})
+	case agentStoreClaudeDesktopMeta:
+		return runClaudeDesktopMetaWriter(id)
+	case agentStoreClaudeDesktopRestMeta:
+		return runClaudeDesktopRestoreMetaWriter()
+	case agentStoreClaudeDesktopProfile:
+		return runClaudeDesktopProfileWriter()
+	case agentStoreClaudeDesktopRestProf:
+		return runClaudeDesktopRestoreProfileWriter()
+	case agentStoreClaudeDesktopMode:
+		return runClaudeDesktopDeploymentModeWriter()
+	case agentStoreClaudeDesktopRestState:
+		return runClaudeDesktopRestoreStateWriter(id)
 	}
 	return fmt.Errorf("unknown launch-integration writer kind %q", kind)
 }

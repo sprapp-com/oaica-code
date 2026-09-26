@@ -80,32 +80,32 @@ func (c *ClaudeDesktop) ConfigureAutodiscovery() error {
 		return err
 	}
 
-	restore, err := loadClaudeDesktopRestoreState()
-	if err != nil {
-		return err
-	}
-
-	for _, path := range targets.normalConfigs {
-		if err := writeClaudeDesktopDeploymentMode(path, "3p"); err != nil {
-			return err
+	// The restore state is loaded, added to and published as one critical
+	// section (updateClaudeDesktopRestoreState), with the Claude Desktop
+	// documents' own locked writes nested inside it.
+	return updateClaudeDesktopRestoreState(func(restore *claudeDesktopRestoreState) error {
+		for _, path := range targets.normalConfigs {
+			if err := writeClaudeDesktopDeploymentMode(path, "3p"); err != nil {
+				return err
+			}
 		}
-	}
-	for _, target := range targets.thirdPartyProfiles {
-		if err := writeClaudeDesktopDeploymentMode(target.desktopConfig, "3p"); err != nil {
-			return err
+		for _, target := range targets.thirdPartyProfiles {
+			if err := writeClaudeDesktopDeploymentMode(target.desktopConfig, "3p"); err != nil {
+				return err
+			}
+			if err := writeClaudeDesktopMeta(target.meta, claudeDesktopProfileID, claudeDesktopProfileName); err != nil {
+				return err
+			}
+			// Before overwriting the profile's credential, remember what was there.
+			if err := recordClaudeDesktopGatewayKeyInjection(restore, target.profile, key); err != nil {
+				return err
+			}
+			if err := writeClaudeDesktopGatewayProfile(target.profile, key, true); err != nil {
+				return err
+			}
 		}
-		if err := writeClaudeDesktopMeta(target.meta, claudeDesktopProfileID, claudeDesktopProfileName); err != nil {
-			return err
-		}
-		// Before overwriting the profile's credential, remember what was there.
-		if err := recordClaudeDesktopGatewayKeyInjection(&restore, target.profile, key); err != nil {
-			return err
-		}
-		if err := writeClaudeDesktopGatewayProfile(target.profile, key, true); err != nil {
-			return err
-		}
-	}
-	return writeClaudeDesktopRestoreState(restore)
+		return nil
+	})
 }
 
 func (c *ClaudeDesktop) RestoreHint() string {
@@ -153,30 +153,30 @@ func (c *ClaudeDesktop) Restore() error {
 		return err
 	}
 
-	restore, err := loadClaudeDesktopRestoreState()
-	if err != nil {
-		return err
-	}
-
-	for _, path := range targets.normalConfigs {
-		if err := writeClaudeDesktopDeploymentMode(path, "1p"); err != nil {
-			return err
+	// The same critical section as ConfigureAutodiscovery: the state is read
+	// under its lock, the profiles' records are consumed inside it, and what is
+	// left is published inside the same section.
+	if err := updateClaudeDesktopRestoreState(func(restore *claudeDesktopRestoreState) error {
+		for _, path := range targets.normalConfigs {
+			if err := writeClaudeDesktopDeploymentMode(path, "1p"); err != nil {
+				return err
+			}
 		}
-	}
-	for _, target := range targets.thirdPartyProfiles {
-		if err := writeClaudeDesktopDeploymentMode(target.desktopConfig, "1p"); err != nil {
-			return err
+		for _, target := range targets.thirdPartyProfiles {
+			if err := writeClaudeDesktopDeploymentMode(target.desktopConfig, "1p"); err != nil {
+				return err
+			}
+			if err := restoreClaudeDesktopMeta(target.meta); err != nil {
+				return err
+			}
+			prior, recorded := restore.Profiles[target.profile]
+			if err := restoreClaudeDesktopOllamaProfile(target.profile, prior, recorded); err != nil {
+				return err
+			}
+			delete(restore.Profiles, target.profile)
 		}
-		if err := restoreClaudeDesktopMeta(target.meta); err != nil {
-			return err
-		}
-		prior, recorded := restore.Profiles[target.profile]
-		if err := restoreClaudeDesktopOllamaProfile(target.profile, prior, recorded); err != nil {
-			return err
-		}
-		delete(restore.Profiles, target.profile)
-	}
-	if err := writeClaudeDesktopRestoreState(restore); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 	return claudeDesktopLaunchOrRestart("Restart Claude Desktop to use the usual Claude profile?")
@@ -588,117 +588,151 @@ func claudeDesktopAPIKeyVerificationError() error {
 	return fmt.Errorf("could not verify Ollama API key; copy a key from %s and try again", claudeDesktopAPIKeyURL)
 }
 
+// withClaudeDesktopConfigLock runs one Claude Desktop JSON document's
+// read-modify-write under that document's lock.
+//
+// Every writer below reads the document with readClaudeDesktopJSONAllowMissing,
+// sets the keys it owns and publishes the whole document back — a lost update
+// waiting to happen, because two `oaica launch claude-desktop` commands whose
+// writers overlap each publish a snapshot taken before the other's keys landed
+// and the publish that renames last decides the file while both report success.
+// The lock therefore has to cover the read, not just the publish, and it has to
+// be the SAME lock for every function that touches the document — write and
+// restore both — which is why it is derived from the path here rather than held
+// per function.
+//
+// Claude Desktop's config directory is not oaica's (oaica writes two profiles
+// into a tree Claude Desktop owns and syncs), so the lock is keyed under
+// ~/.oaica/locks (foreignStoreLockBase) rather than dropped beside the
+// document. ConfigureAutodiscovery and Restore take the restore-state lock
+// first and these inner ones second — the order is the same in both entry
+// points, so two commands cannot deadlock against each other (2026-09-26 audit,
+// thirteenth round).
+func withClaudeDesktopConfigLock(path string, fn func() error) error {
+	return fileutil.WithFileLock(foreignStoreLockBase(path), fn)
+}
+
 func writeClaudeDesktopDeploymentMode(path, mode string) error {
-	cfg, err := readClaudeDesktopJSONAllowMissing(path)
-	if err != nil {
-		return fmt.Errorf("parse Claude Desktop config: %w", err)
-	}
-	cfg["deploymentMode"] = mode
-	return writeClaudeDesktopJSON(path, cfg)
+	return withClaudeDesktopConfigLock(path, func() error {
+		cfg, err := readClaudeDesktopJSONAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("parse Claude Desktop config: %w", err)
+		}
+		cfg["deploymentMode"] = mode
+		return writeClaudeDesktopJSON(path, cfg)
+	})
 }
 
 func writeClaudeDesktopMeta(path, id, name string) error {
-	meta, err := readClaudeDesktopJSONAllowMissing(path)
-	if err != nil {
-		return fmt.Errorf("parse Claude Desktop config metadata: %w", err)
-	}
+	return withClaudeDesktopConfigLock(path, func() error {
+		meta, err := readClaudeDesktopJSONAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("parse Claude Desktop config metadata: %w", err)
+		}
 
-	meta["appliedId"] = id
-	entries := make([]any, 0)
-	for _, entry := range claudeDesktopAnySlice(meta["entries"]) {
-		entryMap, _ := entry.(map[string]any)
-		if entryMap == nil {
-			entries = append(entries, entry)
-			continue
+		meta["appliedId"] = id
+		entries := make([]any, 0)
+		for _, entry := range claudeDesktopAnySlice(meta["entries"]) {
+			entryMap, _ := entry.(map[string]any)
+			if entryMap == nil {
+				entries = append(entries, entry)
+				continue
+			}
+			if entryID, _ := entryMap["id"].(string); entryID == id {
+				continue
+			}
+			entries = append(entries, entryMap)
 		}
-		if entryID, _ := entryMap["id"].(string); entryID == id {
-			continue
-		}
-		entries = append(entries, entryMap)
-	}
-	entries = append(entries, map[string]any{
-		"id":   id,
-		"name": name,
+		entries = append(entries, map[string]any{
+			"id":   id,
+			"name": name,
+		})
+		meta["entries"] = entries
+		return writeClaudeDesktopJSON(path, meta)
 	})
-	meta["entries"] = entries
-	return writeClaudeDesktopJSON(path, meta)
 }
 
 func writeClaudeDesktopGatewayProfile(path string, apiKey string, forceChooser bool) error {
-	cfg, err := readClaudeDesktopJSONAllowMissing(path)
-	if err != nil {
-		return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
-	}
-	cfg["inferenceProvider"] = "gateway"
-	cfg["inferenceGatewayBaseUrl"] = claudeDesktopGatewayBaseURL
-	cfg["inferenceGatewayApiKey"] = apiKey
-	cfg["inferenceGatewayAuthScheme"] = "bearer"
-	delete(cfg, "inferenceModels")
-	cfg["disableDeploymentModeChooser"] = forceChooser
-	return writeClaudeDesktopJSON(path, cfg)
+	return withClaudeDesktopConfigLock(path, func() error {
+		cfg, err := readClaudeDesktopJSONAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
+		}
+		cfg["inferenceProvider"] = "gateway"
+		cfg["inferenceGatewayBaseUrl"] = claudeDesktopGatewayBaseURL
+		cfg["inferenceGatewayApiKey"] = apiKey
+		cfg["inferenceGatewayAuthScheme"] = "bearer"
+		delete(cfg, "inferenceModels")
+		cfg["disableDeploymentModeChooser"] = forceChooser
+		return writeClaudeDesktopJSON(path, cfg)
+	})
 }
 
 func restoreClaudeDesktopMeta(path string) error {
-	meta, err := readClaudeDesktopJSONAllowMissing(path)
-	if err != nil {
-		return fmt.Errorf("parse Claude Desktop config metadata: %w", err)
-	}
-	if len(meta) == 0 {
-		return nil
-	}
-
-	changed := false
-	if appliedID, _ := meta["appliedId"].(string); appliedID == claudeDesktopProfileID {
-		delete(meta, "appliedId")
-		changed = true
-	}
-
-	entries := claudeDesktopAnySlice(meta["entries"])
-	if entries != nil {
-		filtered := make([]any, 0, len(entries))
-		for _, entry := range entries {
-			entryMap, _ := entry.(map[string]any)
-			if entryID, _ := entryMap["id"].(string); entryID == claudeDesktopProfileID {
-				changed = true
-				continue
-			}
-			filtered = append(filtered, entry)
+	return withClaudeDesktopConfigLock(path, func() error {
+		meta, err := readClaudeDesktopJSONAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("parse Claude Desktop config metadata: %w", err)
 		}
-		meta["entries"] = filtered
-	}
+		if len(meta) == 0 {
+			return nil
+		}
 
-	if !changed {
-		return nil
-	}
-	return writeClaudeDesktopJSON(path, meta)
+		changed := false
+		if appliedID, _ := meta["appliedId"].(string); appliedID == claudeDesktopProfileID {
+			delete(meta, "appliedId")
+			changed = true
+		}
+
+		entries := claudeDesktopAnySlice(meta["entries"])
+		if entries != nil {
+			filtered := make([]any, 0, len(entries))
+			for _, entry := range entries {
+				entryMap, _ := entry.(map[string]any)
+				if entryID, _ := entryMap["id"].(string); entryID == claudeDesktopProfileID {
+					changed = true
+					continue
+				}
+				filtered = append(filtered, entry)
+			}
+			meta["entries"] = filtered
+		}
+
+		if !changed {
+			return nil
+		}
+		return writeClaudeDesktopJSON(path, meta)
+	})
 }
 
 func restoreClaudeDesktopOllamaProfile(path string, prior claudeDesktopProfileRestoreState, recorded bool) error {
-	cfg, err := readClaudeDesktopJSONAllowMissing(path)
-	if err != nil {
-		return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
-	}
-	if len(cfg) == 0 {
-		return nil
-	}
-	cfg["disableDeploymentModeChooser"] = false
-	delete(cfg, "inferenceProvider")
-	delete(cfg, "inferenceGatewayBaseUrl")
-	delete(cfg, "inferenceGatewayAuthScheme")
-	delete(cfg, "inferenceModels")
-	// The gateway credential is a secret oaica wrote, so restore removes it —
-	// but only where oaica wrote one. A profile oaica never put a key into
-	// (no record) keeps the key its owner configured; a profile whose own key
-	// oaica replaced gets that value back; a profile whose own key oaica
-	// reused keeps it where it is (2026-09-26 audit).
-	switch {
-	case !recorded || prior.HadKey && prior.Replaced == "":
-	case prior.HadKey:
-		cfg["inferenceGatewayApiKey"] = prior.Replaced
-	default:
-		delete(cfg, "inferenceGatewayApiKey")
-	}
-	return writeClaudeDesktopJSON(path, cfg)
+	return withClaudeDesktopConfigLock(path, func() error {
+		cfg, err := readClaudeDesktopJSONAllowMissing(path)
+		if err != nil {
+			return fmt.Errorf("parse Claude Desktop Ollama profile: %w", err)
+		}
+		if len(cfg) == 0 {
+			return nil
+		}
+		cfg["disableDeploymentModeChooser"] = false
+		delete(cfg, "inferenceProvider")
+		delete(cfg, "inferenceGatewayBaseUrl")
+		delete(cfg, "inferenceGatewayAuthScheme")
+		delete(cfg, "inferenceModels")
+		// The gateway credential is a secret oaica wrote, so restore removes it —
+		// but only where oaica wrote one. A profile oaica never put a key into
+		// (no record) keeps the key its owner configured; a profile whose own key
+		// oaica replaced gets that value back; a profile whose own key oaica
+		// reused keeps it where it is (2026-09-26 audit).
+		switch {
+		case !recorded || prior.HadKey && prior.Replaced == "":
+		case prior.HadKey:
+			cfg["inferenceGatewayApiKey"] = prior.Replaced
+		default:
+			delete(cfg, "inferenceGatewayApiKey")
+		}
+		return writeClaudeDesktopJSON(path, cfg)
+	})
 }
 
 // claudeDesktopRestoreState records what each Ollama third-party profile held
@@ -747,6 +781,33 @@ func loadClaudeDesktopRestoreState() (claudeDesktopRestoreState, error) {
 		return claudeDesktopRestoreState{}, fmt.Errorf("parse Claude Desktop restore state: %w", err)
 	}
 	return state, nil
+}
+
+// updateClaudeDesktopRestoreState runs a load → mutate → publish of oaica's own
+// restore-state file under that file's lock, with the load INSIDE it.
+//
+// Both entry points that use the state (ConfigureAutodiscovery and Restore)
+// need the whole cycle to be one critical section: what each of them records is
+// a before-snapshot of a Claude Desktop profile it is about to overwrite, and a
+// state loaded before the lock is a snapshot that does not hold the other
+// command's records — publishing it deletes them, which costs the user the
+// credential the deleted record existed to protect. The file is oaica's own
+// (unlike the Claude Desktop documents nested inside this cycle), so the lock
+// goes beside it, as the other oaica-owned stores do. The nesting order is
+// fixed at restore-state-first in both entry points, so two commands cannot
+// deadlock against each other (2026-09-26 audit, thirteenth round).
+func updateClaudeDesktopRestoreState(mutate func(*claudeDesktopRestoreState) error) error {
+	path := claudeDesktopRestoreStatePath()
+	return fileutil.WithFileLock(path, func() error {
+		state, err := loadClaudeDesktopRestoreState()
+		if err != nil {
+			return err
+		}
+		if err := mutate(&state); err != nil {
+			return err
+		}
+		return writeClaudeDesktopRestoreState(state)
+	})
 }
 
 func writeClaudeDesktopRestoreState(state claudeDesktopRestoreState) error {

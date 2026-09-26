@@ -82,6 +82,22 @@ func (d *Droid) Edit(models []LaunchModel) error {
 	}
 
 	settingsPath := filepath.Join(home, ".factory", "settings.json")
+	// ~/.factory/settings.json is Factory's own document and oaica rewrites it
+	// whole from a snapshot of it, so the read, the merge and the publish run
+	// under that store's lock: read outside and two overlapping
+	// `oaica launch droid` commands each publish a snapshot taken before the
+	// other's entries landed, and the launch that renames last silently decides
+	// the file while both report success. The store belongs to another program,
+	// so the lock is keyed under ~/.oaica/locks (foreignStoreLockBase) rather
+	// than dropped inside ~/.factory (2026-09-26 audit, thirteenth round).
+	return fileutil.WithFileLock(foreignStoreLockBase(settingsPath), func() error {
+		return writeDroidSettings(settingsPath, models)
+	})
+}
+
+// writeDroidSettings is the load-mutate-save half of Droid.Edit, run under the
+// store's lock.
+func writeDroidSettings(settingsPath string, models []LaunchModel) error {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		return err
 	}
