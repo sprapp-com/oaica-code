@@ -388,8 +388,6 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
-	table.escalations.noteLeg(table.SessionID, base.BaseURL)
-
 	for i := 0; i < autoEscalateAfterFails-1; i++ {
 		table.escalations.recordFail(table.SessionID, base.BaseURL)
 	}
@@ -400,11 +398,10 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
 		t.Errorf("consecutive failures at the threshold must escalate to the big leg (got %s, fallback=%v)", r.BaseURL, fb)
 	}
-	// A success ON THE SERVING LEG clears the consecutive counter, but an
-	// escalation already earned stands until the hold window decays (one
+	// An escalation already earned stands until the hold window decays — one
 	// lucky 200 on the secondary must not bounce the session back onto a
-	// flapping primary — and per-leg signals mean it doesn't even clear the
-	// primary's failure streak).
+	// flapping primary, and the streak belongs to the leg, so a success on
+	// ANOTHER leg doesn't touch the primary's count either.
 	table.escalations.recordOK(table.SessionID, big.BaseURL)
 	if r, _, fb := table.selectRoute("m"); !fb || r.BaseURL != big.BaseURL {
 		t.Errorf("active escalation must survive a success (got %s, fallback=%v)", r.BaseURL, fb)
@@ -413,8 +410,11 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 	if r, _, fb := table.selectRoute("m"); fb || r.BaseURL != base.BaseURL {
 		t.Errorf("escalation must reset after the hold window (got %s, fallback=%v)", r.BaseURL, fb)
 	}
-	// After the reset, ONE failure alone can't re-escalate (the counter was
-	// cleared by the OK above).
+	// After the reset, ONE failure alone can't re-escalate. The streak that
+	// armed the escalation is cleared when the window decays without further
+	// failures — the leg it escalated away from has then been quiet-healthy
+	// for the whole hold window and counts as recovered (per-leg state, so
+	// another leg's success never clears it; the window is what does).
 	table.escalations.recordFail(table.SessionID, base.BaseURL)
 	if _, _, fb := table.selectRoute("m"); fb {
 		t.Error("single post-reset failure must not escalate")
@@ -427,7 +427,6 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
-	table.escalations.noteLeg(table.SessionID, base.BaseURL)
 	for i := 0; i < autoEscalateAfterFails; i++ {
 		table2.escalations.recordFail(table2.SessionID, base.BaseURL)
 	}
@@ -445,7 +444,6 @@ func TestAutoPolicy_ResetAndSignals(t *testing.T) {
 		breakers:    &routeBreakers{},
 		escalations: &routeEscalations{},
 	}
-	table.escalations.noteLeg(table.SessionID, base.BaseURL)
 	for i := 0; i < autoEscalateAfterFails*3; i++ {
 		table3.escalations.recordFail(table3.SessionID, base.BaseURL)
 	}

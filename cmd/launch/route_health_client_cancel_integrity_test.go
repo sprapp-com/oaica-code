@@ -60,7 +60,27 @@ func escalationFails(table proxyRouteTable, sessionID string) int {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.fails
+	total := 0
+	for _, n := range e.fails {
+		total += n
+	}
+	return total
+}
+
+// escalationFailsFor reads ONE leg's consecutive-failure count for a session.
+func escalationFailsFor(table proxyRouteTable, sessionID, baseURL string) int {
+	if table.escalations == nil {
+		return 0
+	}
+	table.escalations.mu.Lock()
+	e := table.escalations.m[sessionID]
+	table.escalations.mu.Unlock()
+	if e == nil {
+		return 0
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.fails[baseURL]
 }
 
 // awaitRouteHealth waits for the request's bookkeeping to land: the feeds run

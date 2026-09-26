@@ -36,7 +36,6 @@ func TestAutoEscalationLeavesOtherTiersAlone(t *testing.T) {
 
 	// The primary leg fails twice — the threshold — while its breaker is still
 	// closed (that needs three).
-	table.escalations.noteLeg(table.SessionID, primary.BaseURL)
 	for i := 0; i < autoEscalateAfterFails; i++ {
 		table.escalations.recordFail(table.SessionID, primary.BaseURL)
 	}
@@ -79,7 +78,6 @@ func TestAutoEscalationStillFiresForTheLegThatFailed(t *testing.T) {
 	table.SessionID = "s2"
 
 	// The BIG leg is the one failing this time; the primary is its fallback.
-	table.escalations.noteLeg(table.SessionID, big.BaseURL)
 	for i := 0; i < autoEscalateAfterFails; i++ {
 		table.escalations.recordFail(table.SessionID, big.BaseURL)
 	}

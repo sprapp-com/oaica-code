@@ -292,9 +292,6 @@ var autoEscalateHoldFor = 10 * time.Minute
 
 // routeEscalation is the state for one SessionID: consecutive failures of
 // its currently chosen leg, and the instant escalation expires (stale, i.e.
-// zero or past, means "not escalated").
-// routeEscalation is the state for one SessionID: consecutive failures of
-// its currently chosen leg, and the instant escalation expires (stale, i.e.
 // zero or past, means "not escalated"). The signal is PER-LEG: only results
 // from the leg selectRoute CHOSE count — a success on some other leg must not
 // clear the primary's failure streak, and a failure on a fallback must not
@@ -304,31 +301,49 @@ var autoEscalateHoldFor = 10 * time.Minute
 // serves a leg on another host by construction (oversizeSwap), and its caller
 // therefore feeds the breaker only — see crossoverEscalationLeg for why that
 // result is deliberately not an escalation signal (2026-09-26 audit).
+// The count is per LEG, not "the leg this session was last served on". A
+// single current-leg slot meant every request for another tier re-pointed the
+// state and RESET the streak: Claude Code interleaves tiers (haiku titling,
+// subagents), and in a plan those tiers resolve to different base URLs, so the
+// primary's consecutive-failure count was wiped before it could ever reach
+// autoEscalateAfterFails and the escalation was unreachable no matter how
+// often the leg failed (2026-09-26 audit, tenth round). Each leg's own streak
+// is the honest signal; a success on one leg still cannot clear another's.
 type routeEscalation struct {
 	mu             sync.Mutex
-	leg            string
-	fails          int
+	fails          map[string]int
 	escalatedLeg   string
 	escalatedUntil atomic.Int64
 }
 
-func (e *routeEscalation) noteLeg(baseURL string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.leg != baseURL {
-		e.leg = baseURL
-		e.fails = 0
+// expireLocked applies what the hold window MEANS: an escalation that ran out
+// with no further failures escalated away from a leg that has now been
+// quiet-healthy for autoEscalateHoldFor, so that leg is considered recovered
+// and its streak starts over. Without this, a leg's count would survive the
+// window and re-arm on the very next single failure — the "reset" the old
+// per-request leg change used to provide as a side effect (2026-09-26 audit,
+// tenth round). Only the leg the escalation was armed on is cleared: every
+// other leg keeps its own independent streak.
+//
+// Callers hold e.mu.
+func (e *routeEscalation) expireLocked() {
+	if e.escalatedLeg == "" || time.Now().UnixNano() < e.escalatedUntil.Load() {
+		return
 	}
+	delete(e.fails, e.escalatedLeg)
+	e.escalatedLeg = ""
+	e.escalatedUntil.Store(0)
 }
 
 func (e *routeEscalation) recordFail(baseURL string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.leg != baseURL {
-		return
+	e.expireLocked()
+	if e.fails == nil {
+		e.fails = map[string]int{}
 	}
-	e.fails++
-	if e.fails >= autoEscalateAfterFails {
+	e.fails[baseURL]++
+	if e.fails[baseURL] >= autoEscalateAfterFails {
 		e.escalatedLeg = baseURL
 		e.escalatedUntil.Store(time.Now().Add(autoEscalateHoldFor).UnixNano())
 	}
@@ -337,10 +352,8 @@ func (e *routeEscalation) recordFail(baseURL string) {
 func (e *routeEscalation) recordOK(baseURL string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.leg != baseURL {
-		return
-	}
-	e.fails = 0
+	e.expireLocked()
+	delete(e.fails, baseURL)
 	if e.escalatedLeg == baseURL {
 		// The leg we were escalating away from served a request: nothing left
 		// to escalate from.
@@ -352,7 +365,8 @@ func (e *routeEscalation) recordOK(baseURL string) {
 func (e *routeEscalation) escalated() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.escalatedLeg != "" && time.Now().UnixNano() < e.escalatedUntil.Load()
+	e.expireLocked()
+	return e.escalatedLeg != ""
 }
 
 // escalatedFor reports whether this session is currently escalated AWAY FROM
@@ -364,7 +378,8 @@ func (e *routeEscalation) escalated() bool {
 func (e *routeEscalation) escalatedFor(baseURL string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.escalatedLeg != "" && e.escalatedLeg == baseURL && time.Now().UnixNano() < e.escalatedUntil.Load()
+	e.expireLocked()
+	return e.escalatedLeg == baseURL && baseURL != ""
 }
 
 // routeEscalations maps a SessionID to its escalation state, keyed by
@@ -391,12 +406,6 @@ func (re *routeEscalations) forSession(sessionID string) *routeEscalation {
 	e := &routeEscalation{}
 	re.m[sessionID] = e
 	return e
-}
-
-func (re *routeEscalations) noteLeg(sessionID, baseURL string) {
-	if e := re.forSession(sessionID); e != nil {
-		e.noteLeg(baseURL)
-	}
 }
 
 func (re *routeEscalations) recordFail(sessionID, baseURL string) {
@@ -547,9 +556,9 @@ func (t proxyRouteTable) weightedPick(base proxyRoute) (proxyRoute, bool) {
 // served it.
 func (t proxyRouteTable) selectRoute(requested string) (proxyRoute, string, bool) {
 	route, model, usedFallback := t.resolveRoute(requested)
-	// Track which leg the session is being served on: the escalation signal
-	// only counts results from that leg (nil-safe — no state is a no-op).
-	t.escalations.noteLeg(t.SessionID, route.BaseURL)
+	// No per-request "note the leg" step: the escalation state counts each
+	// leg's own consecutive failures, so which tier a request happened to
+	// resolve to cannot reset another leg's streak (see routeEscalation).
 	return route, model, usedFallback
 }
 

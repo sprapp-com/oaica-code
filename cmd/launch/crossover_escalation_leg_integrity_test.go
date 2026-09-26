@@ -59,7 +59,6 @@ func TestACrossoverFailureEscalatesNothing(t *testing.T) {
 		Default:     selected,
 	}
 	// selectRoute is what notes the leg the escalation may hear about.
-	table.escalations.noteLeg("sess-1", selected.BaseURL)
 
 	leg := crossoverEscalationLeg(selected.BaseURL, over.BaseURL)
 	for i := 0; i < 5*autoEscalateAfterFails; i++ {
@@ -85,7 +84,6 @@ func TestAChosenLegFailureStillEscalates(t *testing.T) {
 		Policy:      RouteAuto,
 		Default:     route,
 	}
-	table.escalations.noteLeg("sess-1", route.BaseURL)
 
 	for i := 0; i < autoEscalateAfterFails; i++ {
 		feedPassthroughRouteHealth(table, route, "sess-1",
