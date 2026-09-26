@@ -102,7 +102,7 @@ func (c *CodexApp) ConfigureWithModels(primary string, models []LaunchModel) err
 		if err != nil {
 			return err
 		}
-		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, models)); err != nil {
+		if err := writeCodexAppModelCatalog(catalogPath, primary, codexAppCatalogModels(primary, singleEndpointModels(models))); err != nil {
 			return err
 		}
 		return writeCodexAppConfig(configPath, primary, catalogPath)
@@ -251,29 +251,18 @@ func codexAppCatalogContainsModel(model string) bool {
 // shape and same answer as museRejectRemoteModels; lift this when the app's
 // credential field is verifiable.
 func codexAppRejectRemoteModels(primary string, models []LaunchModel) error {
-	reported := map[string]bool{}
-	refuse := func(model LaunchModel) error {
-		name := strings.TrimSpace(model.Name)
-		if !model.Remote || name == "" || reported[name] {
-			return nil
-		}
-		reported[name] = true
-		return fmt.Errorf("the ChatGPT app cannot be pointed at the remote model %q: its config names a single provider endpoint and has no credential field oaica can write — oaica hands a remote's key to a launched child process as OPENAI_API_KEY, and the app is started by you, not by oaica. Add the remote to the app's own settings, or launch a daemon-backed model", name)
+	// Only the PRIMARY is a refusal. `models` is the picker menu, not the
+	// selection (see singleEndpointModels): a remote row the user never picked
+	// used to refuse the launch of a local model outright.
+	model, ok := findLaunchModel(models, primary)
+	if !ok || !model.Remote {
+		return nil
 	}
-
-	// The primary is written as the root model, so it is the one that decides
-	// which model every request names; check it first.
-	if model, ok := findLaunchModel(models, primary); ok {
-		if err := refuse(model); err != nil {
-			return err
-		}
+	name := strings.TrimSpace(model.Name)
+	if name == "" {
+		return nil
 	}
-	for _, model := range models {
-		if err := refuse(model); err != nil {
-			return err
-		}
-	}
-	return nil
+	return fmt.Errorf("the ChatGPT app cannot be pointed at the remote model %q: its config names a single provider endpoint and has no credential field oaica can write — oaica hands a remote's key to a launched child process as OPENAI_API_KEY, and the app is started by you, not by oaica. Add the remote to the app's own settings, or launch a daemon-backed model", name)
 }
 
 func writeCodexAppConfig(configPath, model, modelCatalogPath string) error {

@@ -883,3 +883,26 @@ func launchModelsFromNames(names []string) []LaunchModel {
 	}
 	return models
 }
+
+// singleEndpointModels keeps the rows a store that names ONE endpoint can serve
+// — the daemon-backed integrations that write a whole model list (chatgpt, dsh)
+// beside that one endpoint.
+//
+// The list they are handed is not the user's selection: managedSingleConfigure
+// Models hands the launch target plus every row the picker offers, with the
+// remote rows flagged. Writing those rows into the store advertises models the
+// configured endpoint does not serve, which is the failure round 18 fixed for
+// the harness — but refusing the whole launch because ONE such row exists in the
+// menu refused launches of perfectly ordinary local models (2026-09-27 audit,
+// round 19). The row that decides the endpoint is the primary, and it is refused
+// separately by each store's own primary check; everything else is filtered here.
+func singleEndpointModels(models []LaunchModel) []LaunchModel {
+	servable := make([]LaunchModel, 0, len(models))
+	for _, model := range models {
+		if model.Remote {
+			continue
+		}
+		servable = append(servable, model)
+	}
+	return servable
+}

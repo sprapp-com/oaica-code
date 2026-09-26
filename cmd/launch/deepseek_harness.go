@@ -242,29 +242,19 @@ func (d *DeepSeekHarness) ConfigureWithModels(primary string, models []LaunchMod
 // shape and same answer as museRejectRemoteModels and codexAppRejectRemoteModels;
 // lift this when the harness store grows a per-provider credential.
 func deepSeekHarnessRejectRemoteModels(primary string, models []LaunchModel) error {
-	reported := map[string]bool{}
-	refuse := func(model LaunchModel) error {
-		name := strings.TrimSpace(model.Name)
-		if !model.Remote || name == "" || reported[name] {
-			return nil
-		}
-		reported[name] = true
-		return fmt.Errorf("the DeepSeek Harness cannot be pointed at the remote model %q: its settings carry a single endpoint and a single credential for every model row, both naming the local daemon, which does not resolve namespaced remotes. Add the remote to the harness's own settings, or launch a daemon-backed model", name)
+	// Only the PRIMARY is a refusal: it is what the settings name as the default
+	// model and put in the web-search block. `models` is the picker MENU, not the
+	// selection (see singleEndpointModels), and a remote row in it the user never
+	// picked used to refuse the launch of a local model outright.
+	model, ok := findLaunchModel(models, primary)
+	if !ok || !model.Remote {
+		return nil
 	}
-
-	// The primary is written as the default model and into the web-search block,
-	// so it decides what every request names; check it first.
-	if model, ok := findLaunchModel(models, primary); ok {
-		if err := refuse(model); err != nil {
-			return err
-		}
+	name := strings.TrimSpace(model.Name)
+	if name == "" {
+		return nil
 	}
-	for _, model := range models {
-		if err := refuse(model); err != nil {
-			return err
-		}
-	}
-	return nil
+	return fmt.Errorf("the DeepSeek Harness cannot be pointed at the remote model %q: its settings carry a single endpoint and a single credential for every model row, both naming the local daemon, which does not resolve namespaced remotes. Add the remote to the harness's own settings, or launch a daemon-backed model", name)
 }
 
 // writeDeepSeekHarnessSettings is the load → mutate → publish half of
@@ -325,7 +315,7 @@ func applyDeepSeekHarnessSettings(document *yaml.Node, primary string, models []
 		"apiKeyEnv":   deepSeekHarnessAPIKeyEnv,
 		"api":         "openai-completions",
 		"baseURL":     deepSeekHarnessBaseURL(),
-		"models":      deepSeekHarnessModelConfigs(primary, models),
+		"models":      deepSeekHarnessModelConfigs(primary, singleEndpointModels(models)),
 	} {
 		if err := yamlSetValue(provider, key, value); err != nil {
 			return err
