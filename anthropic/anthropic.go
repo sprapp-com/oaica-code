@@ -974,7 +974,7 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		id := tc.ID
 		if key == "" {
 			key = "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
-			id = "call_" + shortToolCallID(key)
+			id = ToolCallIDFor(tc.Function.Name, string(argsJSON))
 		}
 		if c.toolCallsSent[key] {
 			continue
@@ -1122,6 +1122,22 @@ func GenerateMessageID() string {
 // per distinct call so two parallel calls stay two blocks. FNV-1a, hex — small
 // enough to sit inside a tool_use id, and collision-resistant across the few
 // calls one message carries.
+// ToolCallIDFor returns a stable synthesized id for a tool call the upstream
+// sent WITHOUT one, keyed on the call's own identity: its name and its
+// arguments. Such a call offers only itself as identity (two genuinely
+// different parallel calls differ in arguments, and two identical ones are
+// indistinguishable), and the client needs some id to echo back in its
+// tool_result.
+//
+// Exported because both translation paths must apply the same rule: the
+// streaming converter, which learned it first for OpenAI-compatible GGUF
+// backends that send no id, and the proxy's non-streaming parser, which passed
+// the empty id through and left the client with a tool_use block it could not
+// name back (2026-09-26 audit, thirteenth round).
+func ToolCallIDFor(name, argsJSON string) string {
+	return "call_" + shortToolCallID("\x00"+name+"\x00"+argsJSON)
+}
+
 func shortToolCallID(key string) string {
 	var h uint32 = 2166136261
 	for i := 0; i < len(key); i++ {

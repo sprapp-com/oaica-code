@@ -531,8 +531,25 @@ func parseOpenAIToolCalls(tcs []struct {
 			args = api.NewToolCallFunctionArguments()
 			args.Set("_raw", raw)
 		}
+		id := tc.ID
+		if id == "" {
+			// The upstream sent no id (several OpenAI-compatible GGUF
+			// backends). Passing it through left the client with a tool_use
+			// block carrying NO id at all — ContentBlock.ID is omitempty —
+			// so it could not name the call back, and its tool_result then
+			// carried tool_use_id "" into the next request as an empty OpenAI
+			// tool_call_id. Same rule as the streaming path, one helper
+			// (2026-09-26 audit, thirteenth round). The key is the canonical
+			// encoding of the parsed arguments, so two parallel calls that
+			// differ only in whitespace are one call.
+			key := raw
+			if b, err := json.Marshal(args); err == nil {
+				key = string(b)
+			}
+			id = anthropic.ToolCallIDFor(tc.Function.Name, key)
+		}
 		out = append(out, api.ToolCall{
-			ID:       tc.ID,
+			ID:       id,
 			Function: api.ToolCallFunction{Name: tc.Function.Name, Arguments: args},
 		})
 	}
