@@ -5,7 +5,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/ollama/ollama/anthropic"
-	"github.com/ollama/ollama/api"
 )
 
 // The prompt-size unit the client proxy's context-fit clamp and its
@@ -89,18 +88,20 @@ func convertedPromptBody(body []byte) (serialized, imagePayload, images int, ok 
 		}
 	}
 
-	n, err := marshalPrompt(promptOnly(oai))
+	n, err := promptBytesOf(oai)
 	if err != nil {
 		return 0, 0, 0, false
 	}
 	return n, imagePayload, images, true
 }
 
-// promptOnly is the part of the converted request the upstream tokenizes: the
-// messages and the tool schemas, which is the unit the gateway leg's
-// messagesBytes charges (its "messages" plus "tools"/"functions"). The ENVELOPE
-// — the model id, `stream`, `stream_options`, the sampling options — is not
-// prompt: the chat template renders none of it, so the upstream's
+// promptBytesOf is the part of the converted request the upstream tokenizes: the
+// messages and the tool schemas, each measured as its own JSON text, which is
+// the unit the gateway leg's messagesBytes charges (its "messages" plus
+// "tools"/"functions", each marshalled on its own).
+//
+// The ENVELOPE — the model id, `stream`, `stream_options`, the sampling options
+// — is not prompt: the chat template renders none of it, so the upstream's
 // prompt_tokens do not count it, and charging it made this leg's byte unit
 // differ from the gateway leg's by a constant per request. The same prompt
 // measured 12 tokens more with `stream: true` (and its include_usage
@@ -110,14 +111,35 @@ func convertedPromptBody(body []byte) (serialized, imagePayload, images int, ok 
 // refusal, or the reverse — disagreed by an amount no prompt can calibrate out
 // (2026-09-27 audit, round 47, A-F2).
 //
+// A WRAPPER is an envelope too. The two fields were marshalled inside a
+// synthetic {"messages":…,"tools":…} object, whose braces, key names and comma
+// the gateway leg does not charge; measured against the same documents, this
+// leg's unit carried 13 bytes the gateway's did not (22 with tools), which is a
+// large share of a small prompt and a constant no calibration removes
+// (2026-09-27 audit, round 48, C-F6).
+//
 // The messages keep the marshaller they had: openAIMessage.MarshalJSON is what
 // writes the data-URI form the allowance below is measured against, and it runs
-// for a nested element exactly as it did for the field of the request.
-func promptOnly(oai openAIChatRequest) any {
-	return struct {
-		Messages []openAIMessage `json:"messages"`
-		Tools    []api.Tool      `json:"tools,omitempty"`
-	}{Messages: oai.Messages, Tools: oai.Tools}
+// for a slice element exactly as it did for the field of a request. A field the
+// request does not carry is charged nothing, exactly as the gateway charges
+// nothing for an absent key.
+func promptBytesOf(oai openAIChatRequest) (int, error) {
+	total := 0
+	if len(oai.Messages) > 0 {
+		n, err := marshalPrompt(oai.Messages)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	if len(oai.Tools) > 0 {
+		n, err := marshalPrompt(oai.Tools)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // marshalPrompt returns the length of the converted request as the upstream

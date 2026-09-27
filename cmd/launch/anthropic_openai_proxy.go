@@ -2599,6 +2599,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
+	// adoptedCalls is whether the adopted completion wrote any tool call of its
+	// own — the calls whose blocks the client already holds, and the only
+	// fragments a later tool delta can be a continuation of.
+	adoptedCalls := false
 	// adoptedWhole is whether a whole completion that arrived inside a frame
 	// became the turn (see the frameCarriesWholeCompletion branch below).
 	adoptedWhole := false
@@ -2686,7 +2690,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// stream was discarded, and the client got 200 with no answer and a
 		// healthy leg (2026-09-26 audit, sixteenth round).
 		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
-			if adopted, refused := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			if adopted, refused, wroteCalls := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
 				// goes on: the upstream stated the message and then kept
@@ -2698,16 +2702,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// had already read. So the loop reads on (2026-09-27 audit,
 				// round 47, C-F3).
 				//
-				// A TOOL fragment after this point is the other half of that
-				// contradiction: the call it continues was written in full by
-				// the adoption, and its block is closed — the gateway leg drops
-				// such a fragment for the same reason (its content_block_stop is
-				// out and no wire event reopens a block). Accumulating it here
-				// would flush a SECOND call under the id the adoption already
-				// emitted, and the client can answer one id once. The fragment
-				// is dropped, which is what adoption means for the calls it
-				// carried.
+				// A TOOL fragment after this point is dropped only when the
+				// adoption wrote calls of its OWN: the fragment then continues
+				// one of those, whose block the client already holds under an
+				// id it can answer once, and accumulating it would flush a
+				// SECOND call under that id. An adoption that wrote only text
+				// closed no call, so a tool fragment after it is a call the
+				// model wrote — the gateway leg opens a block for exactly this
+				// wire (its content_block_stop is out for the TEXT block, and a
+				// tool call is a block of its own), and dropping it here made
+				// the turn's answer depend on whether the text arrived as a
+				// whole message or as deltas (2026-09-27 audit, round 48, A-F2
+				// and C-F2).
 				adoptedWhole = true
+				adoptedCalls = wroteCalls
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. Falling
 				// through to the delta loop let the finish_reason it carried
@@ -2742,7 +2750,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			// Tool-call deltas — accumulate by index; flush later.
 			for _, tc := range d.ToolCalls {
-				if adoptedWhole {
+				if adoptedWhole && adoptedCalls {
 					// A call the adoption already wrote in full (see above): its
 					// block is closed on the client's side, so these arguments
 					// cannot be delivered.
@@ -2821,7 +2829,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// completion the upstream sent instead of frames. Adopt it as the turn
 		// rather than reporting a failure over an answer that exists.
 		if !started && upstreamErr == "" {
-			if adopted, refused := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			if adopted, refused, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 			} else if refused {
 				upstreamErr = "upstream returned an empty completion"
@@ -3011,20 +3019,20 @@ func frameCarriesWholeCompletion(payload string) bool {
 // content on every retry (the upstream produced and billed a whole answer) and
 // marked the leg failed, so three such turns opened its breaker and moved the
 // session off a leg that was serving it (2026-09-26 audit, fourteenth round).
-func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused bool) {
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool) {
 	if strings.TrimSpace(raw) == "" {
-		return false, false
+		return false, false, false
 	}
 	var oaiResp openAIChatResponse
 	if err := json.Unmarshal([]byte(raw), &oaiResp); err != nil {
-		return false, false
+		return false, false, false
 	}
 	// No choices is not an answer: the same body the non-streaming path
 	// refuses ("upstream returned no completion choices"), so it keeps the
 	// failure verdict here. refused is what tells the framed caller that the
 	// body IS a whole completion rather than a stream to keep reading.
 	if len(oaiResp.Choices) == 0 {
-		return false, true
+		return false, true, false
 	}
 	// And neither is a whole completion that says nothing. Adopting one
 	// emitted message_start and message_stop around no blocks at all — the
@@ -3033,18 +3041,22 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// the refusing path asks it: a call only counts when the upstream named
 	// it, since an unnamed call is dropped by the converter and cannot be run
 	// (2026-09-27 audit, round 45, A45-5).
+	//
+	// Whether it named one is the caller's business too: this is the adoption
+	// that WROTE the turn's tool calls, so a tool fragment later in the stream
+	// continues a call whose block the client already holds under an id it can
+	// answer once (2026-09-27 audit, round 48, A-F2).
 	{
 		m := oaiResp.Choices[0].Message
-		named := false
 		for _, tc := range m.ToolCalls {
 			if strings.TrimSpace(tc.Function.Name) != "" {
-				named = true
+				wroteCalls = true
 				break
 			}
 		}
 		if m.Content == "" &&
-			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !named {
-			return false, true
+			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !wroteCalls {
+			return false, true, false
 		}
 	}
 
@@ -3063,7 +3075,7 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 		toolCallArgumentsSize(chatResp.Message.ToolCalls)
 	*finishReason = oaiResp.Choices[0].FinishReason
 	*finalUsage = oaiResp.Usage
-	return true, false
+	return true, false, wroteCalls
 }
 
 // upstreamErrorMessage extracts the message from an OpenAI-shaped error

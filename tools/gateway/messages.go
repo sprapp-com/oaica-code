@@ -1430,6 +1430,13 @@ type anthropicBridge struct {
 	// call, and two blocks under one id cannot be answered separately
 	// (2026-09-27 audit, round 46, G45-1 and G45-5).
 	grantedIDs map[string]bool
+	// reservedIDs is every id a whole NON-stream list states, recorded before
+	// any call in it is numbered: a mint walks the list in order, so without
+	// this an id-less call early in the list took the id a later call states,
+	// and the two legs that answer the same list keep the stated id and
+	// renumber the minted one. Only the mint consults it — a stated id is taken
+	// by its own call as before (2026-09-27 audit, round 48, B-F4).
+	reservedIDs map[string]bool
 	// statedIDOwner records, per upstream-stated id, the call identity it was
 	// first stated for, so a second, DIFFERENT call under the same id is
 	// numbered here instead of being folded into the first (the rule leg 1's
@@ -1466,6 +1473,16 @@ type toolBlock struct {
 	// introduction of another call — the distinction toolKey's merge arm needs
 	// (2026-09-27 audit, round 45, B45-1).
 	statedID bool
+	// needsMint is whether the id is one this bridge has to number itself and
+	// has not numbered yet. The mint waits for the block to open, because it
+	// hashes the call's own arguments and those are not all in when the
+	// fragment that names the call arrives (see toolDelta).
+	needsMint bool
+	// merged is whether this block turned out to be a restatement of a call
+	// another block already carries — the same name and the same arguments
+	// under the same stated id. It is not a call: it never opens, and the
+	// fragments that follow it are dropped (see startToolBlock).
+	merged bool
 	// started is whether content_block_start has been emitted for this block.
 	started bool
 	// closed is whether its content_block_stop has been emitted. A closed block
@@ -1553,6 +1570,7 @@ func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthr
 		ResponseWriter: w, stream: stream, model: model,
 		toolBlocks: map[string]*toolBlock{}, mintedIDs: map[string]int{},
 		grantedIDs: map[string]bool{}, statedIDOwner: map[string]string{},
+		reservedIDs: map[string]bool{},
 	}
 }
 
@@ -1964,6 +1982,15 @@ func (b *anthropicBridge) finalize() {
 	// the set is decided by the rule the client leg applies, not by the
 	// upstream's stated call list.
 	truncated := resp.Choices[0].FinishReason == "length"
+	// Every id this list states is reserved before the loop takes a single
+	// mint, so no call in it is numbered with an id another call of the same
+	// list states — whatever order the upstream wrote them in (see
+	// reservedIDs; 2026-09-27 audit, round 48, B-F4).
+	for _, tc := range msg.ToolCalls {
+		if id := tc.ID; id != "" {
+			b.reservedIDs[id] = true
+		}
+	}
 	toolBlocks := 0
 	for _, tc := range msg.ToolCalls {
 		if strings.TrimSpace(firstNonEmptyStr(tc.Function.Name, tc.Name)) == "" {
@@ -2014,6 +2041,17 @@ func (b *anthropicBridge) finalize() {
 		identity := toolCallIdentity(name, callArgs)
 		id := tc.ID
 		if id != "" {
+			if owner, ok := b.statedIDOwner[id]; ok && owner == identity {
+				// A restatement of the SAME call under the same id: one call,
+				// listed twice. Both other legs answer it with one block and
+				// drop the repeat — the client leg and the local converter both
+				// key a stated id and skip what they have already sent
+				// (anthropic.go's seenStatedID, the proxy's dedupKey), and a
+				// repeat under a MINTED id is the different-call rule, not this
+				// one. Emitting both ran the model's call twice, a side effect
+				// the wire never asked for (2026-09-27 audit, round 48, C-F1).
+				continue
+			}
 			if owner, ok := b.statedIDOwner[id]; ok && owner != identity {
 				id = ""
 			} else {
@@ -2564,27 +2602,32 @@ func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
 	return false
 }
 
-// idHeldByAnotherBlock reports whether a call block other than tb already
-// carries tb's id under a DIFFERENT identity — a different name, or different
-// arguments, which is to say a different call (see startToolBlock). It is
-// idHeldByAnotherCall asked of a block that already carries the id, so it
-// cannot ask that function: there the caller's own block is still id-less, and
-// the key-shaped exclusion that tells a call apart from its own restatement
-// does not hold here (a block keyed by an index carries the id under "#n").
-func (b *anthropicBridge) idHeldByAnotherBlock(tb *toolBlock) bool {
-	if tb.id == "" {
-		return false
+// blockCarrying returns the block other than tb that already carries id, or nil
+// when no block does.
+func (b *anthropicBridge) blockCarrying(id string, tb *toolBlock) *toolBlock {
+	if id == "" {
+		return nil
 	}
-	identity := toolCallIdentity(tb.name, tb.args.String())
 	for _, other := range b.toolOrder {
-		if other == tb || other.id != tb.id {
+		if other == tb || other.merged || other.id != id {
 			continue
 		}
-		if toolCallIdentity(other.name, other.args.String()) != identity {
-			return true
-		}
+		return other
 	}
-	return false
+	return nil
+}
+
+// settledIdentity is what a call is, as far as the ids this bridge hands out are
+// concerned — its name and its arguments — and whether the arguments are far
+// enough along for the comparison to mean anything. An argument text the
+// upstream is still writing is half an object, so two blocks showing the same
+// half need not be the same call; the identity is not reported as settled for
+// one, and the caller treats them as different calls.
+func settledIdentity(tb *toolBlock) (string, bool) {
+	if argsAreMidObject(tb.args.String()) {
+		return "", false
+	}
+	return toolCallIdentity(tb.name, tb.args.String()), true
 }
 
 // toolCallIdentity is what a call IS, as far as the ids this bridge hands out
@@ -2615,67 +2658,95 @@ func toolCallIdentity(name, args string) string {
 // them in a plain map[string]any inside the ordered top level, so this matches
 // there too.
 //
-// Text that is not a JSON object has no keys to preserve and is hashed as
-// given: an empty or absent argument list is the empty object, which is what
-// the other legs produce for one (`ToolCallFunctionArguments.MarshalJSON`
-// writes "{}" for a nil map), and a fragment the model was still writing is
-// hashed as the text it is, exactly as this bridge hashed it before.
+// Text that is not a JSON object has no keys to preserve and is kept as the
+// single-key "_raw" object, the shape the client leg and this bridge's own
+// non-stream path both keep it in (a fragment the model was still writing is
+// hashed as the text it is, wrapped the same way).
 func canonicalCallArgs(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed == "null" {
 		return "{}"
 	}
 	if !strings.HasPrefix(trimmed, "{") {
-		return trimmed
+		return rawFallbackArgs(trimmed)
 	}
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	tok, err := dec.Token()
 	if err != nil {
-		return trimmed
+		return rawFallbackArgs(trimmed)
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return trimmed
+		return rawFallbackArgs(trimmed)
 	}
-	var b strings.Builder
-	b.WriteByte('{')
-	for first := true; dec.More(); first = false {
+	// Keys in the order they were first written, each with the LAST value the
+	// object gave it: that is what an ordered map does with a repeated key
+	// (orderedmap.Set replaces the value in place), and it is what the client
+	// leg hashes — {"a":1,"a":2} is {"a":2} there, so hashing both entries here
+	// minted a different id for one call (2026-09-27 audit, round 48, B-F3).
+	var keys []string
+	vals := map[string]any{}
+	for dec.More() {
 		kt, err := dec.Token()
 		if err != nil {
-			return trimmed
+			return rawFallbackArgs(trimmed)
 		}
 		key, ok := kt.(string)
 		if !ok {
-			return trimmed
+			return rawFallbackArgs(trimmed)
 		}
 		var val any
 		if err := dec.Decode(&val); err != nil {
-			return trimmed
+			return rawFallbackArgs(trimmed)
 		}
+		if _, seen := vals[key]; !seen {
+			keys = append(keys, key)
+		}
+		vals[key] = val
+	}
+	// The closing brace, and then nothing: a second value in the same text is
+	// not this object and the text is hashed as the text it is instead.
+	if _, err := dec.Token(); err != nil {
+		return rawFallbackArgs(trimmed)
+	}
+	if dec.More() {
+		return rawFallbackArgs(trimmed)
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, key := range keys {
 		kb, err := json.Marshal(key)
 		if err != nil {
-			return trimmed
+			return rawFallbackArgs(trimmed)
 		}
-		vb, err := json.Marshal(val)
+		vb, err := json.Marshal(vals[key])
 		if err != nil {
-			return trimmed
+			return rawFallbackArgs(trimmed)
 		}
-		if !first {
+		if i > 0 {
 			b.WriteByte(',')
 		}
 		b.Write(kb)
 		b.WriteByte(':')
 		b.Write(vb)
 	}
-	// The closing brace, and then nothing: a second value in the same text is
-	// not this object and the text is hashed as given instead.
-	if _, err := dec.Token(); err != nil {
-		return trimmed
-	}
-	if dec.More() {
-		return trimmed
-	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// rawFallbackArgs is the argument text this bridge keeps for a call whose
+// arguments are not a JSON object, in the shape the client leg keeps it:
+// a single-key map under "_raw" (anthropic_openai_proxy.go, args.Set("_raw",
+// raw)), which is also the input this gateway's own non-stream path hands the
+// client for the same call (callInput). Hashing the bare text instead made one
+// call mint a different id here than through the client leg, and a different id
+// than the very block this bridge was about to emit — the block's input is the
+// _raw object (2026-09-27 audit, round 48, B-F3).
+func rawFallbackArgs(s string) string {
+	b, err := json.Marshal(map[string]any{"_raw": s})
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
@@ -2685,6 +2756,13 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		tb = &toolBlock{key: key, index: -1}
 		b.toolBlocks[key] = tb
 		b.toolOrder = append(b.toolOrder, tb)
+		if name != "" {
+			// This fragment introduces a call, so the calls before it will not
+			// state another argument: any of them still waiting to be numbered
+			// is numbered now, and takes its index before this one
+			// (releaseHeldToolBlocks).
+			b.releaseHeldToolBlocks(tb)
+		}
 	}
 	if name != "" && tb.name == "" {
 		tb.name = name
@@ -2698,6 +2776,10 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		if id != "" && !strings.HasPrefix(tb.key, "?") {
 			tb.id = id
 			tb.statedID = true
+			// The upstream's own id, stated for this very call (the ordinary
+			// OpenAI order states the name first and the id on a later
+			// fragment): nothing is left to mint.
+			tb.needsMint = false
 			b.grantedIDs[id] = true
 		} else {
 			// A block the split rule minted a key for: the fragment repeated an
@@ -2714,8 +2796,25 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// is exactly the wire the split rule exists for, and the block the
 			// split minted then came out carrying the very id it was split from
 			// (2026-09-27 audit, round 44, B44-1; round 39, B-F8 for the split).
-			tb.id = b.mintedToolCallID(tb.name, tb.args.String())
+			//
+			// The mint itself waits for the block to open. It hashes the call
+			// its name and its arguments — and on the ordinary OpenAI order the
+			// name arrives on one fragment and the arguments on the next, so a
+			// mint taken here hashed the EMPTY prefix, the id of an
+			// argument-less call: this bridge's own non-stream path, the client
+			// leg and the local converter all mint from the finished arguments,
+			// so one call reached the client under two different ids depending
+			// on the path that answered it (2026-09-27 audit, round 48, B-F2 and
+			// A-F3).
+			tb.needsMint = true
 		}
+	}
+	if tb.merged {
+		// A restatement of a call another block already carries: this block is
+		// not a call, so its fragments are not arguments the client is owed
+		// (see startToolBlock). Dropped silently — the call they repeat is
+		// already on the wire, complete.
+		return
 	}
 	if tb.closed {
 		// The client has already been told this call is finished, and the wire
@@ -2735,58 +2834,186 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// is held (2026-09-27 audit, round 38, B-F2 / round 39, B-F8).
 			return
 		}
+		if tb.needsMint && !argsAreFinished(tb.args.String()) {
+			// The block has to be numbered by this bridge, and the arguments it
+			// is numbered FROM are not all in: opening now would mint the id of
+			// a half-written call — on the ordinary OpenAI order the name
+			// arrives on one fragment and the arguments on the next, and on
+			// that wire the mint hashed the empty prefix. Held until the
+			// object closes (the arguments stated so far follow in one delta
+			// below), until a fragment introduces the NEXT call (releaseHeldToolBlocks),
+			// or until the turn ends (finishStream).
+			return
+		}
 		b.closeOpen()
 		b.flushHeldText()
 		b.closeOpen() // the held text took a block of its own; the call follows it
-		b.startToolBlock(tb)
+		if !b.startToolBlock(tb) {
+			return // a restatement of a call already delivered (see startToolBlock)
+		}
 	}
-	if tb.emitted < tb.args.Len() {
-		// Everything stated but not yet sent: the fragments that arrived while the
-		// block was held are delivered now, as one delta, so no argument is lost
-		// to the delay in the name.
-		pending := tb.args.String()[tb.emitted:]
-		tb.emitted = tb.args.Len()
-		b.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": tb.index,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": pending},
-		})
+	b.flushToolArgs(tb)
+}
+
+// flushToolArgs emits the argument text a block has accumulated but not yet
+// delivered. A block is held while the arguments that would number it are still
+// arriving (see toolDelta) and while it has no name to open under, so the
+// fragments that arrived in the meantime are delivered the moment it opens, as
+// one delta, and no argument is lost to the delay.
+func (b *anthropicBridge) flushToolArgs(tb *toolBlock) {
+	if tb.emitted >= tb.args.Len() {
+		return
+	}
+	// The whole call arrived in one fragment, so the text is the block's input
+	// entire: if it is not a JSON object — freeform arguments — it is delivered
+	// as the single-key "_raw" object that both other legs deliver it as, and
+	// that this bridge's own non-stream path puts in the same call's block. A
+	// text already delivered in pieces cannot be re-wrapped, and stays as the
+	// model wrote it (the freeform call the upstream split across fragments).
+	first := tb.emitted == 0
+	pending := tb.args.String()[tb.emitted:]
+	tb.emitted = tb.args.Len()
+	if first {
+		if wrapped, ok := rawArgsObject(pending); ok {
+			pending = wrapped
+		}
+	}
+	b.emit("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": tb.index,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": pending},
+	})
+}
+
+// rawArgsObject returns the object an argument text that is not a JSON object
+// has to be delivered as, and whether it was one of those: the empty object for
+// null (what both other legs parse it into), and the single-key "_raw" encoding
+// for anything else that is not an object — the freeform shape the client leg
+// keeps whole rather than dropping (anthropic_openai_proxy.go, callInput here).
+// An object still being written is not this case: it is delivered as it stands,
+// and a tool the model gave no arguments at all needs nothing.
+func rawArgsObject(s string) (string, bool) {
+	if argsAreMidObject(s) {
+		return "", false
+	}
+	t := strings.TrimSpace(s)
+	if t == "" || strings.HasPrefix(t, "{") {
+		return "", false
+	}
+	if t == "null" {
+		return "{}", true
+	}
+	return rawFallbackArgs(t), true
+}
+
+// argsAreMidObject reports whether the argument text is an object the upstream
+// has not finished writing — started with "{" and not yet parseable. Text that
+// does not begin an object is not half of one (a tool that takes freeform
+// arguments, or a complete JSON value of another kind), and an empty argument
+// list is the empty object, which is a complete list for a tool that takes
+// none.
+func argsAreMidObject(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" || !strings.HasPrefix(s, "{") {
+		return false
+	}
+	return !json.Valid([]byte(s))
+}
+
+// argsAreFinished reports whether a call's argument text is finished — a
+// complete JSON object, which is the one spelling the wire has for a call that
+// states its arguments — or is freeform text rather than the beginning of an
+// object. It is the test a mint waits for (see toolDelta): an id-less call is
+// numbered from its own arguments, and the number has to be the one both other
+// legs produce for the same call.
+//
+// An empty argument list is NOT finished: a fragment that names a call states
+// no arguments either, so an argument-less call and a call whose arguments have
+// not arrived yet look the same here. The call is numbered once nothing more
+// can arrive for it — the next call's fragment, or the end of the turn — and
+// its id is then the mint over no arguments, which is the id both other legs
+// mint for a call that states none.
+func argsAreFinished(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return false
+	}
+	if !strings.HasPrefix(s, "{") {
+		return true
+	}
+	return json.Valid([]byte(s))
+}
+
+// releaseHeldToolBlocks opens every block that was waiting to be numbered, ahead
+// of the call whose fragment has just arrived. A fragment that NAMES a call
+// introduces it, so any earlier call that had not stated a finished argument
+// list will not state one — its arguments are whatever it wrote — and its block
+// takes the index the wire gives it, before the new call's rather than after
+// (the blocks are opened in the order the calls appear, as both other legs
+// deliver them).
+func (b *anthropicBridge) releaseHeldToolBlocks(except *toolBlock) {
+	for _, tb := range b.toolOrder {
+		if tb == except || tb.started || tb.merged || tb.name == "" {
+			continue
+		}
+		if !tb.needsMint {
+			continue
+		}
+		b.closeOpen()
+		b.flushHeldText()
+		b.closeOpen()
+		if b.startToolBlock(tb) {
+			b.flushToolArgs(tb)
+		}
 	}
 }
 
-// startToolBlock emits the content_block_start for one tool call, once. The
-// caller has closed whatever was open.
-func (b *anthropicBridge) startToolBlock(tb *toolBlock) {
-	if tb.started {
-		return
+// startToolBlock emits the content_block_start for one tool call, once, and
+// reports whether the block was opened. The caller has closed whatever was
+// open.
+func (b *anthropicBridge) startToolBlock(tb *toolBlock) bool {
+	if tb.started || tb.merged {
+		return false
 	}
-	if b.idHeldByAnotherBlock(tb) {
-		// The id this call is about to carry is one a DIFFERENT call already
-		// carries, so handing it over here would put two tool_use blocks under
-		// one id — which the client can answer only once, and the tool_results
-		// it returns cannot name two calls by one id. The index path reached
-		// this directly: a fragment's index names its call, so two fragments at
-		// two indexes that state one id each opened two blocks carrying it,
-		// while the non-stream list and both other legs answered the same wire
-		// with a distinctly numbered second call (2026-09-27 audit, round 47,
-		// C-F1).
+	if other := b.blockCarrying(tb.id, tb); other != nil {
+		// The id this call is about to carry is one another block already
+		// carries, and the client can answer a tool_use only once: two blocks
+		// under one id get one tool_result for two calls. What that makes this
+		// block depends on whether the two are the same CALL.
 		//
 		// The check sits here, at the one point an id is handed to the client,
 		// rather than at the fragment that stated it: an id can be stated before
 		// the fragment that names its call (the usual OpenAI order is id first),
 		// and only at the start is the call's identity — the name the block will
-		// carry and the arguments accumulated under it — known. The id is minted
-		// from the call itself, the value both other legs mint for a call the
-		// upstream never gave a usable id, and the mint is bumped until it is
-		// one no call of this turn holds (mintedToolCallID).
-		//
-		// A block that carries the id under the SAME identity — the same name
-		// and the same arguments — is not a second call but a restatement of
-		// the one whose id it is, which is the reading the non-stream list's
-		// statedIDOwner gives the same wire and what the client leg's
-		// startsANewToolCall does with a repeated id. tb.statedID is left as
-		// recorded: the upstream did state this call's id, it is only this
-		// bridge that could not hand it over.
+		// carry and the arguments accumulated under it — known.
+		if mine, ok := settledIdentity(tb); ok {
+			if theirs, ok := settledIdentity(other); ok && theirs == mine {
+				// A restatement of the SAME call under its own id, which both
+				// other legs answer with the one block (the client leg and the
+				// local converter both drop the repeat; anthropic.go's
+				// seenStatedID, the proxy's dedupKey). This block is that call
+				// again, so it is not a call: it never opens, and the fragments
+				// that follow it are the arguments of a call already delivered
+				// (2026-09-27 audit, round 48, B-F1, A-F1 and C-F1).
+				tb.merged = true
+				tb.closed = true
+				return false
+			}
+		}
+		// A different call that states an id already handed out — the index
+		// path reaches this directly, since a fragment's index names its call.
+		// It is numbered from its own identity, the value both other legs mint
+		// for a call the upstream never gave a usable id, bumped until it is one
+		// no call of this turn holds (mintedToolCallID).
 		tb.id = b.mintedToolCallID(tb.name, tb.args.String())
+		tb.needsMint = false
+	} else if tb.needsMint {
+		// A block this bridge has to number itself is numbered here, from the
+		// FINISHED arguments — the value the other paths and legs answer with.
+		// The fragment that named it could not number it, because on the
+		// ordinary OpenAI order the arguments arrive after the name
+		// (2026-09-27 audit, round 48, B-F2 and A-F3).
+		tb.id = b.mintedToolCallID(tb.name, tb.args.String())
+		tb.needsMint = false
 	}
 	tb.started = true
 	tb.index = b.takeIdx()
@@ -2795,6 +3022,7 @@ func (b *anthropicBridge) startToolBlock(tb *toolBlock) {
 		"content_block": map[string]any{"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]any{}},
 	})
 	b.cur = &openBlock{index: tb.index, tool: tb}
+	return true
 }
 
 // countedToolBlocks counts the tool blocks this turn carries for the client.
@@ -2906,6 +3134,23 @@ func (b *anthropicBridge) finishStream() {
 	b.closeOpen()
 	b.flushHeldText()
 	b.closeOpen()
+	// A call this bridge had to number, whose arguments were an object the
+	// upstream never closed, opens here — the same block it would have opened on
+	// the fragment that named it before the mint waited for the arguments (a
+	// truncated turn: the model was still writing the call when it stopped).
+	// Started before the nameless arm below, which is for calls that HAVE no
+	// name and so can never open a block at all.
+	for _, tb := range b.toolOrder {
+		if tb.started || tb.merged || tb.name == "" {
+			continue
+		}
+		b.closeOpen()
+		b.flushHeldText()
+		b.closeOpen()
+		if b.startToolBlock(tb) {
+			b.flushToolArgs(tb)
+		}
+	}
 	// A call the upstream never named is not a call the client can make: its
 	// content_block_start could only go out with an empty name (the event that
 	// carries the name has no second chance), so the block is never opened and
@@ -3430,6 +3675,15 @@ func callInput(raw string, truncated bool) (map[string]any, bool) {
 		}
 		return map[string]any{"_raw": s}, true
 	}
+	if in == nil {
+		// The text is the JSON literal null, which unmarshals into a nil map
+		// without an error. The block's input is a required object on this
+		// wire, and the id this bridge minted for the call says so already
+		// (canonicalCallArgs folds null into the empty object, as both other
+		// legs do): emitting "input":null contradicted the very id beside it
+		// (2026-09-27 audit, round 48, C-F5).
+		in = map[string]any{}
+	}
 	return in, true
 }
 
@@ -3470,7 +3724,15 @@ func (b *anthropicBridge) mintedToolCallID(name, args string) string {
 	// gatewayToolCallIDFor promises the same id for the same call whichever leg
 	// mints it — a tool_result written against one leg's answer stays valid if
 	// the retry goes through another (2026-09-27 audit, round 47, G47-4).
-	for k := 0; b.grantedIDs[id]; k++ {
+	// An id the wire STATES is reserved before any mint is taken (reservedIDs,
+	// filled by the non-stream list from the calls it is about to walk), so an
+	// id-less call EARLY in the list is not numbered with the id a LATER call
+	// states: this mint walks in list order, so without the reservation the
+	// first call took the second call's own id and the second call was
+	// renumbered, while the client leg and the local converter both keep the
+	// stated id and renumber the minted one — the answer depended on which call
+	// the upstream happened to write first (2026-09-27 audit, round 48, B-F4).
+	for k := 0; b.grantedIDs[id] || b.reservedIDs[id]; k++ {
 		id = gatewayToolCallIDFor(name, seed+"\x00#"+strconv.Itoa(k))
 	}
 	b.grantedIDs[id] = true

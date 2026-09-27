@@ -191,19 +191,33 @@ func TestANamelessFragmentIsNotAnAnswer(t *testing.T) {
 	}
 }
 
-// TestACollisionBumpMintsTheCrossLegID is G47-4. Three id-less calls — "x",
-// "x", "x#1" — force a bump: the third call's own id lands on the second's, so
-// it is minted again from the seed "\x00#0". The literal is what the local leg's
-// ToolCallIDFor produces for the same call.
+// TestACollisionBumpMintsTheCrossLegID is G47-4. An upstream that states, for
+// one call, the id this bridge will mint for another forces a bump: the second
+// call's own id is already taken, so it is minted again from the seed
+// "\x00#0". Both other legs bump with the same seed, so the literal is the id
+// they mint for that call too.
+//
+// The wire used to be three id-less calls with the arguments "x", "x" and
+// "x#1", on the strength of a literal that claimed to be the local leg's value
+// for the third. No leg produces that value: a call's arguments reach the local
+// leg as a parsed argument map, which has no spelling for the freeform text "x"
+// at all, and the ordinal suffix that made the third call collide there ("x" +
+// "#1") is not what a freeform argument is canonicalised to anywhere — both
+// other legs and this bridge keep it as {"_raw":"x"} (2026-09-27 audit, round
+// 48, B-F3 and C-F3, which changed the encoding). The wire below forces the
+// same bump through the mechanism that still reaches it: an upstream-stated id
+// that collides with a mint.
 func TestACollisionBumpMintsTheCrossLegID(t *testing.T) {
-	want := "call_be2c8409" // anthropic.ToolCallIDFor("a", "x#1\x00#0")
-	if got := round47ToolCallIDFor("a", "x#1\x00#0"); got != want {
+	// The id this bridge mints for a call named "a" with the freeform
+	// arguments "x", which is the id the client leg mints for it too.
+	minted := round47ToolCallIDFor("a", `{"_raw":"x"}`)
+	want := "call_c3450f30" // ToolCallIDFor("a", `{"_raw":"x"}` + "\x00#0")
+	if got := round47ToolCallIDFor("a", "{\"_raw\":\"x\"}\x00#0"); got != want {
 		t.Fatalf("this test's own FNV copy disagrees with the recorded literal: %s != %s", got, want)
 	}
 	doc := `{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,` +
-		`"tool_calls":[{"type":"function","function":{"name":"a","arguments":"x"}},` +
-		`{"type":"function","function":{"name":"a","arguments":"x"}},` +
-		`{"type":"function","function":{"name":"a","arguments":"x#1"}}]},` +
+		`"tool_calls":[{"id":"` + minted + `","type":"function","function":{"name":"b","arguments":"{}"}},` +
+		`{"type":"function","function":{"name":"a","arguments":"x"}}]},` +
 		`"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`
 	up := round45Upstream(t, "application/json", doc)
 	srv, _ := round39Gateway(t, up, nil)
@@ -212,11 +226,14 @@ func TestACollisionBumpMintsTheCrossLegID(t *testing.T) {
 		t.Fatalf("status %d\n%s", status, body)
 	}
 	ids := round46BlockIDs(t, body)
-	if len(ids) != 3 {
-		t.Fatalf("got %d tool_use block(s), want 3:\n%s", len(ids), body)
+	if len(ids) != 2 {
+		t.Fatalf("got %d tool_use block(s), want 2:\n%s", len(ids), body)
 	}
-	if ids[2] != want {
-		t.Errorf("the bumped id is %s, want %s — a tool_result written against the local leg's answer does not name this call when the retry comes through the gateway:\n%s", ids[2], want, body)
+	if ids[0] != minted {
+		t.Errorf("the stated id is %s, want the string the upstream wrote, %s:\n%s", ids[0], minted, body)
+	}
+	if ids[1] != want {
+		t.Errorf("the bumped id is %s, want %s — a tool_result written against the client leg's answer does not name this call when the retry comes through the gateway:\n%s", ids[1], want, body)
 	}
 }
 
