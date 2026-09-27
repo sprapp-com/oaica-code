@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"encoding/json"
 
 	"github.com/ollama/ollama/anthropic"
@@ -97,12 +96,13 @@ func convertedPromptBody(body []byte) (serialized, imagePayload, images int, ok 
 
 // marshalPrompt returns the length of the converted request as the upstream
 // READS it, which is not the length of the bytes that carry it. encoding/json
-// writes `<`, `>` and `&` as their six-character `\u` escapes, so a markup
-// prompt (HTML, XML, JSX, SVG, `2>&1`, a tool result holding a file) was
-// charged up to six bytes per byte — 6x its real size — and the clamp refused
-// a healthy turn locally with "prompt is too long", the compaction-trigger
+// writes the characters it must escape as two- and six-character escapes, so a
+// markup prompt (HTML, XML, JSX, SVG, `2>&1`, a tool result holding a file) was
+// charged up to six bytes per byte — 6x its real size — and the clamp refused a
+// healthy turn locally with "prompt is too long", the compaction-trigger
 // wording, which cannot help because the markup is in the newest turn
-// (2026-09-27 audit, round 35, A-F1). The upstream JSON-decodes the body
+// (2026-09-27 audit, round 35, A-F1; every escape, not only the HTML three,
+// round 36, A-F5). The upstream JSON-decodes the body
 // before tokenizing anything, so the escaping describes the transport, not the
 // prompt; the image base64 is discounted for the same reason.
 //
@@ -116,28 +116,34 @@ func marshalPrompt(v any) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return len(b) - markupEscapeOverhead(b), nil
+	return len(b) - jsonEscapeOverhead(b), nil
 }
 
-// markupEscapeOverhead counts the bytes json.Marshal spends writing `<`, `>`
-// and `&` as `<`, `>` and `&`: five extra bytes each, and the
-// only escapes it writes that a JSON reader turns back into one byte.
+// jsonEscapeOverhead counts the bytes json.Marshal spends writing a character
+// as an escape sequence. Every escape it writes is one it will decode back to a
+// single character, so each two-character escape carries one extra byte and
+// each six-character `\uXXXX` five. Round 35 undid only the three HTML escapes
+// (`<`, `>`, `&`), which left `"`, `\`, `\n`, `\t` — two bytes each, in every
+// prompt holding a quote, a path, or a line break — and every control character
+// charged to the prompt at up to six times their size (2026-09-27 audit, round
+// 36, A-F5). The gateway's jsonEscapeOverhead is this function; the two legs of
+// this product have to measure the same quantity.
 //
-// The scan follows backslashes the way a JSON reader does, so a prompt holding
-// the literal characters `<` (escaped as `\\u003c`) is not counted: its
-// backslash is consumed as the two-character escape it is, and the `u003c`
-// after it is ordinary text.
-func markupEscapeOverhead(b []byte) int {
+// The scan follows backslashes the way a JSON reader does, so text holding the
+// literal characters `\n` is not miscounted: its backslash is consumed as the
+// two-character escape it is, and the `n` after it is ordinary text.
+func jsonEscapeOverhead(b []byte) int {
 	extra := 0
 	for i := 0; i < len(b); i++ {
 		if b[i] != '\\' || i+1 >= len(b) {
 			continue
 		}
-		switch b[i+1] {
-		case '\\', '"', '/':
-			i++ // an escaped backslash, quote or solidus: no markup behind it
+		switch c := b[i+1]; c {
+		case '\\', '"', '/', 'b', 'f', 'n', 'r', 't':
+			extra++
+			i++
 		case 'u':
-			if i+5 < len(b) && isEscapedMarkup(b[i+2:i+6]) {
+			if i+5 < len(b) && isHex4(b[i+2:i+6]) {
 				extra += 5
 				i += 5
 			}
@@ -146,11 +152,16 @@ func markupEscapeOverhead(b []byte) int {
 	return extra
 }
 
-// isEscapedMarkup reports whether a four-character `\u` payload is one of the
-// three characters Go escapes for HTML embedding: `<` (003c), `>` (003e) and
-// `&` (0026), written in the lowercase hex encoding/json emits.
-func isEscapedMarkup(hex []byte) bool {
-	return bytes.Equal(hex, []byte("003c")) ||
-		bytes.Equal(hex, []byte("003e")) ||
-		bytes.Equal(hex, []byte("0026"))
+// isHex4 reports whether a four-character `\u` payload is hex — every escape of
+// that shape is a character json.Marshal escaped, whatever it is.
+func isHex4(p []byte) bool {
+	if len(p) != 4 {
+		return false
+	}
+	for _, c := range p {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }

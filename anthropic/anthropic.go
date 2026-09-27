@@ -141,6 +141,10 @@ type ContentBlock struct {
 	Content   any    `json:"content,omitempty"` // string, []ContentBlock, []WebSearchResult, or WebSearchToolResultError
 	IsError   bool   `json:"is_error,omitempty"`
 
+	// Title labels a search_result block, whose `source` (an ImageSource's Ref,
+	// above) names where the passages came from.
+	Title string `json:"title,omitempty"`
+
 	// For thinking blocks - pointer so field only appears when set (SDK requires it for accumulation)
 	Thinking  *string `json:"thinking,omitempty"`
 	Signature string  `json:"signature,omitempty"`
@@ -176,6 +180,47 @@ type ImageSource struct {
 	MediaType string `json:"media_type,omitempty"`
 	Data      string `json:"data,omitempty"`
 	URL       string `json:"url,omitempty"`
+
+	// Ref is the `source` of a block that states it as a bare string rather
+	// than an object — a `search_result` names the origin of its passages that
+	// way. Kept apart from the object fields above so the object form still
+	// marshals exactly as it did.
+	Ref string `json:"-"`
+}
+
+// UnmarshalJSON accepts both spellings of a block's `source`: the object an
+// image or a document carries ({"type":"base64","media_type":…,"data":…}) and
+// the bare URL string a `search_result` states. Without this the string form
+// failed to unmarshal, and the failure is not local to the block: the whole
+// request was rejected with a decoding error, so a session whose history
+// contains one server-side web search turn could not be sent at all
+// (2026-09-27 audit, round 36, A-F1).
+func (s *ImageSource) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var ref string
+		if err := json.Unmarshal(b, &ref); err != nil {
+			return err
+		}
+		*s = ImageSource{Ref: ref}
+		return nil
+	}
+	type alias ImageSource
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*s = ImageSource(a)
+	return nil
+}
+
+// MarshalJSON writes the form the source arrived in: a bare string when it is a
+// reference and carries no object fields, the object otherwise.
+func (s ImageSource) MarshalJSON() ([]byte, error) {
+	if s.Ref != "" && s.Type == "" && s.Data == "" && s.URL == "" && s.MediaType == "" {
+		return json.Marshal(s.Ref)
+	}
+	type alias ImageSource
+	return json.Marshal(alias(s))
 }
 
 // Tool represents a tool definition
@@ -483,6 +528,8 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	documentBlocks := 0
 	documentTextBlocks := 0
 	documentBinaryBlocks := 0
+	searchResultBlocks := 0
+	searchResultTextBlocks := 0
 	unknownBlocks := 0
 
 	for _, block := range msg.Content {
@@ -593,7 +640,16 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				logutil.Trace("anthropic: document block without a source", "role", role)
 				return nil, errors.New("document block without a source")
 			}
-			if block.Source.Type == "text" && block.Source.Data != "" {
+			if block.Source.Type == "text" && block.Source.Data == "" {
+				// Named apart from the unrepresentable-source refusal below: a
+				// text source is the one kind this wire DOES carry, so telling
+				// the operator that "text" cannot be represented sent them
+				// looking for a converter that exists (2026-09-27 audit, round
+				// 36, lead).
+				logutil.Trace("anthropic: document block with an empty text source", "role", role)
+				return nil, errors.New("document block with an empty text source")
+			}
+			if block.Source.Type == "text" {
 				// The leading separator matters as much as the trailing
 				// one: a trailing newline alone left the PREVIOUS block's
 				// last sentence glued to this one's first ("read the
@@ -632,6 +688,40 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				Content:    formatWebSearchToolResultContent(block.Content),
 				ToolCallID: block.ToolUseID,
 			})
+
+		case "search_result":
+			// A passage the search returned, carried in the turn the model is
+			// asked about: the block's content is the text itself and its
+			// source/title say where it came from. It had no case here, so the
+			// passages were counted and dropped and the turn answered 200: the
+			// model was asked about search results it was never shown, and the
+			// client read a confident answer to a question about text it had
+			// sent (2026-09-27 audit, round 36, A-F1 — the class round 35
+			// closed for a document). The gateway leg of this product carries
+			// the same block, so the two legs must not disagree about whether
+			// the model received it.
+			searchResultBlocks++
+			var sb strings.Builder
+			if block.Title != "" {
+				sb.WriteString(block.Title)
+				sb.WriteString("\n")
+			}
+			if block.Source != nil && block.Source.Ref != "" {
+				sb.WriteString(block.Source.Ref)
+				sb.WriteString("\n")
+			}
+			sb.WriteString(searchResultText(block.Content))
+			if sb.Len() > 0 {
+				if textContent.Len() > 0 {
+					textContent.WriteString("\n\n")
+				}
+				textContent.WriteString(sb.String())
+				if !strings.HasSuffix(sb.String(), "\n") {
+					textContent.WriteString("\n")
+				}
+				searchResultTextBlocks++
+			}
+
 		default:
 			unknownBlocks++
 		}
@@ -670,6 +760,8 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		"document", documentBlocks,
 		"document_text", documentTextBlocks,
 		"document_binary_dropped", documentBinaryBlocks,
+		"search_result", searchResultBlocks,
+		"search_result_text", searchResultTextBlocks,
 		"unknown", unknownBlocks,
 		"messages", TraceAPIMessages(messages),
 	)
@@ -1243,6 +1335,71 @@ func resolveImageSource(source *ImageSource) (api.ImageData, error) {
 	return decoded, nil
 }
 
+// describeToolResultDocument renders a document block nested in a tool result:
+// its text, where the source carries any, and a description naming the type and
+// size of a binary one. The wording matches the gateway leg's describeBlock, so
+// the same body is answered the same way whichever leg serves it.
+func describeToolResultDocument(raw any) string {
+	src, _ := raw.(map[string]any)
+	if src == nil {
+		return "[document tool result omitted: no source]"
+	}
+	if st, _ := src["type"].(string); st == "text" {
+		if d, _ := src["data"].(string); d != "" {
+			return d
+		}
+		return `[document tool result omitted: source.type "text" with no data]`
+	}
+	media, size := "unknown", 0
+	if m, ok := src["media_type"].(string); ok && m != "" {
+		media = m
+	}
+	if d, ok := src["data"].(string); ok {
+		size = len(d)
+	}
+	return fmt.Sprintf("[document tool result omitted: %s, %d bytes of base64]", media, size)
+}
+
+// searchResultText flattens a search_result's content — the passages a search
+// returned — into the text the model is asked about. Its content is text
+// blocks; a block of any other type is described rather than pasted, the way a
+// tool result's unrecognised block is.
+func searchResultText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []ContentBlock:
+		var sb strings.Builder
+		for _, b := range c {
+			if b.Text != nil && *b.Text != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n\n")
+				}
+				sb.WriteString(*b.Text)
+			}
+		}
+		return sb.String()
+	case []any:
+		var sb strings.Builder
+		for _, item := range c {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			t, _ := m["text"].(string)
+			if t == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n\n")
+			}
+			sb.WriteString(t)
+		}
+		return sb.String()
+	}
+	return ""
+}
+
 func convertToolResultContent(content any) (string, []api.ImageData, error) {
 	switch c := content.(type) {
 	case nil:
@@ -1271,6 +1428,25 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 						text.WriteString("\n\n")
 					}
 					text.WriteString(t)
+				}
+			case "document":
+				// A file a tool returned, nested inside its result. This case
+				// did not exist, so the block was skipped: a tool that read a
+				// text file reported back nothing at all, and the model
+				// answered about a file it was never shown while the client
+				// read a 200 (2026-09-27 audit, round 36, A-F2 — the gateway
+				// leg DESCRIBES the same nested block, so the same body was
+				// answered differently depending on which leg served it). A
+				// text source is content and is carried; a binary source is
+				// described by its type and size rather than pasted, which is
+				// that leg's wording and its reason: inlining the base64 bills
+				// the model for the transport encoding of a file it cannot
+				// read.
+				if desc := describeToolResultDocument(cbMap["source"]); desc != "" {
+					if text.Len() > 0 {
+						text.WriteString("\n\n")
+					}
+					text.WriteString(desc)
 				}
 			case "image":
 				rawSource, ok := cbMap["source"].(map[string]any)
@@ -1404,9 +1580,28 @@ func countContentBlock(block ContentBlock) int {
 	if block.Thinking != nil {
 		total += len(*block.Thinking)
 	}
-	if block.Type == "tool_use" || block.Type == "tool_result" {
+	switch block.Type {
+	case "tool_use", "tool_result":
 		if data, err := json.Marshal(block); err == nil {
 			total += len(data)
+		}
+	case "document":
+		// A text source's data is written into the prompt by the converter and
+		// was charged nothing here, so a turn whose newest message was a large
+		// attachment was estimated at a handful of tokens: the estimate is the
+		// fallback middleware/anthropic.go seeds the stream converter's
+		// input_tokens with when the upstream states no usage, so the session's
+		// context meter never grew and its auto-compaction never fired
+		// (2026-09-27 audit, round 36, A-F3).
+		if block.Source != nil {
+			total += len(block.Source.Data) + len(block.Source.Ref)
+		}
+	case "search_result":
+		// Same omission, same consequence: the passages and the label above
+		// them are prompt content the converter now forwards.
+		total += len(block.Title) + countAnyContent(block.Content)
+		if block.Source != nil {
+			total += len(block.Source.Ref)
 		}
 	}
 	return total

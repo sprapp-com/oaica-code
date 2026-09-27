@@ -1853,23 +1853,84 @@ func messagesBytes(req map[string]any) int {
 	// sends, and never under-charges a prefill the upstream will do.
 	total := 0
 	if msgs, ok := req["messages"]; ok {
-		if b, err := json.Marshal(msgs); err == nil {
-			total = promptPayloadBytes(len(b), msgs)
+		if n, ok := jsonMeasuredBytes(msgs); ok {
+			total = promptPayloadBytes(n, msgs)
 		}
 	}
 	if p, ok := req["prompt"]; ok {
-		if b, err := json.Marshal(p); err == nil && len(b) > total {
-			total = len(b)
+		if n, ok := jsonMeasuredBytes(p); ok && n > total {
+			total = n
 		}
 	}
 	for _, k := range []string{"tools", "functions"} {
 		if v, ok := req[k]; ok {
-			if b, err := json.Marshal(v); err == nil {
-				total += len(b)
+			if n, ok := jsonMeasuredBytes(v); ok {
+				total += n
 			}
 		}
 	}
 	return total
+}
+
+// jsonMeasuredBytes returns the size of a value in the unit the prompt-size
+// estimate is expressed in: the bytes the upstream will DECODE, not the bytes
+// Go spent encoding them. encoding/json writes `"`, `\` and the control
+// characters as two-byte escapes and `<`, `>`, `&` and the line separators as
+// six-byte ones; the upstream JSON-decodes the body before tokenizing anything,
+// so none of that is prompt. Charged as prompt, the six bytes per `<` made a
+// markup-heavy turn measure up to 6x its real size — a locally refused healthy
+// turn, and the same unit feeds the calibration ratio and the fit clamp. The
+// client leg stopped charging these escapes in round 35; the two legs of this
+// product have to measure the same quantity, or a prompt one admits the other
+// refuses (2026-09-27 audit, round 36, A-F4).
+func jsonMeasuredBytes(v any) (int, bool) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0, false
+	}
+	return len(b) - jsonEscapeOverhead(b), true
+}
+
+// jsonEscapeOverhead counts the bytes json.Marshal spends writing a character
+// as an escape sequence. Every escape it writes is one it will decode back to a
+// single character, so each two-character escape carries one extra byte and
+// each six-character `\uXXXX` five.
+//
+// The scan follows backslashes the way a JSON reader does, so text holding the
+// literal characters `\n` is not miscounted: its backslash is consumed as the
+// two-character escape it is, and the `n` after it is ordinary text.
+func jsonEscapeOverhead(b []byte) int {
+	extra := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			continue
+		}
+		switch c := b[i+1]; c {
+		case '\\', '"', '/', 'b', 'f', 'n', 'r', 't':
+			extra++
+			i++
+		case 'u':
+			if i+5 < len(b) && isHex4(b[i+2:i+6]) {
+				extra += 5
+				i += 5
+			}
+		}
+	}
+	return extra
+}
+
+// isHex4 reports whether a four-character `\u` payload is hex — every escape of
+// that shape is a character json.Marshal escaped, whatever it is.
+func isHex4(p []byte) bool {
+	if len(p) != 4 {
+		return false
+	}
+	for _, c := range p {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // imagePartByteAllowance is what one inline image is charged to the prompt-size
@@ -1915,6 +1976,21 @@ func inlineImageBytes(v any) (payload, images int) {
 						images++
 						continue
 					}
+				}
+				// The part is also written with the data URI as a bare string
+				// (`{"type":"image_url","image_url":"data:..."}`), which the
+				// admission gate counts as an image and this walk did not
+				// discount: the same 1 MB screenshot the map spelling charges
+				// 4 KB against measured its full base64, so the gate admitted
+				// the part and the meter that follows refused the turn —
+				// locally, with "prompt is too long: N tokens > M maximum;
+				// reduce the prompt or compact the conversation", the wording
+				// Claude Code matches into a compaction path that cannot help
+				// (2026-09-27 audit, round 36, B-F3).
+				if u, ok := e.(string); ok && strings.HasPrefix(u, "data:") {
+					payload += len(u)
+					images++
+					continue
 				}
 			}
 			if k == "source" {

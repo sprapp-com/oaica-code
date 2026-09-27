@@ -49,6 +49,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -207,6 +208,18 @@ func firstNonEmpty(vals ...*string) string {
 	for _, v := range vals {
 		if v != nil && *v != "" {
 			return *v
+		}
+	}
+	return ""
+}
+
+// firstNonEmptyStr is firstNonEmpty for plain strings: a field with more than
+// one spelling on the wire (a tool call's name and arguments are written both
+// nested under `function` and flat) takes whichever the upstream populated.
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
 	return ""
@@ -548,10 +561,19 @@ type anthropicBridge struct {
 	errBody     bytes.Buffer
 
 	// stream state
-	sse        bridgeSSE
-	textOpen   bool
-	blockIdx   int
-	toolBlocks map[int]int // upstream tool_call index -> anthropic block index
+	sse      bridgeSSE
+	textOpen bool
+	blockIdx int
+	// toolBlocks maps the key toolKey derives for an upstream tool call to the
+	// anthropic block index it is being written into.
+	toolBlocks map[string]int
+	// lastToolKey is the key of the last tool call a delta named, so an
+	// upstream that sends the index-less fragments this wire permits (an
+	// arguments-only continuation) keeps writing into the block it opened.
+	lastToolKey string
+	// synthSeq mints keys for calls whose upstream states neither an index nor
+	// an id, so two such calls cannot share a block.
+	synthSeq int
 }
 
 type bridgeSSE struct {
@@ -571,7 +593,7 @@ type bridgeSSE struct {
 }
 
 func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthropicBridge {
-	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[int]int{}}
+	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[string]int{}}
 }
 
 // WriteHeader records the upstream's status; it does not commit one to the
@@ -862,8 +884,30 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 					// DeepSeek's/vLLM's spelling.
 					ReasoningContent *string `json:"reasoning_content"`
 					ToolCalls        []struct {
-						Index     int    `json:"index"`
-						ID        string `json:"id"`
+						// A pointer, because the index is optional on this wire
+						// and a zero default filed every call of a stream into
+						// block 0 — the second call's id, name and arguments
+						// were folded into the first call's (2026-09-27 audit,
+						// round 36, B-F2). The sibling client leg made its own
+						// index a pointer for the same upstreams (round 15).
+						Index *int   `json:"index"`
+						ID    string `json:"id"`
+						Type  string `json:"type"`
+						// The identity is NESTED under `function` on this wire,
+						// which is how the same file's non-stream struct and
+						// the client leg's proxy both read it. Read at the top
+						// level, every streamed tool call reached the client as
+						// {"name":"","input":{}} with stop_reason tool_use and
+						// no input_json_delta: the model's chosen tool and its
+						// arguments dropped and the turn answered as a success,
+						// so Claude Code — which always streams — could neither
+						// name nor execute the call (2026-09-27 audit, round
+						// 36, B-F1). The flat spelling is still read: an
+						// upstream that writes it is not refused for it.
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"`
 					} `json:"tool_calls"`
@@ -920,7 +964,9 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 				b.textDelta(*ch.Delta.Content)
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				b.toolDelta(tc.Index, tc.ID, tc.Name, tc.Arguments)
+				b.toolDelta(tc.Index, tc.ID,
+					firstNonEmptyStr(tc.Function.Name, tc.Name),
+					firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
 			}
 			if ch.FinishReason != nil && *ch.FinishReason != "" {
 				b.sse.stopMsg = *ch.FinishReason
@@ -944,8 +990,33 @@ func (b *anthropicBridge) textDelta(s string) {
 	})
 }
 
-func (b *anthropicBridge) toolDelta(upIdx int, id, name, args string) {
-	block, ok := b.toolBlocks[upIdx]
+// toolKey identifies the anthropic block a tool-call delta belongs to. The
+// upstream's index is the authority where it states one. Where it does not —
+// the index is optional on this wire and several upstreams omit it — the call
+// is keyed by the id that introduces it, and an id-less fragment by the block
+// the previous delta opened. Keyed instead by a zero-valued index, every call
+// after the first in such a stream filed into block 0: its id was discarded and
+// its name and arguments were written into the first call's block, so a turn
+// that chose two tools reached the client as one (2026-09-27 audit, round 36,
+// B-F2).
+func (b *anthropicBridge) toolKey(upIdx *int, id string) string {
+	if upIdx != nil {
+		return "#" + strconv.Itoa(*upIdx)
+	}
+	if id != "" {
+		b.lastToolKey = "!" + id
+		return b.lastToolKey
+	}
+	if b.lastToolKey == "" {
+		b.synthSeq++
+		b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+	}
+	return b.lastToolKey
+}
+
+func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
+	key := b.toolKey(upIdx, id)
+	block, ok := b.toolBlocks[key]
 	if !ok {
 		if b.textOpen {
 			b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.blockIdx})
@@ -954,7 +1025,7 @@ func (b *anthropicBridge) toolDelta(upIdx int, id, name, args string) {
 		}
 		block = b.blockIdx
 		b.blockIdx++
-		b.toolBlocks[upIdx] = block
+		b.toolBlocks[key] = block
 		b.emit("content_block_start", map[string]any{
 			"type": "content_block_start", "index": block,
 			"content_block": map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}},
