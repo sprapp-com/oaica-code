@@ -423,6 +423,90 @@ type ToolProperty struct {
 	Enum        []any              `json:"enum,omitempty"`
 	Properties  *ToolPropertiesMap `json:"properties,omitempty"`
 	Required    []string           `json:"required,omitempty"`
+
+	// raw is the property exactly as it arrived (see ToolFunctionParameters).
+	// It is the bytes, not a decoded map, so the key order the client wrote is
+	// the key order the model is shown (2026-09-27 audit, round 50).
+	raw json.RawMessage
+}
+
+// UnmarshalJSON keeps the property as it arrived and fills the typed fields on
+// a best-effort basis. A property this struct cannot model — `format`,
+// `pattern`, `minimum`, `default`, `title`, a nested `$ref` — is a property the
+// CALLER can still be given back, which is what the model is asked about
+// (2026-09-27 audit, round 50).
+func (t *ToolProperty) UnmarshalJSON(data []byte) error {
+	type plain ToolProperty
+	var p plain
+	_ = json.Unmarshal(data, &p)
+	*t = ToolProperty(p)
+	if json.Valid(data) {
+		t.raw = append(json.RawMessage(nil), data...)
+	}
+	return nil
+}
+
+// MarshalJSON states the property as it arrived. A property built in code has
+// no raw and marshals its typed fields, so nothing that constructs one changes.
+func (t ToolProperty) MarshalJSON() ([]byte, error) {
+	if len(t.raw) > 0 {
+		return t.raw, nil
+	}
+	type plain ToolProperty
+	return json.Marshal(plain(t))
+}
+
+// Equal reports whether two properties are the same as this struct reads them.
+//
+// raw makes the type opaque to go-cmp, which panics on an unexported field
+// rather than reporting a difference; a type that defines Equal(T) bool is
+// compared through it instead. The comparison is the typed view — what a value
+// built in code and the same value read off a wire have in common — so a value
+// that STATES the schema (see MarshalJSON) still compares as the fields it
+// names (2026-09-27 audit, round 50).
+func (t ToolProperty) Equal(other ToolProperty) bool {
+	if len(t.AnyOf) != len(other.AnyOf) {
+		return false
+	}
+	for i := range t.AnyOf {
+		if !t.AnyOf[i].Equal(other.AnyOf[i]) {
+			return false
+		}
+	}
+	return equalStrings(t.Type, other.Type) &&
+		reflect.DeepEqual(t.Items, other.Items) &&
+		t.Description == other.Description &&
+		reflect.DeepEqual(t.Enum, other.Enum) &&
+		equalProperties(t.Properties, other.Properties) &&
+		equalStrings(t.Required, other.Required)
+}
+
+// equalStrings compares two string slices by value.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// equalProperties compares two property maps by the properties they hold; a
+// nil map and an empty one are the same map to a reader.
+func equalProperties(a, b *ToolPropertiesMap) bool {
+	if a.Len() != b.Len() {
+		return false
+	}
+	for name, prop := range a.All() {
+		other, ok := b.Get(name)
+		if !ok || !prop.Equal(other) {
+			return false
+		}
+	}
+	return true
 }
 
 // ToTypeScriptType converts a ToolProperty to a TypeScript type string
@@ -470,12 +554,82 @@ func mapToTypeScriptType(jsonType string) string {
 	}
 }
 
+// ToolFunctionParameters is a tool's JSON Schema as the client stated it.
+//
+// The schema travels VERBATIM; the typed fields are a read-only view of the
+// keys that have a name here. JSON Schema is open-ended, and decoding it into a
+// struct that names five keys and re-marshalling that struct handed the model a
+// DIFFERENT schema than the caller sent: a top-level `$ref` became `{}`, and
+// `format`, `pattern`, `additionalProperties`, `title`, `minLength` and
+// `default` all vanished, while the metered gateway leg — which forwards the
+// tool definition as written — handed over the schema intact. One body was two
+// prompts depending on which leg served it, and a model shown a schema with the
+// types and formats stripped calls the tool with the wrong arguments while the
+// client reads a well-formed answer to a question it did not ask (2026-09-27
+// audit, round 50).
+//
+// raw is authoritative for marshalling exactly when the value was DECODED from
+// a wire. A struct built in code has no raw and marshals its typed fields, so
+// the zero value still puts `{"type":"","properties":null}` on the wire — the
+// shape round 49 pinned for a tool that states no schema. Mutating the typed
+// fields of a decoded value does not change what is marshalled: build the value
+// in code if you mean to state it.
 type ToolFunctionParameters struct {
 	Type       string             `json:"type"`
 	Defs       any                `json:"$defs,omitempty"`
 	Items      any                `json:"items,omitempty"`
 	Required   []string           `json:"required,omitempty"`
 	Properties *ToolPropertiesMap `json:"properties"`
+
+	// raw is the schema exactly as it arrived — the bytes, not a decoded map,
+	// so the key order the client wrote is the key order the model is shown.
+	raw json.RawMessage
+}
+
+// SchemaJSON returns the schema exactly as it was decoded, or nil when this
+// value was built in code rather than read off a wire. Callers that re-emit a
+// schema through a type of their own use this to keep it whole.
+func (t ToolFunctionParameters) SchemaJSON() json.RawMessage { return t.raw }
+
+// UnmarshalJSON keeps the schema as it arrived. A schema that is not a JSON
+// object is refused — the verdict the sibling legs give the same body — and the
+// typed view is filled on a best-effort basis, so a schema this struct cannot
+// model (a `required` holding a number, a `properties` holding a string) is
+// still delivered to the model as the caller wrote it rather than refusing the
+// whole request.
+func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	type plain ToolFunctionParameters
+	var p plain
+	_ = json.Unmarshal(data, &p)
+	*t = ToolFunctionParameters(p)
+	t.raw = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+// MarshalJSON states the schema as it arrived; see the type's comment.
+func (t ToolFunctionParameters) MarshalJSON() ([]byte, error) {
+	if len(t.raw) > 0 {
+		return t.raw, nil
+	}
+	type plain ToolFunctionParameters
+	return json.Marshal(plain(t))
+}
+
+// Equal reports whether two schemas are the same as this struct reads them; see
+// ToolProperty.Equal for why the comparison is the typed view. The bytes a
+// schema was decoded from (raw) are not part of it, so a schema read off a wire
+// and the same schema built in code compare as the keys this struct names
+// (2026-09-27 audit, round 50).
+func (t ToolFunctionParameters) Equal(other ToolFunctionParameters) bool {
+	return t.Type == other.Type &&
+		reflect.DeepEqual(t.Defs, other.Defs) &&
+		reflect.DeepEqual(t.Items, other.Items) &&
+		equalStrings(t.Required, other.Required) &&
+		equalProperties(t.Properties, other.Properties)
 }
 
 func (t *ToolFunctionParameters) String() string {

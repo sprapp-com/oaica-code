@@ -156,9 +156,10 @@ func contentToString(v any) string {
 }
 
 // textOfContent renders an Anthropic content value as prose: a string as
-// itself; an array of content blocks by joining the text of each text block;
-// any other block kept as its JSON (so an image or tool_result is not silently
-// dropped); anything else as compact JSON.
+// itself, and an array of content blocks by joining the text of each TEXT
+// block. Anything else states nothing — this renders a SYSTEM prompt, and a
+// system value that is neither a string nor an array of text is not prose on
+// any leg.
 //
 // The array case used to be json.Marshal'd whole, so Claude Code's system
 // prompt — which arrives as an array of text blocks, one of them carrying a
@@ -168,6 +169,16 @@ func contentToString(v any) string {
 // instruction in it was present and unrecognisable (2026-09-26 audit, fourth
 // round). anthropic.FromMessagesRequest already joined these blocks with a
 // blank line; this path now agrees with it.
+//
+// The remaining arms were rewritten the same way in round 50. A non-text block
+// used to be kept as its JSON "so it is not silently dropped", which for an
+// image meant the payload — up to a megabyte of base64 — was pasted into the
+// system prompt as prose: no leg's converter puts an image there (the local
+// and gateway converters both take text blocks only, from a system array or a
+// system value alike), the model was charged for the bytes, and the picture
+// itself was still never sent. A system value of any other kind (a number, a
+// bool, an object) is likewise not prose on either sibling leg, where it
+// contributes nothing at all.
 func textOfContent(v any) string {
 	switch x := v.(type) {
 	case nil:
@@ -181,24 +192,16 @@ func textOfContent(v any) string {
 			if !ok {
 				continue
 			}
-			if bm["type"] == "text" {
-				if t, ok := bm["text"].(string); ok && t != "" {
-					parts = append(parts, t)
-				}
+			if bm["type"] != "text" {
 				continue
 			}
-			// Not a text block: keep its content rather than dropping it.
-			if bj, err := json.Marshal(bm); err == nil {
-				parts = append(parts, string(bj))
+			if t, ok := bm["text"].(string); ok && t != "" {
+				parts = append(parts, t)
 			}
 		}
 		return strings.Join(parts, "\n\n")
 	default:
-		b, err := json.Marshal(x)
-		if err != nil {
-			return ""
-		}
-		return string(b)
+		return ""
 	}
 }
 

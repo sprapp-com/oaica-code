@@ -271,12 +271,28 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		}
 	}
 	thinkState := 0 // 0 = unstated, 1 = enabled, -1 = disabled
-	if th, ok := req["thinking"].(map[string]any); ok {
-		switch t, _ := th["type"].(string); t {
-		case "enabled":
-			thinkState = 1
-		case "disabled":
-			thinkState = -1
+	if th, present := req["thinking"]; present && th != nil {
+		thm, ok := th.(map[string]any)
+		if !ok {
+			// A control of the wrong shape was dropped in silence and the body
+			// served: the sibling legs decode `thinking` into a typed struct and
+			// fail the request on a bool, a string or a number, so one body was
+			// a 400 there and a 200 here with the control ignored
+			// (2026-09-27 audit, round 50). An explicit `null` is NOT this case
+			// — that is a nil pointer on both siblings and stays unstated.
+			return nil, "thinking must be an object"
+		}
+		if raw, present := thm["type"]; present && raw != nil {
+			t, ok := raw.(string)
+			if !ok {
+				return nil, "thinking.type must be a string"
+			}
+			switch t {
+			case "enabled":
+				thinkState = 1
+			case "disabled":
+				thinkState = -1
+			}
 		}
 	}
 	effortLevel := ""
@@ -321,7 +337,17 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		// (2026-09-27 audit, round 41, C41-14a).
 		role, _ := m["role"].(string)
 		role = strings.ToLower(role)
-		converted, convErr := contentBlocksToOpenAI(role, m["content"], acceptsImages)
+		// An ABSENT content key is not the empty content. Both sibling legs
+		// fail to decode a message that states no content at all (their
+		// un-marshal of the missing raw field errors), where this leg read the
+		// nil as `null` and served the turn with content:"" — one body was a
+		// 400 on two legs and a metered 200 here (2026-09-27 audit, round 50).
+		// An explicit `null` is the empty content on all three.
+		content, present := m["content"]
+		if !present {
+			return nil, "message content is required"
+		}
+		converted, convErr := contentBlocksToOpenAI(role, content, acceptsImages)
 		if convErr != "" {
 			return nil, convErr
 		}
@@ -357,9 +383,29 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	// objection, and it is the shape the other leg sends.
 	choiceType := ""
 	var tc map[string]any
-	if c, ok := req["tool_choice"].(map[string]any); ok {
+	if raw, present := req["tool_choice"]; present && raw != nil {
+		c, ok := raw.(map[string]any)
+		if !ok {
+			// Same rule as `thinking` above: the sibling legs decode this into a
+			// typed struct and 400 a string, a number or an array, where this
+			// leg read nothing and forwarded the request as if the control had
+			// not been stated (2026-09-27 audit, round 50). `null` is a nil
+			// pointer on both siblings and stays unstated.
+			return nil, "tool_choice must be an object"
+		}
 		tc = c
-		choiceType, _ = c["type"].(string)
+		if raw, present := c["type"]; present && raw != nil {
+			s, ok := raw.(string)
+			if !ok {
+				return nil, "tool_choice.type must be a string"
+			}
+			choiceType = s
+		}
+		if raw, present := c["name"]; present && raw != nil {
+			if _, ok := raw.(string); !ok {
+				return nil, "tool_choice.name must be a string"
+			}
+		}
 	}
 	// The type is normalized exactly as the sibling normalizes it before it
 	// reads it (EqualFold over a trimmed value): matching the literal "none"
@@ -1176,19 +1222,32 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 		// Something other than a plain string — image parts, or text folded
 		// onto an already-arrayed content: keep the parts, with whatever string
 		// was already there in front of them.
+		// The message's content is read back with the type the writer STORES.
+		// This branch is reached only after the string arm above declined, so
+		// what is on the message is either an empty string or the parts array
+		// putContent itself wrote — and that array is `[]any`. Asserting
+		// `[]map[string]any` read nothing, so the parts already accumulated
+		// were dropped and the new text was appended to an empty array as a
+		// BARE STRING, which is not a part any backend reads: an assistant
+		// turn of text, an image and more text after a call reached the model
+		// as the last text alone (2026-09-27 audit, round 50, B-F1).
 		arr := []any{}
 		if cur, ok := out[toolMsg]["content"].(string); ok && cur != "" {
 			arr = append(arr, map[string]any{"type": "text", "text": cur})
-		} else if cur, ok := out[toolMsg]["content"].([]map[string]any); ok {
-			for _, p := range cur {
-				arr = append(arr, p)
-			}
+		} else if cur, ok := out[toolMsg]["content"].([]any); ok {
+			arr = append(arr, cur...)
 		}
 		switch c := content.(type) {
 		case []map[string]any:
 			for _, p := range c {
 				arr = append(arr, p)
 			}
+		case string:
+			// Once the message carries PARTS, a string is a text part: a bare
+			// string inside a parts array is not a block on this wire, which
+			// is what putContent wrote for every text block following a call
+			// on a message that already held parts.
+			arr = append(arr, map[string]any{"type": "text", "text": c})
 		default:
 			arr = append(arr, content)
 		}
@@ -3365,6 +3424,12 @@ func (b *anthropicBridge) finishStream() {
 		b.closeOpen()
 		if b.startToolBlock(tb) {
 			b.flushToolArgs(tb)
+			// The block is OPENED here and no fragment is left to close it:
+			// the stream is over (this is finishStream), so the client kept an
+			// unterminated tool_use block for the turn — a call no client-side
+			// accumulator can finish, since nothing told it the arguments had
+			// stopped arriving (2026-09-27 audit, round 50, B-F2).
+			b.closeOpen()
 		}
 	}
 	// A call the upstream never named is not a call the client can make: its

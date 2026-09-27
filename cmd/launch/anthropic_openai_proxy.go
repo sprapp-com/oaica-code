@@ -38,6 +38,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/gif"
+	"image/png"
 	"io"
 	"math"
 	"math/big"
@@ -97,7 +99,14 @@ func (m openAIMessage) MarshalJSON() ([]byte, error) {
 		ToolCallID string              `json:"tool_call_id,omitempty"`
 	}
 	parts := make([]openAIContentPart, 0, len(m.Images)+1)
-	if strings.TrimSpace(m.Content) != "" {
+	// Any non-empty text is text, whitespace included: the client stated a text
+	// block, and the metered gateway leg delivers `{"type":"text","text":"   "}`
+	// for the same turn. Trimming it here sent the model a message whose text
+	// part had vanished beside an image, so one body became two prompts
+	// depending on which leg served it (2026-09-27 audit, round 50). The EMPTY
+	// string is not a part — nothing was stated — which is the case the
+	// round-46 rule on this wire already draws.
+	if m.Content != "" {
 		parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
 	}
 	for _, img := range m.Images {
@@ -143,10 +152,20 @@ type openAIChatRequest struct {
 	// anthropic.FromMessagesRequest folds it into Options and oaica's own
 	// server honours it, so dropping it here made sampling differ by entry
 	// point (2026-09-26 audit, fourth round).
-	TopK          *int       `json:"top_k,omitempty"`
-	Stop          []string   `json:"stop,omitempty"`
-	Tools         []api.Tool `json:"tools,omitempty"`
-	ToolChoice    any        `json:"tool_choice,omitempty"`
+	TopK       *int       `json:"top_k,omitempty"`
+	Stop       []string   `json:"stop,omitempty"`
+	Tools      []api.Tool `json:"tools,omitempty"`
+	ToolChoice any        `json:"tool_choice,omitempty"`
+	// Think is the client's thinking control, carried exactly as the native
+	// chat wire carries it (api.ChatRequest.Think): `thinking:{type:…}` becomes
+	// a bool and an `output_config.effort` becomes a level. The OpenAI
+	// spellings (reasoning / reasoning_effort) can say "none" or a level but
+	// NOT the plain "yes, think" a `type:"enabled"` block means, so forwarding
+	// the control through them would answer a client that asked for thinking
+	// with the upstream's default instead — the same defect round 41 fixed on
+	// the gateway leg. The upstream this proxy talks to is oaica's own server,
+	// which reads this field (2026-09-27 audit, round 50).
+	Think         *api.ThinkValue `json:"think,omitempty"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
@@ -464,7 +483,14 @@ func mapToolChoice(tc *anthropic.ToolChoice) any {
 	case "any":
 		return "required"
 	case "none":
-		return "none"
+		// "none" states nothing on this wire. The client's instruction is
+		// carried by the tool surface itself — FromMessagesRequest drops every
+		// tool for this type — and the metered gateway leg, given the same
+		// body, sends no choice field at all: the OpenAI `none` value is not
+		// the shape the backends this fleet runs validate without objection,
+		// and stating it beside an empty tool list is a field no sibling leg
+		// sends (2026-09-27 audit, round 50).
+		return nil
 	case "tool":
 		return map[string]any{
 			"type": "function",
@@ -518,6 +544,11 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 	}
 
 	oai.ToolChoice = mapToolChoice(anthropicReq.ToolChoice)
+	// The thinking control FromMessagesRequest decoded, carried to the upstream
+	// in the same shape the native chat wire carries it (see openAIChatRequest.
+	// Think): the local leg hands the daemon this exact value, and the gateway
+	// leg hands its backend the same switch as chat_template_kwargs.
+	oai.Think = chatReq.Think
 
 	if anthropicReq.Stream {
 		oai.StreamOptions = &struct {
@@ -636,6 +667,19 @@ func systemMessageIsTextOnly(m openAIMessage) bool {
 // imageDataURL sniffs the image magic bytes for the data-URL MIME type
 // (api.ImageData carries raw bytes with no type). Defaults to jpeg — vLLM's
 // Qwen3.5 vision preprocessor accepts the common web formats.
+//
+// The MIME type is not the client's to choose: the upstream is oaica's own
+// OpenAI door, and that door carries EXACTLY four types in a data URL — jpeg,
+// jpg, png and webp (openai.decodeImageURL, and its test pins the refusal of
+// every other type with 400 "invalid image input"). The sniffer below also
+// recognises GIF, so a client that sent one was handed back a data URL its own
+// upstream refuses: the local leg serves the same body (it passes the raw bytes
+// with no label at all and the runner labels them from the content), so the
+// same client body was a served turn on one leg and a hard 400 on this one
+// (2026-09-27 audit, round 50, A50-4). A GIF is re-encoded to PNG here instead
+// — the same remedy llm.llamaServerMediaBytes already applies to WebP for the
+// runner, and the same bytes the model would have seen, since a still image is
+// what one frame of the conversation can carry either way.
 func imageDataURL(img api.ImageData) string {
 	// A source of type "url" is carried as its own URL text (see
 	// anthropic.IsImageURL): the wire takes it as it stands, and encoding it as
@@ -648,11 +692,32 @@ func imageDataURL(img api.ImageData) string {
 	case len(img) >= 8 && img[0] == 0x89 && img[1] == 'P' && img[2] == 'N' && img[3] == 'G':
 		mime = "image/png"
 	case len(img) >= 3 && img[0] == 'G' && img[1] == 'I' && img[2] == 'F':
-		mime = "image/gif"
+		if encoded, ok := reencodeGIFAsPNG(img); ok {
+			return "data:image/png;base64," + base64.StdEncoding.EncodeToString(encoded)
+		}
+		// It says GIF and decodes as no image at all. Falling through labels it
+		// jpeg, the door takes it, and the runner labels it from the content
+		// again — the client's bytes travel, mislabelled exactly as any payload
+		// this sniffer does not know is mislabelled.
+		mime = "image/jpeg"
 	case len(img) >= 12 && string(img[0:4]) == "RIFF" && string(img[8:12]) == "WEBP":
 		mime = "image/webp"
 	}
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(img)
+}
+
+// reencodeGIFAsPNG decodes a GIF and re-encodes its first frame as PNG,
+// reporting whether it could.
+func reencodeGIFAsPNG(data []byte) ([]byte, bool) {
+	src, err := gif.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, false
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
 }
 
 // toFloat64 coerces numeric-ish values from the Options map.

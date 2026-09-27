@@ -156,9 +156,14 @@ type ChatCompletionRequest struct {
 	Tools            []api.Tool      `json:"tools"`
 	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
 	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
-	Logprobs         *bool           `json:"logprobs"`
-	TopLogprobs      int             `json:"top_logprobs"`
-	DebugRenderOnly  bool            `json:"_debug_render_only"`
+	// Think is this fork's own spelling of the thinking switch, carried on the
+	// OpenAI wire so a client that arrives through the Anthropic proxy states
+	// the same control the native chat wire carries. See FromChatRequest
+	// (2026-09-27 audit, round 50).
+	Think           *api.ThinkValue `json:"think,omitempty"`
+	Logprobs        *bool           `json:"logprobs"`
+	TopLogprobs     int             `json:"top_logprobs"`
+	DebugRenderOnly bool            `json:"_debug_render_only"`
 	// Ollama extension: without it an OpenAI-API client cannot release a model.
 	KeepAlive *api.Duration `json:"keep_alive,omitempty"`
 }
@@ -723,15 +728,26 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		effort = *r.ReasoningEffort
 	}
 
+	// An explicit `think` is the same control the native chat wire carries: the
+	// OpenAI spellings above can say "no thinking" or an effort LEVEL, but not
+	// the plain "yes, think" that a `thinking:{type:"enabled"}` request means,
+	// so a client that reaches this endpoint through the Anthropic proxy had
+	// its switch dropped here and the daemon's default applied
+	// (2026-09-27 audit, round 50). Stated here, it wins: it is the more
+	// specific spelling of the same field.
+	think = r.Think
+
 	if effort != "" {
 		if !slices.Contains([]string{"high", "medium", "low", "max", "none"}, effort) {
 			return nil, fmt.Errorf("invalid reasoning value: '%s' (must be \"high\", \"medium\", \"low\", \"max\", or \"none\")", effort)
 		}
 
-		if effort == "none" {
-			think = &api.ThinkValue{Value: false}
-		} else {
-			think = &api.ThinkValue{Value: effort}
+		if think == nil {
+			if effort == "none" {
+				think = &api.ThinkValue{Value: false}
+			} else {
+				think = &api.ThinkValue{Value: effort}
+			}
 		}
 	}
 

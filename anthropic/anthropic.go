@@ -80,7 +80,7 @@ type MessagesRequest struct {
 	Temperature   *float64        `json:"temperature,omitempty"`
 	TopP          *float64        `json:"top_p,omitempty"`
 	TopK          *int            `json:"top_k,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
+	StopSequences StopSequences   `json:"stop_sequences,omitempty"`
 	Tools         []Tool          `json:"tools,omitempty"`
 	ToolChoice    *ToolChoice     `json:"tool_choice,omitempty"`
 	Thinking      *ThinkingConfig `json:"thinking,omitempty"`
@@ -90,6 +90,49 @@ type MessagesRequest struct {
 
 type OutputConfig struct {
 	Effort string `json:"effort,omitempty"`
+}
+
+// StopSequences is the client's list of strings that end a turn. It is a named
+// type for one reason: the ELEMENTS have to be checked.
+//
+// A plain []string cannot distinguish `["STOP"]` from `[null]`. Go's decoder
+// treats JSON null into a string as a no-op that reports no error, so `[null]`
+// decoded to exactly the same slice as `[""]` — and an empty stop string is not
+// a harmless nothing, it is a stop sequence that matches at every position. The
+// metered gateway leg refuses such a body outright
+// (tools/gateway/messages.go, round 49), so one client body was a 400 through
+// the meter and a served turn here, with the backend handed a stop list that
+// could truncate the reply to nothing (2026-09-27 audit, round 50, C50-4).
+//
+// The whole field being null is NOT refused: that is a client stating nothing,
+// which the gateway also accepts, and the omitempty decode leaves the slice nil.
+type StopSequences []string
+
+func (s *StopSequences) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("stop_sequences must be an array of strings")
+	}
+	out := make(StopSequences, 0, len(raw))
+	for _, el := range raw {
+		// The element must BE a JSON string, checked on the bytes: unmarshalling
+		// null into a string is the no-op documented above, and so is any
+		// element the decoder can leave alone.
+		el = bytes.TrimSpace(el)
+		if len(el) == 0 || el[0] != '"' {
+			return fmt.Errorf("stop_sequences must be an array of strings")
+		}
+		var str string
+		if err := json.Unmarshal(el, &str); err != nil {
+			return fmt.Errorf("stop_sequences must be an array of strings")
+		}
+		out = append(out, str)
+	}
+	*s = out
+	return nil
 }
 
 // MessageParam represents a message in the request
@@ -495,7 +538,10 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 	}
 
 	if len(r.StopSequences) > 0 {
-		options["stop"] = r.StopSequences
+		// Converted to a plain []string on purpose: every reader of this option
+		// type-switches on []string, and the named type would fall through every
+		// arm of those switches and lose the stop list silently.
+		options["stop"] = []string(r.StopSequences)
 	}
 
 	var tools api.Tools

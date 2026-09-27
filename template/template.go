@@ -428,6 +428,25 @@ type templateToolFunctionParameters struct {
 	Items      any                `json:"items,omitempty"`
 	Required   []string           `json:"required,omitempty"`
 	Properties templateProperties `json:"properties"`
+
+	// raw is the schema as the client stated it, carried through for the paths
+	// that marshal a whole tool rather than reading the fields a template
+	// names. The typed fields above are what a template ranges over; raw is
+	// what a marshalled tool states (2026-09-27 audit, round 50). It is kept as
+	// bytes so the key order the client wrote survives.
+	raw json.RawMessage
+}
+
+// MarshalJSON states the schema as the client wrote it. The typed fields above
+// cannot carry `$ref`, `format`, `additionalProperties` and the rest of JSON
+// Schema, so re-marshalling them handed the model a different tool signature
+// than the caller sent.
+func (t templateToolFunctionParameters) MarshalJSON() ([]byte, error) {
+	if len(t.raw) > 0 {
+		return t.raw, nil
+	}
+	type plain templateToolFunctionParameters
+	return json.Marshal(plain(t))
 }
 
 // templateToolCall is a template-compatible representation of api.ToolCall
@@ -474,6 +493,7 @@ func convertToolsForTemplate(tools api.Tools) templateTools {
 					Items:      tool.Function.Parameters.Items,
 					Required:   tool.Function.Parameters.Required,
 					Properties: templateProperties(tool.Function.Parameters.Properties.ToMap()),
+					raw:        tool.Function.Parameters.SchemaJSON(),
 				},
 			},
 		}
