@@ -2432,7 +2432,14 @@ func conversationBytes(messages []MessageParam, system any) int {
 	}
 	entries := make([]entry, 0, len(messages)+1)
 	if text, present := topLevelSystemText(system); present {
-		entries = append(entries, entry{system: true, text: text, bytes: systemBytes(system)})
+		// The role the converter writes in front of that text, charged here for
+		// the same reason the message-level arm charges its own: the top-level
+		// `system` field becomes a system MESSAGE, and leaving the role off the
+		// charge billed one body's "hi" two tokens against the four the
+		// message-level spelling of the same prompt was charged — the client's
+		// input_tokens and auto-compaction threshold read small on the spelling
+		// Claude Code actually sends (2026-09-28 audit, round 57, F57-L1-1).
+		entries = append(entries, entry{system: true, text: text, bytes: len("system") + systemBytes(system)})
 	}
 	mergeable := true
 	for _, msg := range messages {
@@ -2446,11 +2453,11 @@ func conversationBytes(messages []MessageParam, system any) int {
 			entries = append(entries, entry{
 				system: true,
 				text:   joinedMessageText(msg.Content),
-				bytes:  len(msg.Role) + countAnyContent(msg.Content),
+				bytes:  messageRolesBytes(msg.Role, msg.Content) + countAnyContent(msg.Content),
 			})
 			continue
 		}
-		entries = append(entries, entry{bytes: len(msg.Role) + countAnyContent(msg.Content)})
+		entries = append(entries, entry{bytes: messageRolesBytes(msg.Role, msg.Content) + countAnyContent(msg.Content)})
 	}
 
 	rewrite := false
@@ -2605,7 +2612,61 @@ func countAnyContent(content any) int {
 // front of it is written with it — so it is counted here too, exactly as the
 // converter writes it.
 func messageJoinSeparatorBytes(content any) int {
-	separators, run := 0, false
+	separators, _, _ := messageShapeBytes(content)
+	return separators
+}
+
+// messageRolesBytes charges the ROLE bytes of every message convertMessage
+// WRITES for one client message: one message carrying the client's own role —
+// lower-cased, as the converter writes it (convertMessage's `role :=
+// strings.ToLower(msg.Role)`) — per run of the turn's own blocks that states
+// something, and one message carrying "tool" per tool_result /
+// web_search_tool_result block.
+//
+// The message-level charge billed the client's own role once for the whole
+// message instead: a message whose result blocks became a tool message was
+// charged 9 bytes ("assistant") where the converter writes 4 ("tool"), and a
+// message split into two own runs around a result was charged one role for two
+// messages. The estimate seeds the client-visible input_tokens whenever the
+// upstream states no usage, so the session's meter and its auto-compaction read
+// a prompt the model was never sent (2026-09-28 audit, round 57, F57-L1-3).
+//
+// The counts come from messageShapeBytes, the walk that already knows what the
+// converter writes here — the same one that charges the join separators.
+func messageRolesBytes(role string, content any) int {
+	_, ownRuns, results := messageShapeBytes(content)
+	total := results * len("tool")
+	if ownRuns > 0 {
+		total += ownRuns * len(strings.ToLower(role))
+	}
+	return total
+}
+
+// messageShapeBytes is messageJoinSeparatorBytes' walk, reporting the two other
+// things it knows on the way: how many messages convertMessage writes for this
+// content carrying the CLIENT's own role, and how many it writes carrying
+// "tool".
+//
+// A run is one of the former only when it states something the converter
+// writes — text bytes, an image, a call, or reasoning; a lone text block
+// holding the empty string leaves the run empty and the converter drops it
+// (convertMessage's own `text.Len() == 0 && no images && no calls && no
+// thinking` test), and the walk drops it here too. Every tool_result /
+// web_search_tool_result block is one of the latter: the converter writes it as
+// a tool message of its own and ends the run of own blocks around it. The
+// caller that charges roles (messageRolesBytes) reads these two counts, so the
+// rule about what the converter writes stays in ONE walk (2026-09-28 audit,
+// round 57, F57-L1-3).
+func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
+	run, stated := false, false
+	// flush closes the run the walk is inside: a run that stated anything is a
+	// message of the client's own role.
+	flush := func() {
+		if stated {
+			ownRuns++
+		}
+		run, stated = false, false
+	}
 	// write is the converter's join, run by run: the separator in front of a
 	// block is written when the run ALREADY holds text, and the block is what
 	// makes the run hold text from then on. The two tests are not the same one:
@@ -2620,6 +2681,10 @@ func messageJoinSeparatorBytes(content any) int {
 			separators += 2
 		}
 		run = run || written > 0
+		// An empty text block writes the run nothing, so it does not make the
+		// run a message either — the converter drops a run its empty text left
+		// empty.
+		stated = stated || written > 0
 	}
 	// A document with a TEXT source and a search_result are the other two arms
 	// that write into the same run (convertMessage), and they write more than
@@ -2676,9 +2741,19 @@ func messageJoinSeparatorBytes(content any) int {
 		switch blockType {
 		case "tool_result", "web_search_tool_result":
 			// The converter sets cur = nil for both: the next own block opens a
-			// run of its own and takes no separator.
-			run = false
+			// run of its own and takes no separator, and the result itself is a
+			// message of its own carrying role "tool".
+			flush()
+			toolResults++
 		default:
+			switch blockType {
+			case "image", "tool_use", "server_tool_use", "thinking", "redacted_thinking":
+				// The converter writes each of these into the run beside the
+				// text, and the run is a message whether or not it holds any
+				// text: an image-only turn is written, and a lone empty text is
+				// not (see this function's header).
+				stated = true
+			}
 			if chunk <= 0 {
 				return
 			}
@@ -2686,7 +2761,7 @@ func messageJoinSeparatorBytes(content any) int {
 				separators += 2
 			}
 			separators += chunk - billed
-			run = true
+			run, stated = true, true
 		}
 	}
 
@@ -2792,8 +2867,17 @@ func messageJoinSeparatorBytes(content any) int {
 				join(blockType, 0, 0)
 			}
 		}
+	case string:
+		// A bare-string content is the one text block the unmarshal writes for
+		// it (MessageParam.UnmarshalJSON): an empty string states nothing.
+		write(len(c))
+	default:
+		// Content of a shape the converter does not walk (nil, a map) writes no
+		// message.
 	}
-	return separators
+	// The last run is a message too, if it said anything.
+	flush()
+	return separators, ownRuns, toolResults
 }
 
 // systemBytes charges the system prompt for what the converter WRITES for it.
@@ -3194,7 +3278,31 @@ func imageBlockBytes(source any) int {
 // input_tokens and the compaction threshold (2026-09-28 audit, round 55; the
 // same rule round 54's B4 applied to a text block's `text` key).
 func callBlockBytes(block ContentBlock) int {
+	// An input that STATES the empty object is the same call as one that states
+	// no input at all: convertMessage flattens both to the same
+	// "arguments":{} (probed, round 57), so charging the stated key billed 11
+	// bytes for a key the prompt does not contain — 2 to 3 tokens on every call
+	// the client wrote as "input":{} . A stated NULL is not this case and is
+	// left alone: it flattens to "arguments":null, a different prompt, whose
+	// charge is its own (2026-09-28 audit, round 57, F57-L1-2).
+	if callInputStatesNothing(block.Input) {
+		block.Input = api.ToolCallFunctionArguments{}
+	}
 	return clampedJSONBytes(block)
+}
+
+// callInputStatesNothing reports whether a call's input is the empty object the
+// converter writes the same arguments for as an absent one. The zero value of
+// api.ToolCallFunctionArguments — what an absent or null key leaves behind,
+// which the block omits entirely — marshals as "{}" through its own
+// MarshalJSON, and so does a stated empty object; the NULL spelling marshals as
+// "null" and is the case this must not fold (see callBlockBytes).
+func callInputStatesNothing(input api.ToolCallFunctionArguments) bool {
+	if input.Len() > 0 {
+		return false
+	}
+	raw, err := json.Marshal(input)
+	return err == nil && string(raw) == "{}"
 }
 
 // decodedCallBlock reduces a DECODED tool_use / server_tool_use block to the

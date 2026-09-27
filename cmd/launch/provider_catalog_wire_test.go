@@ -81,7 +81,7 @@ func TestCatalog_PlanRowsHitTheVerifiedEndpoint(t *testing.T) {
 		r := userRemote{Name: e.Name, BaseURL: e.BaseURL, Version: e.Version, Wire: e.Wire, ToolFormat: e.ToolFormat}
 		upstream := r.openAIBase() + "/chat/completions"
 		if r.Descriptor().Wire == "anthropic" {
-			target, _, _, ok := routeFor(launchEndpoint{Source: sourceUserRemote, RemoteEndpoint: RemoteEndpoint{
+			target, _, _, _, ok := routeFor(launchEndpoint{Source: sourceUserRemote, RemoteEndpoint: RemoteEndpoint{
 				Name: e.Name, BaseURL: r.openAIBase(), UpstreamModel: "m", Wire: r.Descriptor().Wire, Token: "sk-x",
 			}}).anthropicPassthroughTarget()
 			if !ok {

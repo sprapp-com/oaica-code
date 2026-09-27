@@ -4097,6 +4097,19 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// COMPLETE call is still a call: the test is the arguments' parseability,
 	// exactly as callInput's other callers ask it.
 	truncated := choice.FinishReason == "length"
+	// Every id this document states is reserved before the walk takes a single
+	// mint, exactly as finalize does for the non-stream list it is handed: this
+	// path holds the same whole completion, and without the reservation the
+	// id-less call early in the list was numbered with the id a later call
+	// states while finalize — and both other legs — kept that stated id and
+	// renumbered the minted one. One upstream answer reached the client under
+	// two different ids depending on the arm that relayed it (2026-09-28 audit,
+	// round 57, F57-L3-1; see reservedIDs).
+	for _, tc := range choice.Message.ToolCalls {
+		if tc.ID != "" {
+			b.reservedIDs[tc.ID] = true
+		}
+	}
 	unnamedArgs := []string{}
 	for i, tc := range choice.Message.ToolCalls {
 		name := firstNonEmptyStr(tc.Function.Name, tc.Name)
@@ -4295,6 +4308,20 @@ func (b *anthropicBridge) relayDelta(d oaDelta) {
 	if d.Content != nil && *d.Content != "" {
 		b.sse.outBytes += len(*d.Content)
 		b.textDelta(*d.Content)
+	}
+	// Every id this fragment states is reserved before any call in it is
+	// numbered. The mint is a pure function of the call, so an id-less call
+	// numbered inside this fragment would otherwise take the id a LATER call of
+	// the same fragment states — and the sibling that holds the same list
+	// (finalize, anthropic.StreamConverter.Process, the client leg's
+	// parseOpenAIToolCalls) reserves it first and renumbers the MINTED call
+	// instead, so one upstream answer reached the client under two different
+	// ids depending on how the upstream chunked it (2026-09-28 audit, round 57,
+	// F57-L3-1).
+	for _, tc := range d.ToolCalls {
+		if tc.ID != "" {
+			b.reservedIDs[tc.ID] = true
+		}
 	}
 	for _, tc := range d.ToolCalls {
 		b.sse.outBytes += len(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))

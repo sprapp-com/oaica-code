@@ -1145,9 +1145,17 @@ const oaicaDisplayModelSuffix = "-oaica"
 // resolves the credential the user's own `claude /login` stored
 // (native_anthropic_auth.go), which is what running unproxied would have
 // used.
-func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, headerValue string, ok bool) {
+//
+// credentialIsOurs reports WHOSE credential the resolved header carries: true
+// when it is a key oaica resolved for this row, false when it is the user's
+// own — which happens on a native claude/* leg AND on the keyless
+// api.anthropic.com row below. It is returned here, rather than left for the
+// caller to infer from BaseURL, because the inference was wrong for exactly
+// that row: its keyless fallback sends the user's credential, so a 401 under it
+// was rewritten as if oaica's own key had been refused (round 57, F57-L2-1).
+func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, headerValue string, credentialIsOurs, ok bool) {
 	if route.Wire != "anthropic" {
-		return "", "", "", false
+		return "", "", "", false, false
 	}
 	if route.BaseURL != "" {
 		key := route.resolveKey()
@@ -1158,21 +1166,22 @@ func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, head
 			// (ANTHROPIC_API_KEY or that session) rather than refusing. Any
 			// other vendor's keyless row still fails closed.
 			if !isAnthropicAPIBase(route.BaseURL) {
-				return "", "", "", false
+				return "", "", "", false, false
 			}
 			auth, found := resolveNativeAnthropicAuth()
 			if !found {
-				return "", "", "", false
+				return "", "", "", false, false
 			}
-			return strings.TrimRight(route.BaseURL, "/") + "/messages", auth.Header, auth.Value, true
+			// The user's own credential, on a row that has none of oaica's.
+			return strings.TrimRight(route.BaseURL, "/") + "/messages", auth.Header, auth.Value, false, true
 		}
-		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, true
+		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, true, true
 	}
 	auth, found := resolveNativeAnthropicAuth()
 	if !found {
-		return "", "", "", false
+		return "", "", "", false, false
 	}
-	return nativeAnthropicUpstream, auth.Header, auth.Value, true
+	return nativeAnthropicUpstream, auth.Header, auth.Value, false, true
 }
 
 // anthropicRemoteModelsTarget is anthropicPassthroughTarget's /models
@@ -1183,7 +1192,7 @@ func (route proxyRoute) anthropicRemoteModelsTarget() (upstream, headerName, hea
 	if route.BaseURL == "" {
 		return "", "", "", false
 	}
-	upstream, headerName, headerValue, ok = route.anthropicPassthroughTarget()
+	upstream, headerName, headerValue, _, ok = route.anthropicPassthroughTarget()
 	if !ok {
 		return "", "", "", false
 	}
@@ -1836,13 +1845,13 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 					refuse(http.StatusInternalServerError, "rewrite model for anthropic remote: "+rerr.Error())
 					return
 				}
-				upstream, headerName, headerValue, ok := route.anthropicPassthroughTarget()
+				upstream, headerName, headerValue, credentialIsOurs, ok := route.anthropicPassthroughTarget()
 				if !ok {
 					refuse(http.StatusUnauthorized,
 						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
 					return
 				}
-				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID, true)
+				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID, credentialIsOurs)
 				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false), route.BaseURL,
 					status, relayed, r.Context().Err() != nil)
 				return
@@ -2085,16 +2094,18 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 							}
 						}
 						if over.Wire == "anthropic" {
-							upstream, headerName, headerValue, ok := over.anthropicPassthroughTarget()
+							upstream, headerName, headerValue, credentialIsOurs, ok := over.anthropicPassthroughTarget()
 							if !ok {
 								refuse(http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
 								return
 							}
-							// over.BaseURL is the same discriminator the entitlement
-							// gate above uses: a plan row is a remote under a key
-							// oaica resolved, a native claude/* leg is the user's
-							// own credential (see credentialIsOurs).
-							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID, over.BaseURL != "")
+							// credentialIsOurs comes from the target that resolved
+							// the header, not from over.BaseURL: the keyless
+							// api.anthropic.com row HAS a BaseURL and still goes out
+							// under the user's own credential, so the BaseURL test
+							// read a user's refused key as oaica's and rewrote the
+							// 401 to a 502 (round 57, F57-L2-1).
+							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID, credentialIsOurs)
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 								crossoverEscalationLeg(route.BaseURL, over.BaseURL), status, relayed, r.Context().Err() != nil)
 							return
