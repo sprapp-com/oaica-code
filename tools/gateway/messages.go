@@ -3056,7 +3056,8 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			key = rekeyed
 		}
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
-			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name)) {
+			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
+				((id != "" || name != "") && secondFinishedObject(tb.args.String(), args))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
 			// begins the next one. Two things can say so, and only these two: a
 			// stated id this block does not hold (round 43's B43-3, the shape
@@ -3085,6 +3086,17 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// (2026-09-28 audit, round 58, F58-L3-2). The restatement of a call
 			// the slot already carries is asked first and stays a repeat
 			// (round 56's F1/F2).
+			//
+			// The third clause is the same split one field over, and it is NOT
+			// splitFromCurrent's complete-object reading (see the note above): a
+			// fragment that states the slot's own id or name beside a COMPLETE
+			// argument object that differs from the one the block holds is the
+			// next call the vendor stated this index for — the vendor that reuses
+			// one id for the turn's calls as well as one index. Appended, the
+			// client accumulated `{"a":1}{"b":2}` under a stop_reason of
+			// tool_use and the model's second call did not exist on this arm at
+			// all, while the same body's document arm and the client leg both
+			// answer two calls (2026-09-28 audit, round 60, F60-L3-1).
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
 			if name != "" {
@@ -3123,6 +3135,18 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 				!argsAreFinished(last.args.String()) {
 				return b.lastToolKey
 			}
+			// Nothing goes to a block that carries no call here: the fragment
+			// arrives for a call the client has ALREADY been told is finished
+			// (its block closed on the previous fragment's complete object), and
+			// the Anthropic wire has no way to reopen one — the bytes are
+			// undelivered on this arm by round 39's B-F7
+			// (TestArgumentsAfterABlockClosedAreNotWritten). The document arm
+			// relays the same bytes as text only because there the entry is a
+			// call the upstream never named at all — no block of its own was
+			// ever opened (B-F8, round 55) — which is a different rule and not
+			// this shape. Round 60's F60-L3-2 asked for the two to agree and is
+			// NOT fixed: agreeing here would mean writing argument bytes after a
+			// closed block, which is the one thing this arm must not do.
 		}
 		if name != "" {
 			b.lastToolName = name
@@ -3298,6 +3322,22 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 //
 // No block accumulated under the key yet is not a split — there is nothing to
 // continue — and neither is a fragment that names nothing.
+// secondFinishedObject reports whether an argument-only fragment carries a
+// call's own COMPLETE argument list beside the one a block already holds.
+// Neither is more of the other: two finished objects do not concatenate into
+// JSON. It is the client leg's twoFinishedObjects, and the whole-list arm of
+// every path that holds one reads the same body as two calls.
+//
+// Both sides must be OBJECTS: argsAreFinished counts freeform text as finished
+// too, because freeform is delivered once, whole — so a later fragment is still
+// more of the SAME line, and the wire round 51's G1 pins exactly that: one call
+// whose input is the model's whole command. Splitting it would be a call the
+// client cannot run, out of bytes the model wrote as one.
+func secondFinishedObject(blockArgs, args string) bool {
+	return finishedObjectArgs(blockArgs) && finishedObjectArgs(args) &&
+		canonicalCallArgs(blockArgs) != canonicalCallArgs(args)
+}
+
 func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
 	if name == "" || b.lastToolName == "" {
 		return false
@@ -3896,6 +3936,18 @@ func argsAreFinished(raw string) bool {
 		return true
 	}
 	return json.Valid([]byte(s))
+}
+
+// finishedObjectArgs reports whether an argument list is a COMPLETE JSON object
+// and nothing else — the one shape two of which cannot be concatenated into
+// JSON. argsAreFinished above counts freeform text as finished too, because
+// freeform is delivered once, whole; that is why the bytes that have nowhere
+// left to go are identified by this narrower test, and freeform continuations
+// are left where the ordinary route puts them (round 51's G1: one call whose
+// input is the model's whole line).
+func finishedObjectArgs(raw string) bool {
+	s := strings.TrimSpace(raw)
+	return strings.HasPrefix(s, "{") && json.Valid([]byte(s))
 }
 
 // releaseHeldToolBlocks opens every block that was waiting to be numbered, ahead
