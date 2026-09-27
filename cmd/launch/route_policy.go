@@ -743,6 +743,31 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int, p
 		key := nativeOversizeBreakerKey
 		if t.Oversize.BaseURL != "" {
 			key = t.Oversize.BaseURL
+			// ...and, unlike the native constant, it has a ContextWindow the
+			// launch actually PROBED: withContextWindows asks this leg's own
+			// /models (with x-api-key, the header these rows authenticate
+			// with), so a window it states here is real. Held to the same
+			// destination fit check as the ordinary branch below, by the
+			// destination's OWN measured tokens-per-byte — the request is
+			// forwarded otherwise and the vendor answers a context overflow
+			// after the round trip, having spent it on a prompt nothing there
+			// could hold. Only the native leg — api.anthropic.com, BaseURL
+			// deliberately empty, its ContextWindow always 0 because no /models
+			// of ours ever answered for it — is exempt, which is the exemption
+			// this function's doc gives a reason for. A leg whose window is 0
+			// (a probe that failed) is left to the "worth trying" rule as
+			// before: the anthropic wire enforces its own real window, and this
+			// check only refuses a window the leg itself stated
+			// (2026-09-28 audit, round 56, F3).
+			if t.Oversize.ContextWindow > 0 {
+				destEst, destMargin := estTokens, margin
+				if planFor != nil {
+					destEst, destMargin = planFor(t.Oversize)
+				}
+				if t.Oversize.ContextWindow-destEst-destMargin < minViableCompletionTokens {
+					return route, false // the destination's own count says it cannot hold this
+				}
+			}
 		}
 		if t.breakers.open(key) {
 			return route, false

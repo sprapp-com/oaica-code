@@ -2341,15 +2341,10 @@ type CountTokensResponse struct {
 func estimateTokens(req CountTokensRequest) int {
 	var totalLen int
 
-	// Count system prompt
-	totalLen += systemBytes(req.System)
-
-	for _, msg := range req.Messages {
-		// Count role (always present)
-		totalLen += len(msg.Role)
-		// Count content
-		totalLen += countAnyContent(msg.Content)
-	}
+	// Count the conversation the CONVERTER writes: the system prompt and the
+	// message list after normalizeSystemFirst's rewrite, not the ones the body
+	// carried (see conversationBytes).
+	totalLen += conversationBytes(req.Messages, req.System)
 
 	// Charge the tools the CONVERTER forwards, not the ones the body carries.
 	// FromMessagesRequest drops every tool for tool_choice "none" and drops a
@@ -2403,6 +2398,165 @@ func estimateTokens(req CountTokensRequest) int {
 		tokens = 1
 	}
 	return tokens
+}
+
+// conversationBytes charges the conversation the converter WRITES: the system
+// prompt and the message list that reach the backend, after
+// normalizeSystemFirst has hoisted, merged and dropped the system text.
+//
+// That rewrite fires for a conversation whose system text does not already lead
+// it — a system message after a non-system one, which is the shape a client
+// sends when it puts a per-session system prompt beside the top-level one — and
+// for one holding a whitespace-only system message, which the rewrite deletes.
+// It writes the surviving system texts as ONE message joined with a blank line.
+// Charging the list as the client sent it billed a blank system message the
+// rewrite deletes three tokens against one for the same prompt written without
+// it, and billed a top-level system beside a later one as two messages with two
+// roles while the model read one joined message — four tokens against five for
+// the prompt those two bodies both produce. This estimate seeds the
+// client-visible input_tokens whenever the upstream states no usage, so the
+// difference is the client's context-window arithmetic: auto-compaction is
+// sized on it (2026-09-28 audit, round 56, F56-1).
+//
+// A conversation the rewrite leaves alone — an already-ordered one with no blank
+// system message — is charged exactly as it arrives, byte for byte. A system
+// message carrying anything but text (an image, a call) cannot be merged into
+// that one string without dropping what it carries, and normalizeSystemFirst
+// returns such a conversation untouched for the same reason; it is charged as
+// it arrives here too.
+func conversationBytes(messages []MessageParam, system any) int {
+	type entry struct {
+		system bool
+		text   string // the text the converter writes, for a system entry
+		bytes  int    // the charge for this entry as it stands
+	}
+	entries := make([]entry, 0, len(messages)+1)
+	if text, present := topLevelSystemText(system); present {
+		entries = append(entries, entry{system: true, text: text, bytes: systemBytes(system)})
+	}
+	mergeable := true
+	for _, msg := range messages {
+		if strings.EqualFold(msg.Role, "system") {
+			if !systemContentIsTextOnly(msg.Content) {
+				// Only a system message that is nothing but text can be merged
+				// into the one system string, so a conversation holding one that
+				// is not is left exactly as it arrived (normalizeSystemFirst).
+				mergeable = false
+			}
+			entries = append(entries, entry{
+				system: true,
+				text:   joinedMessageText(msg.Content),
+				bytes:  len(msg.Role) + countAnyContent(msg.Content),
+			})
+			continue
+		}
+		entries = append(entries, entry{bytes: len(msg.Role) + countAnyContent(msg.Content)})
+	}
+
+	rewrite := false
+	seenNonSystem := false
+	for _, e := range entries {
+		if !e.system {
+			seenNonSystem = true
+			continue
+		}
+		if seenNonSystem || strings.TrimSpace(e.text) == "" {
+			rewrite = true
+		}
+	}
+	if !rewrite || !mergeable {
+		total := 0
+		for _, e := range entries {
+			total += e.bytes
+		}
+		return total
+	}
+
+	// The rewrite's output: every non-system message as it stands, and the
+	// surviving system texts as one message with one role, joined by the blank
+	// line the converter writes between them.
+	total := 0
+	for _, e := range entries {
+		if !e.system {
+			total += e.bytes
+		}
+	}
+	joined, sysTexts := 0, 0
+	for _, e := range entries {
+		if !e.system || strings.TrimSpace(e.text) == "" {
+			continue
+		}
+		if sysTexts > 0 {
+			joined += 2
+		}
+		joined += len(e.text)
+		sysTexts++
+	}
+	if sysTexts > 0 {
+		total += len("system") + joined
+	}
+	return total
+}
+
+// topLevelSystemText is the text FromMessagesRequest writes for the request's
+// top-level `system` field, and whether it writes a system message for it at
+// all: a bare string becomes one, and an array becomes the text blocks it
+// holds, joined with a blank line, with the empty ones skipped — the field's
+// own arm, which is not convertMessage's.
+func topLevelSystemText(system any) (string, bool) {
+	switch sys := system.(type) {
+	case string:
+		return sys, sys != ""
+	case []any:
+		var sb strings.Builder
+		for _, block := range sys {
+			bm, ok := block.(map[string]any)
+			if !ok || bm["type"] != "text" {
+				continue
+			}
+			text, ok := bm["text"].(string)
+			if !ok || text == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n\n")
+			}
+			sb.WriteString(text)
+		}
+		return sb.String(), sb.Len() > 0
+	}
+	return "", false
+}
+
+// systemContentIsTextOnly reports whether a system message carries nothing but
+// text — the question normalizeSystemFirst asks of the CONVERTED message
+// (systemMessageIsTextOnly, over its images, calls and thinking) and this asks
+// of the blocks the converter reads them from.
+func systemContentIsTextOnly(content []ContentBlock) bool {
+	for _, block := range content {
+		if block.Type != "text" {
+			return false
+		}
+	}
+	return true
+}
+
+// joinedMessageText is the text convertMessage writes for one message's text
+// blocks: each block's own text, with a blank line before every block after the
+// first — blocks are joined, not concatenated, so that narration either side of
+// a call does not read as one sentence.
+func joinedMessageText(content []ContentBlock) string {
+	var sb strings.Builder
+	for _, block := range content {
+		if block.Type != "text" || block.Text == nil {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(*block.Text)
+	}
+	return sb.String()
 }
 
 func countAnyContent(content any) int {

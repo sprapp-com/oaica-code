@@ -698,7 +698,18 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 					continue
 				}
 				fn := map[string]any{"name": name}
-				if d, ok := tm["description"]; ok {
+				// A description the client did not state is a key the sibling
+				// legs do not write. Legs 1 and 2 decode tools through the
+				// converter's typed function, whose description is a string with
+				// omitempty (api.ToolFunction), so an absent, null or empty
+				// description is dropped there; forwarding whatever the map held
+				// put `"description":null` — and `""` — on the upstream wire for
+				// the same body, which is a different request and a different
+				// prompt byte count for one conversation (2026-09-28 audit,
+				// round 56, F56-3). A description that is present and not a
+				// string is refused by shapeMismatch, exactly as the sibling's
+				// typed decode refuses it.
+				if d, ok := tm["description"].(string); ok && d != "" {
 					fn["description"] = d
 				}
 				// The sibling carries parameters as a VALUE, not a pointer: a
@@ -3240,8 +3251,8 @@ func toolCallIdentity(name, args string) string {
 }
 
 // restatesCarriedCall reports whether one fragment is the call the block already
-// carries, restated: the same stated id, the same name, and the same arguments,
-// complete on both sides.
+// carries, restated: the same name, and the same arguments, complete on both
+// sides — under the block's own stated id, when the fragment states one.
 //
 // An argument text that is already a finished call and a fragment that states
 // that very call again are not a continuation — the concatenation of the two is
@@ -3259,8 +3270,37 @@ func toolCallIdentity(name, args string) string {
 // id the block does not hold is a second call the upstream numbered itself (the
 // wire round 43's B43-3 splits on), and one that states none is a bare repeat,
 // which is a second call outright (round 39's B-F9).
+//
+// The fragment is NOT required to restate the id, because the ordinary OpenAI
+// chunk order states it on a chunk of its own: the wire that reported this rule
+// sent the call whole (id, name and arguments together), then the id again, then
+// the name again, then the ARGUMENTS again — and asked here with that last
+// fragment's empty id, the guard answered "not a restatement", the text was
+// appended as more of the object, and the client accumulated
+// `{"a":1}{"a":1}` under stop_reason tool_use while the leg's own document arm
+// answered the same call once (2026-09-28 audit, round 56, F1). Whether the
+// fragment states the id is not what makes it this call: the KEY it arrived on
+// did, and on the ordinary wire that key is the upstream's own index. A fragment
+// that states an id at all must state THIS call's — an id the block does not
+// hold is the second call the split rule exists for (round 43's B43-3, round
+// 45's B45-1), and an id-less fragment never introduces one.
+//
+// The same wire listed the slot twice within ONE delta: two entries at one
+// index, the second with the same name and arguments and no id, reached this
+// guard, was read as more of the same object, and left the client the same
+// unparseable `{"a":1}{"a":1}` (round 56, F2). The index is the upstream's own
+// slot identity — the shape the client's accumulator keys on — so a repeat at
+// one slot is that slot's call restated, which is what this answers. The
+// document arm keeps two calls for the same body, and deliberately: a
+// `tool_calls` LIST has no slot identity, and each entry of it is a call the
+// upstream named in the list's own order (anthropic.go's seenInList, round 39's
+// B-F9). What the wire states is what separates them, and neither arm may
+// concatenate them into input no one can run.
 func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
-	if tb == nil || tb.name == "" || id == "" || !tb.statedID || id != tb.id {
+	if tb == nil || tb.name == "" {
+		return false
+	}
+	if id != "" && (!tb.statedID || id != tb.id) {
 		return false
 	}
 	if name != "" && name != tb.name {

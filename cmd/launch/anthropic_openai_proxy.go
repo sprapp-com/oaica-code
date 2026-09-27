@@ -2556,6 +2556,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // secret is the credential this leg injected upstream; every recognition site
 // below renders the upstream's own text to the client, so it is passed to
 // upstreamErrorMessage for the literal redaction (see redactUpstreamDiagnosis).
+
 func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int, secret string) bool {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2590,6 +2591,77 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// omits tool-call indices; it advances when a delta starts a new call
 	// (see the accumulation loop below).
 	syntheticToolSlot := 0
+
+	// argsFinished reports whether an argument text is a call's own finished
+	// argument list: a complete JSON object — the one spelling the wire has for
+	// a call that states its arguments — or freeform text rather than the
+	// beginning of an object. An empty argument list is NOT finished: a fragment
+	// that names a call states no arguments either, so an argument-less call and
+	// a call whose arguments have not arrived yet look the same. This is the
+	// gateway leg's argsAreFinished, and this leg's answer to the same wire has
+	// to be the same answer.
+	argsFinished := func(raw string) bool {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			return false
+		}
+		if !strings.HasPrefix(s, "{") {
+			return true
+		}
+		return json.Valid([]byte(s))
+	}
+	// canonicalArgs re-encodes an argument text the way this leg's own mint and
+	// its non-stream list encode it (the parsed object, or the `_raw` wrapper for
+	// text that is not one), so two spellings of one call — whitespace, key order
+	// — compare equal here as they do everywhere else in this file.
+	canonicalArgs := func(raw string) string {
+		s := strings.TrimSpace(raw)
+		var args api.ToolCallFunctionArguments
+		if err := json.Unmarshal([]byte(s), &args); err != nil {
+			args = api.NewToolCallFunctionArguments()
+			args.Set("_raw", s)
+		}
+		b, err := json.Marshal(args)
+		if err != nil {
+			return s
+		}
+		return string(b)
+	}
+
+	// restatesAccumulatedCall reports whether one tool-call delta is the call the
+	// accumulator already holds, restated — the same name (or none), the same
+	// finished arguments, canonically equal — rather than more of it. Two
+	// finished argument objects do not concatenate into JSON, so the only
+	// reading that leaves the client a call it can run is that the upstream
+	// listed the same call twice; appended, the client accumulated
+	// `{"a":1}{"a":1}` for a call the model made once (2026-09-28 audit, round
+	// 56, F1 and F2). Both this leg's non-stream list and the gateway leg answer
+	// that wire with ONE call, and the local converter drops a stated id it has
+	// already sent (seenStatedID).
+	//
+	// A delta that states an id at all must state THIS call's: an id the
+	// accumulator does not hold is a second call the upstream numbered itself,
+	// which the slot logic above and the split below are for (round 43's B43-3,
+	// round 45's A45-3). A delta that states none never introduces one — it
+	// arrived at this slot, and on the ordinary wire the slot is the upstream's
+	// own index. The same wire listed one slot twice within a single delta (round
+	// 56, F2): the second entry carried the same name and arguments and no id,
+	// and the index it stated is the upstream's own slot identity, which is what
+	// this answers.
+	restatesAccumulatedCall := func(acc *toolAccum, id, name, args string) bool {
+		if acc == nil || acc.name == "" {
+			return false
+		}
+		if id != "" && id != acc.id {
+			return false
+		}
+		if name != "" && name != acc.name {
+			return false
+		}
+		accArgs := acc.args.String()
+		return argsFinished(accArgs) && argsFinished(args) &&
+			canonicalArgs(accArgs) == canonicalArgs(args)
+	}
 	finishReason := ""
 	var finalUsage *openAIUsage
 	// nonSSE collects the lines that carry no "data:" prefix. An upstream that
@@ -2756,6 +2828,36 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		emit(conv.Process(chatResp))
 	}
 
+	// toolAccumsRelaySomething reports whether the accumulated call fragments would
+	// put anything in front of the client when they are flushed — the question the
+	// empty-turn guard below and the whole-completion adoption gate both mean by
+	// "this turn said something". The accumulator MAP is not the block: a fragment
+	// with neither a name nor arguments opens nothing and relays nothing
+	// (flushToolCalls skips it whole, contributing neither text nor a call), so
+	// counting it as a turn marked a stream that never said a word as a complete
+	// one — answered 200 + end_turn with empty content, and the leg recorded
+	// healthy, while the byte-identical non-stream body and the gateway leg both
+	// refuse it (2026-09-28 audit, round 56, F1/F2).
+	//
+	// A call the upstream NAMED counts even when its arguments never parsed: the
+	// flush either runs it, or — when the token limit cut it short — drops it and
+	// reports max_tokens, which is the shape this leg serves rather than refuses
+	// (round 17). Dropping it from the tally would turn that turn into the refusal
+	// this leg deliberately does not make. A call with no name is never executable;
+	// its arguments are the model's raw output and reach the client as TEXT, so it
+	// counts by its bytes — and only when it has any.
+	relaysSomething := func(accums map[int]*toolAccum) bool {
+		for _, a := range accums {
+			if strings.TrimSpace(a.name) != "" {
+				return true
+			}
+			if strings.TrimSpace(a.args.String()) != "" {
+				return true
+			}
+		}
+		return false
+	}
+
 	// A stream is COMPLETE only when the upstream said so: a finish_reason on
 	// a choice, or the [DONE] sentinel. Without one of those we have no idea
 	// whether the answer we relayed was the whole answer, so the tail below
@@ -2860,7 +2962,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// adopted as a whole completion with an EMPTY message, the rest of the
 		// stream was discarded, and the client got 200 with no answer and a
 		// healthy leg (2026-09-26 audit, sixteenth round).
-		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
+		// Not `len(toolAccums) == 0`: a fragment with neither a name nor
+		// arguments relays nothing when it is flushed, so letting it close this
+		// gate discarded the whole completion that followed — the client got
+		// 200, an empty message and output_tokens for an answer the upstream had
+		// already written, while the identical frame without the fragment relays
+		// that answer (and the gateway leg relays it too, its own nothingRelayed
+		// asking the same question of the same fragment) (2026-09-28 audit,
+		// round 56, F2).
+		if !started && !relaysSomething(toolAccums) && frameCarriesWholeCompletion(payload) {
 			if adopted, refused, wroteCalls, wroteSlots := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
@@ -2961,6 +3071,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					acc = &toolAccum{}
 					toolAccums[slot] = acc
 				}
+				if exists && restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) {
+					// The call this slot already carries, listed again: its
+					// arguments are on the wire and complete, so this fragment is
+					// neither more of them nor a second call — see the helper.
+					// Asked before the writes, because a text appended here is a
+					// text already delivered.
+					continue
+				}
 				if tc.ID != "" {
 					acc.id = tc.ID
 				}
@@ -3031,7 +3149,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// (2026-09-27 audit, round 47, A-F1). Text that was relayed counts as an
 	// answer whatever it says, which is why this asks `started` rather than
 	// re-reading the bytes (round 44's rule; round 46, A46-2).
-	if completed && !started && len(toolAccums) == 0 {
+	//
+	// Not `len(toolAccums) == 0`: the map holds what ACCUMULATED, and a
+	// fragment with neither a name nor arguments accumulates without ever
+	// becoming a block — the flush above relays nothing of it. Counting it said
+	// this stream had said something and answered 200 + end_turn with empty
+	// content for a turn whose every framing (the non-stream body, a whole
+	// completion in a frame, and the same delta stream with the fragment
+	// removed) is refused, and recorded the leg healthy so `auto` never moved
+	// the session off it (2026-09-28 audit, round 56, F1).
+	if completed && !started && !relaysSomething(toolAccums) {
 		upstreamErr = "upstream returned an empty completion"
 	}
 

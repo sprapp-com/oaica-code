@@ -301,6 +301,10 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 		toolUseID := loopServerToolUseID(w.inner.id, loop)
 		searchResults := anthropic.ConvertOllamaToAnthropicResults(searchResp)
+		// The turn that asked for this search leads with what it said before
+		// asking; it is prepended here rather than at the terminal response so
+		// each iteration's narration sits before its own search block.
+		serverContent = append(serverContent, carriedNarrationBlocks(currentResponse)...)
 		serverContent = append(serverContent,
 			anthropic.ContentBlock{
 				Type:  "server_tool_use",
@@ -368,6 +372,9 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 	maxLoopQuery := extractQueryFromToolCall(&currentToolCall)
 	maxLoopToolUseID := loopServerToolUseID(w.inner.id, maxWebSearchLoops+1)
+	// The last turn's narration, dropped by the same rule: it carried the call
+	// that ran the loop out.
+	serverContent = append(serverContent, carriedNarrationBlocks(currentResponse)...)
 	serverContent = append(serverContent,
 		anthropic.ContentBlock{
 			Type:  "server_tool_use",
@@ -520,6 +527,31 @@ func (w *WebSearchAnthropicWriter) combineServerAndFinalContent(serverContent []
 		StopSequence: converted.StopSequence,
 		Usage:        usage,
 	}
+}
+
+// carriedNarrationBlocks is the narration of the response that carried a
+// web_search call — what the model said and thought before it asked to search —
+// as content blocks, in the order the converter writes them.
+//
+// The loop consumes that response: neither arm serves it as it stands. The
+// passthrough arm relays only the chunks that carried no call, so the chunk
+// that carries the call is the one chunk of a turn whose text is not streamed
+// (and a turn can put its text and its call in one chunk); the non-stream arm
+// serves the loop's terminal response alone. Left out, the same completion
+// reached the client with the model's text on one wire and without it on the
+// other, and the text of every further loop iteration was lost on both
+// (2026-09-28 audit, round 56, F56-2).
+func carriedNarrationBlocks(response api.ChatResponse) []anthropic.ContentBlock {
+	var blocks []anthropic.ContentBlock
+	if response.Message.Thinking != "" {
+		thinking := response.Message.Thinking
+		blocks = append(blocks, anthropic.ContentBlock{Type: "thinking", Thinking: &thinking})
+	}
+	if response.Message.Content != "" {
+		text := response.Message.Content
+		blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: &text})
+	}
+	return blocks
 }
 
 func buildWebSearchAssistantMessage(response api.ChatResponse, webSearchCall api.ToolCall) api.Message {
@@ -732,6 +764,39 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 				Delta: anthropic.Delta{
 					Type: "text_delta",
 					Text: text,
+				},
+			}); err != nil {
+				return err
+			}
+		} else if block.Type == "thinking" {
+			// A thinking block, like a tool_use one above, is accumulated from
+			// its deltas: the agent shim reads thinking text from
+			// thinking_delta and never from the start event's block
+			// (cmd/agent/sse.go), so a thought written whole inside
+			// content_block_start reached the engine as nothing. The converter
+			// emits this same shape (anthropic.StreamConverter).
+			emptyThinking := ""
+			if err := writeSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
+				Type:  "content_block_start",
+				Index: index,
+				ContentBlock: anthropic.ContentBlock{
+					Type:     "thinking",
+					Thinking: &emptyThinking,
+				},
+			}); err != nil {
+				return err
+			}
+
+			thinking := ""
+			if block.Thinking != nil {
+				thinking = *block.Thinking
+			}
+			if err := writeSSE(w.ResponseWriter, "content_block_delta", anthropic.ContentBlockDeltaEvent{
+				Type:  "content_block_delta",
+				Index: index,
+				Delta: anthropic.Delta{
+					Type:     "thinking_delta",
+					Thinking: thinking,
 				},
 			}); err != nil {
 				return err
