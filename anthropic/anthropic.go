@@ -1167,6 +1167,7 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		})
 	}
 
+	seenInCall := make(map[string]int, len(r.Message.ToolCalls))
 	for _, tc := range r.Message.ToolCalls {
 		argsJSON, err := json.Marshal(tc.Function.Arguments)
 		if err != nil {
@@ -1184,11 +1185,30 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		// calls differ in arguments; two identical ones are
 		// indistinguishable), and the client gets a stable synthesized id to
 		// echo back in tool_result.
+		//
+		// The dedup is ACROSS Process calls, not within one: a list that names
+		// the same id-less call twice says two calls — the caller's accumulator
+		// splits a bare repeat (a name restated over a call that accumulated no
+		// arguments) into a second call, which IS the rule both legs adopted
+		// (2026-09-27 audit, round 39, B-F9), and collapsing the pair here
+		// delivered one tool_use where the model asked for two, making that fix
+		// inert on this wire (2026-09-27 audit, round 40, A40-6). The second and
+		// later occurrences of a key within a list take a distinct key and a
+		// distinct id — two tool_use blocks with one id cannot be answered
+		// separately — while a restatement of an already-sent call in a LATER
+		// call still dedups, which is what this map is for.
 		key := tc.ID
 		id := tc.ID
 		if key == "" {
-			key = "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
+			base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
+			n := seenInCall[base]
+			seenInCall[base] = n + 1
+			key = base
 			id = ToolCallIDFor(tc.Function.Name, string(argsJSON))
+			if n > 0 {
+				key = base + "\x00#" + strconv.Itoa(n)
+				id = ToolCallIDFor(tc.Function.Name, string(argsJSON)+"#"+strconv.Itoa(n))
+			}
 		}
 		if c.toolCallsSent[key] {
 			continue
@@ -1954,12 +1974,26 @@ func imageBlockBytes(source any) int {
 // a 74-byte notice), so serializing the enclosing block pasted the base64 back
 // in and billed a 74-byte prompt as 100 051 tokens. The clamp is the same
 // distinction the converter draws, in bytes (2026-09-27 audit, round 39, A-F3).
+//
+// The walk runs over the DECODED view of v, not v itself. binaryOverflow reads
+// the two shapes a decoder produces — map[string]any and []any — and a caller
+// that passes a typed struct (the production path: MessageParam.Content is
+// []ContentBlock) got the default arm and a clamp of zero, so the round-39 fix
+// was inert exactly where it was meant to bite: a 400 KB document nested in a
+// tool_result still measured 420 132 bytes against a 192-byte wire, and the
+// estimate reported 100 086 tokens for it (2026-09-27 audit, round 40, A40-1).
+// Decoding here is one rule for every caller, and it is the same reading the
+// converter itself takes.
 func clampedJSONBytes(v any) int {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return 0
 	}
-	return len(data) - binaryOverflow(v)
+	var decoded any
+	if json.Unmarshal(data, &decoded) != nil {
+		return len(data)
+	}
+	return len(data) - binaryOverflow(decoded)
 }
 
 // binaryOverflow is the length by which serializing v overstates the prompt:
@@ -1998,17 +2032,24 @@ func countContentBlock(block ContentBlock) int {
 	if block.Text != nil {
 		total += len(*block.Text)
 	}
-	// A thinking block is charged NOTHING, and a redacted one never was. The
-	// reasoning a client echoes back in its history is not prompt text on any
-	// wire this fork speaks (api.Message.Thinking is never projected onto an
-	// OpenAI message, and is not rendered by a chat template), so charging it
-	// billed the context meter for text the model is not asked about: a 700 KB
-	// thinking blob — with a 400 KB redacted one beside it — took the estimate
-	// from 5 502 tokens to 180 502 while the converted prompt was byte-for-byte
-	// the same 22 084 bytes. The estimate seeds the client-visible input_tokens
-	// when the upstream states nothing, so the session's meter and its
+	// A thinking block is charged NOTHING, and a redacted one never was. A
+	// 700 KB thinking blob — with a 400 KB redacted one beside it — took the
+	// estimate from 5 502 tokens to 180 502 while the converted prompt was
+	// byte-for-byte the same 22 084 bytes: the session's meter and its
 	// auto-compaction read a prompt 32× its real size (2026-09-27 audit, round
 	// 39, C-F13).
+	//
+	// Whether the blob reaches a prefill is the MODEL's template deciding: the
+	// estimate has one consumer, middleware/anthropic.go's handler for the local
+	// leg, and that leg renders api.Message.Thinking only if the template names
+	// `.Thinking` — which none of the templates this repo bundles does, so for
+	// every model the product ships, charging the block would be wrong by the
+	// blob's size in the direction that breaks sessions (round-40 auditor A40-7
+	// argued the block is rendered on that leg and read the round-39 wording as
+	// claiming otherwise for it — the wording was about the OpenAI wire, and it
+	// is corrected here rather than acted on: a third-party template that does
+	// render `.Thinking` is out of scope for this fallback, and the upstream's
+	// own count corrects the estimate whenever it states one).
 	switch block.Type {
 	case "tool_use", "tool_result":
 		total += clampedJSONBytes(block)

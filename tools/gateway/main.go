@@ -1609,7 +1609,19 @@ type usage struct {
 //   - clamped at zero below and at the prompt size above: the cost math
 //     subtracts this from the prompt, so a malformed negative count INFLATES
 //     the fresh tokens (prompt - (-5000) = prompt + 5000), and the ledger row
-//     would record a negative hit.
+//     would record a negative hit;
+//   - reported as it stands when the prompt size was never stated, because
+//     there is then no measurement to clamp against and "0" is silence, not a
+//     measurement. A hit the upstream stated and a size it left out is a real
+//     shape — a stream that narrates only the hit — and returning 0 for it
+//     told the client the whole prompt was fresh input while the row for the
+//     same turn recorded the hit: the two records of one request disagreeing
+//     about the one number either of them had evidence for (2026-09-27 audit,
+//     round 40, A40-3). Every caller that reports this against a prompt raises
+//     that prompt to the hit (EstimatedUsage, promptSplit, and the non-stream
+//     leg's own split), so no field can come out negative — which is why the
+//     sibling function in cmd/launch's client proxy has carried exactly this
+//     branch since round 39 (A-F4).
 func (u usage) cachedTokens() int {
 	c := 0
 	if u.PromptTokensDetails != nil {
@@ -1628,10 +1640,12 @@ func (u usage) cachedTokens() int {
 	if c < 0 {
 		return 0
 	}
+	if u.PromptTokens <= 0 {
+		// No measurement to clamp against, so the hit stands (see this
+		// function's doc). A negative prompt is no statement either.
+		return c
+	}
 	if c > u.PromptTokens {
-		if u.PromptTokens < 0 {
-			return 0
-		}
 		return u.PromptTokens
 	}
 	return c
@@ -1663,6 +1677,34 @@ func (u *usage) merge(next usage) {
 			u.PromptTokensDetails = next.PromptTokensDetails
 		} else if next.PromptTokensDetails.CachedTokens > 0 {
 			u.PromptTokensDetails.CachedTokens = next.PromptTokensDetails.CachedTokens
+		}
+	}
+}
+
+// fillEmpty folds a translating writer's own reading of a turn into the
+// recorder's, field by field, and takes a field ONLY where the recorder has
+// nothing: a count the upstream stated is the upstream's word for the turn, and
+// an estimate exists to fill its silence, never to replace its statement
+// (2026-09-27 audit, round 40, B40-2 — the substitution overwrote a stated
+// prompt_tokens=11/completion_tokens=2 with the prompt estimate and a zero, so
+// the row for a served turn stated counts the upstream never sent while the
+// client read the real ones). Per field rather than per turn for merge's
+// reason: an upstream may state one count and not the other.
+func (u *usage) fillEmpty(next usage) {
+	if next.PromptTokens > 0 && u.PromptTokens <= 0 {
+		u.PromptTokens = next.PromptTokens
+	}
+	if next.CompletionTokens > 0 && u.CompletionTokens <= 0 {
+		u.CompletionTokens = next.CompletionTokens
+	}
+	// The hit, read through cachedTokens() so "this row already states a hit"
+	// is the same question the cost math asks, in either spelling.
+	if u.cachedTokens() <= 0 {
+		if d := next.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			u.PromptTokensDetails = d
+		}
+		if next.PromptCacheHitTokens > 0 {
+			u.PromptCacheHitTokens = next.PromptCacheHitTokens
 		}
 	}
 }
@@ -2063,6 +2105,26 @@ func inlineImageBytes(v any) (payload, images int) {
 					images++
 					continue
 				}
+				// Anything else under this key is still an image the upstream
+				// will fetch — a remote URL, or the string spelling of one. It
+				// carries no base64 to discount, but it is not free, and the
+				// other two measures in this product (anthropic.imageBlockBytes
+				// and cmd/launch's clientPromptBytes) charge it the same
+				// allowance. Counting it zero here left a URL-image turn
+				// measuring smaller on this leg than on either of the others
+				// (2026-09-27 audit, round 40, A40-9).
+				switch x := e.(type) {
+				case map[string]any:
+					if u, _ := x["url"].(string); u != "" {
+						images++
+						continue
+					}
+				case string:
+					if x != "" {
+						images++
+						continue
+					}
+				}
 			}
 			if k == "source" {
 				if m, ok := e.(map[string]any); ok {
@@ -2079,6 +2141,18 @@ func inlineImageBytes(v any) (payload, images int) {
 							payload += len(d)
 							images++
 							continue
+						}
+						// A url-sourced image is the same image, fetched instead
+						// of carried — the same allowance, and it is not
+						// discounted because there is nothing encoded to discount
+						// (2026-09-27 audit, round 40, A40-9).
+						if st, _ := m["type"].(string); st == "url" {
+							u, _ := m["url"].(string)
+							r, _ := m["ref"].(string)
+							if u != "" || r != "" {
+								images++
+								continue
+							}
 						}
 					}
 				}
@@ -2496,25 +2570,6 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 // entry builds the ledger row for one completion.
 func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string, overage bool) ledgerEntry {
 	u := rec.usage.nonNegative()
-	// A translating writer may know the counts when the upstream stated none:
-	// the recorder reads the UPSTREAM's bytes, and an upstream that sends no
-	// usage object at all leaves the row recording zero for a turn the client was
-	// served and the upstream billed. The /v1/messages bridge is the writer that
-	// can say — the same estimate it sends the client — so the row and the client
-	// agree (2026-09-27 audit, round 39, C-F3). Only consulted when nothing was
-	// stated: a stated zero is a statement.
-	// UsageSeen is deliberately left alone: it records whether the UPSTREAM
-	// stated usage, and these counts are this gateway's own reading of the turn,
-	// not the upstream's word for it.
-	if !rec.seen {
-		if est, ok := rec.ResponseWriter.(interface{ EstimatedUsage() (usage, bool) }); ok {
-			if eu, has := est.EstimatedUsage(); has {
-				u = eu.nonNegative()
-			}
-		}
-	}
-	cached := u.cachedTokens()
-	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
 	// The status the CLIENT will read, when the writer knows better than the
 	// upstream's own header: the /v1/messages bridge answers an untranslatable
 	// 200 with 502 and that decision is made after this row is built (see
@@ -2523,6 +2578,42 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	if reporter, ok := rec.ResponseWriter.(ledgerStatusWriter); ok {
 		status = reporter.LedgerStatus(status)
 	}
+	// A translating writer may know the counts when the upstream stated none:
+	// the recorder reads the UPSTREAM's bytes, and an upstream that sends no
+	// usage object at all leaves the row recording zero for a turn the client was
+	// served and the upstream billed. The /v1/messages bridge is the writer that
+	// can say — the same estimate it sends the client — so the row and the client
+	// agree (2026-09-27 audit, round 39, C-F3; per field since round 40, B40-2).
+	// UsageSeen is deliberately left alone: it records whether the UPSTREAM
+	// stated usage, and these counts are this gateway's own reading of the turn,
+	// not the upstream's word for it.
+	//
+	// Only for a turn the client was told SUCCEEDED. A turn the upstream refused
+	// (429) or that the bridge itself failed (502 for no answer, an unparseable
+	// body, or an error frame mid-stream) was not served and not billed, and
+	// booking it with the prompt estimate and a positive cost_usd charged the
+	// overage accounting for an answer nobody received — the bridge's own
+	// estimate of a turn that produced nothing (2026-09-27 audit, round 40,
+	// B40-1).
+	if status == http.StatusOK {
+		if est, ok := rec.ResponseWriter.(interface{ EstimatedUsage() (usage, bool) }); ok {
+			if eu, has := est.EstimatedUsage(); has {
+				u.fillEmpty(eu.nonNegative())
+			}
+		}
+	}
+	cached := u.cachedTokens()
+	// A hit the upstream stated is a statement about the prompt: tokens served
+	// from its prefix cache are tokens OF this prompt, so a row that recorded
+	// prompt_tokens below its own cached_tokens would be recording a fact that
+	// cannot hold, and the fresh count its cost math derives from the two
+	// (prompt - cached) would be negative. Raised here rather than left to the
+	// estimate, so a path with no translating writer to ask still books a
+	// coherent row (2026-09-27 audit, round 40, A40-3).
+	if cached > u.PromptTokens {
+		u.PromptTokens = cached
+	}
+	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,

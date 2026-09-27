@@ -492,19 +492,28 @@ func TestTheClientAndTheLedgerAreToldAnEstimateWhenNothingIsStated(t *testing.T)
 	if err := json.Unmarshal([]byte(body), &event); err != nil {
 		t.Fatalf("message_delta is not JSON (%v): %s", err, delta)
 	}
-	if event.Usage.InputTokens <= 0 {
-		t.Errorf("the client was told input_tokens:%d for a real prompt:\n%s\na session's context meter never moves, so auto-compaction never fires and the session walks into the context wall", event.Usage.InputTokens, stream)
+	const answer = "an answer with no usage stated at all"
+	// The expectations are spelled out, not read back from this gateway's own
+	// measures: the prompt is the request's messages as the upstream decodes
+	// them (keys in the order json.Marshal writes a map), and the answer is the
+	// relayed content counted at four bytes to the token (round 40's C40-7/8 —
+	// sign-only assertions passed for ANY positive number, including one ten
+	// times the turn's real size).
+	wantPrompt := len(`[{"content":"go","role":"user"}]`) / 4
+	wantOutput := len(answer)/4 + 1
+	if event.Usage.InputTokens != wantPrompt {
+		t.Errorf("the client was told input_tokens:%d for a %d-byte prompt, want %d:\n%s\na session's context meter reads the estimate the upstream's silence leaves, and one that reads the wrong size either never grows (auto-compaction never fires) or fires early", event.Usage.InputTokens, len(`[{"content":"go","role":"user"}]`), wantPrompt, stream)
 	}
-	if event.Usage.OutputTokens <= 0 {
-		t.Errorf("the client was told output_tokens:%d for a real answer:\n%s", event.Usage.OutputTokens, stream)
+	if event.Usage.OutputTokens != wantOutput {
+		t.Errorf("the client was told output_tokens:%d for a %d-byte answer, want %d:\n%s", event.Usage.OutputTokens, len(answer), wantOutput, stream)
 	}
 
 	rows := waitLedger(t, ledger, 1)
 	if len(rows) == 0 {
 		t.Fatal("no ledger row for the turn")
 	}
-	if rows[0].PromptTokens <= 0 || rows[0].CompletionTokens <= 0 {
-		t.Errorf("ledger recorded prompt=%d completion=%d: the recorder reads the upstream's own bytes, and this upstream said nothing — the row for a served, billed turn says it carried nothing", rows[0].PromptTokens, rows[0].CompletionTokens)
+	if rows[0].PromptTokens != wantPrompt || rows[0].CompletionTokens != wantOutput {
+		t.Errorf("ledger recorded prompt=%d completion=%d, want %d/%d: the recorder reads the upstream's own bytes, and this upstream said nothing — the row for a served, billed turn must carry this gateway's reading, the same numbers the client was told", rows[0].PromptTokens, rows[0].CompletionTokens, wantPrompt, wantOutput)
 	}
 	if rows[0].UsageSeen {
 		t.Errorf("the ledger row claims the upstream stated usage: UsageSeen records the UPSTREAM's word, and this estimate is the gateway's own reading of the turn")

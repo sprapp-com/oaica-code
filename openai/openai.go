@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/types/model"
 )
@@ -803,6 +804,17 @@ func decodeImageURL(url string) (api.ImageData, error) {
 	img, err := base64.StdEncoding.DecodeString(url)
 	if err != nil {
 		return nil, errors.New("invalid image input")
+	}
+	if anthropic.IsImageURL(img) {
+		// A payload that says "base64" and decodes to a URL is not an image.
+		// Carried on as bytes it reached the runner as a JPEG OF THE ADDRESS
+		// TEXT — llm/llama_server.go labels an unrecognised payload
+		// "image/jpeg" — so the client was told its image was understood while
+		// the model was asked about a picture of a string. The other legs
+		// refuse this payload in words (anthropic.resolveImageSource, and the
+		// gateway's base64ImagePayload); this one is the /v1/chat/completions
+		// door onto the same rule (2026-09-27 audit, round 40, C40-5).
+		return nil, errors.New("invalid image input: base64 data decodes to a URL, not image bytes")
 	}
 	return img, nil
 }

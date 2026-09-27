@@ -74,6 +74,21 @@ func buildMessagesRequest(req *api.ChatRequest, meta launch.AgentModelMeta) (*an
 				param.Content = append(param.Content, anthropic.ContentBlock{Type: "text", Text: &msg.Content})
 			}
 			for _, img := range msg.Images {
+				// A source of type "url" is carried through api.ImageData as its
+				// own URL text (anthropic.resolveImageSource, IsImageURL), and
+				// the wire takes it as it stands. Base64-encoding it here sent
+				// the upstream a picture of a string — and since round 39 the
+				// converter refuses that payload outright, so the shim turned a
+				// url image into a 400 the user could not see the cause of
+				// (2026-09-27 audit, round 40, C40-2). cmd/launch's imageDataURL
+				// reads the same convention.
+				if anthropic.IsImageURL(img) {
+					param.Content = append(param.Content, anthropic.ContentBlock{
+						Type:   "image",
+						Source: &anthropic.ImageSource{Type: "url", URL: string(img)},
+					})
+					continue
+				}
 				data := []byte(img)
 				param.Content = append(param.Content, anthropic.ContentBlock{
 					Type: "image",

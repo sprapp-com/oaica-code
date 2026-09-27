@@ -27,6 +27,29 @@ type AnthropicWriter struct {
 	stream    bool
 	id        string
 	converter *anthropic.StreamConverter
+	// estimatedInputTokens is the prompt size this handler worked out for
+	// itself, used where the upstream states none. The streaming shape already
+	// carries it (NewStreamConverter seeds message_start with it); the
+	// non-stream shape applied nothing, so the same turn answered with
+	// stream:false reported input_tokens:0 — a context meter that never grew
+	// and auto-compaction that never fired, for a request the client can send
+	// just as easily (2026-09-27 audit, round 40, C40-6).
+	estimatedInputTokens int
+}
+
+// withInputEstimate fills in the prompt count a turn's usage does not state. It
+// is the converter's own rule (both counts silent ⇒ the estimate), applied
+// where the terminal event is written instead — the message_delta of a
+// web-search turn is emitted here, and writing input_tokens:0 after
+// message_start stated the estimate RESETS the client's context accounting for
+// a turn whose size it had already been told (2026-09-27 audit, round 40,
+// C40-6). A stated prompt, or a stated cache read, is the upstream's word and
+// is left alone.
+func withInputEstimate(u anthropic.Usage, estimate int) anthropic.Usage {
+	if estimate > 0 && u.InputTokens == 0 && optionalIntValue(u.CacheReadInputTokens) == 0 {
+		u.InputTokens = estimate
+	}
+	return u
 }
 
 func (w *AnthropicWriter) writeError(data []byte) (int, error) {
@@ -73,6 +96,7 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
 	response := anthropic.ToMessagesResponse(w.id, chatResponse)
+	response.Usage = withInputEstimate(response.Usage, w.estimatedInputTokens)
 	logutil.Trace("anthropic middleware: converted response", "resp", anthropic.TraceMessagesResponse(response))
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
 }
@@ -740,6 +764,8 @@ func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.Mess
 		return nil
 	}
 
+	response.Usage = withInputEstimate(response.Usage, w.estimatedInputTokens)
+
 	if !w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w.ResponseWriter).Encode(response); err != nil {
@@ -874,10 +900,11 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 		estimatedTokens := anthropic.EstimateInputTokens(req)
 
 		innerWriter := &AnthropicWriter{
-			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
-			stream:     req.Stream,
-			id:         messageID,
-			converter:  anthropic.NewStreamConverter(messageID, req.Model, estimatedTokens),
+			BaseWriter:           BaseWriter{ResponseWriter: c.Writer},
+			stream:               req.Stream,
+			id:                   messageID,
+			converter:            anthropic.NewStreamConverter(messageID, req.Model, estimatedTokens),
+			estimatedInputTokens: estimatedTokens,
 		}
 
 		if req.Stream {

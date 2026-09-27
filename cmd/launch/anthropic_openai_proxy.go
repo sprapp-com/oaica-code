@@ -417,6 +417,17 @@ func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName, deltaArgs s
 	if deltaName == "" {
 		return false
 	}
+	// A DIFFERENT name can only be introducing a call: an argument
+	// continuation carries arguments alone. Keeping one call whole here when
+	// the arguments are not yet valid JSON gave the client a single tool_use
+	// named after the LAST call with the two calls' arguments concatenated —
+	// a well-formed-looking call with the wrong name, which is worse than a
+	// visibly truncated one, because nothing about it signals the damage. The
+	// gateway leg's toolKey splits on exactly this name change, and one wire
+	// must be answered one way (2026-09-27 audit, round 40, A40-8).
+	if deltaName != accName {
+		return true
+	}
 	raw := strings.TrimSpace(accArgs)
 	if raw != "" && json.Valid([]byte(raw)) {
 		return true
@@ -2657,21 +2668,46 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		doneResp.Metrics.EvalCount = streamedText/4 + 1
 	}
 	events := conv.Process(doneResp)
-	if finalUsage != nil && finalUsage.PromptTokens > 0 {
-		// The converter only overwrites message_start's seeded estimate when
-		// PromptEvalCount > 0, which is right for a done event that states
-		// nothing — but here the upstream DID state usage, and an upstream
-		// that reports the whole prompt as cache-read leaves the uncached
-		// count at 0. The converter then kept the pre-turn estimate, so the
-		// client was told input_tokens = the full prompt AND
-		// cache_read_input_tokens = the same full prompt: 2x the real prompt
-		// for a fully-cached turn, and Claude Code's context meter and
-		// auto-compaction sum both fields (2026-09-26 audit). Usage was
-		// stated, so this owns the field.
+	// The patch that carries the cache read onto the client. Its gate is the
+	// cache hit, not the prompt size: an upstream that states
+	// prompt_cache_hit_tokens and no prompt_tokens — the shape the non-stream
+	// leg reports as cache_read_input_tokens for the identical usage object —
+	// left `cached` computed and then thrown away here, and the client read the
+	// whole estimate as FRESH input with no cache_read at all, byte-identical to
+	// the same turn with no usage chunk (2026-09-27 audit, round 40, A40-2).
+	// The prompt is partitioned the way the non-stream leg and the gateway's
+	// promptSplit partition it: the stated size, else the estimate the converter
+	// was seeded with, else the hit itself; a stated hit that is larger than
+	// either is evidence that the reading is short, so the total is raised to
+	// it rather than the hit clamped down to a prompt the upstream never stated
+	// — clamping it there told the client input_tokens=cache_read=the estimate
+	// for a turn whose upstream had just said 900 of its prompt came from cache,
+	// which is the same A40-3 shape the server leg answered (2026-09-27 audit,
+	// round 40).
+	total := 0
+	if finalUsage != nil {
+		total = finalUsage.PromptTokens
+	}
+	if total <= 0 {
+		total = estInputTokens
+	}
+	if total < cached {
+		total = cached
+	}
+	if finalUsage != nil && (statedPrompt || cached > 0) {
+		// An upstream that reports the whole prompt as cache-read leaves the
+		// uncached count at 0, and the converter only overwrites message_start's
+		// seeded estimate when PromptEvalCount > 0 — so without this the client
+		// was told input_tokens = the full prompt AND cache_read_input_tokens =
+		// the same full prompt: 2x the real prompt for a fully-cached turn, and
+		// Claude Code's context meter and auto-compaction sum both fields
+		// (2026-09-26 audit). A stated prompt, or a stated hit, owns the field.
 		for i := range events {
 			if d, ok := events[i].Data.(anthropic.MessageDeltaEvent); ok {
-				d.Usage.InputTokens = finalUsage.PromptTokens - cached
-				d.Usage.CacheReadInputTokens = intPtr(cached)
+				d.Usage.InputTokens = total - cached
+				if cached > 0 {
+					d.Usage.CacheReadInputTokens = intPtr(cached)
+				}
 				events[i].Data = d
 			}
 		}

@@ -110,12 +110,19 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	model, _ := req["model"].(string)
 	bridge := newAnthropicBridge(w, stream, model)
 	// The prompt size this request really carries, in the unit the rest of the
-	// gateway measures prompts in: the serialized body with each inline image's
-	// base64 replaced by its allowance. It is what the client is told when the
-	// upstream states no usage at all, rather than the 0 that left a session's
-	// context meter still and its auto-compaction unfired (2026-09-27 audit,
-	// round 39, C-F3).
-	bridge.promptEstimate = promptPayloadBytes(len(nb), openai) / 4
+	// gateway measures prompts in: messagesBytes, which charges the body the
+	// upstream will DECODE rather than the bytes Go spent encoding it, with each
+	// inline image's base64 replaced by its allowance. It is what the client is
+	// told when the upstream states no usage at all, rather than the 0 that left
+	// a session's context meter still and its auto-compaction unfired
+	// (2026-09-27 audit, round 39, C-F3). Measuring len(nb) put the OTHER two
+	// measures' bug in this one: encoding/json writes `"`, `\`, `<`, `>` and the
+	// control characters as two- or six-byte escapes that are not prompt, so a
+	// markup-heavy turn (the shape Claude Code sends, and every code file in it)
+	// was estimated up to 6x its real size and the client's input_tokens — the
+	// field auto-compaction is sized on — read high from the first turn the
+	// upstream stated nothing for (2026-09-27 audit, round 40, C40-4).
+	bridge.promptEstimate = messagesBytes(openai) / 4
 	g.completionHandler(bridge, r)
 	bridge.finalize()
 }
@@ -255,39 +262,49 @@ func firstNonEmptyStr(vals ...string) string {
 // describing a picture the request also attaches would tell the model about a
 // screenshot it can already see, and the client leg — which sends the image —
 // writes no such notice (2026-09-27 audit, round 38, B-F5).
-func toolResultText(content any, carryImages bool) string {
+//
+// The second return is the refusal the client leg already makes. A non-object
+// element inside the array is not a content block — the other leg 400s the body
+// — and marshalling it into the prompt here made one body two different prompts
+// depending on which leg served it ("1\n\"x\"\nafter" against "1\nafter"),
+// which is the divergence round 39's C-F6 closed on the client side only
+// (2026-09-27 audit, round 40, A40-4). One rule on both legs: refuse it, and
+// name what was refused.
+func toolResultText(content any, carryImages bool) (string, string) {
 	switch c := content.(type) {
 	case nil:
-		return ""
+		return "", ""
 	case string:
-		return c
+		return c, ""
 	case []any:
 		parts := make([]string, 0, len(c))
 		for _, cb := range c {
-			if bm, ok := cb.(map[string]any); ok {
-				switch bm["type"] {
-				case "text":
-					// An empty text block is no text: joined as an empty part it
-					// put a blank line in front of the real content, where the
-					// client leg's copy skips it (2026-09-27 audit, round 39,
-					// A-F6).
-					if s, ok := bm["text"].(string); ok {
-						if s != "" {
-							parts = append(parts, s)
-						}
-						continue
+			bm, ok := cb.(map[string]any)
+			if !ok {
+				return "", "tool_result content holds an element that is not a JSON object"
+			}
+			switch bm["type"] {
+			case "text":
+				// An empty text block is no text: joined as an empty part it
+				// put a blank line in front of the real content, where the
+				// client leg's copy skips it (2026-09-27 audit, round 39,
+				// A-F6).
+				if s, ok := bm["text"].(string); ok {
+					if s != "" {
+						parts = append(parts, s)
 					}
-				case "image":
-					if carryImages {
-						continue
-					}
+					continue
+				}
+			case "image":
+				if carryImages {
+					continue
 				}
 			}
 			parts = append(parts, describeBlock(cb))
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), ""
 	default:
-		return describeBlock(c)
+		return describeBlock(c), ""
 	}
 }
 
@@ -306,7 +323,10 @@ func toolResultText(content any, carryImages bool) string {
 // silence, the message was byte-identical to "the tool returned nothing" and the
 // model answered as if the tool had said nothing (2026-09-27 audit, round 39,
 // C-F2).
-func toolResultImageParts(content any) (parts []any, notices []string) {
+//
+// The third return is the refusal a payload the client leg refuses earns here
+// too — see base64ImagePayload (2026-09-27 audit, round 40, A40-5).
+func toolResultImageParts(content any) (parts []any, notices []string, refuse string) {
 	blocks, _ := content.([]any)
 	parts = make([]any, 0, len(blocks))
 	for _, cb := range blocks {
@@ -334,6 +354,9 @@ func toolResultImageParts(content any) (parts []any, notices []string) {
 				notices = append(notices, describeBlock(cb))
 				continue
 			}
+			if _, refuse := base64ImagePayload(data); refuse != "" {
+				return nil, nil, refuse
+			}
 			media, _ := src["media_type"].(string)
 			parts = append(parts, map[string]any{
 				"type": "image_url",
@@ -344,7 +367,7 @@ func toolResultImageParts(content any) (parts []any, notices []string) {
 			notices = append(notices, describeBlock(cb))
 		}
 	}
-	return parts, notices
+	return parts, notices, ""
 }
 
 // inlineImageMediaType is the MIME type a data URL is written with: the type the
@@ -382,6 +405,56 @@ func inlineImageMediaType(media, data string) string {
 		return media
 	}
 	return "image/jpeg"
+}
+
+// base64ImagePayload decodes an inline base64 image source and refuses the two
+// payloads the client leg refuses, in its own words: a string that is not
+// base64 at all, and a payload that decodes to a URL rather than to image
+// bytes. This leg forwarded both as a data URI — an undecodable one reaches the
+// upstream as an image it fails on, and a base64-of-a-URL is a payload the
+// client never sent as bytes, which the other leg has refused in words since
+// round 39 (2026-09-27 audit, round 40, A40-5). "" means the payload is image
+// bytes; the second return is the refusal to hand the client.
+func base64ImagePayload(data string) ([]byte, string) {
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, "invalid base64 image data"
+	}
+	if imageURLText(string(decoded)) {
+		return nil, "invalid image source: base64 data decodes to a URL, not image bytes"
+	}
+	return decoded, ""
+}
+
+// imageURLText reports whether s reads as a URL: "//" (protocol-relative),
+// "data:" case-insensitively, or an alpha scheme followed by "://".
+//
+// The third copy of this predicate in the tree, deliberately: this module is
+// built and deployed on its own (its go.mod has no ollama dependency), so it
+// cannot import the converter's — the same reason the inline-image allowance is
+// spelled out in three places. The two legs must answer "is this a URL" the
+// same way for the same body, which is what the tests on both sides pin.
+func imageURLText(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "//") {
+		return true
+	}
+	if len(s) >= 5 && strings.EqualFold(s[:5], "data:") {
+		return true
+	}
+	i := strings.Index(s, "://")
+	if i <= 0 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := s[j]
+		alpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		tail := (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
+		if !alpha && !(j > 0 && tail) {
+			return false
+		}
+	}
+	return true
 }
 
 // searchResultOrigin reads a search_result's source — where the passage came
@@ -657,6 +730,9 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				if data == "" {
 					return nil, "image block with no inline data"
 				}
+				if _, refuse := base64ImagePayload(data); refuse != "" {
+					return nil, refuse
+				}
 				parts = append(parts, map[string]any{
 					"type":      "image_url",
 					"image_url": map[string]any{"url": "data:" + inlineImageMediaType(media, data) + ";base64," + data},
@@ -701,22 +777,41 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			// are in the client's history from the moment it is answered
 			// (2026-09-27 audit, round 35, B-F1/A-F4).
 			carryImages := acceptsImages && t == "tool_result"
-			content := toolResultText(bm["content"], carryImages)
+			var content string
 			if t == "web_search_tool_result" {
 				content = webSearchResultText(bm["content"])
+			} else {
+				var refuse string
+				content, refuse = toolResultText(bm["content"], carryImages)
+				if refuse != "" {
+					return nil, refuse
+				}
 			}
 			var dropped []string
 			if carryImages {
 				// The images this model can be shown, and a sentence for each one
-				// it cannot: an image that yields no part is stated in the text
-				// (below), not erased (2026-09-27 audit, round 39, C-F2).
+				// it cannot: an image that yields no part is stated in the text,
+				// not erased (2026-09-27 audit, round 39, C-F2).
 				var parts []any
-				parts, dropped = toolResultImageParts(bm["content"])
-				if len(parts) > 0 {
-					if content == "" && len(dropped) > 0 {
-						content = strings.Join(dropped, "\n")
-						dropped = nil
+				var refuse string
+				parts, dropped, refuse = toolResultImageParts(bm["content"])
+				if refuse != "" {
+					return nil, refuse
+				}
+				// The sentences are folded into the text HERE, before the parts
+				// are built, so a tool_result that carries text AND one showable
+				// image AND one unshowable one states the omission too. Folding
+				// them only when the text was empty lost the notice for exactly
+				// the mixed message, which is the erasure C-F2 forbids
+				// (2026-09-27 audit, round 40, B40-5).
+				if len(dropped) > 0 {
+					if content != "" {
+						content += "\n"
 					}
+					content += strings.Join(dropped, "\n")
+					dropped = nil
+				}
+				if len(parts) > 0 {
 					arr := make([]any, 0, len(parts)+1)
 					if content != "" {
 						arr = append(arr, map[string]any{"type": "text", "text": content})
@@ -1130,20 +1225,68 @@ func (b *anthropicBridge) LedgerStatus(upstream int) int {
 // prompt=0/completion=0/cost=0 — the one record kept of a turn that was served
 // and billed, saying it carried nothing (2026-09-27 audit, round 39, C-F3). The
 // same numbers go out in the client's message_delta, so the row and the client
-// cannot disagree. It reports false when the upstream stated anything, and the
-// recorder's own reading then stands.
+// cannot disagree.
+//
+// It is PER FIELD, which is what the client leg is. Gating the whole
+// substitution on "the upstream stated NOTHING" meant a turn stating one of the
+// two counts kept the other at zero in the row while the client was told this
+// gateway's estimate for it — the same client/ledger disagreement the caller's
+// comment promises cannot happen, reachable by any upstream that reports its
+// prompt and not its answer (2026-09-27 audit, round 40, B40-2). A field the
+// upstream DID state stands as the recorder read it: the caller folds this in
+// with fillEmpty, which takes a field only where the row has nothing.
+//
+// A document the bridge is still HOLDING is read as the document, not through
+// the counters: the non-stream leg copies the stated counts into them only in
+// finalize(), which runs after this row is built, so reading the counters there
+// answered the estimate for a prompt the upstream had stated — the same defect
+// one layer down. bufferedCompletion() is the same bytes the recorder read
+// (2026-09-27 audit, round 40, B40-2).
 func (b *anthropicBridge) EstimatedUsage() (usage, bool) {
-	if b.sse.statedPrompt || b.sse.statedCompletion {
-		return usage{}, false
+	if doc, ok := b.bufferedCompletion(); ok {
+		u := doc.Usage.nonNegative()
+		cached := u.cachedTokens()
+		prompt := u.PromptTokens
+		if prompt <= 0 {
+			prompt = b.promptEstimate
+		}
+		// A stated hit is evidence about the prompt, and the prompt is raised to
+		// it rather than the hit clamped down to a size the upstream never
+		// stated — the same rule promptSplit applies to the stream path, so a
+		// non-stream turn and a streaming one report the same hit at the same
+		// total (2026-09-27 audit, round 40, A40-3).
+		if prompt < cached {
+			prompt = cached
+		}
+		out := u.CompletionTokens
+		if out <= 0 {
+			out = b.documentOutputEstimate(doc)
+		}
+		if prompt <= 0 && out <= 0 {
+			return usage{}, false
+		}
+		est := usage{PromptTokens: prompt, CompletionTokens: out}
+		if cached > 0 {
+			est.PromptCacheHitTokens = cached
+		}
+		return est, true
 	}
-	u := usage{PromptTokens: b.promptEstimate, CompletionTokens: b.sse.outTok}
+	// The prompt is reported to the client as a PARTITION (uncached + cached),
+	// so the row's total is the sum and its cache column is the hit — the same
+	// numbers, read the way the ledger states them.
+	fresh, cached := b.promptSplit()
+	out := b.sse.outTok
 	if !b.sse.statedCompletion {
 		if est := b.outputEstimate(); est > 0 {
-			u.CompletionTokens = est
+			out = est
 		}
 	}
-	if u.PromptTokens <= 0 && u.CompletionTokens <= 0 {
+	if fresh+cached <= 0 && out <= 0 {
 		return usage{}, false
+	}
+	u := usage{PromptTokens: fresh + cached, CompletionTokens: out}
+	if cached > 0 {
+		u.PromptCacheHitTokens = cached
 	}
 	return u, true
 }
@@ -1245,8 +1388,32 @@ func (b *anthropicBridge) finalize() {
 	// raw subtraction handed the client input_tokens=-400 for the same turn
 	// the ledger records as 0 (2026-09-27 audit, round 34, B-F3).
 	u := resp.Usage.nonNegative()
+	// The same split promptSplit makes, for the same reason: a stated hit is
+	// evidence about the prompt, so the total is raised to it rather than the
+	// hit being clamped down to a size the upstream never stated — which here
+	// would have reported input_tokens = the estimate, cache_read = the
+	// estimate, or (with the subtraction below unraised) input_tokens = -900
+	// (2026-09-27 audit, round 40, A40-3).
 	cached := u.cachedTokens()
-	in, out := u.PromptTokens-cached, u.CompletionTokens
+	promptTotal := u.PromptTokens
+	if promptTotal < cached {
+		promptTotal = cached
+	}
+	// The same three counters the streaming and adopt paths keep, so one place
+	// holds "what the upstream stated" for every path this bridge can serve.
+	// EstimatedUsage reads them, and a non-stream turn that left them at zero
+	// had its STATED counts replaced by this gateway's estimate in the ledger row
+	// (2026-09-27 audit, round 40, B40-2).
+	if u.PromptTokens > 0 {
+		b.sse.inTok = u.PromptTokens
+		b.sse.statedPrompt = true
+	}
+	if u.CompletionTokens > 0 {
+		b.sse.outTok = u.CompletionTokens
+		b.sse.statedCompletion = true
+	}
+	b.sse.cacheTok = cached
+	in, out := promptTotal-cached, u.CompletionTokens
 	// The answer's size, in the unit the stream path counts it in, so the
 	// fallback below is one rule for both paths (2026-09-27 audit, round 39,
 	// C-F3).
@@ -1439,6 +1606,13 @@ func (b *anthropicBridge) textDelta(s string) {
 			return
 		}
 		b.closeOpen()
+		// The call is over, so the narration that was held behind it comes out
+		// FIRST — before the text arriving now. Draining it only from toolDelta
+		// and finishStream left the two chunks emitted in the order they were
+		// unblocked rather than the order they were written, and the client read
+		// the model's prose reversed ("SECOND" then "FIRST") (2026-09-27 audit,
+		// round 40, B40-4: a regression of the round-39 hold).
+		b.flushHeldText()
 	}
 	if b.cur == nil {
 		b.openText()
@@ -1685,14 +1859,22 @@ func (b *anthropicBridge) promptSplit() (fresh, cached int) {
 		// turn whose ledger row recorded the same hit, which is the round-38
 		// disagreement surviving a different chunk order (2026-09-27 audit,
 		// round 39, B-F4/C-F4). With no estimate either, the hit is all that is
-		// known of the prompt and it is reported as it stands.
+		// known of the prompt and the raise below reports it as it stands.
 		prompt = b.promptEstimate
-		if prompt <= 0 {
-			prompt = cached
-		}
 	}
-	if cached > prompt {
-		cached = prompt
+	// The hit is evidence about the prompt: tokens the upstream served from its
+	// prefix cache are tokens OF this prompt, so a stated hit larger than this
+	// gateway's own reading of the body proves the reading is short. Clamping
+	// the hit DOWN to the reading discarded the only first-hand measure of the
+	// turn's prompt that either record had, and both records discarded it the
+	// same way — the client was told input_tokens=0/cache_read_input_tokens=8
+	// for a turn the upstream had just said 900 of its prompt came from cache,
+	// and the ledger row agreed, so no reconciliation between them could see
+	// it (2026-09-27 audit, round 40, A40-3). The prompt is raised to the hit
+	// instead, so the two halves still sum to the prompt and neither is
+	// negative.
+	if prompt < cached {
+		prompt = cached
 	}
 	return prompt - cached, cached
 }
@@ -1821,17 +2003,25 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 		},
 	})
+	// The bytes relayed are counted here exactly as relayDelta counts them: this
+	// path writes the turn directly, and relayDelta is the only other writer of
+	// sse.outBytes — so an adopted answer was relayed in full and then closed
+	// with output_tokens:0, and the ledger row recorded completion=0 for it
+	// (2026-09-27 audit, round 40, B40-3).
 	choice := resp.Choices[0]
 	if choice.Message.Content != nil && *choice.Message.Content != "" {
+		b.sse.outBytes += len(*choice.Message.Content)
 		b.textDelta(*choice.Message.Content)
 	}
 	if r := firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent); r != "" {
+		b.sse.outBytes += len(r)
 		b.textDelta(r)
 	}
 	for i, tc := range choice.Message.ToolCalls {
 		idx := i
-		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name),
-			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
+		b.sse.outBytes += len(args)
+		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name), args)
 	}
 	if choice.FinishReason != "" {
 		b.sse.stopMsg = choice.FinishReason
@@ -1931,6 +2121,30 @@ func (b *anthropicBridge) outputEstimate() int {
 		return 0
 	}
 	return b.sse.outBytes/4 + 1
+}
+
+// documentOutputEstimate is outputEstimate's arm for a document the bridge is
+// still holding: the same number finalize() will put in the client's
+// output_tokens for it, worked out from the document's own text rather than
+// from a counter that is only written later (2026-09-27 audit, round 40,
+// B40-2). Empty text is no answer to measure, and reports 0 — finalize()'s
+// outBytes is len(content), so the two agree there too.
+func (b *anthropicBridge) documentOutputEstimate(doc openAICompletion) int {
+	if len(doc.Choices) == 0 {
+		return 0
+	}
+	msg := doc.Choices[0].Message
+	content := ""
+	if msg.Content != nil {
+		content = *msg.Content
+	}
+	if content == "" {
+		content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent)
+	}
+	if content == "" {
+		return 0
+	}
+	return len(content)/4 + 1
 }
 
 // nothingRelayed reports whether the stream has said nothing yet — no block
