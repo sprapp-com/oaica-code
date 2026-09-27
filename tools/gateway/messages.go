@@ -1423,6 +1423,18 @@ type anthropicBridge struct {
 	// converter applies to the same wire (anthropic.go, seenInCall). See
 	// mintedToolCallID.
 	mintedIDs map[string]int
+	// grantedIDs is every id this bridge has given to a call — minted here, or
+	// stated by the upstream and taken by a block. A minted id is a pure
+	// function of the call's own identity, so without this set a call the
+	// upstream NAMED could collide with the id minted for an earlier id-less
+	// call, and two blocks under one id cannot be answered separately
+	// (2026-09-27 audit, round 46, G45-1 and G45-5).
+	grantedIDs map[string]bool
+	// statedIDOwner records, per upstream-stated id, the call identity it was
+	// first stated for, so a second, DIFFERENT call under the same id is
+	// numbered here instead of being folded into the first (the rule leg 1's
+	// seenStatedID and the client leg's parser apply — round 45, A45-3).
+	statedIDOwner map[string]string
 }
 
 // toolBlock is one tool call being translated into an Anthropic content block.
@@ -1540,6 +1552,7 @@ func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthr
 	return &anthropicBridge{
 		ResponseWriter: w, stream: stream, model: model,
 		toolBlocks: map[string]*toolBlock{}, mintedIDs: map[string]int{},
+		grantedIDs: map[string]bool{}, statedIDOwner: map[string]string{},
 	}
 }
 
@@ -1619,6 +1632,25 @@ func (b *anthropicBridge) Write(p []byte) (int, error) {
 
 func (b *anthropicBridge) bufCapOK() bool { return b.sse.tail.Len() < 8<<20 }
 
+// flushStreamTail feeds the frame reader the last line of a stream that ended
+// without a newline. writeStream completes a line only when it sees "\n", so a
+// terminal frame — the upstream's finish_reason, or its [DONE] — that arrived as
+// the final bytes of the body stayed in the buffer and was never read: the turn
+// was refused as an unterminated stream although the upstream had said it was
+// complete. Called once, at end of body, before the stream is judged
+// (2026-09-27 audit, round 46, G45-3).
+func (b *anthropicBridge) flushStreamTail() {
+	if !b.stream || b.sse.tail.Len() == 0 {
+		return
+	}
+	// Only a frame: anything else in the buffer is a whole completion document
+	// (adoptWholeStream's business) or bytes the frame reader already declined.
+	if !strings.HasPrefix(strings.TrimSpace(b.sse.tail.String()), "data:") {
+		return
+	}
+	b.writeStream([]byte("\n"))
+}
+
 // Flush satisfies http.Flusher (ReverseProxy asserts it to stream).
 // Suppressed until commit: an upstream Flush would make the underlying writer
 // implicitly WriteHeader(200) (httptest and net/http both do this), locking
@@ -1650,6 +1682,14 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 		return 0, ""
 	}
 	if b.stream {
+		// Both readers of this turn — the ledger row and the client — ask this
+		// predicate, and the ledger asks FIRST, so the terminal frame has to be
+		// parsed before either of them judges the stream: a finish_reason that
+		// arrived without a trailing newline is still the upstream saying it was
+		// done, and reading it as an unterminated stream here also SET the
+		// error finishStream later emits to the client (2026-09-27 audit, round
+		// 46, G45-3). Idempotent: the buffer is empty once the line is read.
+		b.flushStreamTail()
 		if b.sse.upstreamErr != "" {
 			// The upstream reported a failure inside the stream. Whether or not
 			// events were already sent, the client and the ledger must read the
@@ -1851,6 +1891,11 @@ func (b *anthropicBridge) finalize() {
 		return
 	}
 	if b.stream {
+		// The upstream's last frame may have arrived without a trailing
+		// newline — the frame reader only ever completes a LINE, so a terminal
+		// finish_reason or [DONE] was left in the buffer and the turn read as
+		// unterminated (2026-09-27 audit, round 46, G45-3).
+		b.flushStreamTail()
 		// A stream request the upstream answered with ONE completion document
 		// instead of frames (or no frames at all) is ADOPTED as the turn, on
 		// the same reading the client leg's adoptNonSSECompletion makes: the
@@ -1952,9 +1997,32 @@ func (b *anthropicBridge) finalize() {
 		// a caller that is not streaming lost every tool call on the gateway and
 		// kept them on the local server (2026-09-27 audit, round 45, B45-19 and
 		// C45-1).
+		// The id this call ends up with: the upstream's own when it stated one
+		// for THIS call, and a numbered one otherwise — either because it
+		// stated none, or because it stated an id that already belongs to
+		// another call in this same list. The id-less call before it may have
+		// been numbered with exactly that string (it is a pure function of the
+		// call), and two blocks under one id cannot be answered separately
+		// (2026-09-27 audit, round 46, G45-1).
+		callArgs := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
+		identity := "\x00" + name + "\x00" + callArgs
 		id := tc.ID
+		if id != "" {
+			if owner, ok := b.statedIDOwner[id]; ok && owner != identity {
+				id = ""
+			} else {
+				b.statedIDOwner[id] = identity
+				// A restatement of the SAME call under the same id is one
+				// call's id, but the id is still this bridge's to hand out
+				// only once: an id a minted call already carries cannot be
+				// taken here as well.
+				if b.grantedIDs[id] {
+					id = ""
+				}
+			}
+		}
 		if id == "" {
-			id = b.mintedToolCallID(name, firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+			id = b.mintedToolCallID(name, callArgs)
 		}
 		toolBlocks++
 		respBlocks = append(respBlocks, map[string]any{
@@ -2192,7 +2260,16 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 				// as the first thing the stream said has terminated it even when
 				// no finish_reason frame follows — the same reading the client
 				// leg gives this wire (round 45, B45-2).
-				b.sse.finished = true
+				//
+				// Only when it actually relayed something: an EMPTY `message`
+				// frame says nothing, so it terminates nothing — setting
+				// finished on it made a stream that later ends with no
+				// finish_reason and no [DONE] read as a complete turn (200,
+				// end_turn) instead of the unterminated one B45-2 refuses
+				// (2026-09-27 audit, round 46, G45-2).
+				if !b.nothingRelayed() {
+					b.sse.finished = true
+				}
 			}
 			b.relayDelta(ch.Delta)
 			if ch.FinishReason != nil && *ch.FinishReason != "" {
@@ -2322,6 +2399,20 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	}
 	if id != "" {
 		key := "!" + id
+		if b.toolBlocks[key] == nil && b.idHeldByAnotherCall(id) {
+			// The upstream states an id this bridge has already given to a
+			// DIFFERENT call — most often the id it minted for an id-less call,
+			// which is a pure function of that call and therefore reproducible.
+			// Taking it here would put two blocks under one id, which the client
+			// can answer only once; the fragment is numbered as its own call
+			// instead (2026-09-27 audit, round 46, G45-1).
+			b.synthSeq++
+			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+			if name != "" {
+				b.lastToolName = name
+			}
+			return b.lastToolKey
+		}
 		// The id names the call, but a repeated id is not proof this fragment
 		// continues it: an upstream that reuses one id for the turn's second call
 		// is the same wire the id-less path below splits on, and returning on the
@@ -2371,6 +2462,16 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 				b.lastToolKey = key
 				return key
 			}
+			// A block in progress whose id the UPSTREAM stated is left where it
+			// is: the fall-through below keys this fragment's own new block by
+			// the id it states, which is what the client leg's
+			// startsANewToolCall answers the same wire with (a delta id over an
+			// accumulator that already carries one begins the next call, under
+			// the id the delta stated). A round-46 candidate that numbered this
+			// call instead was removed: it changed no wire but this one, and
+			// here it diverged — the second call's arguments were stranded on a
+			// block that could never be named, and the id the upstream stated
+			// was never the call's (2026-09-27 audit, round 46, G45-4).
 		}
 		if name != "" {
 			b.lastToolName = name
@@ -2431,6 +2532,19 @@ func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
 		(acc == "" && strings.TrimSpace(args) == "")
 }
 
+// idHeldByAnotherCall reports whether a call block other than the one keyed by
+// id's own key already carries this id — a minted id from an id-less call, or
+// an id the upstream stated for a different call. Two blocks under one id
+// cannot be answered separately (2026-09-27 audit, round 46, G45-1).
+func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
+	for _, tb := range b.toolOrder {
+		if tb.id == id && tb.key != "!"+id {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	key := b.toolKey(upIdx, id, name, args)
 	tb, ok := b.toolBlocks[key]
@@ -2451,6 +2565,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		if id != "" && !strings.HasPrefix(tb.key, "?") {
 			tb.id = id
 			tb.statedID = true
+			b.grantedIDs[id] = true
 		} else {
 			// A block the split rule minted a key for: the fragment repeated an
 			// id another block already carries, so this block must NOT inherit
@@ -3063,10 +3178,23 @@ func (b *anthropicBridge) mintedToolCallID(name, args string) string {
 	base := "\x00" + name + "\x00" + args
 	n := b.mintedIDs[base]
 	b.mintedIDs[base] = n + 1
-	if n == 0 {
-		return gatewayToolCallIDFor(name, args)
+	seed := args
+	if n > 0 {
+		seed = args + "#" + strconv.Itoa(n)
 	}
-	return gatewayToolCallIDFor(name, args+"#"+strconv.Itoa(n))
+	id := gatewayToolCallIDFor(name, seed)
+	// A minted id must not be one a call already carries. The "#n" suffix the
+	// repeat rule appends is part of the CALL's own text as far as this hash can
+	// tell, so an upstream whose second call really states the arguments
+	// "x#1" and an upstream that merely repeats "x" both hash to the same id —
+	// two blocks the client can answer only once. The suffix is bumped until
+	// the id is one no call in this turn holds (2026-09-27 audit, round 46,
+	// G45-5).
+	for k := 0; b.grantedIDs[id]; k++ {
+		id = gatewayToolCallIDFor(name, seed+"#"+strconv.Itoa(k))
+	}
+	b.grantedIDs[id] = true
+	return id
 }
 
 // gatewayToolCallIDFor mints an id for a tool call from the call's own identity

@@ -55,6 +55,46 @@ func TestANamelessCallFragmentIsRelayedAsText(t *testing.T) {
 	}
 }
 
+// TestAWhitespaceOnlyCallNameIsNoName is round 46's A46-5: the nameless rule
+// above tested the name against "" exactly, so an upstream that sent the name
+// as whitespace (" ", "\t") was treated as a NAMED call — the fragment was not
+// relayed as text, and the turn ended as an empty end_turn with the model's
+// arguments nowhere in it. Every other site of this leg and both paths of the
+// local server read the name with strings.TrimSpace, and the client proxy's
+// non-streaming parser does too, so one body had two answers depending on the
+// bytes of a name nobody can dispatch.
+func TestAWhitespaceOnlyCallNameIsNoName(t *testing.T) {
+	// The name is inserted as JSON ESCAPE TEXT, so a tab is "\t" on the wire
+	// and decodes to whitespace — a raw tab inside a JSON string is not valid
+	// JSON, and the frame would never reach the converter at all.
+	for _, tc := range []struct{ label, enc string }{
+		{"space", " "},
+		{"tab", `\t`},
+		{"newline", `\n`},
+	} {
+		up := streamUpstream(t, strings.Join([]string{
+			`data: {"id":"x","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"` + tc.enc + `","arguments":"{\"a\":1}"}}]}}]}`,
+			"",
+			`data: {"id":"x","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n"), true)
+		proxy := startCalibProxy(t, up.URL, "sess-r46-ws-name")
+		body, status := postMessagesStream(t, proxy)
+		up.Close()
+		if status != http.StatusOK {
+			t.Fatalf("%s: status %d, body:\n%s", tc.label, status, body)
+		}
+		for _, b := range sseToolUseBlocks(t, body) {
+			t.Errorf("%s: a tool_use block was emitted for a call whose name is whitespace: %+v\n%s", tc.label, b, body)
+		}
+		if !strings.Contains(body, `{\"a\":1}`) && !strings.Contains(body, `{"a":1}`) {
+			t.Errorf("%s: the fragment's arguments are nowhere in the stream — a name of whitespace names nothing, so the fragment belongs in the turn as text:\n%s", tc.label, body)
+		}
+	}
+}
+
 // TestANamedCallIsStillAToolUseBlock is the control: the rule above is about a
 // call with no name, not about tool calls in general.
 func TestANamedCallIsStillAToolUseBlock(t *testing.T) {

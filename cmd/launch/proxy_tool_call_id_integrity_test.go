@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/ollama/ollama/anthropic"
 )
 
 // toolCallBlocks returns the tool_use content blocks from an Anthropic
@@ -192,5 +194,77 @@ func TestTwoIdenticalCallsWithoutIDsDoNotShareOneID(t *testing.T) {
 			blocks = append(blocks, b)
 		}
 		check(t, blocks, body)
+	})
+}
+
+// TestAMintedIDNeverLandsOnAStatedOne is round 46's A46-4. The synthesized id
+// for an id-less call is a pure function of that call (name + arguments), and
+// an upstream is free to STATE that same string for another call in the same
+// list — an aggregator that echoes ids it saw from this proxy does exactly
+// that. Minting without looking at the list's stated ids put two different
+// calls under one id, and the local server's translation (anthropic.
+// ToMessagesResponse) reads a repeat of one id as one call restated: the call
+// the upstream NAMED was dropped, so the agent ran one of the model's two
+// calls. The synthesized id is now bumped off any stated id, on this leg and
+// on both of the local server's translation sites.
+func TestAMintedIDNeverLandsOnAStatedOne(t *testing.T) {
+	name, args := "a", "{}"
+	minted := anthropic.ToolCallIDFor(name, args)
+	doc := `{"id":"x","model":"kat-awq","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[` +
+		`{"type":"function","function":{"name":"` + name + `","arguments":"` + args + `"}},` +
+		`{"id":"` + minted + `","type":"function","function":{"name":"` + name + `","arguments":"` + args + `"}}]},` +
+		`"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`
+
+	t.Run("non-stream", func(t *testing.T) {
+		up := jsonUpstream(t, doc)
+		defer up.Close()
+		proxy := startCalibProxy(t, up.URL, "sess-tool-id-mintcollide")
+		resp, err := http.Post(proxy+"/v1/messages", "application/json", strings.NewReader(string(calibMessagesBody(t, 32, 64, false))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d\n%s", resp.StatusCode, raw)
+		}
+		blocks := toolCallBlocks(t, raw)
+		if len(blocks) != 2 {
+			t.Fatalf("got %d tool_use block(s), want 2 — an id-less call and a call the upstream NAMED reached the client under one id, and the local server reads that as one call restated:\n%s", len(blocks), raw)
+		}
+		a, _ := blocks[0]["id"].(string)
+		b, _ := blocks[1]["id"].(string)
+		if a == b {
+			t.Errorf("both blocks carry id %q\n%s", a, raw)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		frames := strings.Join([]string{
+			`data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"` + name + `","arguments":"` + args + `"}}]}}]}`,
+			"",
+			`data: {"choices":[{"delta":{"tool_calls":[{"id":"` + minted + `","function":{"name":"` + name + `","arguments":"` + args + `"}}]}}]}`,
+			"",
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n")
+		up := streamUpstream(t, frames, true)
+		defer up.Close()
+		proxy := startCalibProxy(t, up.URL, "sess-tool-id-mintcollide-st")
+		body, status := postMessagesStream(t, proxy)
+		if status != http.StatusOK {
+			t.Fatalf("status=%d\n%s", status, body)
+		}
+		blocks := sseToolUseBlocks(t, body)
+		if len(blocks) != 2 {
+			t.Fatalf("the stream path emitted %d tool_use block(s), want 2:\n%s", len(blocks), body)
+		}
+		a, _ := blocks[0]["id"].(string)
+		b, _ := blocks[1]["id"].(string)
+		if a == b {
+			t.Errorf("both stream blocks carry id %q\n%s", a, body)
+		}
 	})
 }

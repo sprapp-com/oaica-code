@@ -726,6 +726,9 @@ func parseOpenAIToolCalls(tcs []struct {
 	// body, so the two paths disagreed about it; they agree now
 	// (2026-09-26 audit, fourteenth round).
 	seen := make(map[string]bool, len(tcs))
+	// usedIDs holds every id the upstream STATED in this list, so a
+	// synthesized id cannot land on one of them (A46-4).
+	usedIDs := make(map[string]bool, len(tcs))
 	// seenID records, per stated id, the call it was first stated for, so a
 	// second, different call under the same id is re-minted rather than
 	// dropped (A45-3).
@@ -733,6 +736,11 @@ func parseOpenAIToolCalls(tcs []struct {
 	// seenInList counts how often each call identity has appeared in this
 	// list, so a repeat takes the streaming converter's "#n" rule (A45-2).
 	seenInList := make(map[string]int, len(tcs))
+	for _, tc := range tcs {
+		if tc.ID != "" {
+			usedIDs[tc.ID] = true
+		}
+	}
 	for _, tc := range tcs {
 		var args api.ToolCallFunctionArguments
 		raw := strings.TrimSpace(tc.Function.Arguments)
@@ -766,6 +774,7 @@ func parseOpenAIToolCalls(tcs []struct {
 		// keys it: name plus canonical arguments.
 		identity := "\x00" + tc.Function.Name + "\x00" + key
 		id := tc.ID
+		minted := false
 		if id != "" {
 			// An id the upstream states is that call's own, unless it already
 			// stated the same id for a DIFFERENT call. Deduping on the id alone
@@ -811,8 +820,34 @@ func parseOpenAIToolCalls(tcs []struct {
 				mintedKey = key + "#" + strconv.Itoa(n)
 			}
 			id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey)
+			// A synthesized id must not be one the upstream STATED for another
+			// call in this same list: the id-less call and the call the
+			// upstream named would then reach the client as two entries under
+			// one id, which the local server's translation reads as one call
+			// restated and drops — the agent ran one of the model's two calls.
+			// The id is a pure function of the call, so a collision is bumped
+			// onto the same "#n" rule the repeats already use
+			// (2026-09-27 audit, round 46, A46-4).
+			for k := 0; usedIDs[id]; k++ {
+				id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+			}
+			minted = true
+			usedIDs[id] = true
 		}
-		dedupKey := id
+		// The dedup key namespaces a MINTED id apart from a STATED one. The
+		// minted id for an id-less call is a pure function of its name and
+		// arguments, so a later call that STATES that same string is a
+		// different call whose id merely collides with it — deduping on the
+		// bare string dropped a call the upstream had named, while the
+		// streaming converter emitted both blocks under one id, so one body
+		// had two answers and neither was two routable calls (2026-09-27
+		// audit, round 46, A46-4). A restatement of the same call under the
+		// same STATED id is still one call: `seen` keys the stated ids
+		// verbatim, which is what that rule is for.
+		dedupKey := "\x01" + id
+		if minted {
+			dedupKey = "\x00" + id
+		}
 		if seen[dedupKey] {
 			continue
 		}
@@ -2286,8 +2321,15 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 			break
 		}
 	}
-	if strings.TrimSpace(choice.Message.Content) == "" &&
-		strings.TrimSpace(firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent)) == "" &&
+	// Not with TrimSpace: a text is content whatever it says, and the gateway
+	// leg's documentSaysSomething already reads the identical body that way —
+	// relayDelta relays a content of whitespace as a text block, so trimming
+	// here refused a turn the other two legs answer (and this leg's own
+	// streaming path answers too), on a body whose text the upstream did write
+	// (2026-09-27 audit, round 44's rule; reintroduced here in round 45 and
+	// caught in round 46, A46-2).
+	if choice.Message.Content == "" &&
+		firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent) == "" &&
 		!namedCall {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream returned an empty completion")
 		return false
@@ -2491,7 +2533,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				args = api.NewToolCallFunctionArguments()
 				args.Set("_raw", raw)
 			}
-			if a.name == "" {
+			if strings.TrimSpace(a.name) == "" {
 				// A call the upstream never named. This path used to emit it
 				// anyway, as a content_block_start with no "name" key at all and
 				// a stop_reason of "tool_use": the client was told to expect a
@@ -2629,8 +2671,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// stream was discarded, and the client got 200 with no answer and a
 		// healthy leg (2026-09-26 audit, sixteenth round).
 		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
-			if adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText) {
+			if adopted, refused := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
+				break
+			} else if refused {
+				// The frame IS a whole completion and it says nothing. Falling
+				// through to the delta loop let the finish_reason it carried
+				// complete an EMPTY turn with a 200, while the unframed twin of
+				// the same document and the gateway leg both refuse it — the
+				// verdict depended on the shape the upstream chose, which is
+				// exactly what routing the frame through this adoption exists
+				// to prevent (2026-09-27 audit, round 46, A46-3).
+				upstreamErr = "upstream returned an empty completion"
 				break
 			}
 		}
@@ -2728,9 +2780,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// Nothing streamed and no error seen: the body may be a whole
 		// completion the upstream sent instead of frames. Adopt it as the turn
 		// rather than reporting a failure over an answer that exists.
-		if !started && upstreamErr == "" &&
-			adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText) {
-			completed = true
+		if !started && upstreamErr == "" {
+			if adopted, refused := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+				completed = true
+			} else if refused {
+				upstreamErr = "upstream returned an empty completion"
+			}
 		}
 	}
 
@@ -2899,19 +2954,20 @@ func frameCarriesWholeCompletion(payload string) bool {
 // content on every retry (the upstream produced and billed a whole answer) and
 // marked the leg failed, so three such turns opened its breaker and moved the
 // session off a leg that was serving it (2026-09-26 audit, fourteenth round).
-func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) bool {
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused bool) {
 	if strings.TrimSpace(raw) == "" {
-		return false
+		return false, false
 	}
 	var oaiResp openAIChatResponse
 	if err := json.Unmarshal([]byte(raw), &oaiResp); err != nil {
-		return false
+		return false, false
 	}
 	// No choices is not an answer: the same body the non-streaming path
 	// refuses ("upstream returned no completion choices"), so it keeps the
-	// failure verdict here.
+	// failure verdict here. refused is what tells the framed caller that the
+	// body IS a whole completion rather than a stream to keep reading.
 	if len(oaiResp.Choices) == 0 {
-		return false
+		return false, true
 	}
 	// And neither is a whole completion that says nothing. Adopting one
 	// emitted message_start and message_stop around no blocks at all — the
@@ -2929,9 +2985,9 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 				break
 			}
 		}
-		if strings.TrimSpace(m.Content) == "" &&
-			strings.TrimSpace(firstNonEmpty(m.Reasoning, m.ReasoningContent)) == "" && !named {
-			return false
+		if m.Content == "" &&
+			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !named {
+			return false, true
 		}
 	}
 
@@ -2950,7 +3006,7 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 		toolCallArgumentsSize(chatResp.Message.ToolCalls)
 	*finishReason = oaiResp.Choices[0].FinishReason
 	*finalUsage = oaiResp.Usage
-	return true
+	return true, false
 }
 
 // upstreamErrorMessage extracts the message from an OpenAI-shaped error

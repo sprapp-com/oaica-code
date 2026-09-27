@@ -1079,6 +1079,14 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 
 	toolBlocks := 0
 	seenInCall := map[string]int{}
+	seenStatedID := map[string]string{}
+	usedIDs := map[string]bool{}
+	sentKey := map[string]bool{}
+	for _, tc := range r.Message.ToolCalls {
+		if tc.ID != "" {
+			usedIDs[tc.ID] = true
+		}
+	}
 	for _, tc := range r.Message.ToolCalls {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call the client can
@@ -1091,7 +1099,40 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			// call nobody could dispatch (2026-09-27 audit, round 45, A45-1).
 			continue
 		}
+		// One body, one answer: this loop now carries the streaming
+		// converter's own key/identity rule, so a list answers the same
+		// whether or not the client asked for `stream`. It was applied to the
+		// streaming twin in round 45 and not here, which left this path the
+		// only one of the four translation sites that could emit two tool_use
+		// blocks under one id (2026-09-27 audit, round 46, A46-1).
+		argsJSON, _ := json.Marshal(tc.Function.Arguments)
+		base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
+
 		id := tc.ID
+		// dedupKey namespaces a STATED id apart from a MINTED one. A stated id
+		// is the upstream's own correlation key, so a restatement of the same
+		// call under it is one call; a minted id is this leg's own synthesis
+		// (ToolCallIDFor), so a later call that merely STATES that same string
+		// is a different call — deduping the two together dropped a call the
+		// upstream had named while the client proxy's parser now keeps both
+		// (2026-09-27 audit, round 46, A46-4).
+		key := "\x01" + tc.ID
+		if tc.ID != "" {
+			// An id the upstream states is that call's own — unless it already
+			// stated the same id for a DIFFERENT call. One id reused for two
+			// calls is the wire the client leg's startsANewToolCall splits and
+			// the gateway leg mints a fresh id for; treating the repeat as a
+			// duplicate threw the second call away, so the agent ran one of the
+			// model's two calls and was told the turn was a tool call. A
+			// restatement of the SAME call under the same id is still a
+			// duplicate, and the key below still drops it (2026-09-27 audit,
+			// round 45, A45-3).
+			if owner, ok := seenStatedID[key]; ok && owner != base {
+				key, id = "", ""
+			} else {
+				seenStatedID[key] = base
+			}
+		}
 		if id == "" {
 			// The upstream sent no id (several OpenAI-compatible GGUF backends,
 			// and the Go parsers). ContentBlock.ID is omitempty, so passing it
@@ -1112,15 +1153,32 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			// The second and later occurrences take the streaming path's own
 			// rule, the same key and the same "#n" suffix (2026-09-27 audit,
 			// round 45, A45-2).
-			key, _ := json.Marshal(tc.Function.Arguments)
-			base := "\x00" + tc.Function.Name + "\x00" + string(key)
 			n := seenInCall[base]
 			seenInCall[base] = n + 1
-			id = ToolCallIDFor(tc.Function.Name, string(key))
+			key = "\x00" + base
+			id = ToolCallIDFor(tc.Function.Name, string(argsJSON))
 			if n > 0 {
-				id = ToolCallIDFor(tc.Function.Name, string(key)+"#"+strconv.Itoa(n))
+				key = "\x00" + base + "\x00#" + strconv.Itoa(n)
+				id = ToolCallIDFor(tc.Function.Name, string(argsJSON)+"#"+strconv.Itoa(n))
 			}
+			// The synthesized id must not land on an id another call in this
+			// same list STATES: the two calls would then reach this loop under
+			// one id and read as one call restated, so the call the upstream
+			// named was dropped (2026-09-27 audit, round 46, A46-4). Bumped
+			// onto the same "#n" rule the repeats use.
+			mintedKey := string(argsJSON)
+			if n > 0 {
+				mintedKey = string(argsJSON) + "#" + strconv.Itoa(n)
+			}
+			for k := 0; usedIDs[id]; k++ {
+				id = ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+			}
+			usedIDs[id] = true
 		}
+		if sentKey[key] {
+			continue
+		}
+		sentKey[key] = true
 		// `input` is a required field of a tool_use block, and the zero value
 		// of this type marshals to NO key at all (json:",omitzero" with an
 		// unallocated map): a call with no arguments reached the client as a
@@ -1216,6 +1274,10 @@ type StreamConverter struct {
 	// tool_use where the model asked for two, silently, on a turn that still
 	// reported tool_use (2026-09-27 audit, round 45, A45-3).
 	statedIDOwner map[string]string
+	// mintedIDs holds every id this converter has STATED or minted, so a
+	// synthesized id cannot land on one the upstream stated for another call
+	// in the same turn (2026-09-27 audit, round 46, A46-4).
+	mintedIDs map[string]bool
 }
 
 func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConverter {
@@ -1226,6 +1288,7 @@ func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConve
 		estimatedInputTokens: estimatedInputTokens,
 		toolCallsSent:        make(map[string]bool),
 		statedIDOwner:        make(map[string]string),
+		mintedIDs:            make(map[string]bool),
 	}
 }
 
@@ -1368,6 +1431,11 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 
 	seenInCall := make(map[string]int, len(r.Message.ToolCalls))
 	for _, tc := range r.Message.ToolCalls {
+		if tc.ID != "" {
+			c.mintedIDs[tc.ID] = true
+		}
+	}
+	for _, tc := range r.Message.ToolCalls {
 		argsJSON, err := json.Marshal(tc.Function.Arguments)
 		if err != nil {
 			slog.Error("failed to marshal tool arguments", "error", err, "tool_id", tc.ID)
@@ -1408,9 +1476,14 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		// separately — while a restatement of an already-sent call in a LATER
 		// call still dedups, which is what this map is for.
 		base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
-		key := tc.ID
+		// As in ToMessagesResponse: a STATED id is the upstream's correlation
+		// key, a MINTED one is this converter's own synthesis, and only the
+		// former may be deduped on its own string — a call that merely states
+		// an id this converter minted for an earlier id-less call is a
+		// different call (2026-09-27 audit, round 46, A46-4).
+		key := "\x01" + tc.ID
 		id := tc.ID
-		if key != "" {
+		if tc.ID != "" {
 			// An id the upstream states is that call's own — unless it already
 			// stated the same id for a DIFFERENT call. One id reused for two
 			// calls is the wire the client leg's startsANewToolCall splits (and
@@ -1428,15 +1501,27 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 				c.statedIDOwner[key] = base
 			}
 		}
-		if key == "" {
+		if id == "" {
 			n := seenInCall[base]
 			seenInCall[base] = n + 1
-			key = base
+			key = "\x00" + base
 			id = ToolCallIDFor(tc.Function.Name, string(argsJSON))
 			if n > 0 {
-				key = base + "\x00#" + strconv.Itoa(n)
+				key = "\x00" + base + "\x00#" + strconv.Itoa(n)
 				id = ToolCallIDFor(tc.Function.Name, string(argsJSON)+"#"+strconv.Itoa(n))
 			}
+			// A synthesized id must not land on an id another call in this
+			// same turn STATES: the two would reach the client under one id,
+			// and the non-stream twin of this body reads such a pair as one
+			// call restated (2026-09-27 audit, round 46, A46-4).
+			mintedKey := string(argsJSON)
+			if n > 0 {
+				mintedKey = string(argsJSON) + "#" + strconv.Itoa(n)
+			}
+			for k := 0; c.mintedIDs[id]; k++ {
+				id = ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+			}
+			c.mintedIDs[id] = true
 		}
 		if c.toolCallsSent[key] {
 			continue
