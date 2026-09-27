@@ -2005,7 +2005,13 @@ func (b *anthropicBridge) finalize() {
 		// call), and two blocks under one id cannot be answered separately
 		// (2026-09-27 audit, round 46, G45-1).
 		callArgs := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
-		identity := "\x00" + name + "\x00" + callArgs
+		// The identity is the call's own, in the canonical argument encoding the
+		// mint hashes and both other legs key their own "same call restated"
+		// rule by (see canonicalCallArgs): raw text made a restatement that
+		// differed only in whitespace or key order read as a second call, and
+		// the id the upstream had already given it was minted over
+		// (2026-09-27 audit, round 47, C-F5).
+		identity := toolCallIdentity(name, callArgs)
 		id := tc.ID
 		if id != "" {
 			if owner, ok := b.statedIDOwner[id]; ok && owner != identity {
@@ -2018,6 +2024,18 @@ func (b *anthropicBridge) finalize() {
 				// taken here as well.
 				if b.grantedIDs[id] {
 					id = ""
+				} else {
+					// An id this bridge has now given to a call is GRANTED,
+					// exactly as the stream path records it when a block takes
+					// a stated id (toolDelta). Without this the record was
+					// write-only for mints here, so an id-less call later in
+					// this same list minted the id the upstream had already
+					// NAMED for another call — the two blocks shared it, and a
+					// second call the upstream named with it kept it too,
+					// while the stream path and the other two legs answer both
+					// wires with distinct ids (2026-09-27 audit, round 47,
+					// G47-1).
+					b.grantedIDs[id] = true
 				}
 			}
 		}
@@ -2167,7 +2185,32 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			}
 			continue
 		}
-		if !b.sse.startSent {
+		var chunk oaStreamChunk
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			b.sse.upstreamErr = upstreamErrorSentence(payload, errorFrameMessage(chunk.Error))
+			continue
+		}
+		// The stream is committed by the first frame that CARRIES something, not
+		// by the first frame that arrives. A frame is not an answer: an upstream
+		// that sends an empty delta (or a usage-only chunk, or the turn's
+		// finish_reason alone) and then ends has said nothing, and committing on
+		// it opened message_start, which fixed the status at 200 and left the
+		// client reading an `error` event for a turn the ledger row — written
+		// from the same predicate, noAnswer's empty-stream arm — booked as a
+		// 502. The row and the client disagreed about one turn, and the client
+		// leg answers the same wire with a 502 the caller can retry (its status
+		// is still its own to choose, because it commits on the first event it
+		// RELAYS) (2026-09-27 audit, round 47, C-F7). Until something is
+		// relayed, the status is still this bridge's to choose: noAnswer's arm
+		// above writes it (see the `!(b.stream && b.sse.startSent)` branch).
+		//
+		// An error frame does not commit either — it is checked above, and its
+		// verdict is the upstream's failure, which the same branch answers with
+		// its status.
+		if !b.sse.startSent && frameRelaysSomething(chunk) {
 			b.sse.startSent = true
 			b.emit("message_start", map[string]any{
 				"type": "message_start",
@@ -2177,40 +2220,6 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 					"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 				},
 			})
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta        oaDelta  `json:"delta"`
-				Message      *oaDelta `json:"message"`
-				FinishReason *string  `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				// The same two spellings the ledger's usage type carries; the
-				// cached part is reported to the client as
-				// cache_read_input_tokens rather than folded into input_tokens
-				// (2026-09-27 audit, round 23).
-				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
-				PromptTokensDetails  *struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"prompt_tokens_details"`
-			} `json:"usage"`
-			// Raw, because a failure stated inside the stream is not always an
-			// object: an upstream may send {"error":"upstream ran out of KV
-			// cache"} as a bare string, and modelling only the object made the
-			// whole frame fail to parse — so it was discarded, the client read a
-			// turn that ended normally with stop_reason end_turn, and the ledger
-			// recorded 200 for a request the upstream failed (2026-09-27 audit,
-			// round 39, B-F6).
-			Error json.RawMessage `json:"error"`
-		}
-		if json.Unmarshal([]byte(payload), &chunk) != nil {
-			continue
-		}
-		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
-			b.sse.upstreamErr = upstreamErrorSentence(payload, errorFrameMessage(chunk.Error))
-			continue
 		}
 		if chunk.Usage != nil {
 			// Per-field, not wholesale: an upstream that narrates usage per
@@ -2399,13 +2408,23 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	}
 	if id != "" {
 		key := "!" + id
-		if b.toolBlocks[key] == nil && b.idHeldByAnotherCall(id) {
+		if b.toolBlocks[key] == nil && name != "" && b.idHeldByAnotherCall(id) {
 			// The upstream states an id this bridge has already given to a
 			// DIFFERENT call — most often the id it minted for an id-less call,
 			// which is a pure function of that call and therefore reproducible.
 			// Taking it here would put two blocks under one id, which the client
 			// can answer only once; the fragment is numbered as its own call
 			// instead (2026-09-27 audit, round 46, G45-1).
+			//
+			// Only for a fragment that NAMES its call: a call is introduced by
+			// its name (see splitFromCurrent), and the client leg's
+			// startsANewToolCall merges exactly here — `deltaName == ""` over a
+			// call in progress returns false whatever the id is. Reading the id
+			// alone split the ordinary "the id arrives on the fragment AFTER the
+			// name" wire whenever that id happened to be the one this bridge
+			// minted, and the arguments of the call in progress were relayed to
+			// the client as prose beside a tool_use with an empty input
+			// (2026-09-27 audit, round 47, G47-2).
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
 			if name != "" {
@@ -2545,6 +2564,120 @@ func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
 	return false
 }
 
+// idHeldByAnotherBlock reports whether a call block other than tb already
+// carries tb's id under a DIFFERENT identity — a different name, or different
+// arguments, which is to say a different call (see startToolBlock). It is
+// idHeldByAnotherCall asked of a block that already carries the id, so it
+// cannot ask that function: there the caller's own block is still id-less, and
+// the key-shaped exclusion that tells a call apart from its own restatement
+// does not hold here (a block keyed by an index carries the id under "#n").
+func (b *anthropicBridge) idHeldByAnotherBlock(tb *toolBlock) bool {
+	if tb.id == "" {
+		return false
+	}
+	identity := toolCallIdentity(tb.name, tb.args.String())
+	for _, other := range b.toolOrder {
+		if other == tb || other.id != tb.id {
+			continue
+		}
+		if toolCallIdentity(other.name, other.args.String()) != identity {
+			return true
+		}
+	}
+	return false
+}
+
+// toolCallIdentity is what a call IS, as far as the ids this bridge hands out
+// are concerned: its name and its arguments, the two fields gatewayToolCallIDFor
+// mints from and the shape the non-stream list records as statedIDOwner. Two
+// blocks that share it are one call restated, not two calls.
+func toolCallIdentity(name, args string) string {
+	return "\x00" + name + "\x00" + canonicalCallArgs(args)
+}
+
+// canonicalCallArgs re-encodes a tool call's argument text the way both other
+// legs hash it — anthropic.go's `json.Marshal(tc.Function.Arguments)` and the
+// proxy's mintedKey are the same re-encoding of the parsed arguments: the
+// object's own keys in the order the upstream wrote them, each value re-encoded
+// by encoding/json, whitespace gone. Hashing the RAW text instead made the same
+// call mint two ids depending on the leg that answered it — a call whose
+// arguments the upstream wrote as {"z":1,"a":2}, or as a pretty-printed object,
+// hashed differently here than through the local server or the client proxy,
+// and the id is the promise that a tool_result written against one leg's answer
+// stays valid when the retry goes through another (2026-09-27 audit, round 47,
+// C-F5; round 47's G47-4 is the same promise for the "#n" suffix).
+//
+// The encoding is deliberately the generic one, not a faithful copy of the
+// input: a key order is the only thing the raw text holds that the parsed value
+// does not, and numbers re-encode exactly as both other legs re-encode them
+// (json.Unmarshal into `any`, so float64). Nested objects are re-encoded by
+// encoding/json on both sides, which sorts their keys — the other legs hold
+// them in a plain map[string]any inside the ordered top level, so this matches
+// there too.
+//
+// Text that is not a JSON object has no keys to preserve and is hashed as
+// given: an empty or absent argument list is the empty object, which is what
+// the other legs produce for one (`ToolCallFunctionArguments.MarshalJSON`
+// writes "{}" for a nil map), and a fragment the model was still writing is
+// hashed as the text it is, exactly as this bridge hashed it before.
+func canonicalCallArgs(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return "{}"
+	}
+	if !strings.HasPrefix(trimmed, "{") {
+		return trimmed
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	tok, err := dec.Token()
+	if err != nil {
+		return trimmed
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return trimmed
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for first := true; dec.More(); first = false {
+		kt, err := dec.Token()
+		if err != nil {
+			return trimmed
+		}
+		key, ok := kt.(string)
+		if !ok {
+			return trimmed
+		}
+		var val any
+		if err := dec.Decode(&val); err != nil {
+			return trimmed
+		}
+		kb, err := json.Marshal(key)
+		if err != nil {
+			return trimmed
+		}
+		vb, err := json.Marshal(val)
+		if err != nil {
+			return trimmed
+		}
+		if !first {
+			b.WriteByte(',')
+		}
+		b.Write(kb)
+		b.WriteByte(':')
+		b.Write(vb)
+	}
+	// The closing brace, and then nothing: a second value in the same text is
+	// not this object and the text is hashed as given instead.
+	if _, err := dec.Token(); err != nil {
+		return trimmed
+	}
+	if dec.More() {
+		return trimmed
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	key := b.toolKey(upIdx, id, name, args)
 	tb, ok := b.toolBlocks[key]
@@ -2625,6 +2758,35 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 func (b *anthropicBridge) startToolBlock(tb *toolBlock) {
 	if tb.started {
 		return
+	}
+	if b.idHeldByAnotherBlock(tb) {
+		// The id this call is about to carry is one a DIFFERENT call already
+		// carries, so handing it over here would put two tool_use blocks under
+		// one id — which the client can answer only once, and the tool_results
+		// it returns cannot name two calls by one id. The index path reached
+		// this directly: a fragment's index names its call, so two fragments at
+		// two indexes that state one id each opened two blocks carrying it,
+		// while the non-stream list and both other legs answered the same wire
+		// with a distinctly numbered second call (2026-09-27 audit, round 47,
+		// C-F1).
+		//
+		// The check sits here, at the one point an id is handed to the client,
+		// rather than at the fragment that stated it: an id can be stated before
+		// the fragment that names its call (the usual OpenAI order is id first),
+		// and only at the start is the call's identity — the name the block will
+		// carry and the arguments accumulated under it — known. The id is minted
+		// from the call itself, the value both other legs mint for a call the
+		// upstream never gave a usable id, and the mint is bumped until it is
+		// one no call of this turn holds (mintedToolCallID).
+		//
+		// A block that carries the id under the SAME identity — the same name
+		// and the same arguments — is not a second call but a restatement of
+		// the one whose id it is, which is the reading the non-stream list's
+		// statedIDOwner gives the same wire and what the client leg's
+		// startsANewToolCall does with a repeated id. tb.statedID is left as
+		// recorded: the upstream did state this call's id, it is only this
+		// bridge that could not hand it over.
+		tb.id = b.mintedToolCallID(tb.name, tb.args.String())
 	}
 	tb.started = true
 	tb.index = b.takeIdx()
@@ -2960,6 +3122,78 @@ type oaDelta struct {
 	ToolCalls        []oaToolCall `json:"tool_calls"`
 }
 
+// oaStreamChunk is one parsed `data:` frame of the upstream's stream. Nothing
+// here is translated until a frame is in hand (see writeStream): the frame
+// decides whether the stream is committed at all.
+type oaStreamChunk struct {
+	Choices []struct {
+		Delta        oaDelta  `json:"delta"`
+		Message      *oaDelta `json:"message"`
+		FinishReason *string  `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		// The same two spellings the ledger's usage type carries; the
+		// cached part is reported to the client as
+		// cache_read_input_tokens rather than folded into input_tokens
+		// (2026-09-27 audit, round 23).
+		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+		PromptTokensDetails  *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} `json:"usage"`
+	// Raw, because a failure stated inside the stream is not always an
+	// object: an upstream may send {"error":"upstream ran out of KV
+	// cache"} as a bare string, and modelling only the object made the
+	// whole frame fail to parse — so it was discarded, the client read a
+	// turn that ended normally with stop_reason end_turn, and the ledger
+	// recorded 200 for a request the upstream failed (2026-09-27 audit,
+	// round 39, B-F6).
+	Error json.RawMessage `json:"error"`
+}
+
+// frameRelaysSomething reports whether one frame of the upstream's stream holds
+// anything the client will be shown: text, reasoning, or a tool-call fragment
+// that states a name (the block opens on its name) or arguments (a call the
+// upstream never names has its arguments relayed as TEXT by finishStream, so
+// they are shown too — round 39, B-F8). It is the question message_start's
+// commitment turns on (see writeStream).
+//
+// Not documentSaysSomething: that predicate answers for a whole completion this
+// bridge HOLDS, where a nameless call relays nothing, and it is asked by the
+// ledger before the turn is written. This one answers for one frame mid-stream,
+// where a nameless call's arguments do reach the client.
+func frameRelaysSomething(chunk oaStreamChunk) bool {
+	for _, ch := range chunk.Choices {
+		if ch.Message != nil && deltaRelaysSomething(*ch.Message) {
+			return true
+		}
+		if deltaRelaysSomething(ch.Delta) {
+			return true
+		}
+	}
+	return false
+}
+
+// deltaRelaysSomething is frameRelaysSomething's question for one delta, in the
+// fields relayDelta reads.
+func deltaRelaysSomething(d oaDelta) bool {
+	if firstNonEmpty(d.Reasoning, d.ReasoningContent) != "" {
+		return true
+	}
+	if d.Content != nil && *d.Content != "" {
+		return true
+	}
+	for _, tc := range d.ToolCalls {
+		if firstNonEmptyStr(tc.Function.Name, tc.Name) != "" ||
+			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // oaToolCall is one tool call on the OpenAI wire. The index is a POINTER
 // because it is optional here and a zero default filed every call of a stream
 // into block 0 — the second call's id, name and arguments were folded into the
@@ -3094,8 +3328,47 @@ func (b *anthropicBridge) documentOutputEstimate(doc openAICompletion) int {
 // nothingRelayed reports whether the stream has said nothing yet — no block
 // opened and no text held — which is the condition for adopting a whole
 // completion that arrives inside a frame as the turn itself.
+//
+// A call counts only when it NAMES itself, which is the rule the document twin
+// states outright (documentSaysSomething): a fragment that states arguments
+// without a name is held until a name arrives, because content_block_start is
+// the only event that carries one and a start without it can never be
+// corrected (startToolBlock) — so counting the block made a stream that relayed
+// NOTHING read as one that had said something. It set `finished` on an empty
+// `message` frame carrying such a fragment (so an unterminated stream was
+// relayed as the model's complete answer), and it defeated the `[DONE]` and
+// empty-stream arms, which then booked and metered a turn with no block, no
+// text and no call — the byte-identical outcome with no frames at all is a 502
+// (2026-09-27 audit, round 47, G47-3).
 func (b *anthropicBridge) nothingRelayed() bool {
-	return b.nextIdx == 0 && len(b.toolOrder) == 0 && b.heldText.Len() == 0
+	return b.nextIdx == 0 && b.heldText.Len() == 0 && b.callsCarryingOutput() == 0
+}
+
+// callsCarryingOutput counts the tool calls that will reach the client as
+// something — the blocks that NAME themselves, and the unnamed ones whose
+// arguments are relayed as text at the end of the turn (finishStream).
+//
+// A call with neither a name nor arguments is not one of them: content_block_start
+// is the only event that carries a name and a start without one can never be
+// corrected (startToolBlock holds the block instead), so such a fragment relays
+// nothing at all — and counting the BLOCK rather than its content made a stream
+// that said nothing read as one that had said something. It set `finished` on an
+// EMPTY `message` frame that carried such a fragment, so a stream that then
+// ended with no finish_reason and no [DONE] was relayed as the model's complete
+// answer; and it defeated the `[DONE]` and empty-stream arms, which booked and
+// metered a turn with no block, no text and no call — while the byte-identical
+// outcome with no frames at all is a 502. The arguments case is why this counts
+// content and not names alone: round 39's B-F8 requires the raw arguments of a
+// call the upstream never named to stay readable to the client, so that turn is
+// NOT empty (2026-09-27 audit, round 47, G47-3).
+func (b *anthropicBridge) callsCarryingOutput() int {
+	n := 0
+	for _, tb := range b.toolOrder {
+		if tb.name != "" || tb.args.Len() > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // errorFrameMessage reads the explanation out of a mid-stream error frame,
@@ -3175,6 +3448,7 @@ func callInput(raw string, truncated bool) (map[string]any, bool) {
 // (anthropic.go, seenInCall: "\x00"+name+"\x00"+args, then that with "#"+n)
 // (2026-09-27 audit, round 45, B45-4 and C45-2).
 func (b *anthropicBridge) mintedToolCallID(name, args string) string {
+	args = canonicalCallArgs(args)
 	base := "\x00" + name + "\x00" + args
 	n := b.mintedIDs[base]
 	b.mintedIDs[base] = n + 1
@@ -3190,8 +3464,14 @@ func (b *anthropicBridge) mintedToolCallID(name, args string) string {
 	// two blocks the client can answer only once. The suffix is bumped until
 	// the id is one no call in this turn holds (2026-09-27 audit, round 46,
 	// G45-5).
+	//
+	// The bump seed is spelled "\x00#k", the shape the local and client legs
+	// bump with (anthropic.go, anthropic_openai_proxy.go), because
+	// gatewayToolCallIDFor promises the same id for the same call whichever leg
+	// mints it — a tool_result written against one leg's answer stays valid if
+	// the retry goes through another (2026-09-27 audit, round 47, G47-4).
 	for k := 0; b.grantedIDs[id]; k++ {
-		id = gatewayToolCallIDFor(name, seed+"#"+strconv.Itoa(k))
+		id = gatewayToolCallIDFor(name, seed+"\x00#"+strconv.Itoa(k))
 	}
 	b.grantedIDs[id] = true
 	return id

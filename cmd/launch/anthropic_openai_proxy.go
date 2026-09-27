@@ -2560,6 +2560,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		if unnamedText.Len() > 0 {
 			// Emitted before the calls that follow it, in the order the
 			// fragments arrived: it is the same turn's output either way.
+			//
+			// It is streamedText too, by the rule this function's tally below
+			// is written to: what reaches the client as output is counted, and
+			// this reaches it as a text block. Left out, an id-less turn whose
+			// only output was the fragment relayed here reported
+			// output_tokens=0 to a client reading that text — while the gateway
+			// leg's own byte tally counts a nameless call's arguments (its
+			// relayDelta books them into outBytes) and this leg's non-stream
+			// path drops the call instead, so the same document's output count
+			// depended on the path that answered it (2026-09-27 audit, round
+			// 47, C-F5's sibling).
+			streamedText += unnamedText.Len()
 			emit(conv.Process(api.ChatResponse{Model: upstreamModel, Message: api.Message{Content: unnamedText.String()}}))
 		}
 		// Counted HERE, on the calls about to be emitted, not where the
@@ -2587,6 +2599,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
+	// adoptedWhole is whether a whole completion that arrived inside a frame
+	// became the turn (see the frameCarriesWholeCompletion branch below).
+	adoptedWhole := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -2673,7 +2688,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
 			if adopted, refused := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
-				break
+				// The turn's whole completion has been relayed, and the stream
+				// goes on: the upstream stated the message and then kept
+				// sending. Its TEXT is still text the model wrote, and both
+				// other legs relay it — the local server's converter answers a
+				// whole message followed by deltas with the concatenation, and
+				// the gateway leg answers this exact wire with "hi there" where
+				// this leg stopped at "hi", dropping the rest of the stream it
+				// had already read. So the loop reads on (2026-09-27 audit,
+				// round 47, C-F3).
+				//
+				// A TOOL fragment after this point is the other half of that
+				// contradiction: the call it continues was written in full by
+				// the adoption, and its block is closed — the gateway leg drops
+				// such a fragment for the same reason (its content_block_stop is
+				// out and no wire event reopens a block). Accumulating it here
+				// would flush a SECOND call under the id the adoption already
+				// emitted, and the client can answer one id once. The fragment
+				// is dropped, which is what adoption means for the calls it
+				// carried.
+				adoptedWhole = true
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. Falling
 				// through to the delta loop let the finish_reason it carried
@@ -2708,6 +2742,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			// Tool-call deltas — accumulate by index; flush later.
 			for _, tc := range d.ToolCalls {
+				if adoptedWhole {
+					// A call the adoption already wrote in full (see above): its
+					// block is closed on the client's side, so these arguments
+					// cannot be delivered.
+					continue
+				}
 				slot := 0
 				if tc.Index != nil {
 					slot = *tc.Index
@@ -2787,6 +2827,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				upstreamErr = "upstream returned an empty completion"
 			}
 		}
+	}
+
+	// A stream that ENDED — the upstream's own finish_reason on a choice, or its
+	// [DONE] — and said NOTHING is not an answer. An empty delta frame carrying
+	// a finish_reason was proof of a turn here: the client got 200, an empty
+	// assistant message and end_turn, and the leg was recorded healthy, so its
+	// breaker never opened and `auto` never moved the session off it. The
+	// non-stream path refuses the same document with 502 ("upstream returned an
+	// empty completion" — an empty content, no reasoning, no call the client
+	// could run), the tail below refuses the wire whose sentinel carried no
+	// choice at all, and the gateway leg refuses it too; the verdict must not
+	// depend on whether the emptiness was framed as a delta or as a message
+	// (2026-09-27 audit, round 47, A-F1). Text that was relayed counts as an
+	// answer whatever it says, which is why this asks `started` rather than
+	// re-reading the bytes (round 44's rule; round 46, A46-2).
+	if completed && !started && len(toolAccums) == 0 {
+		upstreamErr = "upstream returned an empty completion"
 	}
 
 	if !completed {

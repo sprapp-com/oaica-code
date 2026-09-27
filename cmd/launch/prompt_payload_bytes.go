@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ollama/ollama/anthropic"
+	"github.com/ollama/ollama/api"
 )
 
 // The prompt-size unit the client proxy's context-fit clamp and its
@@ -88,11 +89,35 @@ func convertedPromptBody(body []byte) (serialized, imagePayload, images int, ok 
 		}
 	}
 
-	n, err := marshalPrompt(oai)
+	n, err := marshalPrompt(promptOnly(oai))
 	if err != nil {
 		return 0, 0, 0, false
 	}
 	return n, imagePayload, images, true
+}
+
+// promptOnly is the part of the converted request the upstream tokenizes: the
+// messages and the tool schemas, which is the unit the gateway leg's
+// messagesBytes charges (its "messages" plus "tools"/"functions"). The ENVELOPE
+// — the model id, `stream`, `stream_options`, the sampling options — is not
+// prompt: the chat template renders none of it, so the upstream's
+// prompt_tokens do not count it, and charging it made this leg's byte unit
+// differ from the gateway leg's by a constant per request. The same prompt
+// measured 12 tokens more with `stream: true` (and its include_usage
+// instruction) than without, which is the flag Claude Code always sets: the
+// calibrated tokens-per-byte ratio therefore carried a per-request offset, and
+// the two legs' thresholds — a prompt the gateway admits against the client's
+// refusal, or the reverse — disagreed by an amount no prompt can calibrate out
+// (2026-09-27 audit, round 47, A-F2).
+//
+// The messages keep the marshaller they had: openAIMessage.MarshalJSON is what
+// writes the data-URI form the allowance below is measured against, and it runs
+// for a nested element exactly as it did for the field of the request.
+func promptOnly(oai openAIChatRequest) any {
+	return struct {
+		Messages []openAIMessage `json:"messages"`
+		Tools    []api.Tool      `json:"tools,omitempty"`
+	}{Messages: oai.Messages, Tools: oai.Tools}
 }
 
 // marshalPrompt returns the length of the converted request as the upstream
