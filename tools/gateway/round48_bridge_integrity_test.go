@@ -300,9 +300,17 @@ func TestRepeatedArgumentKeysTakeTheLastValue(t *testing.T) {
 }
 
 // TestNullArgumentsAreTheEmptyObject is C-F5. The JSON literal null is not an
-// object, and the tool_use contract requires one.
+// object, and the tool_use contract requires one — but the ID beside it is the
+// one the other two legs mint, and they mint it from the text they were handed:
+// an ordered map re-encodes null as `null`, so legs 1 and 2 hash "null"
+// (call_8dd75358) while this round's first reading folded the literal into {} and
+// numbered the call call_ab56f21 — a gateway id neither sibling would mint for
+// the same call (2026-09-27 audit, round 49, correcting round 48's C-F5).
 func TestNullArgumentsAreTheEmptyObject(t *testing.T) {
-	want := "call_ab56f21" // round47ToolCallIDFor("n", `{}`)
+	want := "call_8dd75358" // round47ToolCallIDFor("n", `null`)
+	if got := round47ToolCallIDFor("n", "null"); got != want {
+		t.Fatalf("this test's own FNV copy disagrees with the recorded literal: %s != %s", got, want)
+	}
 	doc := round48Doc(`{"type":"function","function":{"name":"n","arguments":"null"}}`)
 	up := round45Upstream(t, "application/json", doc)
 	srv, _ := round39Gateway(t, up, nil)
@@ -315,9 +323,9 @@ func TestNullArgumentsAreTheEmptyObject(t *testing.T) {
 		t.Fatalf("got %d tool_use block(s), want 1:\n%s", len(blocks), body)
 	}
 	if blocks[0].id != want {
-		t.Errorf("the minted id is %s, want %s (the empty object, which both other legs fold null into):\n%s", blocks[0].id, want, body)
+		t.Errorf("the minted id is %s, want %s (the literal both other legs hash; only the INPUT folds to the empty object):\n%s", blocks[0].id, want, body)
 	}
 	if blocks[0].input != `{}` {
-		t.Errorf("the block's input is %s, want {} — the id beside it was minted from the empty object\n%s", blocks[0].input, body)
+		t.Errorf("the block's input is %s, want {} — the tool_use contract requires an object\n%s", blocks[0].input, body)
 	}
 }

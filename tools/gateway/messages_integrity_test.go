@@ -33,8 +33,12 @@ func asMap(t *testing.T, v any) map[string]any {
 	return m
 }
 
-// G1: text between two tool_use blocks must not duplicate a call, and no
-// tool_calls may land on the text message.
+// G1: text between two tool_use blocks must not duplicate a call — each call
+// appears once and the wire carries the whole list once. The text travels on
+// the message that carries the calls, because an assistant's text and its
+// calls are two fields of ONE OpenAI message (round 49, B-F4, where the
+// gateway used to open a second assistant message for a turn the client wrote
+// as one; the local converter and the client leg have always sent one).
 func TestToolCallsAreNotDuplicatedByInterleavedText(t *testing.T) {
 	out, _ := contentBlocksToOpenAI("assistant", []any{
 		map[string]any{"type": "tool_use", "id": "call_1", "name": "a", "input": map[string]any{"x": 1}},
@@ -43,28 +47,25 @@ func TestToolCallsAreNotDuplicatedByInterleavedText(t *testing.T) {
 	}, false)
 
 	var calls []string
-	var textMsgs []map[string]any
+	var carriers []map[string]any
 	for _, m := range out {
-		if tcs, ok := m["tool_calls"].([]map[string]any); ok {
+		if tcs, ok := m["tool_calls"].([]map[string]any); ok && len(tcs) > 0 {
+			carriers = append(carriers, m)
 			for _, tc := range tcs {
 				id, _ := tc["id"].(string)
 				calls = append(calls, id)
 			}
-		}
-		if m["role"] == "assistant" && m["content"] == "thinking out loud" {
-			textMsgs = append(textMsgs, m)
 		}
 	}
 
 	if len(calls) != 2 || calls[0] != "call_1" || calls[1] != "call_2" {
 		t.Errorf("tool_calls across the converted messages = %v, want exactly [call_1 call_2] — an interleaved text block made the second call be appended to a copy of the list on the text message", calls)
 	}
-	if len(textMsgs) != 1 {
-		t.Fatalf("found %d text messages, want 1: %#v", len(textMsgs), out)
+	if len(carriers) != 1 {
+		t.Fatalf("found %d message(s) carrying tool_calls, want 1 — a copy of the list on a second message is the call replayed: %#v", len(carriers), out)
 	}
-	tc := textMsgs[0]["tool_calls"]
-	if tcs, ok := tc.([]map[string]any); ok && len(tcs) > 0 {
-		t.Errorf("the text message carries %d tool_calls (%#v) — the upstream would replay that call twice", len(tcs), tcs)
+	if carriers[0]["content"] != "thinking out loud" {
+		t.Errorf("the message carrying the calls has content %#v, want the turn's own text: an assistant's text and its calls are one message", carriers[0]["content"])
 	}
 }
 

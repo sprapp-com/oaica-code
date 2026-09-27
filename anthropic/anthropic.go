@@ -398,7 +398,15 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 			for _, block := range sys {
 				if blockMap, ok := block.(map[string]any); ok {
 					if blockMap["type"] == "text" {
-						if text, ok := blockMap["text"].(string); ok {
+						// An empty text block contributes no text, so it earns no
+						// separator either: writing the separator before knowing
+						// whether the block has anything to say left a trailing
+						// blank line on the system prompt of every array whose
+						// last block was empty, where the gateway leg (and this
+						// file's own normalizeSystemFirst, which skips empty
+						// parts) drops the block entirely (2026-09-27 audit,
+						// round 49, B-F5).
+						if text, ok := blockMap["text"].(string); ok && text != "" {
 							// Blocks are joined, not concatenated: a system
 							// array is how --append-system-prompt arrives, and
 							// gluing two blocks with nothing between them

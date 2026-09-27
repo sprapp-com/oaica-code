@@ -191,13 +191,64 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	// sibling omits it — and forwarding it read as 0 on the backend, which is
 	// greedy decoding for a client that sent `"temperature":null` to mean
 	// "unset" (2026-09-27 audit, round 41, C41-14b).
-	for _, k := range []string{"temperature", "top_p", "top_k", "stream"} {
-		if v, ok := req[k]; ok && v != nil {
-			out[k] = v
+	// Every field below is carried by a TYPED field on the sibling legs
+	// (MessagesRequest.Temperature/TopP/TopK/Stream/StopSequences), so a body
+	// whose JSON shape is not the one this wire means does not decode there and
+	// the request is refused. Forwarding the value verbatim served the same
+	// body 200 here with a string where a backend's schema expects a number (or
+	// a bool where a float belongs), dropped a stated stop sequence on the floor
+	// because the type assertion below did not match, and — for a non-bool
+	// `stream` — answered an SSE request with a single JSON object. The rule is
+	// the one already stated beside max_tokens: a value that is not the shape
+	// this wire means is not a statement (2026-09-27 audit, round 42, B42-6;
+	// round 49, B-F2).
+	//
+	// A JSON null is NOT that case: the sibling's pointer fields decode it to
+	// nil and omit the field, which is what the `v != nil` test below does.
+	for _, k := range []string{"temperature", "top_p"} {
+		v, ok := req[k]
+		if !ok || v == nil {
+			continue
 		}
+		if _, ok := jsonNumber(v); !ok {
+			return nil, k + " must be a number"
+		}
+		out[k] = v
 	}
-	if ss, ok := req["stop_sequences"].([]any); ok && len(ss) > 0 {
-		out["stop"] = ss
+	if v, ok := req["top_k"]; ok && v != nil {
+		// The sibling's TopK is an *int: a fractional value does not decode
+		// into it, so it is refused rather than rounded here.
+		f, ok := jsonNumber(v)
+		if !ok {
+			return nil, "top_k must be an integer"
+		}
+		if f != float64(int64(f)) {
+			return nil, "top_k must be an integer"
+		}
+		out["top_k"] = v
+	}
+	if v, ok := req["stream"]; ok && v != nil {
+		// The handler reads this field with a type assertion and a failed one
+		// reads as false, so a body asking to stream by any other spelling was
+		// answered as one non-streaming object (2026-09-27 audit, round 49).
+		if _, isBool := v.(bool); !isBool {
+			return nil, "stream must be a boolean"
+		}
+		out["stream"] = v
+	}
+	if v, ok := req["stop_sequences"]; ok && v != nil {
+		ss, isArr := v.([]any)
+		if !isArr {
+			return nil, "stop_sequences must be an array of strings"
+		}
+		for _, s := range ss {
+			if _, isStr := s.(string); !isStr {
+				return nil, "stop_sequences must be an array of strings"
+			}
+		}
+		if len(ss) > 0 {
+			out["stop"] = ss
+		}
 	}
 	// The thinking control, in the spelling this product's own llama-server
 	// takes for the same control (llm.llamaServerChatTemplateKwargs): the
@@ -318,6 +369,25 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	choiceType = strings.ToLower(strings.TrimSpace(choiceType))
 	if choiceType != "none" {
 		if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+			// The built-in web_search tool is a SERVER tool, and the sibling
+			// converter rewrites it into the `web_search` function its backends
+			// actually call — with a required `query` — and drops a client tool
+			// of the same name from the same request so the model's call is not
+			// ambiguous. This leg forwarded the definition as written: a
+			// function with a name and nothing else, so one body handed the
+			// model a query-less tool on one leg and a query-taking one on the
+			// other, and a request carrying both put two identically-named
+			// functions in one tools array, which a backend resolves arbitrarily
+			// or rejects (2026-09-27 audit, round 49, B-F3).
+			hasBuiltinWebSearch := false
+			for _, t := range tools {
+				if tm, ok := t.(map[string]any); ok {
+					if ty, ok := tm["type"].(string); ok && strings.HasPrefix(ty, "web_search") {
+						hasBuiltinWebSearch = true
+						break
+					}
+				}
+			}
 			var oai []map[string]any
 			for i, t := range tools {
 				tm, _ := t.(map[string]any)
@@ -328,11 +398,35 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 					// send (2026-09-27 audit, round 42, B42-8).
 					return nil, "tools element is not an object (index " + strconv.Itoa(i) + ")"
 				}
-				fn := map[string]any{"name": tm["name"]}
+				toolType, _ := tm["type"].(string)
+				if strings.HasPrefix(toolType, "web_search") {
+					oai = append(oai, map[string]any{"type": "function", "function": webSearchToolFunction()})
+					continue
+				}
+				name, _ := tm["name"].(string)
+				if hasBuiltinWebSearch && name == "web_search" {
+					continue
+				}
+				fn := map[string]any{"name": name}
 				if d, ok := tm["description"]; ok {
 					fn["description"] = d
 				}
-				if sc, ok := tm["input_schema"]; ok {
+				// The sibling carries parameters as a VALUE, not a pointer: a
+				// tool that states no schema still puts one on the wire (the
+				// zero value, `{"type":"","properties":null}`), and one whose
+				// schema is not an object fails the whole request at decode.
+				// Omitting the key sent a function with no parameters where the
+				// sibling sent an empty schema, and forwarding an array or a
+				// string put a shape no backend's validator accepts on the wire
+				// for a request the other legs refuse (2026-09-27 audit, round
+				// 49, verification of the tool surface).
+				switch sc, ok := tm["input_schema"]; {
+				case !ok || sc == nil:
+					fn["parameters"] = map[string]any{"type": "", "properties": nil}
+				default:
+					if _, isObj := sc.(map[string]any); !isObj {
+						return nil, "invalid input_schema for tool " + strconv.Quote(name) + ": not a JSON object"
+					}
 					fn["parameters"] = sc
 				}
 				oai = append(oai, map[string]any{"type": "function", "function": fn})
@@ -352,6 +446,28 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		out["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
 	return out, ""
+}
+
+// webSearchToolFunction is the function the sibling converter rewrites an
+// Anthropic built-in web_search tool into — the same name, the same
+// description and the same required `query` property it builds in convertTool.
+// The model is asked to call a tool by this signature; two legs offering two
+// signatures for one body is two different asks of the same model.
+func webSearchToolFunction() map[string]any {
+	return map[string]any{
+		"name":        "web_search",
+		"description": "Search the web for current information. Use this to find up-to-date information about any topic.",
+		"parameters": map[string]any{
+			"type":     "object",
+			"required": []any{"query"},
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "The search query to look up on the web",
+				},
+			},
+		},
+	}
 }
 
 // ensureTrailingNewline returns s with a newline appended when it does not
@@ -1023,6 +1139,61 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 	// the whole list) and the client saw the first call twice, on two
 	// different messages (2026-09-26 audit, fourth round).
 	toolMsg := -1
+	// openToolMsg opens the assistant message a call rides on, once.
+	openToolMsg := func() {
+		if toolMsg < 0 {
+			out = append(out, map[string]any{"role": role, "content": "", "tool_calls": []map[string]any{}})
+			toolMsg = len(out) - 1
+		}
+	}
+	// putContent places a delivered block of text (or image parts) on the wire.
+	// An assistant turn's text and its calls are ONE message on this wire —
+	// `content` and `tool_calls` are two fields of the same assistant message,
+	// and that is the shape both other legs send and the shape the client sent
+	// its blocks in. Flushing the text first opened a SECOND assistant message
+	// per turn (one carrying prose, one carrying the calls with an empty
+	// content), so a turn the client wrote as one was answered as two, and the
+	// same body reached the model differently depending on which leg served it
+	// (2026-09-27 audit, round 49, B-F4). Every other role keeps the order it
+	// had: its text goes out as its own message first.
+	putContent := func(content any) {
+		if role != "assistant" || toolMsg < 0 {
+			out = append(out, map[string]any{"role": role, "content": content})
+			return
+		}
+		if s, ok := content.(string); ok {
+			if cur, ok := out[toolMsg]["content"].(string); ok {
+				if cur == "" {
+					out[toolMsg]["content"] = s
+				} else {
+					// The separator between two text blocks of one turn is the
+					// blank line the rest of this file joins them with.
+					out[toolMsg]["content"] = cur + "\n\n" + s
+				}
+				return
+			}
+		}
+		// Something other than a plain string — image parts, or text folded
+		// onto an already-arrayed content: keep the parts, with whatever string
+		// was already there in front of them.
+		arr := []any{}
+		if cur, ok := out[toolMsg]["content"].(string); ok && cur != "" {
+			arr = append(arr, map[string]any{"type": "text", "text": cur})
+		} else if cur, ok := out[toolMsg]["content"].([]map[string]any); ok {
+			for _, p := range cur {
+				arr = append(arr, p)
+			}
+		}
+		switch c := content.(type) {
+		case []map[string]any:
+			for _, p := range c {
+				arr = append(arr, p)
+			}
+		default:
+			arr = append(arr, content)
+		}
+		out[toolMsg]["content"] = arr
+	}
 	flushText := func() {
 		if len(parts) == 0 {
 			return
@@ -1050,11 +1221,11 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 					texts = append(texts, t)
 				}
 			}
-			out = append(out, map[string]any{"role": role, "content": strings.Join(texts, "\n\n")})
+			putContent(strings.Join(texts, "\n\n"))
 			parts = nil
 			return
 		}
-		out = append(out, map[string]any{"role": role, "content": parts})
+		putContent(parts)
 		parts = nil
 	}
 	for _, b := range blocks {
@@ -1139,11 +1310,14 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				return nil, fmt.Sprintf("image source.type %q cannot be represented on the OpenAI wire", st)
 			}
 		case "tool_use", "server_tool_use":
-			flushText()
-			if toolMsg < 0 {
-				out = append(out, map[string]any{"role": role, "content": "", "tool_calls": []map[string]any{}})
-				toolMsg = len(out) - 1
+			// The call's message is opened BEFORE the pending text is flushed,
+			// so an assistant's text folds onto the turn it belongs to (see
+			// putContent). A user message keeps the order it had.
+			if role == "assistant" {
+				openToolMsg()
 			}
+			flushText()
+			openToolMsg()
 			id, _ := bm["id"].(string)
 			name, _ := bm["name"].(string)
 			// A tool_use without its id or its name is a call the client cannot
@@ -2664,8 +2838,23 @@ func toolCallIdentity(name, args string) string {
 // hashed as the text it is, wrapped the same way).
 func canonicalCallArgs(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "null" {
+	if trimmed == "" {
 		return "{}"
+	}
+	if trimmed == "null" {
+		// The JSON literal null is an argument text with no keys, and an ordered
+		// map parses it into an EMPTY one — but the value it re-encodes to is
+		// still `null`, and that is the string both other legs hash: the local
+		// converter marshals its own ordered map (a null argument text marshals
+		// back to `null`, an empty one to `{}`) and the client leg's parser
+		// marshals the map it unmarshalled into. Folding the two together here
+		// minted `{}`'s id for a call the other two legs number from `null`, so
+		// one upstream turn produced two ids depending on which leg answered it
+		// — the block's own INPUT is the empty object on all three legs (a
+		// tool_use input is an object; round 42/43), which is what made the
+		// fold look right (2026-09-27 audit, round 49, correcting round 48's
+		// C-F5, whose id half was pinned without checking the sibling legs).
+		return "null"
 	}
 	if !strings.HasPrefix(trimmed, "{") {
 		return rawFallbackArgs(trimmed)
@@ -2731,6 +2920,23 @@ func canonicalCallArgs(raw string) string {
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// jsonNumber reads a value as a number, in either of the two shapes this
+// process handles: the float64 a JSON number decodes into, and the plain int
+// types a body this process built itself carries (the same pair the max_tokens
+// reader accepts, round 42). Anything else is not a number and has no place on
+// a field a backend's schema types as one.
+func jsonNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 // rawFallbackArgs is the argument text this bridge keeps for a call whose
@@ -2986,7 +3192,17 @@ func (b *anthropicBridge) startToolBlock(tb *toolBlock) bool {
 		// and only at the start is the call's identity — the name the block will
 		// carry and the arguments accumulated under it — known.
 		if mine, ok := settledIdentity(tb); ok {
-			if theirs, ok := settledIdentity(other); ok && theirs == mine {
+			// `other.statedID` is the whole difference between a restatement and
+			// two calls. A block whose id this bridge MINTED has been numbered
+			// from its own name and arguments, and the upstream stating that
+			// string for a separately-indexed entry is naming a SECOND call
+			// (`call_` + a hash of the call is reproducible, so an upstream that
+			// wants to state it can) — the non-stream list answers that wire
+			// with two blocks, and so does the client leg's parser. Only when
+			// the id came from the upstream is a repeat of the same name and
+			// arguments under it the one call restated, which both other legs
+			// answer with ONE block (2026-09-27 audit, round 49, A-F3).
+			if theirs, ok := settledIdentity(other); ok && theirs == mine && other.statedID {
 				// A restatement of the SAME call under its own id, which both
 				// other legs answer with the one block (the client leg and the
 				// local converter both drop the repeat; anthropic.go's
@@ -3158,7 +3374,13 @@ func (b *anthropicBridge) finishStream() {
 	// which is at least readable — rather than as a tool_use Claude Code would
 	// report as pending and could never run (2026-09-27 audit, round 39, B-F8).
 	for _, tb := range b.toolOrder {
-		if tb.started || tb.args.Len() == 0 {
+		// A MERGED block is not a call this bridge failed to name: it is the
+		// restatement of one the client already holds, and its arguments were
+		// the arguments of that delivered call. Relaying them as text — the
+		// fate of a call that has no name — put the call's own JSON on the wire
+		// as assistant prose, so the client read `{"a":1}` as something the
+		// model said (2026-09-27 audit, round 49, A-F1).
+		if tb.started || tb.merged || tb.args.Len() == 0 {
 			continue
 		}
 		log.Printf("oaica-gateway: a tool call the upstream never named (%d bytes of arguments) is relayed as text", tb.args.Len())

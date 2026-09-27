@@ -57,8 +57,16 @@ import (
 
 // openAIMessage is the OpenAI chat-completions wire shape for one message.
 type openAIMessage struct {
-	Role       string             `json:"role"`
-	Content    string             `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content is always written, even when empty: `content` is a property of a
+	// chat message on this wire, and both other legs state it — the local
+	// converter through api.Message's own `json:"content"` (no omitempty) and
+	// the gateway leg with content:"" — so a turn the client sent as an empty
+	// content array reached some backends as a message with no content key at
+	// all and the others as one with an empty string (2026-09-27 audit, round
+	// 49, B-F6). Same rule as round 45's `"input":{}`: an absent key is not a
+	// statement, and the empty value is.
+	Content    string             `json:"content"`
 	ToolCalls  []openAIToolCall   `json:"tool_calls,omitempty"`
 	ToolCallID string             `json:"tool_call_id,omitempty"`
 	Images     []openAIImageBlock `json:"-"`
@@ -1658,6 +1666,31 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			refuse(http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
 			return
 		}
+		// The request's own shape, before any translation. This is the one
+		// translation site that had NO such check: the local server's handler
+		// refuses a body with no max_tokens, a non-positive one, or no messages
+		// at all (middleware/anthropic.go), and the gateway leg refuses the same
+		// three (tools/gateway/messages.go), where here they were served: a body
+		// asking for a refusal (max_tokens 0) had `max_tokens` dropped from the
+		// upstream request so the backend applied its own cap, a negative one
+		// was forwarded as written, and a body with no messages was converted
+		// into an empty conversation — one body answered three ways depending on
+		// which leg the client reached (2026-09-27 audit, round 49, B-F1).
+		//
+		// A MISSING model is deliberately not one of them: this proxy was
+		// started with an upstream model and falls back to it, which is a
+		// pinned, documented behaviour of this entry point
+		// (TestProxyFallsBackToFixedModelWhenRequestOmitsIt) — a body the local
+		// server cannot serve at all is servable here, so the two legs answer it
+		// differently on purpose (2026-09-27 audit, round 49, rejection).
+		if anthReq.MaxTokens <= 0 {
+			refuse(http.StatusBadRequest, "max_tokens is required and must be positive")
+			return
+		}
+		if len(anthReq.Messages) == 0 {
+			refuse(http.StatusBadRequest, "messages is required")
+			return
+		}
 		// promptBytes is the unit the context-fit clamp below and every
 		// calibration read/write in this handler share: the CONVERTED body —
 		// the OpenAI-wire request the upstream is handed, which is where every
@@ -2599,6 +2632,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
+	// adoptedSlots are the call slots an adopted whole completion wrote, so a
+	// fragment later in the stream can be told apart: one at a slot the adoption
+	// wrote continues a call the client already holds (it cannot be delivered);
+	// one at a NEW slot is a call of the model's own (2026-09-27 audit, round
+	// 49, A-F2). Keyed as the accumulator keys its slots: the call's own index,
+	// or — for a completion whose calls carry none — the order they were
+	// written in, which is the slot the index-less accumulator would have used.
+	adoptedSlots := map[int]bool{}
 	// adoptedCalls is whether the adopted completion wrote any tool call of its
 	// own — the calls whose blocks the client already holds, and the only
 	// fragments a later tool delta can be a continuation of.
@@ -2690,7 +2731,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// stream was discarded, and the client got 200 with no answer and a
 		// healthy leg (2026-09-26 audit, sixteenth round).
 		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) {
-			if adopted, refused, wroteCalls := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			if adopted, refused, wroteCalls, wroteSlots := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
 				// goes on: the upstream stated the message and then kept
@@ -2716,6 +2757,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// and C-F2).
 				adoptedWhole = true
 				adoptedCalls = wroteCalls
+				adoptedSlots = wroteSlots
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. Falling
 				// through to the delta loop let the finish_reason it carried
@@ -2750,14 +2792,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 			// Tool-call deltas — accumulate by index; flush later.
 			for _, tc := range d.ToolCalls {
-				if adoptedWhole && adoptedCalls {
-					// A call the adoption already wrote in full (see above): its
-					// block is closed on the client's side, so these arguments
-					// cannot be delivered.
-					continue
-				}
 				slot := 0
-				if tc.Index != nil {
+				indexed := tc.Index != nil
+				if indexed {
 					slot = *tc.Index
 				} else {
 					// The upstream sent no index, so there is nothing to key
@@ -2774,6 +2811,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						syntheticToolSlot++
 					}
 					slot = syntheticToolSlot
+				}
+				if adoptedWhole && adoptedCalls {
+					// A call the adoption already wrote in full (see above): its
+					// block is closed on the client's side, so these arguments
+					// cannot be delivered. Only that call, though — a fragment at
+					// a slot the adoption never wrote is a call of the model's
+					// own, which the gateway leg opens a block for, and dropping
+					// it lost a tool the upstream had asked for (2026-09-27
+					// audit, round 49, A-F2). A fragment carrying no index is
+					// dropped either way: it cannot be told from a continuation
+					// of the calls the adoption wrote.
+					if !indexed || adoptedSlots[slot] {
+						continue
+					}
 				}
 				acc, exists := toolAccums[slot]
 				if !exists {
@@ -2829,7 +2880,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// completion the upstream sent instead of frames. Adopt it as the turn
 		// rather than reporting a failure over an answer that exists.
 		if !started && upstreamErr == "" {
-			if adopted, refused, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			if adopted, refused, _, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 			} else if refused {
 				upstreamErr = "upstream returned an empty completion"
@@ -3019,20 +3070,20 @@ func frameCarriesWholeCompletion(payload string) bool {
 // content on every retry (the upstream produced and billed a whole answer) and
 // marked the leg failed, so three such turns opened its breaker and moved the
 // session off a leg that was serving it (2026-09-26 audit, fourteenth round).
-func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool) {
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool, wroteSlots map[int]bool) {
 	if strings.TrimSpace(raw) == "" {
-		return false, false, false
+		return false, false, false, nil
 	}
 	var oaiResp openAIChatResponse
 	if err := json.Unmarshal([]byte(raw), &oaiResp); err != nil {
-		return false, false, false
+		return false, false, false, nil
 	}
 	// No choices is not an answer: the same body the non-streaming path
 	// refuses ("upstream returned no completion choices"), so it keeps the
 	// failure verdict here. refused is what tells the framed caller that the
 	// body IS a whole completion rather than a stream to keep reading.
 	if len(oaiResp.Choices) == 0 {
-		return false, true, false
+		return false, true, false, nil
 	}
 	// And neither is a whole completion that says nothing. Adopting one
 	// emitted message_start and message_stop around no blocks at all — the
@@ -3046,17 +3097,27 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// that WROTE the turn's tool calls, so a tool fragment later in the stream
 	// continues a call whose block the client already holds under an id it can
 	// answer once (2026-09-27 audit, round 48, A-F2).
+	wroteSlots = map[int]bool{}
 	{
 		m := oaiResp.Choices[0].Message
+		// The slots these calls occupy in the accumulator's terms. A call of a
+		// whole completion carries no index here (the document's tool_calls
+		// entries have no index field), so the order they are written in is the
+		// only slot they can be said to hold — and it is the slot an index-less
+		// delta stream would have given them, since the accumulator keys those
+		// by the same sequence.
+		slot := 0
 		for _, tc := range m.ToolCalls {
-			if strings.TrimSpace(tc.Function.Name) != "" {
-				wroteCalls = true
-				break
+			if strings.TrimSpace(tc.Function.Name) == "" {
+				continue
 			}
+			wroteSlots[slot] = true
+			slot++
 		}
+		wroteCalls = len(wroteSlots) > 0
 		if m.Content == "" &&
 			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !wroteCalls {
-			return false, true, false
+			return false, true, false, nil
 		}
 	}
 
@@ -3075,7 +3136,7 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 		toolCallArgumentsSize(chatResp.Message.ToolCalls)
 	*finishReason = oaiResp.Choices[0].FinishReason
 	*finalUsage = oaiResp.Usage
-	return true, false, wroteCalls
+	return true, false, wroteCalls, wroteSlots
 }
 
 // upstreamErrorMessage extracts the message from an OpenAI-shaped error
