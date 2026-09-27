@@ -169,6 +169,14 @@ func TestStreamingTurnAlwaysClosesWithAStopReason(t *testing.T) {
 }
 
 // F7c: tool_calls with nothing attached is not tool_use.
+//
+// Round 45 (A45-5), the other half of the same answer: a document with no
+// content, no reasoning and no named call is refused with 502 — the status the
+// gateway leg gives the identical body — rather than relayed as a 200 turn
+// carrying zero blocks and end_turn, which a session reads as "the model
+// answered nothing" and simply stops on, where it should have surfaced the
+// upstream failure. The assertion that no tool_use is claimed survives the
+// change: an error carries no stop_reason at all.
 func TestProxyDoesNotReportToolUseWithoutAToolCall(t *testing.T) {
 	url, token := proxyUnderTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -176,19 +184,37 @@ func TestProxyDoesNotReportToolUseWithoutAToolCall(t *testing.T) {
 			"choices": []map[string]any{{"index": 0, "finish_reason": "tool_calls",
 				"message": map[string]any{"role": "assistant", "content": ""}}}})
 	}))
-	body := postMessagesBody(t, url, token,
-		`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	req, _ := http.NewRequest("POST", url+"/v1/messages",
+		bytes.NewReader([]byte(`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	httpResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResp.Body.Close()
+	raw, _ := io.ReadAll(httpResp.Body)
+	body := string(raw)
+	if httpResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502:\n%s", httpResp.StatusCode, body)
+	}
 
 	var resp struct {
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
 			Type string `json:"type"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		t.Fatalf("not Anthropic JSON: %v\n%s", err, body)
 	}
 	if resp.StopReason == "tool_use" {
 		t.Errorf("stop_reason = tool_use with %d content blocks (%s) — an agent reads that as a tool call arriving, finds none, and stalls", len(resp.Content), body)
+	}
+	if resp.Type != "error" || !strings.Contains(resp.Error.Message, "empty completion") {
+		t.Errorf("the refusal does not say the completion was empty: %s", body)
 	}
 }

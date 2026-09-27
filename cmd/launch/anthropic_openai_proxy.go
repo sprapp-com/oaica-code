@@ -726,6 +726,13 @@ func parseOpenAIToolCalls(tcs []struct {
 	// body, so the two paths disagreed about it; they agree now
 	// (2026-09-26 audit, fourteenth round).
 	seen := make(map[string]bool, len(tcs))
+	// seenID records, per stated id, the call it was first stated for, so a
+	// second, different call under the same id is re-minted rather than
+	// dropped (A45-3).
+	seenID := make(map[string]string, len(tcs))
+	// seenInList counts how often each call identity has appeared in this
+	// list, so a repeat takes the streaming converter's "#n" rule (A45-2).
+	seenInList := make(map[string]int, len(tcs))
 	for _, tc := range tcs {
 		var args api.ToolCallFunctionArguments
 		raw := strings.TrimSpace(tc.Function.Arguments)
@@ -751,29 +758,61 @@ func parseOpenAIToolCalls(tcs []struct {
 			args = api.NewToolCallFunctionArguments()
 			args.Set("_raw", raw)
 		}
+		key := raw
+		if b, err := json.Marshal(args); err == nil {
+			key = string(b)
+		}
+		// The call's own identity, keyed exactly as the streaming converter
+		// keys it: name plus canonical arguments.
+		identity := "\x00" + tc.Function.Name + "\x00" + key
 		id := tc.ID
+		if id != "" {
+			// An id the upstream states is that call's own, unless it already
+			// stated the same id for a DIFFERENT call. Deduping on the id alone
+			// threw that second call away — the turn reached the client as one
+			// tool_use under stop_reason "tool_use" while the model had asked
+			// for two, and the streaming converter (and the gateway leg) each
+			// recover it, so the same body had two answers (2026-09-27 audit,
+			// round 45, A45-3). A reused id is re-minted below from the call
+			// itself, never from a counter.
+			if owner, ok := seenID[id]; ok && owner != identity {
+				id = ""
+			} else {
+				seenID[id] = identity
+			}
+		}
 		if id == "" {
 			// The upstream sent no id (several OpenAI-compatible GGUF
-			// backends). Passing it through left the client with a tool_use
-			// block carrying NO id at all — ContentBlock.ID is omitempty —
-			// so it could not name the call back, and its tool_result then
-			// carried tool_use_id "" into the next request as an empty OpenAI
-			// tool_call_id. Same rule as the streaming path, one helper
-			// (2026-09-26 audit, thirteenth round). The key is the canonical
-			// encoding of the parsed arguments, so two parallel calls that
-			// differ only in whitespace are one call.
-			key := raw
-			if b, err := json.Marshal(args); err == nil {
-				key = string(b)
+			// backends), or reused one id for a second call. Passing an absent
+			// id through left the client with a tool_use block carrying NO id
+			// at all — ContentBlock.ID is omitempty — so it could not name the
+			// call back, and its tool_result then carried tool_use_id "" into
+			// the next request as an empty OpenAI tool_call_id. Same rule as
+			// the streaming path, one helper (2026-09-26 audit, thirteenth
+			// round). The key is the canonical encoding of the parsed
+			// arguments, so two parallel calls that differ only in whitespace
+			// are one call.
+			//
+			// Two IDENTICAL id-less calls are two calls, not one call stated
+			// twice: the id is a pure function of name and arguments, so the
+			// repeat takes the streaming converter's own rule — a distinct key
+			// and a distinct "#n" id. Collapsing the pair delivered one
+			// tool_use where the model asked for two, under stop_reason
+			// "tool_use", on a wire the streaming path of this same leg (and
+			// both paths of the local server) answers with two blocks
+			// (2026-09-27 audit, round 45, A45-2; round 39, B-F9 and round 40,
+			// A40-6 fixed the stream twins). A restatement of the same call
+			// under the same STATED id is still a duplicate: `seen` below is
+			// keyed on the id, and that is what it exists for.
+			n := seenInList[identity]
+			seenInList[identity] = n + 1
+			mintedKey := key
+			if n > 0 {
+				mintedKey = key + "#" + strconv.Itoa(n)
 			}
-			id = anthropic.ToolCallIDFor(tc.Function.Name, key)
+			id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey)
 		}
 		dedupKey := id
-		if tc.ID == "" {
-			// Same key the streaming accumulator uses for an id-less call
-			// (anthropic.go, toolCallsSent): the call's own identity.
-			dedupKey = "\x00" + tc.Function.Name + "\x00" + id
-		}
 		if seen[dedupKey] {
 			continue
 		}
@@ -2220,6 +2259,39 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		onUsage(oaiResp.Usage.PromptTokens)
 	}
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
+	// A whole completion that says nothing — no text, no reasoning, no call
+	// the client could run — is not an answer. Relayed, it reached the client
+	// as a successful assistant turn with zero content blocks and end_turn:
+	// nothing to render, nothing to run, so a session that should have
+	// surfaced an upstream failure simply stopped, and the leg recorded a
+	// healthy 200 for it. The gateway leg refuses the identical document with
+	// 502 ("upstream returned an empty completion", messages.go), and this
+	// path already refuses the same body with no choices at all — the verdict
+	// must not depend on which of the two empty shapes the upstream sent
+	// (2026-09-27 audit, round 45, A45-5).
+	//
+	// Asked of the UPSTREAM's document, not of the blocks that survived
+	// translation: a call the upstream never named is not a call
+	// (parseOpenAIToolCalls drops it above, and a truncated fragment with it),
+	// so the document says nothing, exactly as the gateway leg's
+	// documentSaysSomething reads the same body. A call that IS named says
+	// something even when its arguments were cut off — the turn is refused
+	// nowhere for that, it is answered with the stop_reason the upstream
+	// stated.
+	choice := oaiResp.Choices[0]
+	namedCall := false
+	for _, tc := range choice.Message.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) != "" {
+			namedCall = true
+			break
+		}
+	}
+	if strings.TrimSpace(choice.Message.Content) == "" &&
+		strings.TrimSpace(firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent)) == "" &&
+		!namedCall {
+		writeAnthropicError(w, http.StatusBadGateway, "upstream returned an empty completion")
+		return false
+	}
 	// Per FIELD, not per object: an object that states one count says nothing
 	// about the other, and gating on the object suppressed the fallback for
 	// the field the upstream never spoke about — the "session never appears to
@@ -2840,6 +2912,27 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// failure verdict here.
 	if len(oaiResp.Choices) == 0 {
 		return false
+	}
+	// And neither is a whole completion that says nothing. Adopting one
+	// emitted message_start and message_stop around no blocks at all — the
+	// same empty turn the non-streaming path now refuses, told to a client
+	// that waits for the answer and never retries. Asked of the document, as
+	// the refusing path asks it: a call only counts when the upstream named
+	// it, since an unnamed call is dropped by the converter and cannot be run
+	// (2026-09-27 audit, round 45, A45-5).
+	{
+		m := oaiResp.Choices[0].Message
+		named := false
+		for _, tc := range m.ToolCalls {
+			if strings.TrimSpace(tc.Function.Name) != "" {
+				named = true
+				break
+			}
+		}
+		if strings.TrimSpace(m.Content) == "" &&
+			strings.TrimSpace(firstNonEmpty(m.Reasoning, m.ReasoningContent)) == "" && !named {
+			return false
+		}
 	}
 
 	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {

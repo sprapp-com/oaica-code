@@ -105,6 +105,12 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	// completionHandler forwards r.URL.Path verbatim; upstream oaicalb
 	// answers /v1/messages itself (in Anthropic shape). We must hit its
 	// OpenAI wire so the response is the one shape this file translates.
+	// The rewrite is why the path the CLIENT asked for is recorded on the
+	// context first: the ledger row is built from r.URL.Path, so every
+	// bridged turn used to be booked under the upstream's OpenAI path and
+	// no per-path rate card or accounting split could tell an Anthropic-wire
+	// turn from an OpenAI-wire one (2026-09-27 audit, round 45, B45-3).
+	r = withInboundPath(r)
 	r.URL.Path = "/v1/chat/completions"
 
 	model, _ := req["model"].(string)
@@ -1411,6 +1417,12 @@ type anthropicBridge struct {
 	// synthSeq mints keys for calls whose upstream states neither an index nor
 	// an id, so two such calls cannot share a block.
 	synthSeq int
+	// mintedIDs counts the calls this bridge has had to number itself, keyed by
+	// each call's own identity (name and arguments), so the second and later
+	// occurrence of one identity takes a distinct id — the rule the local leg's
+	// converter applies to the same wire (anthropic.go, seenInCall). See
+	// mintedToolCallID.
+	mintedIDs map[string]int
 }
 
 // toolBlock is one tool call being translated into an Anthropic content block.
@@ -1436,6 +1448,12 @@ type toolBlock struct {
 	key   string
 	id    string
 	name  string
+	// statedID is whether id came from the upstream. A block this bridge had to
+	// open before the upstream named its id carries a MINTED one, and an id the
+	// upstream states afterwards is that same call's own id rather than the
+	// introduction of another call — the distinction toolKey's merge arm needs
+	// (2026-09-27 audit, round 45, B45-1).
+	statedID bool
 	// started is whether content_block_start has been emitted for this block.
 	started bool
 	// closed is whether its content_block_stop has been emitted. A closed block
@@ -1495,6 +1513,15 @@ type bridgeSSE struct {
 	// argument fragments), the unit the client leg divides for the same fallback
 	// (streamedText/4 + 1).
 	outBytes int
+	// finished is whether the upstream said the stream was over — a choice's
+	// finish_reason, a `[DONE]` sentinel that follows something relayed, or a
+	// whole completion adopted as the turn. A stream is COMPLETE only when the
+	// upstream says so, which is the rule the client leg applies: a connection
+	// that closes with neither marker was cut off mid-answer, and relaying it as
+	// a turn that finished — end_turn, message_stop, a booked 200 — sold a
+	// truncated answer as the model's reply and told a caller that never got
+	// message_stop to retry a turn it had already been charged for
+	// (2026-09-27 audit, round 45, B45-2).
 	finished bool
 	// startSent is whether message_start has been emitted.
 	startSent bool
@@ -1510,7 +1537,10 @@ type bridgeSSE struct {
 }
 
 func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthropicBridge {
-	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[string]*toolBlock{}}
+	return &anthropicBridge{
+		ResponseWriter: w, stream: stream, model: model,
+		toolBlocks: map[string]*toolBlock{}, mintedIDs: map[string]int{},
+	}
 }
 
 // WriteHeader records the upstream's status; it does not commit one to the
@@ -1643,6 +1673,25 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 				b.sse.upstreamErr = "upstream returned an empty stream"
 				return http.StatusBadGateway, b.sse.upstreamErr
 			}
+			if !b.sse.finished {
+				// Frames were relayed and the upstream never said they were the
+				// whole answer: no choice stated a finish_reason, no `[DONE]`
+				// followed them, and the body is not a whole completion this
+				// bridge adopted. The client leg reports the same condition in
+				// the same words ("upstream stream ended before the response was
+				// complete") and refuses to flush the calls it accumulated,
+				// because partial argument JSON cannot be told from a model that
+				// writes freeform arguments — and this leg used to relay the
+				// turn as finished instead: end_turn, message_stop and a booked
+				// 200, so a caller was sold a truncated answer as the model's
+				// reply and never retried, and one that reads the missing
+				// message_stop as a failure retried a turn already charged
+				// (2026-09-27 audit, round 45, B45-2). Recorded as this stream's
+				// own failure, so finishStream emits it as an `error` event and
+				// this same predicate gives the ledger row its 502.
+				b.sse.upstreamErr = "upstream stream ended before the response was complete"
+				return http.StatusBadGateway, b.sse.upstreamErr
+			}
 			return 0, ""
 		}
 		if doc, ok := b.bufferedCompletion(); ok && documentSaysSomething(doc) {
@@ -1680,6 +1729,20 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 		// Upstream 200 with no choices (some backends do this on refusal or
 		// empty completion) — an empty message beats a panic.
 		return http.StatusBadGateway, "upstream returned no completion choices"
+	}
+	if !documentSaysSomething(resp) {
+		// A whole completion that says nothing — no text, no reasoning, no call
+		// the client could run — is the same turn the stream arms above refuse
+		// and that finalize() answers 502 on this path. The row is written
+		// BEFORE finalize() runs, and this predicate is how it learns the
+		// client's answer: asking only whether the body PARSED told the ledger
+		// the upstream's own 200 for a turn the client read as a 502 — the one
+		// record of a refused turn saying it succeeded, with the upstream's
+		// prompt booked against it, and no reconciliation between the two
+		// records able to see it (2026-09-27 audit, round 45, B45-18). The
+		// stream arms ask documentSaysSomething of a whole completion they are
+		// holding; this is the same question for the path that holds no frames.
+		return http.StatusBadGateway, "upstream returned an empty completion"
 	}
 	return 0, ""
 }
@@ -1823,20 +1886,11 @@ func (b *anthropicBridge) finalize() {
 		writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned no completion choices")
 		return
 	}
-	if !documentSaysSomething(resp) {
-		// A completion that says nothing — no text, no reasoning, no call the
-		// client could run — is the same turn the stream path answers with a
-		// 502, and the two paths must agree about it: this one used to answer
-		// 200 with a fabricated {"type":"text","text":""} block and a metered
-		// success, so the byte-identical upstream body was a success through one
-		// path and a failure through the other, and the client kept a completed
-		// empty turn in both cases instead of retrying. The upstream's own
-		// status decides the rest: nothing here has been committed yet, so 502
-		// is ours to choose (2026-09-27 audit, round 44, B44-3; round 42,
-		// B42-3).
-		writeAnthropicErr(b.ResponseWriter, http.StatusBadGateway, "api_error", "upstream returned an empty completion")
-		return
-	}
+	// A completion that says nothing — no text, no reasoning, no call the client
+	// could run — never reaches here: noAnswer() above answers it with the 502
+	// this path used to write itself, which is what the ledger row reads for it
+	// too (2026-09-27 audit, round 44, B44-3; round 42, B42-3; round 45,
+	// B45-18).
 	msg := resp.Choices[0].Message
 	content := ""
 	if msg.Content != nil {
@@ -1850,7 +1904,14 @@ func (b *anthropicBridge) finalize() {
 		content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent)
 	}
 	respBlocks := []map[string]any{}
-	if strings.TrimSpace(content) != "" {
+	// A text is content whatever it says: relayDelta relays a content of
+	// whitespace as a text block, so trimming here dropped the text from a
+	// completion this path had already decided is an answer — the client's
+	// context meter was charged output_tokens for a turn whose body it was
+	// never shown, while the stream path and both other legs served the same
+	// text. Not TrimSpace, exactly as documentSaysSomething is not (2026-09-27
+	// audit, round 45, C45-4; round 44 for the same decision about the status).
+	if content != "" {
 		respBlocks = append(respBlocks, map[string]any{"type": "text", "text": content})
 	}
 	// The blocks this turn carries decide its stop_reason, so the loop that
@@ -1881,10 +1942,24 @@ func (b *anthropicBridge) finalize() {
 			// 43, C43-4 pinned the complete-call half).
 			continue
 		}
+		name := firstNonEmptyStr(tc.Function.Name, tc.Name)
+		// A call the upstream did not number is numbered here, by the rule the
+		// stream path mints with. Passing the absent id through emitted a
+		// tool_use block whose "id" is empty: the client answers a call by its
+		// id, so it could never answer this one, and its tool_result went back
+		// with tool_use_id "" — while the same upstream body answered as frames
+		// carried a minted id, and both other legs mint one on this path too, so
+		// a caller that is not streaming lost every tool call on the gateway and
+		// kept them on the local server (2026-09-27 audit, round 45, B45-19 and
+		// C45-1).
+		id := tc.ID
+		if id == "" {
+			id = b.mintedToolCallID(name, firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+		}
 		toolBlocks++
 		respBlocks = append(respBlocks, map[string]any{
-			"type": "tool_use", "id": tc.ID,
-			"name":  firstNonEmptyStr(tc.Function.Name, tc.Name),
+			"type": "tool_use", "id": id,
+			"name":  name,
 			"input": input,
 		})
 	}
@@ -2008,7 +2083,20 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			// The sentinel says the stream ENDED, not that it ever held a turn:
+			// a body terminated by [DONE] with nothing relayed before it is the
+			// empty stream the arms below refuse. When something WAS relayed it
+			// is this stream's completion marker, which is what the client leg
+			// reads it as ([DONE] with `started` or a finish_reason) — see
+			// noAnswer's arm for a stream that ends without either
+			// (2026-09-27 audit, round 45, B45-2).
+			if !b.nothingRelayed() || b.sse.stopMsg != "" {
+				b.sse.finished = true
+			}
 			continue
 		}
 		if !b.sse.startSent {
@@ -2100,10 +2188,20 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			// turn, and only its finish_reason is read.
 			if ch.Message != nil && b.nothingRelayed() {
 				b.relayDelta(*ch.Message)
+				// A whole completion IS the answer, so a frame that carried one
+				// as the first thing the stream said has terminated it even when
+				// no finish_reason frame follows — the same reading the client
+				// leg gives this wire (round 45, B45-2).
+				b.sse.finished = true
 			}
 			b.relayDelta(ch.Delta)
 			if ch.FinishReason != nil && *ch.FinishReason != "" {
 				b.sse.stopMsg = *ch.FinishReason
+				// The upstream said the turn is over. This is the other
+				// completion marker the OpenAI wire uses, and either one is
+				// enough for the stream to count as finished — a connection that
+				// closes with neither was cut off mid-answer (round 45, B45-2).
+				b.sse.finished = true
 			}
 		}
 	}
@@ -2238,6 +2336,42 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			b.lastToolName = name
 			return b.lastToolKey
 		}
+		if b.toolBlocks[key] == nil && name == "" {
+			// An id on a fragment that names NOTHING is not introducing a call:
+			// a call is introduced by its name (see this function's note about a
+			// fragment that carries a NAME), and the client leg's
+			// startsANewToolCall merges exactly here — a fresh id starts a call
+			// only once the accumulator HAS one, and `deltaName == ""` over an
+			// unnumbered call in progress is a continuation. Opening a second
+			// block instead sent the client a tool_use named Bash with input {}
+			// beside the call's real arguments relayed to the agent as prose,
+			// while the leg that merges ran the call the model wrote
+			// (2026-09-27 audit, round 45, B45-1). The block is re-keyed to the
+			// id, so every fragment after this one continues it here too.
+			//
+			// The block's id, not its emptiness, is what the test turns on: the
+			// name alone opens a block, and one opened before the id arrived
+			// carries a MINTED id — which `cur.id == ""` read as "a call that
+			// already has its own id", so the merge never ran for exactly the
+			// wire it was written for and the arguments went to a second block
+			// that could never be opened. A block whose id the UPSTREAM stated
+			// (statedID) is the other case, and there the id is a new call's.
+			// A minted id is replaced by the stated one when the block has not
+			// opened yet, so a tool_result keyed on this call carries the id the
+			// upstream itself used; once content_block_start is out the client
+			// already holds the minted id and it is kept (2026-09-27 audit,
+			// round 45, B45-1).
+			if cur := b.toolBlocks[b.lastToolKey]; cur != nil && !cur.statedID {
+				if !cur.started {
+					cur.id = ""
+				}
+				delete(b.toolBlocks, b.lastToolKey)
+				b.toolBlocks[key] = cur
+				cur.key = key
+				b.lastToolKey = key
+				return key
+			}
+		}
 		if name != "" {
 			b.lastToolName = name
 		}
@@ -2316,6 +2450,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		// the fallback below has the call's own identity to work from.
 		if id != "" && !strings.HasPrefix(tb.key, "?") {
 			tb.id = id
+			tb.statedID = true
 		} else {
 			// A block the split rule minted a key for: the fragment repeated an
 			// id another block already carries, so this block must NOT inherit
@@ -2331,7 +2466,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// is exactly the wire the split rule exists for, and the block the
 			// split minted then came out carrying the very id it was split from
 			// (2026-09-27 audit, round 44, B44-1; round 39, B-F8 for the split).
-			tb.id = gatewayToolCallIDFor(tb.name, tb.args.String())
+			tb.id = b.mintedToolCallID(tb.name, tb.args.String())
 		}
 	}
 	if tb.closed {
@@ -2603,6 +2738,9 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		return false
 	}
 	b.sse.startSent = true
+	// The document IS the turn's completion marker: it is the whole completion,
+	// so nothing is missing from it (round 45, B45-2's rule).
+	b.sse.finished = true
 	b.emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -2634,7 +2772,20 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	if choice.Message.Content != nil && *choice.Message.Content != "" {
 		b.textDelta(*choice.Message.Content)
 	}
+	// A truncated fragment is not a call on this path either. A call the model
+	// was still writing when it hit the token limit is dropped by the
+	// non-stream path (finalize) and by the client leg on both of its paths;
+	// adoption relayed it, so one identical document told the client to run a
+	// tool whose input_json_delta is not JSON — arguments the model never
+	// finished, handed to an agent that would parse them as a call
+	// (2026-09-27 audit, round 45, B45-13). A truncated turn that carries a
+	// COMPLETE call is still a call: the test is the arguments' parseability,
+	// exactly as callInput's other callers ask it.
+	truncated := choice.FinishReason == "length"
 	for i, tc := range choice.Message.ToolCalls {
+		if _, ok := callInput(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments), truncated); !ok {
+			continue
+		}
 		idx := i
 		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name),
 			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
@@ -2894,9 +3045,32 @@ func callInput(raw string, truncated bool) (map[string]any, bool) {
 	return in, true
 }
 
-// gatewayToolCallIDFor mints an id for a tool call this bridge had to name
-// itself, keyed on the call's own identity — its name and its arguments — so
-// that two calls never share one id however the upstream numbered them.
+// mintedToolCallID returns the id for a call this bridge has to number itself,
+// keyed on the call's own identity — its name and its arguments — and distinct
+// for the second and later call that states the same identity.
+//
+// The identity alone is not enough, and round 44's fix for the block the split
+// rule mints rested on it: a model that runs one command twice sends two calls
+// with the same name and the same arguments, which hashed to one id — two
+// tool_use blocks the client can answer only once, and an OpenAI wire that
+// cannot key two tool_results by one tool_call_id. This is the shape round 39's
+// B-F9 rule is about (a bare repeat is a second call), so the pair is kept as
+// two blocks and the second takes the identity of its ordinal, exactly as the
+// local leg's converter does for a list that names the same id-less call twice
+// (anthropic.go, seenInCall: "\x00"+name+"\x00"+args, then that with "#"+n)
+// (2026-09-27 audit, round 45, B45-4 and C45-2).
+func (b *anthropicBridge) mintedToolCallID(name, args string) string {
+	base := "\x00" + name + "\x00" + args
+	n := b.mintedIDs[base]
+	b.mintedIDs[base] = n + 1
+	if n == 0 {
+		return gatewayToolCallIDFor(name, args)
+	}
+	return gatewayToolCallIDFor(name, args+"#"+strconv.Itoa(n))
+}
+
+// gatewayToolCallIDFor mints an id for a tool call from the call's own identity
+// — its name and its arguments.
 //
 // It is the same function the local and client legs mint with
 // (anthropic.ToolCallIDFor, FNV-1a over "\x00"+name+"\x00"+arguments), copied
@@ -2905,6 +3079,11 @@ func callInput(raw string, truncated bool) (map[string]any, bool) {
 // carries the same id, so a tool_result written against one leg's answer is
 // still a valid id if the retry goes through the other (2026-09-27 audit,
 // round 44, B44-1).
+//
+// Two calls sharing one identity are distinguished by the caller, not here:
+// this function is a pure function of what it is given, which is what makes it
+// reproducible, and mintedToolCallID is the rule that keeps two identical calls
+// apart.
 func gatewayToolCallIDFor(name, argsJSON string) string {
 	var h uint32 = 2166136261
 	for _, c := range []byte("\x00" + name + "\x00" + argsJSON) {

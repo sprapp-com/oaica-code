@@ -2603,7 +2603,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		if p := recover(); p != nil {
 			aborted = true
 			rec.finish()
-			g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
+			g.writeLedger(g.entry(rec, m, label, rid, inboundPath(r), stream, start, aborted, *backend, sessionID, isOverage))
 			panic(p)
 		}
 	}()
@@ -2624,7 +2624,26 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		g.lastOKAt.Store(time.Now().Unix())
 		g.calibrator().record(calibKey, msgBytes, rec.usage.PromptTokens)
 	}
-	g.writeLedger(g.entry(rec, m, label, rid, r.URL.Path, stream, start, aborted, *backend, sessionID, isOverage))
+	g.writeLedger(g.entry(rec, m, label, rid, inboundPath(r), stream, start, aborted, *backend, sessionID, isOverage))
+}
+
+// inboundPathKey carries the path the client asked for across the /v1/messages
+// bridge, which rewrites r.URL.Path to reach the upstream's OpenAI wire.
+type inboundPathKey struct{}
+
+// withInboundPath records the path the client asked for on the request
+// context. Call it BEFORE any rewrite of r.URL.Path.
+func withInboundPath(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), inboundPathKey{}, r.URL.Path))
+}
+
+// inboundPath returns the path the client asked for, falling back to the
+// request's current path when nothing was recorded (every direct caller).
+func inboundPath(r *http.Request) string {
+	if p, ok := r.Context().Value(inboundPathKey{}).(string); ok && p != "" {
+		return p
+	}
+	return r.URL.Path
 }
 
 // entry builds the ledger row for one completion.
@@ -2680,6 +2699,18 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	}
 	cached := u.cachedTokens()
 	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
+	// And a turn the client was told FAILED is not a turn this gateway may
+	// charge for at all, whatever the upstream stated about it. The guard above
+	// only ever suppressed this gateway's OWN estimate; the counts the upstream
+	// stated entered u unconditionally, so a 502 row — refused before the client
+	// received an answer — was still booked with a positive cost_usd, and the
+	// overage accounting charges what this row costs: every refused turn was
+	// charged once for nothing served and again for its retry. Zeroed here, at
+	// the one place the row is built, rather than at each failing arm
+	// (2026-09-27 audit, round 45, B45-14).
+	if status != http.StatusOK {
+		cost, tier = 0, 0
+	}
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),
 		RequestID:        rid,

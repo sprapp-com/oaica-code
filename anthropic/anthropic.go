@@ -1077,7 +1077,20 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		})
 	}
 
+	toolBlocks := 0
+	seenInCall := map[string]int{}
 	for _, tc := range r.Message.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			// A call the upstream never named is not a call the client can
+			// make: the block carries the name, and a tool_use whose name is
+			// empty is one Claude Code reports as pending and can never run.
+			// The streaming converter holds such a fragment, the proxy's
+			// streaming path relays its arguments as text, and its
+			// non-streaming path drops it, so this path answering with a
+			// nameless block was the one site that told the client to expect a
+			// call nobody could dispatch (2026-09-27 audit, round 45, A45-1).
+			continue
+		}
 		id := tc.ID
 		if id == "" {
 			// The upstream sent no id (several OpenAI-compatible GGUF backends,
@@ -1089,18 +1102,50 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			// was the third translation site and the only one that did not, so
 			// one upstream turn produced two different blocks depending on
 			// `stream` (2026-09-26 audit, sixteenth round).
+			//
+			// The synthesized id is a function of the call's name and
+			// arguments, so a list that names the same id-less call twice
+			// produced two blocks answering to ONE id — the shape the streaming
+			// converter's comment calls out ("two tool_use blocks with one id
+			// cannot be answered separately"): the client runs one call, sends
+			// one tool_result, and the second block can never be satisfied.
+			// The second and later occurrences take the streaming path's own
+			// rule, the same key and the same "#n" suffix (2026-09-27 audit,
+			// round 45, A45-2).
 			key, _ := json.Marshal(tc.Function.Arguments)
+			base := "\x00" + tc.Function.Name + "\x00" + string(key)
+			n := seenInCall[base]
+			seenInCall[base] = n + 1
 			id = ToolCallIDFor(tc.Function.Name, string(key))
+			if n > 0 {
+				id = ToolCallIDFor(tc.Function.Name, string(key)+"#"+strconv.Itoa(n))
+			}
 		}
+		// `input` is a required field of a tool_use block, and the zero value
+		// of this type marshals to NO key at all (json:",omitzero" with an
+		// unallocated map): a call with no arguments reached the client as a
+		// block it could only read as a nil argument map, while the streaming
+		// converter and the proxy both emit "input":{} for the same turn, so
+		// the client's view of one call depended on `stream` (2026-09-27
+		// audit, round 45, A45-4).
+		input := tc.Function.Arguments
+		if input.Len() == 0 {
+			input = api.NewToolCallFunctionArguments()
+		}
+		toolBlocks++
 		content = append(content, ContentBlock{
 			Type:  "tool_use",
 			ID:    id,
 			Name:  tc.Function.Name,
-			Input: tc.Function.Arguments,
+			Input: input,
 		})
 	}
 
-	stopReason := mapStopReason(r.DoneReason, len(r.Message.ToolCalls) > 0)
+	// The blocks this turn actually carries decide its stop_reason, not the
+	// upstream's stated call list: a turn whose only calls were nameless has no
+	// block for the client to run, and reporting tool_use there told it to wait
+	// for a call it will never receive (round 39's rule on the other two legs).
+	stopReason := mapStopReason(r.DoneReason, toolBlocks > 0)
 
 	return MessagesResponse{
 		ID:         id,
@@ -1164,6 +1209,13 @@ type StreamConverter struct {
 	thinkingDone         bool
 	textStarted          bool
 	toolCallsSent        map[string]bool
+	// statedIDOwner records, per upstream-stated id, the call that id was
+	// first stated for. The OpenAI wire keys a tool_result by tool_call_id, so
+	// an upstream that reuses one id for the turn's second call states two
+	// calls under one key — and deduping on the id alone delivered one
+	// tool_use where the model asked for two, silently, on a turn that still
+	// reported tool_use (2026-09-27 audit, round 45, A45-3).
+	statedIDOwner map[string]string
 }
 
 func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConverter {
@@ -1173,6 +1225,7 @@ func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConve
 		firstWrite:           true,
 		estimatedInputTokens: estimatedInputTokens,
 		toolCallsSent:        make(map[string]bool),
+		statedIDOwner:        make(map[string]string),
 	}
 }
 
@@ -1320,6 +1373,17 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			slog.Error("failed to marshal tool arguments", "error", err, "tool_id", tc.ID)
 			continue
 		}
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			// A call the upstream never named cannot be dispatched: this block
+			// carries the name and there is no second event that does, so the
+			// client was handed a tool_use it can only report as pending
+			// forever. The non-stream converter and the proxy both drop such a
+			// call on the paths that never accumulate, and the proxy's
+			// streaming path relays its arguments as text — this converter was
+			// the site that emitted the nameless block (2026-09-27 audit,
+			// round 45, A45-1).
+			continue
+		}
 
 		// An upstream that omits tool-call ids used to lose calls here: the
 		// dedup map is keyed by id, so every id-less call after the first
@@ -1343,10 +1407,28 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		// distinct id — two tool_use blocks with one id cannot be answered
 		// separately — while a restatement of an already-sent call in a LATER
 		// call still dedups, which is what this map is for.
+		base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
 		key := tc.ID
 		id := tc.ID
+		if key != "" {
+			// An id the upstream states is that call's own — unless it already
+			// stated the same id for a DIFFERENT call. One id reused for two
+			// calls is the wire the client leg's startsANewToolCall splits (and
+			// the gateway leg mints a fresh id for), and treating the repeat as
+			// a duplicate here threw the second call away after the split had
+			// recovered it: the agent ran one of the model's two calls and was
+			// told the turn was a tool call (2026-09-27 audit, round 45,
+			// A45-3). The reused id falls through to the identity-minting
+			// branch below, which is keyed on the call itself and never on a
+			// counter. A restatement of the SAME call under the same id is
+			// still a duplicate, and toolCallsSent below still drops it.
+			if owner, ok := c.statedIDOwner[key]; ok && owner != base {
+				key, id = "", ""
+			} else {
+				c.statedIDOwner[key] = base
+			}
+		}
 		if key == "" {
-			base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
 			n := seenInCall[base]
 			seenInCall[base] = n + 1
 			key = base

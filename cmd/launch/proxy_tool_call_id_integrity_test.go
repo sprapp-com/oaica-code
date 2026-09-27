@@ -128,32 +128,69 @@ func TestTwoDistinctCallsWithoutIDsGetDistinctIDs(t *testing.T) {
 // tool_result satisfies both blocks, and the follow-up request carries two
 // OpenAI tool messages with the same tool_call_id.
 //
-// The streaming path already answers this exact body with ONE block: its
-// accumulator keys on name+arguments (`anthropic.go`, toolCallsSent), so the
-// duplicate is skipped. Both paths translate the same upstream body, so they
-// must agree; the duplicate-id shape is the half that cannot be right
-// (2026-09-26 audit, fourteenth round).
+// This test used to want ONE block, on the claim that the streaming path
+// collapsed the pair into one (its accumulator keyed on name+arguments). That
+// claim was the defect, not the rule: the model asked for two calls, and the
+// agent was handed one, silently, under stop_reason "tool_use". Round 45 gave
+// the streaming converter the same "#n" disambiguation the minted ids already
+// used elsewhere, so both paths now translate this body into two blocks with
+// two ids — the agreement this test exists to check, in the direction that
+// keeps both calls (2026-09-27 audit, round 45, A45-2).
 func TestTwoIdenticalCallsWithoutIDsDoNotShareOneID(t *testing.T) {
-	up := jsonUpstream(t, `{"id":"x","model":"kat-awq","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","function":{"name":"Bash","arguments":"{}"}},{"type":"function","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`)
-	defer up.Close()
-	proxy := startCalibProxy(t, up.URL, "sess-tool-id-identical")
+	const twoIdentical = `{"id":"x","model":"kat-awq","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","function":{"name":"Bash","arguments":"{}"}},{"type":"function","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`
 
-	resp, err := http.Post(proxy+"/v1/messages", "application/json", strings.NewReader(string(calibMessagesBody(t, 32, 64, false))))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-
-	blocks := toolCallBlocks(t, raw)
-	if len(blocks) != 1 {
-		t.Errorf("got %d tool_use block(s) for two identical id-less calls, want 1 — the streaming path emits one for this same body, and two blocks sharing one synthesized id is a protocol violation\n%s", len(blocks), raw)
-	}
-	if len(blocks) > 1 {
+	check := func(t *testing.T, blocks []map[string]any, raw any) {
+		t.Helper()
+		if len(blocks) != 2 {
+			t.Fatalf("got %d tool_use block(s) for two identical id-less calls, want 2: the model asked for two calls and one was dropped, silently, under stop_reason tool_use\n%v", len(blocks), raw)
+		}
 		a, _ := blocks[0]["id"].(string)
 		b, _ := blocks[1]["id"].(string)
+		if a == "" || b == "" {
+			t.Errorf("ids = %q, %q — both must be non-empty\n%v", a, b, raw)
+		}
 		if a == b {
-			t.Errorf("both tool_use blocks carry id %q; a tool_result for it satisfies both\n%s", a, raw)
+			t.Errorf("both tool_use blocks carry id %q; a tool_result for it satisfies both\n%v", a, raw)
 		}
 	}
+
+	t.Run("non-stream", func(t *testing.T) {
+		up := jsonUpstream(t, twoIdentical)
+		defer up.Close()
+		proxy := startCalibProxy(t, up.URL, "sess-tool-id-identical")
+
+		resp, err := http.Post(proxy+"/v1/messages", "application/json", strings.NewReader(string(calibMessagesBody(t, 32, 64, false))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		check(t, toolCallBlocks(t, raw), string(raw))
+	})
+
+	// The same upstream body on the streaming path: the two translations of one
+	// body must agree.
+	t.Run("stream", func(t *testing.T) {
+		up := streamUpstream(t, strings.Join([]string{
+			`data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"Bash","arguments":"{}"}}]}}]}`,
+			"",
+			`data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"Bash","arguments":"{}"}}]}}]}`,
+			"",
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n"), true)
+		defer up.Close()
+		proxy := startCalibProxy(t, up.URL, "sess-tool-id-identical-st")
+		body, status := postMessagesStream(t, proxy)
+		if status != http.StatusOK {
+			t.Fatalf("status=%d\n%s", status, body)
+		}
+		blocks := []map[string]any{}
+		for _, b := range r45ToolUseBlocks(t, body) {
+			blocks = append(blocks, b)
+		}
+		check(t, blocks, body)
+	})
 }
