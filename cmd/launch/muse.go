@@ -173,6 +173,67 @@ func (m *Muse) Paths() []string {
 	return []string{settingsPath}
 }
 
+// DeclaresSelection reports whether muse's settings already hold what a write
+// of models would leave.
+//
+// Written in muse's own vocabulary, like OpenClaw's: a row is written as
+// museCatalogModelID — the daemon-side id of an ollama-cloud catalogue row, not
+// the picker name the launcher saves — so comparing the saved names against
+// what Models() reports could never be true and every launch re-ran the
+// configure path over an unchanged file (2026-09-27 audit, round 31, the defect
+// rounds 25/26 fixed for openclaw and opencode).
+//
+// The endpoint is read too: muse's settings carry ONE endpoint for every
+// catalogue row (endpoint_transport), the writer sets it on every write, and a
+// store naming the daemon this launch is no longer using is not what a write
+// would leave — reading the rows alone left muse talking to an address that no
+// longer serves the model the launch resolved.
+func (m *Muse) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) == 0 {
+		return false
+	}
+	settingsPath, err := museSettingsPath()
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return false
+	}
+	var settings struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		// The global provider switch every catalog row is reached through.
+		EndpointTransport struct {
+			BaseURL string `json:"base_url"`
+		} `json:"endpoint_transport"`
+		ModelCatalog []museCatalogRow `json:"model_catalog"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+
+	held := make([]string, 0, len(settings.ModelCatalog))
+	for _, row := range settings.ModelCatalog {
+		held = append(held, row.ModelID)
+	}
+	want := make([]string, 0, len(models))
+	for _, model := range models {
+		want = append(want, museCatalogModelID(model))
+	}
+	if !sameStoreStrings(held, want) {
+		return false
+	}
+	// The row muse starts, and the provider the rows are declared under, are
+	// both written per selection: a file naming another model as the session's,
+	// or attributing the rows to another provider, is not what a write leaves.
+	if settings.Provider != museProviderID || settings.Model != museCatalogModelID(models[0]) {
+		return false
+	}
+	wantBase := envconfig.ConnectableHost().String() + "/v1"
+	return strings.TrimRight(settings.EndpointTransport.BaseURL, "/") == strings.TrimRight(wantBase, "/")
+}
+
 func (m *Muse) Models() []string {
 	settingsPath, err := museSettingsPath()
 	if err != nil {

@@ -629,11 +629,12 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 	// Cap the partial-line buffer (2026-09-01 audit M5): an upstream
 	// emitting one endless SSE line would otherwise grow tail unboundedly.
 	// Past the cap the remaining line is dropped — its deltas were already
-	// forwarded; only usage extraction from a hypothetical later segment of
-	// the same line is lost.
-	if b.sse.tail.Len() < 1<<20 {
-		b.sse.tail.Write(p)
-	}
+	// forwarded — but nothing later may be: skipping the write once the
+	// buffer was over the cap left it over the cap forever, so translation
+	// stalled after the overlong line instead of resuming with the next one
+	// (2026-09-27 audit, round 31).
+	trimOverlongSSETail(&b.sse.tail, sseTailLimit)
+	b.sse.tail.Write(p)
 	for {
 		raw := b.sse.tail.Bytes()
 		i := bytes.IndexByte(raw, '\n')

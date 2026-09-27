@@ -463,8 +463,9 @@ func TestValidatePullConfig(t *testing.T) {
 		{"short key", base(gwPullEntry{Model: "m", Source: "hf", HFURL: "u", SizeBytes: 1, DecryptKeyHex: "aa"}), "decrypt_key must be 64 hex chars"},
 		{"nonhex key", base(gwPullEntry{Model: "m", Source: "hf", HFURL: "u", SizeBytes: 1, DecryptKeyHex: strings.Repeat("z", 64)}), "decrypt_key is not hex"},
 		{"dupe", gwConfig{PullCatalog: []gwPullEntry{good, good}}, "duplicate model"},
-		{"bad license key", gwConfig{PullLicenseKeys: []gwKey{{SHA256: "short"}}}, "sha256 must be 64 hex chars"},
-		{"nonhex license key", gwConfig{PullLicenseKeys: []gwKey{{SHA256: strings.Repeat("z", 64)}}}, "sha256 is not hex"},
+		{"bad license key", gwConfig{PullLicenseKeys: []gwKey{{SHA256: "short", Label: "lic"}}}, "sha256 must be 64 hex chars"},
+		{"nonhex license key", gwConfig{PullLicenseKeys: []gwKey{{SHA256: strings.Repeat("z", 64), Label: "lic"}}}, "sha256 is not hex"},
+		{"empty license label", gwConfig{PullLicenseKeys: []gwKey{{SHA256: strings.Repeat("b", 64)}}}, "label must be non-empty"},
 		{"empty catalog is fine", gwConfig{}, ""},
 	}
 	for _, tc := range cases {

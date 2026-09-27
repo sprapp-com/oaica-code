@@ -890,26 +890,49 @@ func (p *Pi) Models() []string {
 // piEditDocuments owns and rebuilds, so they are the ones a write of a
 // selection leaves: an entry with no _launch marker is the user's and is
 // carried over untouched.
-func piStoredOwnedIDs(home string) []string {
+// piStoredProvider is what Pi's ollama provider slot holds: the entries this
+// package wrote, and the endpoint and credential the writer sets on the slot
+// itself.
+type piStoredProvider struct {
+	ids     []string
+	api     string
+	baseURL string
+	apiKey  string
+	// present is false when the file holds no ollama provider at all, which is
+	// not the same as one with empty fields: a missing slot is one the writer
+	// creates, so nothing there can be what a write would leave.
+	present bool
+}
+
+func readPiStoredProvider(home string) piStoredProvider {
+	var slot piStoredProvider
 	config, err := fileutil.ReadJSON(filepath.Join(home, ".pi", "agent", "models.json"))
 	if err != nil {
-		return nil
+		return slot
 	}
 	providers, _ := config["providers"].(map[string]any)
-	ollama, _ := providers["ollama"].(map[string]any)
+	ollama, ok := providers["ollama"].(map[string]any)
+	if !ok {
+		return slot
+	}
+	slot.present = true
+	slot.api, _ = ollama["api"].(string)
+	slot.baseURL, _ = ollama["baseUrl"].(string)
+	slot.apiKey, _ = ollama["apiKey"].(string)
 	models, _ := ollama["models"].([]any)
-	var ids []string
 	for _, m := range models {
 		modelObj, ok := m.(map[string]any)
 		if !ok || !isPiOllamaModel(modelObj) {
 			continue
 		}
 		if id, ok := modelObj["id"].(string); ok {
-			ids = append(ids, id)
+			slot.ids = append(slot.ids, id)
 		}
 	}
-	return ids
+	return slot
 }
+
+func piStoredOwnedIDs(home string) []string { return readPiStoredProvider(home).ids }
 
 // DeclaresSelection reports whether Pi's store already holds what a write of
 // models would leave.
@@ -952,7 +975,31 @@ func (p *Pi) DeclaresSelection(models []LaunchModel) bool {
 	}
 	slices.Sort(want)
 	slices.Sort(held)
-	return sameStoreStrings(held, want)
+	if !sameStoreStrings(held, want) {
+		return false
+	}
+	// The slot's address and credential are part of what a write leaves: the
+	// writer sets both whenever the slot is one it wrote (an api value of its
+	// own AND a base URL piEndpointWasOurs recognises). Reading the ids alone
+	// answered "current" for a slot a write would move — the daemon has since
+	// changed address, or the slot still carries an earlier remote launch's
+	// token — so the launch skipped the write and Pi kept dialling the old
+	// endpoint with a credential that does not belong to it (2026-09-27 audit,
+	// round 31; the same field the round-22 warning is about, and the read
+	// cline's store key has carried since round 29).
+	slot := readPiStoredProvider(home)
+	if !slot.present {
+		return false
+	}
+	if slot.api == piProviderAPI && piEndpointWasOurs(slot.baseURL) {
+		if strings.TrimRight(slot.baseURL, "/") != strings.TrimRight(piProviderBaseURL(models), "/") {
+			return false
+		}
+		if slot.apiKey != piProviderKey(models) {
+			return false
+		}
+	}
+	return true
 }
 
 // piPickerNameFor is the inverse of piModelIDFor for an entry on disk: the

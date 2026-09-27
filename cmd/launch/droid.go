@@ -233,6 +233,73 @@ func updateDroidSettings(settingsMap map[string]any, settings droidSettings, mod
 	return settingsMap
 }
 
+// droidStoredOwnedKeys is one key per customModels entry this package wrote:
+// the model id it stores beside the endpoint it points at. That pair is a
+// model's identity in this store — the same id on another endpoint is a
+// different model (round 27's lesson for Cline and opencode) — and only entries
+// droidOwnedEntry recognises are the writer's to rebuild.
+func droidStoredOwnedKeys(home string) []string {
+	data, err := os.ReadFile(filepath.Join(home, ".factory", "settings.json"))
+	if err != nil {
+		return nil
+	}
+	var settings droidSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil
+	}
+	var keys []string
+	for _, m := range settings.CustomModels {
+		if _, owned := droidOwnedEntry(m.APIKey, m.ID, m.Model, m.BaseURL); !owned {
+			continue
+		}
+		keys = append(keys, droidStoreKey(m.Model, m.BaseURL))
+	}
+	return keys
+}
+
+func droidStoreKey(id, baseURL string) string {
+	return id + "\x00" + strings.TrimRight(baseURL, "/")
+}
+
+// DeclaresSelection reports whether Droid's store already holds what a write of
+// models would leave.
+//
+// The comparison is the pair (the id the writer stores, the endpoint it writes
+// beside it), not the picker names Models() translates those entries back into:
+// an ollama-cloud catalogue row is picked as "ollama/gpt-oss" and written as
+// the daemon-side id "gpt-oss:cloud", so the names the launcher saves can never
+// equal what the store holds and every launch re-ran the whole configure path
+// over a config it had just read — the defect rounds 25/26 fixed for OpenClaw
+// and opencode (2026-09-27 audit, round 31). Reading the ids alone was not
+// enough either: the writer sets BaseURL on every write, so a store naming the
+// daemon this launch is no longer using read as current and the launch skipped
+// the write that would have moved it.
+//
+// Ordered, because the writer rebuilds its own entries in selection order and
+// appends the user's own after them: the owned subsequence is the sequence the
+// selection was written in.
+func (d *Droid) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) == 0 {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	want := make([]string, 0, len(models))
+	for _, m := range models {
+		// The same two fields the writer sets, from the same two sources.
+		writeID := droidWriteModelID(m)
+		baseURL := envconfig.ConnectableHost().String() + "/v1"
+		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
+			writeID = ep.UpstreamModel
+			baseURL = ep.BaseURL
+		}
+		want = append(want, droidStoreKey(writeID, baseURL))
+	}
+	return sameStoreStrings(droidStoredOwnedKeys(home), want)
+}
+
 func (d *Droid) Models() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {

@@ -328,6 +328,55 @@ func (v *VSCode) Edit(models []LaunchModel) error {
 	return nil
 }
 
+// ollamaVendorURL is the url of the Ollama vendor entry in
+// chatLanguageModels.json — the ONLY thing Edit writes there, and the address
+// VS Code's chat picker dials. Empty when the file has no such entry, or
+// cannot be read.
+func (v *VSCode) ollamaVendorURL() string {
+	data, err := os.ReadFile(v.chatLanguageModelsPath())
+	if err != nil {
+		return ""
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if vendor, _ := entry["vendor"].(string); vendor == "ollama" {
+			url, _ := entry["url"].(string)
+			return url
+		}
+	}
+	return ""
+}
+
+// DeclaresSelection reports whether VS Code's stores already hold what a write
+// of models would leave.
+//
+// Models() answers out of the SAVED integration state, which is this launcher's
+// own record of what a previous launch wrote: it equals the selection by
+// construction, so a drift term built on it could never see the file Edit
+// writes — a vendor entry pointing at the daemon this launch is no longer using,
+// or one the user deleted by hand, both read as current and the launch skipped
+// the write that would have fixed them (2026-09-27 audit, round 31).
+//
+// The live half is the vendor entry's url; the models live only in the saved
+// state (the vendor entry holds no model list), so that half is still what
+// Models() reports.
+func (v *VSCode) DeclaresSelection(models []LaunchModel) bool {
+	if len(models) == 0 {
+		return false
+	}
+	url := v.ollamaVendorURL()
+	if url == "" {
+		return false
+	}
+	if strings.TrimRight(url, "/") != strings.TrimRight(envconfig.ConnectableHost().String(), "/") {
+		return false
+	}
+	return sameModelSelection(v.Models(), launchModelNames(models))
+}
+
 func (v *VSCode) Models() []string {
 	if !v.hasOllamaVendor() {
 		return nil

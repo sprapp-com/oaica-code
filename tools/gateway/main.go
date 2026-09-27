@@ -1682,13 +1682,12 @@ func (u *usageRecorder) Write(p []byte) (int, error) {
 	if u.stream {
 		// Cap the partial-line buffer (2026-09-01 audit M5): a wedged
 		// upstream emitting one endless SSE line with no newline would grow
-		// tail without limit and OOM the gateway. scanSSE keeps parsing
-		// whatever fits — past the cap usage extraction from an overlong
-		// line is abandoned, but the include_usage close-up chunk is on its
-		// own line anyway.
-		if u.tail.Len() < 1<<20 {
-			u.scanSSE(p)
-		}
+		// tail without limit and OOM the gateway. The trim happens INSIDE
+		// scanSSE, which is also what drains the buffer — gating the call
+		// itself made the cap a one-way door: once the buffer was over the
+		// cap the drain never ran again, so every later line was dropped too
+		// and a served 200 was metered as zero (2026-09-27 audit, round 31).
+		u.scanSSE(p)
 	} else if u.body.Len() < 4<<20 {
 		u.body.Write(p)
 	}
@@ -1703,7 +1702,31 @@ func (u *usageRecorder) Flush() {
 	}
 }
 
+// sseTailLimit bounds the partial-line buffer every SSE scanner keeps between
+// writes (2026-09-01 audit M5).
+const sseTailLimit = 1 << 20
+
+// trimOverlongSSETail keeps that buffer bounded WITHOUT going deaf. When the
+// buffer has reached the limit, the bytes up to and including the last
+// newline are dropped so scanning resumes with the next whole line; a line
+// still incomplete at the limit leaves nothing to resume from, and the bytes
+// that continue it are dropped by this same check on later writes. Dropping
+// the buffer outright — or skipping the scan that drains it — is what stopped
+// usage extraction, and translation, for the whole rest of the stream
+// (2026-09-27 audit, round 31).
+func trimOverlongSSETail(buf *bytes.Buffer, limit int) {
+	if buf.Len() < limit {
+		return
+	}
+	if i := bytes.LastIndexByte(buf.Bytes(), '\n'); i >= 0 {
+		buf.Next(i + 1)
+		return
+	}
+	buf.Reset()
+}
+
 func (u *usageRecorder) scanSSE(p []byte) {
+	trimOverlongSSETail(&u.tail, sseTailLimit)
 	u.tail.Write(p)
 	for {
 		raw := u.tail.Bytes()
@@ -2023,8 +2046,21 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
-			if v, ok := req[k].(float64); ok && int(v) > fitBudget {
-				req[k] = fitBudget
+			// Both shapes: JSON unmarshalling only ever produces float64, but
+			// the output-budget clamp above rewrites the field with a plain
+			// int, and a float64-only assertion silently skipped this clamp on
+			// exactly the requests that ask for more than the window can hold
+			// (2026-09-27 audit, round 31). Same two cases as the maxTokens
+			// read further down, which was fixed the same way.
+			switch v := req[k].(type) {
+			case float64:
+				if int(v) > fitBudget {
+					req[k] = fitBudget
+				}
+			case int:
+				if v > fitBudget {
+					req[k] = fitBudget
+				}
 			}
 		}
 	}

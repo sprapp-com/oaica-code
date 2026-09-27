@@ -156,6 +156,14 @@ func validatePullConfig(cfg gwConfig) error {
 		}
 	}
 	for i, k := range cfg.PullLicenseKeys {
+		// The same check api_keys gets, and for the same reason: an empty
+		// label authenticates by digest and then fails the license gate
+		// (licenseLabel returns ""), so a config that looks fine at load tells
+		// the licensee their correct key is "license_invalid" — with nothing
+		// logged to say why (2026-09-27 audit, round 31).
+		if strings.TrimSpace(k.Label) == "" {
+			return fmt.Errorf("pull_license_keys[%d]: label must be non-empty (an empty label authenticates by digest but then 401s as license_invalid)", i)
+		}
 		if len(k.SHA256) != 64 {
 			return fmt.Errorf("pull_license_keys[%d]: sha256 must be 64 hex chars (got %d)", i, len(k.SHA256))
 		}
