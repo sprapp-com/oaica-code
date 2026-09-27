@@ -2460,6 +2460,13 @@ func conversationBytes(messages []MessageParam, system any) int {
 		system bool
 		text   string // the text the converter writes, for a system entry
 		bytes  int    // the charge for this entry as it stands
+		// sep and joinedSep are the two readings of the blank lines this turn's
+		// content carries (messageShapeBytes): the converter's per-run count the
+		// charge above uses, and the count the JOINED text has, which is the one
+		// len(text) carries. The joined branch needs both, because it subtracts a
+		// text that was measured the second way from a charge taken the first
+		// (round 63, F63-L1-1).
+		sep, joinedSep int
 		// roleBytes is the role part of that charge (messageRoleBytesFor): what
 		// the joined branch must leave off a system turn's extra, whose own role
 		// the merged message already carries (round 62, F62-L1-3).
@@ -2482,7 +2489,7 @@ func conversationBytes(messages []MessageParam, system any) int {
 	mergeable := true
 	carriesContent := false
 	for _, msg := range messages {
-		_, ownRuns, toolResults, resultsStated := messageShapeBytes(msg.Content)
+		sep, ownRuns, toolResults, resultsStated, joinedSep := messageShapeBytes(msg.Content)
 		role := messageRoleBytesFor(msg.Role, ownRuns, toolResults)
 		if strings.EqualFold(msg.Role, "system") {
 			textOnly := systemContentIsTextOnly(msg.Content)
@@ -2525,6 +2532,8 @@ func conversationBytes(messages []MessageParam, system any) int {
 				bytes:       role + countAnyContent(msg.Content),
 				roleBytes:   role,
 				toolResults: toolResults,
+				sep:         sep,
+				joinedSep:   joinedSep,
 			})
 			continue
 		}
@@ -2603,7 +2612,15 @@ func conversationBytes(messages []MessageParam, system any) int {
 			// twice: a 114-byte prompt cost 16 tokens with the turn merged and 14
 			// with the same prompt written with the text already first
 			// (2026-09-28 audit, round 62, F62-L1-3).
-			if extra := e.bytes - (e.roleBytes - e.toolResults*len("tool")) - len(e.text); extra > 0 {
+			//
+			// The blank lines the merge writes ACROSS a result (joinedSep minus
+			// the converter's per-run sep) are charged back here: len(e.text)
+			// carries them, the charge above does not, and subtracting one from
+			// the other billed the turn's result messages two bytes short for
+			// every text its result split off (2026-09-28 audit, round 63,
+			// F63-L1-1).
+			if extra := e.bytes - (e.roleBytes - e.toolResults*len("tool")) - len(e.text) +
+				(e.joinedSep - e.sep); extra > 0 {
 				total += extra
 			}
 		}
@@ -2865,7 +2882,7 @@ func countAnyContent(content any) int {
 // front of it is written with it — so it is counted here too, exactly as the
 // converter writes it.
 func messageJoinSeparatorBytes(content any) int {
-	separators, _, _, _ := messageShapeBytes(content)
+	separators, _, _, _, _ := messageShapeBytes(content)
 	return separators
 }
 
@@ -2906,7 +2923,7 @@ func messageRoleBytesFor(role string, ownRuns, toolResults int) int {
 
 // messageRolesBytes is messageRoleBytesFor over one client message's content.
 func messageRolesBytes(role string, content any) int {
-	_, ownRuns, results, _ := messageShapeBytes(content)
+	_, ownRuns, results, _, _ := messageShapeBytes(content)
 	return messageRoleBytesFor(role, ownRuns, results)
 }
 
@@ -2961,8 +2978,20 @@ func toolResultStatesSomething(blockType, toolUseID string, content any) bool {
 // caller that charges roles (messageRolesBytes) reads these two counts, so the
 // rule about what the converter writes stays in ONE walk (2026-09-28 audit,
 // round 57, F57-L1-3).
-func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsStated int) {
+func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsStated, joinedSeparators int) {
 	run, stated := false, false
+	// jrun is this same walk read for the JOINED text — what the rewrite writes
+	// when it merges the turn's surviving text into one system message. The
+	// converter's runs END at a tool result (flush: the next own block opens a
+	// run of its own and takes no blank line), but joinedMessageText keeps
+	// writing across the result: the two texts a result splits are joined with
+	// the same blank line any other pair is, so ["S1", result, "S2"] is written
+	// "S1\n\nS2" by the merge and was charged its two bytes short. The joined
+	// branch subtracts len(e.text), which carries that blank line, from a charge
+	// the walk had left it out of, so the turn's result messages were billed two
+	// bytes less for every text the result split off (2026-09-28 audit, round
+	// 63, F63-L1-1).
+	jrun := false
 	// flush closes the run the walk is inside: a run that stated anything is a
 	// message of the client's own role.
 	flush := func() {
@@ -2984,7 +3013,11 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 		if run {
 			separators += 2
 		}
+		if jrun {
+			joinedSeparators += 2
+		}
 		run = run || written > 0
+		jrun = jrun || written > 0
 		// An empty text block writes the run nothing, so it does not make the
 		// run a message either — the converter drops a run its empty text left
 		// empty.
@@ -3054,8 +3087,11 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 			if run {
 				separators += 2
 			}
+			if jrun {
+				joinedSeparators += 2
+			}
 			separators += chunk - billed
-			run, stated = true, true
+			run, stated, jrun = true, true, true
 		}
 	}
 
@@ -3201,7 +3237,7 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 	}
 	// The last run is a message too, if it said anything.
 	flush()
-	return separators, ownRuns, toolResults, resultsStated
+	return separators, ownRuns, toolResults, resultsStated, joinedSeparators
 }
 
 // systemBytes charges the system prompt for what the converter WRITES for it.

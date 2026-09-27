@@ -63,11 +63,23 @@ func round52StopReason(t *testing.T, stream string) string {
 	return got
 }
 
-// TestALateFragmentDoesNotCompleteTheTurnsCall is G1. The upstream truncated
-// while the model was still writing the call; the rest of that call arrived
-// after its block had closed and was dropped. The client holds an unterminated
-// input, so the turn is a truncation — not a call.
-func TestALateFragmentDoesNotCompleteTheTurnsCall(t *testing.T) {
+// TestALateFragmentCompletesTheCallItBelongsTo is G1 re-read by round 63. The
+// upstream truncated while the model was still writing the call, and the rest
+// of that call arrived after a SECOND call had opened — the same interleaving
+// round 63's F63-L3-2 is about. Round 52 read the second call's start as
+// closing the first call's block, so the tail was logged and dropped and the
+// turn fell to max_tokens. Round 63's feed rule is that a call whose arguments
+// are still an unfinished object is not closed by the next call's start, which
+// would strand the bytes the client is owed: the tail is delivered, the call
+// reaches the client whole, and — with it whole — the verdict follows the call
+// the client was given, exactly as this bridge's own document arm answers the
+// same turn (round 60's r60DocArm).
+//
+// What round 52 pinned is unchanged and still held: the verdict is taken over
+// the bytes the CLIENT was handed, never over everything the upstream stated.
+// TestATruncatedCallIsNotACall below is that property's own guard, on the
+// same body without the interleaved tail.
+func TestALateFragmentCompletesTheCallItBelongsTo(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -82,7 +94,8 @@ func TestALateFragmentDoesNotCompleteTheTurnsCall(t *testing.T) {
 		io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"Write","arguments":"{\"x\":1}oops"}}]}}]}`+"\n\n")
 		f.Flush()
 		// The rest of the FIRST call's arguments, arriving across the second
-		// call's events — a fragment the client can no longer be handed.
+		// call's events. The index says they are that call's, so they are owed
+		// to the client, and the first call's block is still open to take them.
 		io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":".txt\"}"}}]}}]}`+"\n\n")
 		f.Flush()
 		io.WriteString(w, `data: {"choices":[{"delta":{},"finish_reason":"length"}]}`+"\n\n")
@@ -96,11 +109,43 @@ func TestALateFragmentDoesNotCompleteTheTurnsCall(t *testing.T) {
 	stream := round36Stream(t, srv, round44AskStream)
 
 	acc := round51StreamArgs(t, stream)
-	if got, ok := acc[0]; ok && got != `{"path":"a` {
-		t.Errorf("the client was handed %q for a call it was never told the rest of; the dropped fragment belongs to a closed block and cannot reach it", got)
+	if got, ok := acc[0]; !ok || got != `{"path":"a.txt"}` {
+		t.Errorf("the first call reaches the client as %q, want {\"path\":\"a.txt\"}:\n%s\nits own fragment arrived after the second call opened; the second call's start does not close a block whose arguments are still an unfinished object, or the bytes the model wrote for that call are stranded", got, stream)
+	}
+	if reason := round52StopReason(t, stream); reason != "tool_use" {
+		t.Errorf("the turn's stop_reason is %q, want tool_use:\n%s\nthe client was handed the first call whole, which is what this bridge's own document arm answers the same turn with", reason, stream)
+	}
+}
+
+// TestATruncatedCallIsNotACall is the guard round 52 left behind, and the
+// property its G1 finding is really about: a call the model was cut off inside
+// is not a call. Nothing completes it — no later fragment carries the rest, and
+// nothing follows it — so the client holds an unterminated input and the turn
+// is the upstream's truncation. The verdict is taken over the bytes the client
+// was HANDED; a fragment that arrives after its block closed, or that never
+// arrives, cannot promote it to tool_use.
+func TestATruncatedCallIsNotACall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		io.WriteString(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"path\":\"a"}}]}}]}`+"\n\n")
+		f.Flush()
+		io.WriteString(w, `data: {"choices":[{"delta":{},"finish_reason":"length"}]}`+"\n\n")
+		f.Flush()
+		io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	defer upstream.Close()
+
+	srv := round36Gateway(t, upstream)
+	stream := round36Stream(t, srv, round44AskStream)
+
+	if got, ok := round51StreamArgs(t, stream)[0]; !ok || got != `{"path":"a` {
+		t.Errorf("the truncated call reaches the client as %q, want the unterminated {\"path\":\"a the model wrote", got)
 	}
 	if reason := round52StopReason(t, stream); reason != "max_tokens" {
-		t.Errorf("the turn's stop_reason is %q, want max_tokens:\n%s\nthe upstream truncated mid-call and the fragment that would have completed it was dropped; reporting tool_use promises the client a call the model never finished writing", reason, stream)
+		t.Errorf("the turn's stop_reason is %q, want max_tokens:\n%s\nthe upstream truncated mid-call and nothing completed it; reporting tool_use promises the client a call the model never finished writing", reason, stream)
 	}
 }
 

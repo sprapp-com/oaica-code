@@ -540,7 +540,13 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	var msgs []map[string]any
 	rawMsgs, _ := req["messages"].([]any)
 	if len(rawMsgs) == 0 {
-		return nil, "messages is required"
+		// A conversation with no turns at all — the key absent, or stated as an
+		// empty array — is one empty user turn on both sibling legs: their
+		// converter writes a message carrying the client's role and no content,
+		// and the request is served. Refusing it here made the same body a 400
+		// on this leg and a 200 on the other two, for a turn whose cost is one
+		// word (2026-09-28 audit, round 63, F63-L3-6).
+		rawMsgs = []any{map[string]any{"role": "user", "content": ""}}
 	}
 	for _, rm := range rawMsgs {
 		m, _ := rm.(map[string]any)
@@ -1693,8 +1699,10 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			// ("tool_use block missing required 'id' field"), where this leg put
 			// `"id":""` on the wire and the backend answered a malformed call —
 			// the client then read a tool result for a call it never made
-			// (2026-09-27 audit, round 41, C41-6). server_tool_use is exempt:
-			// the sibling carries it with whatever fields it has.
+			// (2026-09-27 audit, round 41, C41-6). An id and a name are asked of
+			// tool_use alone: server_tool_use is carried by the sibling with
+			// whatever fields it has, and only its `input` is decoded as an
+			// object whatever the block is called (see the check below).
 			if t == "tool_use" {
 				if id == "" {
 					return nil, "tool_use block missing required 'id' field"
@@ -1702,16 +1710,22 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				if name == "" {
 					return nil, "tool_use block missing required 'name' field"
 				}
-				// The sibling decodes this field into a JSON object and fails
-				// the whole request on anything else; re-marshalling it here
-				// wrote the raw string back as a JSON string, so a call whose
-				// arguments the client leg refuses reached the model here with
-				// arguments no tool can parse (2026-09-27 audit, round 42,
-				// C42-6).
-				if in, present := bm["input"]; present && in != nil {
-					if _, isObj := in.(map[string]any); !isObj {
-						return nil, "tool_use block 'input' must be a JSON object"
-					}
+			}
+			// The sibling decodes this field into a JSON object and fails the
+			// whole request on anything else; re-marshalling it here wrote the
+			// raw string back as a JSON string, so a call whose arguments the
+			// client leg refuses reached the model here with arguments no tool
+			// can parse (2026-09-27 audit, round 42, C42-6).
+			//
+			// The check is the FIELD's, not the type's: the sibling's decode
+			// refuses a non-object input whatever the block is called, and the
+			// exemption this arm used to take for server_tool_use turned an
+			// input of 5 into a call whose arguments are the bare scalar 5 — no
+			// tool can parse that, and both sibling legs answer the body 400
+			// (2026-09-28 audit, round 63, F63-L3-5).
+			if in, present := bm["input"]; present && in != nil {
+				if _, isObj := in.(map[string]any); !isObj {
+					return nil, t + " block 'input' must be a JSON object"
 				}
 			}
 			// An input the block does not state at all is a call made with no
@@ -3064,9 +3078,37 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// the same slot identity either way.
 			key = rekeyed
 		}
+		if id != "" && strings.TrimSpace(args) != "" && !restatesCarriedCall(b.toolBlocks[key], id, name, args) {
+			// A stated id names its call wherever the fragment writes it. The
+			// ordinary OpenAI order states the call's id on its introducing
+			// chunk, so its arguments continue at the index that chunk used;
+			// a vendor that numbers its fragments ITSELF (one upstream index
+			// per chunk of the whole turn) states the id again beside the
+			// bytes, and the slot those bytes are written at is then a slot
+			// this call never opened — the bridge keyed the fragment by the
+			// index and opened a block for a call the upstream never named
+			// there, while the call it DOES name stayed at the index of its
+			// introduction holding half its arguments: the client ran Bash
+			// with the input `{"cmd":` and the rest of its arguments were
+			// relayed as prose, where the document arm of the same body and
+			// the client leg both answer the whole call. The client leg asks
+			// this of its own slots (openSlotStating, the slot of the open
+			// call whose id this is); only a call still being written is
+			// reached, so a repeat of a call's FINISHED arguments is left to
+			// the split below — which is what tells a vendor reusing one id
+			// for the turn's calls (round 43's B43-3) from this wire
+			// (2026-09-28 audit, round 63, F63-L3-3).
+			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
+				!argsAreFinished(carried.args.String()) {
+				b.lastToolKey = carried.key
+				return carried.key
+			}
+		}
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
 			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
-				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args))) {
+				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args)) ||
+				(id != "" && name != "" && strings.TrimSpace(args) == "" && tb.statedID && id == tb.id &&
+					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && argsAreFinished(tb.args.String()))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
 			// begins the next one. Two things can say so, and only these two: a
 			// stated id this block does not hold (round 43's B43-3, the shape
@@ -3783,13 +3825,6 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 				b.indexKeys[0] = key
 			}
 		}
-		if name != "" {
-			// This fragment introduces a call, so the calls before it will not
-			// state another argument: any of them still waiting to be numbered
-			// is numbered now, and takes its index before this one
-			// (releaseHeldToolBlocks).
-			b.releaseHeldToolBlocks(tb)
-		}
 	}
 	if restatesCarriedCall(tb, id, name, args) {
 		// The call already carried, listed again under its own id: its arguments
@@ -3907,8 +3942,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// second call's start has already opened and closed can never receive
 			// those bytes (round 39's B-F7 for the closed-block case: the client
 			// ran the first call with NO input while its arguments were dropped).
-			// Held until a fragment states its first bytes, until a later call
-			// takes its arguments (releaseHeldToolBlocks), or until the turn ends
+			// Held until a fragment states its first bytes or until the turn ends
 			// (finishStream), which opens it with its empty input.
 			return
 		}
@@ -3919,8 +3953,17 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// arrives on one fragment and the arguments on the next, and on
 			// that wire the mint hashed the empty prefix. Held until the
 			// object closes (the arguments stated so far follow in one delta
-			// below), until a fragment introduces the NEXT call (releaseHeldToolBlocks),
-			// or until the turn ends (finishStream).
+			// below) or until the turn ends (finishStream).
+			return
+		}
+		if b.waitsForEarlierToolCall(tb) {
+			// An earlier call has not opened yet: this one waits for it, so the
+			// client's list keeps the order the upstream wrote (F63-L3-1).
+			return
+		}
+		if b.openBlockStillWriting(tb) {
+			// The call in progress has arguments left to write: opening this one
+			// would close it mid-object and strand them (F63-L3-2).
 			return
 		}
 		b.closeOpen()
@@ -4064,28 +4107,60 @@ func finishedObjectArgs(raw string) bool {
 	return strings.HasPrefix(s, "{") && json.Valid([]byte(s))
 }
 
-// releaseHeldToolBlocks opens every block that was waiting to be numbered, ahead
-// of the call whose fragment has just arrived. A fragment that NAMES a call
-// introduces it, so any earlier call that had not stated a finished argument
-// list will not state one — its arguments are whatever it wrote — and its block
-// takes the index the wire gives it, before the new call's rather than after
-// (the blocks are opened in the order the calls appear, as both other legs
-// deliver them).
-func (b *anthropicBridge) releaseHeldToolBlocks(except *toolBlock) {
-	for _, tb := range b.toolOrder {
-		if tb == except || tb.started || tb.merged || tb.name == "" {
-			continue
+// waitsForEarlierToolCall reports whether the block about to open has a call
+// before it that has not opened yet, so that call keeps its place.
+//
+// A block that is held — a call whose fragment stated no arguments yet, or one
+// this bridge still has to number from arguments that are not all in — opens
+// later than the fragment that introduced it, and the index it takes is the
+// index of the moment it opens (nextIdx; an index is the wire's slot identity,
+// and this bridge's blocks are numbered in the order their events go out). So a
+// call that opened while an earlier one was still held took the earlier call's
+// place in the client's list: a turn whose first call stated no arguments and
+// whose second stated them whole reached the client with the two calls SWAPPED
+// — [Read, Bash] where the document arm of the same body, the client leg's
+// slots and the upstream's own order all say [Bash, Read] (2026-09-28 audit,
+// round 63, F63-L3-1, a regression of round 62's hold). Waiting here is what
+// the hold's own release always relied on: a later call is written into its
+// block whatever the block is doing, so nothing of it is lost by waiting, and
+// the held call opens the moment its own arguments arrive or, if they never do,
+// at the end of the turn (finishStream), which opens the waiting calls behind
+// it in this same order.
+func (b *anthropicBridge) waitsForEarlierToolCall(tb *toolBlock) bool {
+	for _, earlier := range b.toolOrder {
+		if earlier == tb {
+			return false
 		}
-		if !tb.needsMint {
-			continue
-		}
-		b.closeOpen()
-		b.flushHeldText()
-		b.closeOpen()
-		if b.startToolBlock(tb) {
-			b.flushToolArgs(tb)
+		if !earlier.started && !earlier.merged && earlier.name != "" {
+			return true
 		}
 	}
+	return false
+}
+
+// openBlockStillWriting reports whether the block currently open is a tool call
+// whose arguments are an unfinished JSON object — the one state in which opening
+// anything would strand the rest of them. The block's stop is the only event
+// that can close it and the Anthropic wire has no way to reopen one, so a block
+// closed mid-object leaves the client a tool_use whose partial_json stops inside
+// the object: unparseable JSON under a stop_reason of tool_use, while the same
+// body's document arm and the client leg both carry the whole call.
+//
+// textDelta has held narration for exactly this reason since round 37's B-F1
+// (the same test, json.Valid over the trimmed text); this is that rule for the
+// other kind of block that can arrive while a call is open — a second tool call,
+// which is the ordinary interleaved-parallel wire (`{"cmd":` at one index,
+// `{"p":` at another, then each call's tail). Opening the second call closed the
+// first, and the first call's tail was refused by the closed-block guard
+// (round 39's B-F7), so the client ran Bash with the input `{"cmd":` while the
+// document arm of the same body ran it with `{"cmd":"ls"}` (2026-09-28 audit,
+// round 63, F63-L3-2). Freeform arguments are not this case: they are delivered
+// once, whole, and count as finished (see argsAreFinished).
+func (b *anthropicBridge) openBlockStillWriting(tb *toolBlock) bool {
+	if b.cur == nil || b.cur.tool == nil || b.cur.tool == tb {
+		return false
+	}
+	return !argsAreFinished(b.cur.tool.args.String())
 }
 
 // startToolBlock emits the content_block_start for one tool call, once, and

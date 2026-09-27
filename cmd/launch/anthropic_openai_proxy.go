@@ -2610,12 +2610,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		args strings.Builder
 	}
 	toolAccums := map[int]*toolAccum{}
+	// toolArrival is the order the stream first wrote each slot — the order the
+	// calls were INTRODUCED, which is the order flushToolCalls hands them to the
+	// client. The slot is the upstream's own index whenever it states one, so
+	// ordering by slot ordered by that index: an upstream whose fragment order
+	// and stated positions disagree (the call at index 1 written before the call
+	// at index 0) had its calls delivered in an order its own whole-completion
+	// document does not use — where this arm hands the client [b, a], the
+	// whole-list arm reads the array and answers [a, b], and the gateway leg
+	// keeps the wire's own order on both its arms (2026-09-28 audit, round 63,
+	// F63-L2-1).
+	toolArrival := map[int]int{}
+	nextToolArrival := 0
 	// nextFreeToolSlot is the slot for a call the upstream gave none: one that
 	// omits the index entirely, or one that states an index already carrying a
 	// different call. It is kept above every index the stream has stated, so a
-	// numbered call can never land on a slot another call owns, and
-	// flushToolCalls' ascending-slot order stays the order the model wrote the
-	// calls in (2026-09-28 audit, round 58, F58-L3-2).
+	// numbered call can never land on a slot another call owns (2026-09-28
+	// audit, round 58, F58-L3-2).
 	nextFreeToolSlot := 0
 	// lastToolSlot is the slot of the call this stream last named, so an
 	// index-less argument continuation is written into THAT call and not into
@@ -2873,15 +2884,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		if len(toolAccums) == 0 {
 			return
 		}
-		// Stable order by index.
+		// Stable order by the order the calls were introduced. The slot the
+		// fragment stated is the upstream's own index, and sorting by it put the
+		// calls in the order that index names rather than the order the stream
+		// wrote them: an upstream whose two disagree had this arm answer [b, a]
+		// where its own whole-completion document and the gateway leg both answer
+		// [a, b]. A slot with no recorded arrival (which cannot happen — every
+		// accumulator is created through the one site that records it) sorts
+		// last, so the order stays total whatever the map holds.
 		indices := make([]int, 0, len(toolAccums))
 		for i := range toolAccums {
 			indices = append(indices, i)
 		}
+		arrival := func(slot int) int {
+			if n, ok := toolArrival[slot]; ok {
+				return n
+			}
+			return nextToolArrival
+		}
 		// Simple sort.
 		for i := 0; i < len(indices); i++ {
 			for j := i + 1; j < len(indices); j++ {
-				if indices[j] < indices[i] {
+				if arrival(indices[j]) < arrival(indices[i]) {
 					indices[i], indices[j] = indices[j], indices[i]
 				}
 			}
@@ -2970,6 +2994,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// adopt paths, so the two agree (round 23).
 		streamedText += toolCallArgumentsSize(tcs)
 		toolAccums = map[int]*toolAccum{}
+		// The arrival order is the map's own lifetime: a slot written again
+		// after this flush is a call of the next turn's output, not one of these.
+		toolArrival = map[int]int{}
+		nextToolArrival = 0
 		if len(tcs) == 0 {
 			// Every accumulated call was a truncated fragment. Emitting an
 			// empty ToolCalls response would still make the converter say
@@ -3421,6 +3449,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				if !exists {
 					acc = &toolAccum{}
 					toolAccums[slot] = acc
+					toolArrival[slot] = nextToolArrival
+					nextToolArrival++
 				}
 				if exists && restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) {
 					// The call this slot already carries, listed again: its
