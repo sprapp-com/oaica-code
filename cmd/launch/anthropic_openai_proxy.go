@@ -816,6 +816,29 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		}
 	}
 	for _, tc := range tcs {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			// A call the upstream never named is not a call on this path either:
+			// its arguments reach the client as TEXT (relayUnnamedCallArguments,
+			// the same fate the streaming arm gives such a fragment, and the one
+			// both other legs' arms give it), so no block is built from it — and,
+			// because no block is built, the id it states is not this call's to
+			// claim. Claiming it here made an entry the client never sees decide
+			// the id of a call it does: an upstream that numbers its first
+			// fragment and then states that id again for the call itself (a
+			// nameless fragment carrying the arguments, the call carrying the
+			// name) reached the client with the stated id on the local server's
+			// two paths and on this bridge's own whole-list arm, and with a
+			// MINTED one here, because the reuse rule below read the dropped
+			// fragment as the id's first owner — the id the model's call actually
+			// answered to was gone, and two legs answered one body with two
+			// different ids (2026-09-28 audit, round 65, F65-L2-2).
+			//
+			// The pre-pass above still records such an entry's id: it exists so a
+			// minted id cannot land on an id the wire states, which is a question
+			// about the TEXT of the turn and not about who owns it (the local
+			// server's ToMessagesResponse reserves exactly the same way).
+			continue
+		}
 		var args api.ToolCallFunctionArguments
 		raw := strings.TrimSpace(tc.Function.Arguments)
 		if raw == "" {

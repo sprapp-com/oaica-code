@@ -3248,6 +3248,29 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			}
 			if tb := b.toolBlocks[key]; tb == nil || strings.TrimSpace(tb.args.String()) == "" ||
 				argsAreFinished(tb.args.String()) {
+				if len(b.indexChain[*upIdx]) == 0 {
+					// The index has named no call at all, so there is no chain to
+					// walk: the vendor numbered its own fragments and closed the
+					// call's object at an index of its own choosing, one it never
+					// used to introduce anything. The only call such a fragment can
+					// belong to is the one still being written — and it does belong
+					// to it exactly when appending its bytes yields JSON, which is
+					// the same test the argument write itself asks. Without this
+					// the closing byte opened a block of its own that names nothing
+					// and was relayed to the client as assistant prose while the
+					// call it finishes reached it unterminated, under a stop_reason
+					// of tool_use: the client ran the tool with `{"cmd":"ls"` on the
+					// fragment arm and with `{"cmd":"ls"}` on every other arm of the
+					// same body (2026-09-28 audit, round 65, R65-L3-1). A fragment
+					// whose bytes do NOT complete the open call is a call of its
+					// own — the vendor that opens a fresh call rather than closing
+					// one — and still opens its own block below.
+					if last := b.toolBlocks[b.lastToolKey]; b.lastToolKey != "" && b.lastToolKey != key && last != nil &&
+						!argsAreFinished(last.args.String()) &&
+						json.Valid([]byte(strings.TrimSpace(last.args.String())+strings.TrimSpace(args))) {
+						key = b.lastToolKey
+					}
+				}
 				for _, k := range b.indexChain[*upIdx] {
 					held := b.toolBlocks[k]
 					if k == newest || held == nil || argsAreFinished(held.args.String()) {
@@ -3328,6 +3351,25 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		// (2026-09-27 audit, round 43, B43-3). An id no block carries yet is a
 		// new call outright, which is why this asks only about a key already
 		// accumulated.
+		if tb := b.toolBlocks[key]; tb != nil && !namesItself(tb) && name != "" && strings.TrimSpace(args) != "" &&
+			!callArgsExtend(tb.args.String(), args) {
+			// A fragment that NAMES itself over a block that has never named
+			// itself, whose bytes the block's arguments cannot take, is the next
+			// call — this arm's reading of the clause the index arm already
+			// applies (its third split clause). The block is not a call (a
+			// fragment that names nothing opens none), so its bytes are not this
+			// call's arguments: they stay where they are and are relayed as the
+			// model's own text, and the call keeps the arguments the upstream
+			// wrote for it. Named instead, the block took the name and the
+			// fragment's object was refused at the write: the client ran the tool
+			// with `{}`, the model's real call did not exist, and the prose the
+			// whole-list arm relays for the nameless entry was never written
+			// either (2026-09-28 audit, round 65).
+			b.synthSeq++
+			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+			b.lastToolName = name
+			return b.lastToolKey
+		}
 		if b.toolBlocks[key] != nil && b.splitFromCurrent(key, name, args) {
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
@@ -3530,6 +3572,18 @@ func (b *anthropicBridge) noteIndexKey(idx int, key string) {
 	b.indexChain[idx] = append(b.indexChain[idx], key)
 }
 
+// namesItself reports whether a block is a CALL: content_block_start is the
+// only event that carries a name and a start without one can never be
+// corrected, so a fragment that names nothing opens no block of its own and its
+// arguments reach the client as text (round 39's B-F8, round 45's B45-1, round
+// 55). The whole-list arm and both other legs treat a nameless entry the same
+// way, which is why the id such a fragment states is not one this block holds:
+// the call that DOES name itself, and states that very id, must still reach the
+// client under the id the upstream wrote for it (2026-09-28 audit, round 65).
+func namesItself(tb *toolBlock) bool {
+	return strings.TrimSpace(tb.name) != ""
+}
+
 // idHeldByAnotherCall reports whether a call block other than the one keyed by
 // id's own key already carries this id — a minted id from an id-less call, or
 // an id the upstream stated for a different call. Two blocks under one id
@@ -3555,7 +3609,7 @@ func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
 func (b *anthropicBridge) idHeldByASeparateCall(tb *toolBlock, id string) bool {
 	mine, settled := settledIdentity(tb)
 	for _, other := range b.toolOrder {
-		if other == tb || other.merged || other.key == "!"+id || other.id != id {
+		if other == tb || other.merged || other.key == "!"+id || other.id != id || !namesItself(other) {
 			continue
 		}
 		if settled && other.statedID {
@@ -4198,7 +4252,7 @@ func (b *anthropicBridge) startToolBlock(tb *toolBlock) bool {
 	if tb.started || tb.merged {
 		return false
 	}
-	if other := b.blockCarrying(tb.id, tb); other != nil {
+	if other := b.blockCarrying(tb.id, tb); other != nil && namesItself(other) {
 		// The id this call is about to carry is one another block already
 		// carries, and the client can answer a tool_use only once: two blocks
 		// under one id get one tool_result for two calls. What that makes this

@@ -36,7 +36,7 @@ func TestAWebSearchResultsFrameIsChargedLikeItsToolResultTwin(t *testing.T) {
 		},
 	})
 	for _, id := range []string{"c1", "c1234567890"} {
-		want := len(`"tool_use_id":"` + id + `",`)
+		want := len(`"tool_use_id":"` + id + `"`)
 		with := countContentBlock(ContentBlock{
 			Type:      "web_search_tool_result",
 			ToolUseID: id,

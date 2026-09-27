@@ -95,13 +95,16 @@ func TestAToolResultOnlyTurnIsChargedForItsMessage(t *testing.T) {
 // tool_call_id key at all — so the charge must move exactly by the key an id
 // adds, and not by bytes no body wrote.
 func TestAnIdlessToolResultFrameStatesNoId(t *testing.T) {
-	if _, stated := toolResultFrame("tool_result", "")["tool_use_id"]; stated {
+	if _, stated := toolResultFrame("")["tool_use_id"]; stated {
 		t.Errorf("F61-L1-4: the frame states a tool_use_id for a body that wrote none: the message the block becomes writes its tool_call_id with omitempty, so the key is not in the prompt (2026-09-28 audit, round 61)")
 	}
-	noID := toolResultBytes(toolResultFrame("tool_result", ""), "out")
+	noID := toolResultBytes(toolResultFrame(""), "out")
 	for _, id := range []string{"c1", "c1234567890"} {
-		want := len(`"tool_use_id":"` + id + `",`)
-		if got := toolResultBytes(toolResultFrame("tool_result", id), "out") - noID; got != want {
+		// The frame states the body's type nowhere: a tool_result and a
+		// web_search_tool_result convert to the same message, so the frame is the
+		// id and nothing else and the id adds exactly its key (round 65, F65-L1-1).
+		want := len(`"tool_use_id":"` + id + `"`)
+		if got := toolResultBytes(toolResultFrame(id), "out") - noID; got != want {
 			t.Errorf("F61-L1-4: a %d-byte id adds %d bytes to a tool_result's charge, want the %d bytes the key writes (2026-09-28 audit, round 61)", len(id), got, want)
 		}
 	}
