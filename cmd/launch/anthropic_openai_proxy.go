@@ -752,11 +752,16 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 		chatResp.DoneReason = mapFinishReason(c.FinishReason)
 	}
 	if resp.Usage != nil {
-		// Anthropic semantics: input_tokens is the UNCACHED part; the cached
-		// prefix is reported separately as cache_read_input_tokens (see
-		// anthropic.Usage) so a client's input+cache_read sum is the real
-		// prompt length -- neither double-counted nor missing.
-		chatResp.Metrics.PromptEvalCount = resp.Usage.PromptTokens - resp.Usage.cachedTokens()
+		// The TOTAL prompt, uncached included: Metrics is the shape
+		// anthropic.UsageFromMetrics splits, and it derives input_tokens as
+		// total minus the cache read. Pre-subtracting the cached part here
+		// made that function subtract it a second time and report
+		// input_tokens 0 for a prompt the cache had served — a 5000-token
+		// prompt with 4096 cached arrived at the client as {input 0,
+		// cache_read 904} (2026-09-26 audit follow-up). The call site pairs
+		// this with PromptEvalCachedCount, so input+cache_read is the real
+		// prompt length: neither double-counted nor missing.
+		chatResp.Metrics.PromptEvalCount = resp.Usage.PromptTokens
 		chatResp.Metrics.EvalCount = resp.Usage.CompletionTokens
 	}
 	return chatResp
