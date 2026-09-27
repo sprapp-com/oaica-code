@@ -2691,15 +2691,27 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 
 	// canExtend reports whether a fragment's argument bytes can still be more of
 	// the call whose arguments have accumulated as accArgs — the one question
-	// that decides whether appending them is a continuation or damage. An object
-	// in progress takes more of itself; a COMPLETE object takes nothing (two of
-	// them never concatenate into JSON, and neither does an object onto a
-	// finished one); a freeform line — the model's whole command, delivered once
-	// (round 51's G1) — takes more of the same line and not the beginning of an
-	// object. Appending bytes that cannot be more of a call handed clients
-	// `{"b":{"c":3}2}` and `{"_raw":"echo hi{\"c\":3}"}` for calls the model
-	// never made, and the same bodies' whole-list arms answer them with the
-	// calls the model did make (2026-09-28 audit, round 61, F61-L2-4, F61-L2-5).
+	// that decides whether appending them is a continuation or damage. A COMPLETE
+	// object takes nothing (two of them never concatenate into JSON); an object
+	// in progress takes more of itself, INCLUDING a nested object — `{"query":`
+	// ++ `{"sql":"select 1"}` ++ `,"limit":10}` is one call's value in progress
+	// and the same vendor's document holds that whole string; a freeform line —
+	// the model's whole command, delivered once (round 51's G1) — takes more of
+	// the same line and not the beginning of an object, where a fragment after a
+	// finished object is the NEXT call and the slot rules above own it
+	// (2026-09-28 audit, round 61, F61-L2-4, F61-L2-5).
+	//
+	// What this predicate cannot do is split one call's fragments from two calls
+	// that share them: `{"b":` ++ `{"c":3}` is a nested value to an object in
+	// progress and a second call to a vendor that reuses its slots, and the bytes
+	// are the same either way. The reading taken here is the one that agrees with
+	// the SAME upstream's whole-list arm, where the turn's calls are separate
+	// entries: fragments of one call are the pieces of that call's argument
+	// string, so their concatenation is what the document holds — `{"b":` ++
+	// `{"c":3}` ++ `2}` is `{"b":{"c":3}2}` on both arms, and it is only the
+	// SLOT the fragment states that lets this arm tell two calls apart
+	// (2026-09-28 audit, round 62; the append site is NOT guarded by the document
+	// arm, which holds the same concatenation).
 	canExtend := func(accArgs, delta string) bool {
 		a := strings.TrimSpace(accArgs)
 		d := strings.TrimSpace(delta)
@@ -2710,9 +2722,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			return false
 		}
 		if strings.HasPrefix(a, "{") {
-			// An object the model is still writing: only more of that object —
-			// a fragment that is itself a whole object cannot be part of one.
-			return !finishedObjectArgs(d)
+			return true
 		}
 		return !strings.HasPrefix(d, "{")
 	}
@@ -3227,7 +3237,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// the newest call has received none of its own: a fragment
 					// arriving after that one has started belongs to it.
 					if tc.ID == "" && tc.Function.Name == "" {
-						if acc, exists := toolAccums[slot]; exists && strings.TrimSpace(acc.args.String()) == "" {
+						if acc, exists := toolAccums[slot]; exists &&
+							(strings.TrimSpace(acc.args.String()) == "" || argsFinished(acc.args.String())) {
+							// The index names the call the vendor wrote into it
+							// last, and that call is either waiting for its
+							// arguments (the vendor feeds its calls in the order
+							// it introduced them, so the newest is fed last) or
+							// already done with them (the vendor's newest call
+							// closed while an earlier one it named is still
+							// open). Either way the fragment belongs to the
+							// EARLIEST call this index named that is still
+							// waiting — the same answer the gateway leg's chain
+							// gives, and without it the client ran the first call
+							// with NO input while this call's own arguments were
+							// dropped at the write (2026-09-28 audit, round 62).
 							for _, s := range indexChain[*tc.Index] {
 								if a, ok := toolAccums[s]; ok && s != slot && !argsFinished(a.args.String()) {
 									slot = s

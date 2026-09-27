@@ -2460,6 +2460,10 @@ func conversationBytes(messages []MessageParam, system any) int {
 		system bool
 		text   string // the text the converter writes, for a system entry
 		bytes  int    // the charge for this entry as it stands
+		// roleBytes is the role part of that charge (messageRoleBytesFor): what
+		// the joined branch must leave off a system turn's extra, whose own role
+		// the merged message already carries (round 62, F62-L1-3).
+		roleBytes int
 		// toolResults counts the blocks of this turn that become their OWN
 		// role-"tool" messages (see the rewrite's charge below).
 		toolResults int
@@ -2519,6 +2523,7 @@ func conversationBytes(messages []MessageParam, system any) int {
 				system:      true,
 				text:        text,
 				bytes:       role + countAnyContent(msg.Content),
+				roleBytes:   role,
 				toolResults: toolResults,
 			})
 			continue
@@ -2591,7 +2596,14 @@ func conversationBytes(messages []MessageParam, system any) int {
 		// round 61, F61-L1-2; round 60 had already taught the same arm to count a
 		// stated result as content so the fallback is not taken).
 		if e.toolResults > 0 {
-			if extra := e.bytes - len(e.text); extra > 0 {
+			// What this turn keeps beside the merged text: the result messages,
+			// which are charged their own role ("tool", one per result) — and NOT
+			// the turn's own role, which the merged system message is charged for
+			// once below. Charging it as well billed the same prompt its role
+			// twice: a 114-byte prompt cost 16 tokens with the turn merged and 14
+			// with the same prompt written with the text already first
+			// (2026-09-28 audit, round 62, F62-L1-3).
+			if extra := e.bytes - (e.roleBytes - e.toolResults*len("tool")) - len(e.text); extra > 0 {
 				total += extra
 			}
 		}
@@ -3367,12 +3379,16 @@ func countContentItemIn(item any, ctx chargeContext) int {
 		// kilobytes of opaque blob billed against a wire holding a title, a URL
 		// and a newline, on an estimate that seeds the client-visible
 		// input_tokens (2026-09-27 audit, round 41, A41-3; the decoded arm was
-		// the last spelling still doing it, round 61, F61-L1-3).
+		// the last spelling still doing it, round 61, F61-L1-3). The frame is
+		// charged too, from the same reader the typed arm uses, so the two
+		// spellings of one block stay one charge (round 62, F62-L1-1).
 		//
 		// A NESTED one — inside a tool result or a passage list — never reaches
 		// this arm: those carriers return above, through the readers that
 		// describe what the converter writes for them.
-		total += len(formatWebSearchToolResultContent(m["content"]))
+		id, _ := m["tool_use_id"].(string)
+		total += frameBytes(toolResultFrame("web_search_tool_result", id)) +
+			len(formatWebSearchToolResultContent(m["content"]))
 	}
 	return total
 }
@@ -3449,11 +3465,18 @@ func countItemsIn(content any, ctx chargeContext) int {
 // at 4 bytes measured 148 against a 156-byte wire, i.e. the charge tracked the
 // payload rather than the notice (2026-09-27 audit, round 42, A42-2/A42-6).
 func toolResultBytes(frame map[string]any, content any) int {
-	total := 0
+	return frameBytes(frame) + toolResultContentBytes(content)
+}
+
+// frameBytes charges one converted block's frame — the JSON the counter builds
+// as a stand-in for the keys the message carries BESIDE its content, with the
+// transport's escapes subtracted (a call id of 2 000 quotes is decoded by the
+// receiver, so serializing it raw billed the encoding twice over).
+func frameBytes(frame map[string]any) int {
 	if data, err := json.Marshal(frame); err == nil {
-		total += len(data) - jsonEscapeOverhead(data)
+		return len(data) - jsonEscapeOverhead(data)
 	}
-	return total + toolResultContentBytes(content)
+	return 0
 }
 
 // toolResultFrame is the part of a tool_result the converter writes beside its
@@ -3930,8 +3953,15 @@ func countContentBlock(block ContentBlock) int {
 		// seeds the client-visible input_tokens, so the session's context meter
 		// and auto-compaction read a prompt the model was never sent
 		// (2026-09-27 audit, round 41, A41-3). Charge what the converter
-		// writes, through the very function that writes it.
-		total += len(formatWebSearchToolResultContent(block.Content))
+		// writes, through the very function that writes it — and charge the
+		// FRAME beside it, which is the same frame its tool_result twin is
+		// charged: the message this block becomes writes its tool_call_id with
+		// the content, so a stated id is prompt bytes the hits alone do not
+		// cover. Charging the hits alone left the estimate 20 bytes behind the
+		// wire the moment the block stated one (2026-09-28 audit, round 62,
+		// F62-L1-1).
+		total += frameBytes(toolResultFrame(block.Type, block.ToolUseID)) +
+			len(formatWebSearchToolResultContent(block.Content))
 	}
 	return total
 }

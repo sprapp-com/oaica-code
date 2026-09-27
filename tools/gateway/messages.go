@@ -1965,6 +1965,15 @@ type anthropicBridge struct {
 	// of them relayed to the client as prose beside a truncated tool_use
 	// (2026-09-28 audit, round 58, F58-L3-1).
 	indexKeys map[int]string
+	// indexChain is every block key one stated index has named, in the order the
+	// index named them. indexKeys holds only the NEWEST of them, which is what a
+	// fragment stating arguments alone continues when the newest has received
+	// none of its own — but the vendor that writes ONE index for every call of
+	// the turn streams its calls' arguments in the order the calls were
+	// introduced, so the newest is named first and fed LAST, and the fragment
+	// that belongs to an earlier call has to be able to find it (2026-09-28
+	// audit, round 62; the client leg's indexChain is the same list).
+	indexChain map[int][]string
 	// synthSeq mints keys for calls whose upstream states neither an index nor
 	// an id, so two such calls cannot share a block.
 	synthSeq int
@@ -3119,10 +3128,7 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// F59-L3-1). The index is the wire's own slot identity, and the slot
 			// holds the newest call written into it — there is no other reading
 			// under which the second call's own fragments are reachable.
-			if b.indexKeys == nil {
-				b.indexKeys = map[int]string{}
-			}
-			b.indexKeys[*upIdx] = b.lastToolKey
+			b.noteIndexKey(*upIdx, b.lastToolKey)
 			return b.lastToolKey
 		}
 		if tb := b.toolBlocks[key]; tb != nil && id == "" && name == "" &&
@@ -3156,12 +3162,33 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		if name != "" {
 			b.lastToolName = name
 		}
-		if b.indexKeys == nil {
-			b.indexKeys = map[int]string{}
+		if b.indexChain != nil && id == "" && name == "" {
+			// A nameless fragment that has nowhere to go where the index put it:
+			// the block there has received nothing of its own (the index names
+			// the NEWEST call of a vendor that writes one index for the whole
+			// turn, and that call is fed last), or it already holds a FINISHED
+			// list (the call the index names is done). Either way the fragment
+			// belongs to the earlier call this index named that is still open —
+			// the same answer the client leg's chain gives, and without it the
+			// client ran the first call with NO input while this call's own
+			// arguments were dropped at the write (2026-09-28 audit, round 62).
+			newest := b.lastToolKey
+			if b.toolBlocks[newest] == nil {
+				newest = key
+			}
+			if tb := b.toolBlocks[key]; tb == nil || strings.TrimSpace(tb.args.String()) == "" ||
+				argsAreFinished(tb.args.String()) {
+				for _, k := range b.indexChain[*upIdx] {
+					held := b.toolBlocks[k]
+					if k == newest || held == nil || argsAreFinished(held.args.String()) {
+						continue
+					}
+					key = k
+					break
+				}
+			}
 		}
-		if _, taken := b.indexKeys[*upIdx]; !taken {
-			b.indexKeys[*upIdx] = key
-		}
+		b.noteIndexKey(*upIdx, key)
 		b.lastToolKey = key
 		return b.lastToolKey
 	}
@@ -3353,7 +3380,17 @@ func callArgsExtend(blockArgs, args string) bool {
 		return false
 	}
 	if strings.HasPrefix(a, "{") {
-		return !finishedObjectArgs(d)
+		// An object the model is still writing takes more of itself — INCLUDING
+		// a nested object, which is the ordinary spelling of a value in progress:
+		// `{"query":` ++ `{"sql":"select 1"}` ++ `,"limit":10}` is one call, and
+		// refusing that middle piece left the client the pieces either side of it
+		// — `{"query":,"limit":10}`, JSON no tool can parse, under a
+		// stop_reason of tool_use — while the same body's document arm carried
+		// the call whole (2026-09-28 audit, round 62). A nested value and a
+		// second call are the same bytes here, so the reading that keeps a call
+		// runnable wins; the arm that sees a whole list is the one that can tell
+		// them apart.
+		return true
 	}
 	return !strings.HasPrefix(d, "{")
 }
@@ -3392,6 +3429,35 @@ func (b *anthropicBridge) rekeyToolBlock(oldKey, newKey string) {
 			b.indexKeys[idx] = newKey
 		}
 	}
+	for idx, chain := range b.indexChain {
+		for i, k := range chain {
+			if k == oldKey {
+				b.indexChain[idx][i] = newKey
+			}
+		}
+	}
+}
+
+// noteIndexKey records that a stated index named this block key. indexKeys keeps
+// the FIRST key the index opened (round 58's F58-L3-1 — a fragment stating the
+// index again finds the block the index opened, even after it was re-keyed to
+// an id), while indexChain keeps every key it has named, in order.
+func (b *anthropicBridge) noteIndexKey(idx int, key string) {
+	if b.indexKeys == nil {
+		b.indexKeys = map[int]string{}
+	}
+	if _, taken := b.indexKeys[idx]; !taken {
+		b.indexKeys[idx] = key
+	}
+	if b.indexChain == nil {
+		b.indexChain = map[int][]string{}
+	}
+	for _, k := range b.indexChain[idx] {
+		if k == key {
+			return
+		}
+	}
+	b.indexChain[idx] = append(b.indexChain[idx], key)
 }
 
 // idHeldByAnotherCall reports whether a call block other than the one keyed by
@@ -3830,6 +3896,20 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// event that carries the name, and a start that goes out without one
 			// can never be corrected. A fragment that states an id, or arguments,
 			// is held (2026-09-27 audit, round 38, B-F2 / round 39, B-F8).
+			return
+		}
+		if strings.TrimSpace(tb.args.String()) == "" {
+			// The fragment that introduced this call stated no arguments at all,
+			// so the block has nothing to deliver yet and a start now would be the
+			// only thing it ever held: the wire permits the slot's FIRST call to
+			// be fed after the slot has been restated for a second one (the vendor
+			// that writes one index for every call of the turn), and a block the
+			// second call's start has already opened and closed can never receive
+			// those bytes (round 39's B-F7 for the closed-block case: the client
+			// ran the first call with NO input while its arguments were dropped).
+			// Held until a fragment states its first bytes, until a later call
+			// takes its arguments (releaseHeldToolBlocks), or until the turn ends
+			// (finishStream), which opens it with its empty input.
 			return
 		}
 		if tb.needsMint && !argsAreFinished(tb.args.String()) {
