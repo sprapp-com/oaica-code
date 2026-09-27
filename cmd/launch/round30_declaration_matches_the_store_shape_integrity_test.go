@@ -23,8 +23,10 @@ import (
 	"testing"
 )
 
-// TestAPiStoreHoldingTheSameModelsInAnotherOrderIsNotDrift is A-F1.
-func TestAPiStoreHoldingTheSameModelsInAnotherOrderIsNotDrift(t *testing.T) {
+// TestAPiStoreHoldsTheSameModelSetWhateverTheFilesOrder is A-F1: the entries
+// list is a set (a reordered file is not drift), and the selection's own order
+// is read where it means something — settings.defaultModel (round 32, A-F2).
+func TestAPiStoreHoldsTheSameModelSetWhateverTheFilesOrder(t *testing.T) {
 	home := t.TempDir()
 	setLaunchTestHome(t, home)
 
@@ -45,12 +47,34 @@ func TestAPiStoreHoldingTheSameModelsInAnotherOrderIsNotDrift(t *testing.T) {
 		t.Error("Pi's store reads as drift for the very selection a write just left there: the launch re-resolves the inventory and re-runs the configure step on every run")
 	}
 
-	// The same set in the other order — a launch selecting them the other way
-	// round, or a picker whose check order differs. The list is not a sequence:
-	// Pi's primary is settings.defaultModel, and the writer keeps the entries it
-	// finds where they are.
-	if !(&Pi{}).DeclaresSelection([]LaunchModel{fallbackLaunchModel("llama3.2"), fallbackLaunchModel("qwen3")}) {
-		t.Error("Pi's store reads as drift for the same two models in another order: the list carries no sequence a write leaves, so comparing it as one is drift on every run")
+	// The same set in the other order is DRIFT, and round 32 is why: the
+	// entries list is not a sequence (the writer keeps the entries it finds
+	// where they are, and the assertion below proves a reordered file still
+	// reads as current), but the selection's order is not without meaning
+	// either — settings.defaultModel is piModelIDFor(models[0]), so a launch
+	// asking for the other order would rewrite that field. The declaration
+	// answers for the whole write, so it says so instead of skipping a write
+	// that would change the file (round 30 asserted the opposite, reading the
+	// list half alone).
+	if (&Pi{}).DeclaresSelection([]LaunchModel{fallbackLaunchModel("llama3.2"), fallbackLaunchModel("qwen3")}) {
+		t.Error("Pi's store reads as current for the same two models in another order: the write would set settings.defaultModel to the first of them, so the launch must not skip it")
+	}
+
+	// The entries list itself is still read as a set: a file whose entries were
+	// reordered by hand holds the same models a write of this selection leaves,
+	// and the writer would leave them where it found them.
+	configPath := filepath.Join(home, ".pi", "agent", "models.json")
+	doc := readJSONMapForTest(t, configPath)
+	providers, _ := doc["providers"].(map[string]any)
+	ollama, _ := providers["ollama"].(map[string]any)
+	entries, _ := ollama["models"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("stored entries = %v, want the two this selection wrote", entries)
+	}
+	ollama["models"] = []any{entries[1], entries[0]}
+	writeJSONMapForTest(t, configPath, doc)
+	if !(&Pi{}).DeclaresSelection(selection) {
+		t.Error("Pi's store reads as drift for the same two entries in another file order: the writer keeps the entries it finds where they are, so the order they sit in carries nothing a write changes")
 	}
 
 	// It is not a rubber stamp: a model the store does not hold is drift, and

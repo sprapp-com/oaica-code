@@ -252,13 +252,45 @@ func droidStoredOwnedKeys(home string) []string {
 		if _, owned := droidOwnedEntry(m.APIKey, m.ID, m.Model, m.BaseURL); !owned {
 			continue
 		}
-		keys = append(keys, droidStoreKey(m.Model, m.BaseURL))
+		keys = append(keys, droidStoreKey(m.Model, m.BaseURL, m.APIKey))
 	}
 	return keys
 }
 
-func droidStoreKey(id, baseURL string) string {
-	return id + "\x00" + strings.TrimRight(baseURL, "/")
+// droidStoreKey is one entry's identity in this store: the id, the endpoint it
+// is reached at, and the credential sent to it. The writer sets all three — for
+// a user-remote entry the token the remote issued is the bearer Droid presents
+// (droidEntryFor's comment), and for a daemon entry the fixed daemon key — so a
+// store still holding a credential the remote has replaced is not the state a
+// write would leave (2026-09-27 audit, round 32, A-F1; the same field round 29
+// added to Cline's provider half).
+func droidStoreKey(id, baseURL, apiKey string) string {
+	return id + "\x00" + strings.TrimRight(baseURL, "/") + "\x00" + apiKey
+}
+
+// droidSessionModelID is the customModels id the writer makes the session
+// start on for the first row of a selection: the entry id it builds for that
+// row (see the writer's modelID), not the row's own id.
+func droidSessionModelID(model LaunchModel) string {
+	return fmt.Sprintf("custom:%s-0", droidWriteModelID(model))
+}
+
+// droidStoredSessionModel is the model sessionDefaultSettings names, or "" —
+// which no write leaves, so an absent or model-less section is drift.
+func droidStoredSessionModel(home string) string {
+	data, err := os.ReadFile(filepath.Join(home, ".factory", "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var settings struct {
+		SessionDefaultSettings struct {
+			Model string `json:"model"`
+		} `json:"sessionDefaultSettings"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return ""
+	}
+	return settings.SessionDefaultSettings.Model
 }
 
 // DeclaresSelection reports whether Droid's store already holds what a write of
@@ -288,14 +320,24 @@ func (d *Droid) DeclaresSelection(models []LaunchModel) bool {
 	}
 	want := make([]string, 0, len(models))
 	for _, m := range models {
-		// The same two fields the writer sets, from the same two sources.
+		// The same three fields the writer sets, from the same sources.
 		writeID := droidWriteModelID(m)
 		baseURL := envconfig.ConnectableHost().String() + "/v1"
+		apiKey := droidDaemonKey
 		if ep, ok := resolveRemoteEndpoint(m.Name); ok {
 			writeID = ep.UpstreamModel
 			baseURL = ep.BaseURL
+			apiKey = ep.Token
 		}
-		want = append(want, droidStoreKey(writeID, baseURL))
+		want = append(want, droidStoreKey(writeID, baseURL, apiKey))
+	}
+	// The session default is a field of the same document, set from the same
+	// selection: Droid.Run hands the launch's model to nothing but the
+	// capability gate, so this is what decides the model Droid actually starts
+	// on — a file naming another entry (Droid's own UI writes one) is not what a
+	// write would leave (2026-09-27 audit, round 32, A-F1).
+	if droidStoredSessionModel(home) != droidSessionModelID(models[0]) {
+		return false
 	}
 	return sameStoreStrings(droidStoredOwnedKeys(home), want)
 }

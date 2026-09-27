@@ -69,6 +69,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1795,20 +1796,92 @@ func estimateMessageTokens(req map[string]any) int {
 	return messagesBytes(req) / 4
 }
 
-// messagesBytes is the serialized size of req["messages"]. It is the unit
-// BOTH the chars/4 estimate and the per-session calibration
-// (context_calibration.go) are expressed in, so a calibrated
-// tokens-per-byte ratio measured on one turn applies directly to the next.
+// messagesBytes is the serialized size of the prompt a request carries --
+// req["messages"] for the chat shape, req["prompt"] for the legacy
+// completions shape both served by completionHandler. It is the unit BOTH the
+// chars/4 estimate and the per-session calibration (context_calibration.go)
+// are expressed in, so a calibrated tokens-per-byte ratio measured on one turn
+// applies directly to the next.
+//
+// A legacy body was measured as zero (2026-09-27 audit, round 32, B-F3): the
+// two prompt guards are in this one handler, but they read "messages" only, so
+// a `{"prompt": ...}` request skipped admission control and the context-fit
+// clamp entirely and reached the upstream as a raw prefill.
 func messagesBytes(req map[string]any) int {
-	msgs, ok := req["messages"]
-	if !ok {
+	if msgs, ok := req["messages"]; ok {
+		if b, err := json.Marshal(msgs); err == nil {
+			return promptPayloadBytes(len(b), msgs)
+		}
 		return 0
 	}
-	b, err := json.Marshal(msgs)
-	if err != nil {
-		return 0
+	if p, ok := req["prompt"]; ok {
+		if b, err := json.Marshal(p); err == nil {
+			return len(b)
+		}
 	}
-	return len(b)
+	return 0
+}
+
+// imagePartByteAllowance is what one inline image is charged to the prompt-size
+// estimate, in the same bytes-of-prompt unit messagesBytes returns. A data URI
+// is a transport encoding, not prompt: leaving its base64 in the measurement
+// billed a 1 MB screenshot as ~349563 prompt tokens and hard-rejected it on a
+// model that publishes 262144 and accepts images, with no way for the session
+// to recover (2026-09-27 audit, round 32, B-F1). ~1 MP is order 1e3 real
+// tokens, so 4096 bytes (1024 tokens at chars/4) is the right order of
+// magnitude for admission and for the fit clamp's estimate; a real usage
+// report still corrects the per-session ratio either way.
+const imagePartByteAllowance = 4096
+
+// promptPayloadBytes turns a serialized prompt body into the byte count the
+// estimate is expressed in: the serialized size, with any inline image's
+// base64 payload replaced by imagePartByteAllowance.
+func promptPayloadBytes(serialized int, v any) int {
+	payload, images := inlineImageBytes(v)
+	return serialized - payload + images*imagePartByteAllowance
+}
+
+// inlineImageBytes reports the total base64 payload length of the inline images
+// found in a decoded request body and how many images there are. It recognises
+// both shapes the gateway sees: the OpenAI part the Anthropic bridge itself
+// writes (`{"type":"image_url","image_url":{"url":"data:..."}}`, messages.go)
+// and an Anthropic `{"source":{"data":...}}` block a client sent straight
+// through. Anything without inline data (a remote URL) is left alone -- there
+// is no base64 to charge.
+func inlineImageBytes(v any) (payload, images int) {
+	switch t := v.(type) {
+	case []any:
+		for _, e := range t {
+			p, n := inlineImageBytes(e)
+			payload += p
+			images += n
+		}
+	case map[string]any:
+		for k, e := range t {
+			if k == "image_url" {
+				if m, ok := e.(map[string]any); ok {
+					if u, ok := m["url"].(string); ok && strings.HasPrefix(u, "data:") {
+						payload += len(u)
+						images++
+						continue
+					}
+				}
+			}
+			if k == "source" {
+				if m, ok := e.(map[string]any); ok {
+					if d, ok := m["data"].(string); ok && d != "" {
+						payload += len(d)
+						images++
+						continue
+					}
+				}
+			}
+			p, n := inlineImageBytes(e)
+			payload += p
+			images += n
+		}
+	}
+	return payload, images
 }
 
 func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
@@ -1976,8 +2049,20 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if limit > 0 {
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
-			if v, ok := req[k].(float64); ok && int(v) > limit {
-				req[k] = limit
+			// Compare as float64, never through int(): a client asking for
+			// max_tokens 1e19 wrapped int(v) to a negative, so the comparison
+			// was false and the absurd ask was forwarded verbatim (2026-09-27
+			// audit, round 32). The int case is the fit clamp below rewriting
+			// the field, or any future caller that writes one.
+			switch v := req[k].(type) {
+			case float64:
+				if v > float64(limit) {
+					req[k] = limit
+				}
+			case int:
+				if v > limit {
+					req[k] = limit
+				}
 			}
 		}
 	}
@@ -2110,16 +2195,31 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// reached a backend (blocked earlier, or the error path never set
 	// oaicalb's header).
 	backend := new(string)
-	// req["max_tokens"] may be a float64 (as unmarshaled from client JSON) or
-	// a plain int (if the non-stream clamp above rewrote it -- see that
-	// loop's req[k] = limit) -- handle both rather than silently reading 0
-	// for every clamped non-streaming request.
-	maxTokens := 0
-	switch mt := req["max_tokens"].(type) {
-	case float64:
-		maxTokens = int(mt)
-	case int:
-		maxTokens = mt
+	// The row exists to correlate "estimated prompt + output budget vs the
+	// model's context_length", so record the budget the client asked for
+	// under either spelling, and handle the types the clamps above leave
+	// behind: a float64 (as unmarshaled from client JSON) or a plain int (if
+	// the clamp rewrote it -- see that loop's req[k] = limit). A conversion
+	// straight through int() wrapped a 1e19 ask to a negative and the row
+	// recorded that instead of the clamped value (2026-09-27 audit, round 32).
+	outputBudget := func(v any) int {
+		switch n := v.(type) {
+		case float64:
+			if n >= math.MaxInt64 {
+				return math.MaxInt64
+			}
+			if n <= 0 {
+				return 0
+			}
+			return int(n)
+		case int:
+			return n
+		}
+		return 0
+	}
+	maxTokens := outputBudget(req["max_tokens"])
+	if b := outputBudget(req["max_completion_tokens"]); b > maxTokens {
+		maxTokens = b
 	}
 	errInfo := &errCaptureInfo{
 		RequestID: rid, SessionID: sessionID, Model: modelID,
@@ -2380,7 +2480,7 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool, boo
 	}
 	switch s.Status {
 	case "active", "past_due":
-		allowed, reason := c.checkWindowCap(label)
+		allowed, reason, capAuthoritative := c.checkWindowCap(label)
 		// allowed=false with overageBilling on can only happen here if
 		// checkWindowCap itself failed open/closed on an unreachable
 		// meterhub (reason won't have the "rate limit:" prefix in that
@@ -2390,7 +2490,14 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool, boo
 		if overage {
 			return true, reason, true, true
 		}
-		return allowed, reason, false, true
+		// The status lookup answered, but the cap lookup behind it may not
+		// have -- it degrades exactly like the status probe does (meterhub
+		// unreachable, non-200, undecodable), and that degradation has to
+		// reach check()'s 5s TTL. Stamping it authoritative cached a paying
+		// subscriber's 403 (or, fail-open, an over-cap key's admission) for
+		// the whole EntitlementCacheTTLSec after a blip (2026-09-27 audit,
+		// round 32, B-F2 -- the same M6 fix the status path already had).
+		return allowed, reason, false, capAuthoritative
 	case "canceled":
 		return false, "subscription canceled", false, true
 	case "suspended":
@@ -2412,10 +2519,15 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool, boo
 // never gets this far. Same fail-open/fail-closed policy as the status
 // check: a meterhub hiccup here degrades to c.failOpen rather than
 // blocking (or silently admitting) every request while it's unreachable.
-func (c *entitlementCache) checkWindowCap(label string) (bool, string) {
+//
+// The third return, authoritative, is fetchAndDecide's 4th: false when this
+// answer came from a DEGRADED path rather than an actual usage lookup, so
+// check() gives it the short TTL instead of the full one. Every degraded
+// branch below says so.
+func (c *entitlementCache) checkWindowCap(label string) (allowed bool, reason string, authoritative bool) {
 	req, err := http.NewRequest(http.MethodGet, c.addr+"/subscribers/usage?key="+url.QueryEscape(label), nil)
 	if err != nil {
-		return c.failOpen, "usage check unavailable"
+		return c.failOpen, "usage check unavailable", false
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -2423,16 +2535,16 @@ func (c *entitlementCache) checkWindowCap(label string) (bool, string) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "usage check unreachable"
+		return false, "usage check unreachable", false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "usage check failed"
+		return false, "usage check failed", false
 	}
 	var u struct {
 		Window5h struct {
@@ -2444,17 +2556,17 @@ func (c *entitlementCache) checkWindowCap(label string) (bool, string) {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
 		if c.failOpen {
-			return true, ""
+			return true, "", false
 		}
-		return false, "usage check failed"
+		return false, "usage check failed", false
 	}
 	if u.Window5h.Over {
-		return false, "rate limit: 5-hour token cap exceeded, resets on a rolling window"
+		return false, "rate limit: 5-hour token cap exceeded, resets on a rolling window", true
 	}
 	if u.Window7d.Over {
-		return false, "rate limit: weekly token cap exceeded, resets on a rolling window"
+		return false, "rate limit: weekly token cap exceeded, resets on a rolling window", true
 	}
-	return true, ""
+	return true, "", true
 }
 
 // mux builds the routing table. It lives here rather than inline in main

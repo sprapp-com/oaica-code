@@ -837,7 +837,7 @@ func piEditDocuments(configPath, settingsPath string, models []LaunchModel) erro
 	}
 
 	// Update settings.json with default provider and model
-	settings["defaultProvider"] = "ollama"
+	settings["defaultProvider"] = piDefaultProvider
 	settings["defaultModel"] = piModelIDFor(models[0])
 
 	settingsData, err := json.MarshalIndent(settings, "", "  ")
@@ -999,7 +999,31 @@ func (p *Pi) DeclaresSelection(models []LaunchModel) bool {
 			return false
 		}
 	}
-	return true
+	// Pi's write publishes TWO documents, and this declaration reads one: the
+	// provider and model settings.json names are set from the same selection,
+	// and Pi.Run hands the model it is given to nothing but the capability gate
+	// — so that file is what Pi actually opens on. Reading only models.json
+	// left a file naming another provider or model (Pi's own TUI writes one)
+	// reading as current, and the launch reported success while Pi started
+	// something else (2026-09-27 audit, round 32, A-F2).
+	return piSettingsDeclare(models[0], home)
+}
+
+// piDefaultProvider is the provider name Pi's settings name for the slot this
+// package writes.
+const piDefaultProvider = "ollama"
+
+// piSettingsDeclare reports whether settings.json already names the provider
+// and model a write of model would leave there. An unreadable or silent file is
+// not a declaration: "cannot tell" has to mean "write".
+func piSettingsDeclare(model LaunchModel, home string) bool {
+	settings, err := fileutil.ReadJSON(filepath.Join(home, ".pi", "agent", "settings.json"))
+	if err != nil {
+		return false
+	}
+	provider, _ := settings["defaultProvider"].(string)
+	id, _ := settings["defaultModel"].(string)
+	return provider == piDefaultProvider && id == piModelIDFor(model)
 }
 
 // piPickerNameFor is the inverse of piModelIDFor for an entry on disk: the

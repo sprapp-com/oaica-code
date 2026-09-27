@@ -562,16 +562,51 @@ func clineHeldStoreKeys(home string) []string {
 		}
 	}
 	if config, err := fileutil.ReadJSON(clineLegacyGlobalStatePath(home)); err == nil {
-		if config["actModeApiProvider"] == clineLaunchProvider {
-			modelID, _ := config["actModeOllamaModelId"].(string)
-			baseURL, _ := config["actModeOllamaBaseUrl"].(string)
-			if modelID != "" {
-				keys = append(keys, clineStoreKey(modelID, baseURL))
-			}
+		if legacy, ok := clineLegacyHeldKeys(config); ok {
+			keys = append(keys, legacy...)
 		}
 	}
 	return keys
 }
+
+// clineLegacyHeldKeys is the projection of globalState.json a write leaves: the
+// root endpoint, and the (id, endpoint) pair of EACH mode. The writer sets all
+// four from the one model a launch resolves — Cline's own UI is where plan and
+// act come apart, which is exactly why a half naming another model has to be
+// visible here: reading the act pair alone let a store whose plan mode still
+// ran the user's other model read as the state a write would leave, and the
+// write that would have published this launch's model was skipped
+// (2026-09-27 audit, round 32, A-F3). The root address is the third copy of the
+// endpoint in this document, written from the same value
+// (clineRefuseForeignLegacyEndpoint treats all three as one).
+//
+// ok is false for a document no write of this package leaves (a mode naming
+// another provider, no model, no root): it contributes no key, and the
+// caller's length check then reads it as drift.
+func clineLegacyHeldKeys(config map[string]any) ([]string, bool) {
+	rootURL, _ := config["ollamaBaseUrl"].(string)
+	if rootURL == "" {
+		return nil, false
+	}
+	keys := []string{clineRootStoreKey(rootURL)}
+	for _, mode := range []string{"act", "plan"} {
+		if config[mode+"ModeApiProvider"] != clineLaunchProvider {
+			return nil, false
+		}
+		modelID, _ := config[mode+"ModeOllamaModelId"].(string)
+		baseURL, _ := config[mode+"ModeOllamaBaseUrl"].(string)
+		if modelID == "" {
+			return nil, false
+		}
+		keys = append(keys, clineStoreKey(modelID, baseURL))
+	}
+	return keys, true
+}
+
+// clineRootStoreKey is the root endpoint's key. The empty id cannot collide
+// with a model: every key clineStoreKey builds for a model carries a non-empty
+// id.
+func clineRootStoreKey(baseURL string) string { return clineStoreKey("", baseURL) }
 
 // DeclaresSelection reports whether BOTH halves of Cline's pair already hold
 // what a write of models would leave. Cline keeps one model (it is a narrowing
@@ -606,6 +641,10 @@ func (c *Cline) DeclaresSelection(models []LaunchModel) bool {
 		// rotated away, or a key the write would delete — is drift. The legacy
 		// half states no credential at all.
 		clineProviderStoreKey(id, clineProviderBaseURLFor(row.Name), clineProviderTokenFor(row.Name)),
+		// The legacy half: the root endpoint, then one pair per mode — both
+		// written from this one model (clineLegacyHeldKeys).
+		clineRootStoreKey(clineLegacyBaseURLFor(row.Name)),
+		clineStoreKey(id, clineLegacyBaseURLFor(row.Name)),
 		clineStoreKey(id, clineLegacyBaseURLFor(row.Name)),
 	}
 	held := clineHeldStoreKeys(home)
