@@ -1225,7 +1225,21 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		// streaming twin in round 45 and not here, which left this path the
 		// only one of the four translation sites that could emit two tool_use
 		// blocks under one id (2026-09-27 audit, round 46, A46-1).
-		argsJSON, _ := json.Marshal(callArgumentsStated(tc.Function.Arguments))
+		// The identity a minted id is derived from is the arguments as the
+		// UPSTREAM stated them, not the shape this leg WRITES: the JSON literal
+		// null and the empty object are two different argument texts, and every
+		// other site that mints an id for the same call hashes the text it was
+		// given — the client proxy's whole-list parser marshals the map it
+		// unmarshalled into (a null text marshals back to `null`, an empty one
+		// to `{}`) and the gateway's canonicalCallArgs returns the literal for
+		// exactly this reason (round 49). Folding the two here minted `{}`'s id
+		// for a call the other two legs number from `null`: one upstream turn,
+		// one id-less call, and the client got two different ids depending on
+		// whether it had asked for `stream` — a retry through another leg, or a
+		// backend that switches to a buffered response, then answers the next
+		// turn's `tool_result` with an id no `tool_use` carried (2026-09-28
+		// audit, round 66, F66-L2-1).
+		argsJSON, _ := json.Marshal(tc.Function.Arguments)
 		base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
 
 		id := tc.ID
@@ -1556,11 +1570,20 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		}
 	}
 	for _, tc := range r.Message.ToolCalls {
+		// argsJSON is the argument text this leg DELIVERS — the fold of round 65,
+		// so a null spelling reaches the client as the object its
+		// content_block_start already announced. The id is minted from the text
+		// the UPSTREAM stated instead (argsSeed): the two spellings are two
+		// different texts, every other mint site hashes the one it was given,
+		// and deriving the id from the folded shape left this arm and the
+		// client proxy's whole-list arm answering one id-less call with two
+		// different ids (2026-09-28 audit, round 66, F66-L2-1).
 		argsJSON, err := json.Marshal(callArgumentsStated(tc.Function.Arguments))
 		if err != nil {
 			slog.Error("failed to marshal tool arguments", "error", err, "tool_id", tc.ID)
 			continue
 		}
+		argsSeed, _ := json.Marshal(tc.Function.Arguments)
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named cannot be dispatched: this block
 			// carries the name and there is no second event that does, so the
@@ -1595,7 +1618,7 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		// distinct id — two tool_use blocks with one id cannot be answered
 		// separately — while a restatement of an already-sent call in a LATER
 		// call still dedups, which is what this map is for.
-		base := "\x00" + tc.Function.Name + "\x00" + string(argsJSON)
+		base := "\x00" + tc.Function.Name + "\x00" + string(argsSeed)
 		// As in ToMessagesResponse: a STATED id is the upstream's correlation
 		// key, a MINTED one is this converter's own synthesis, and only the
 		// former may be deduped on its own string — a call that merely states
@@ -1625,18 +1648,18 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			n := seenInCall[base]
 			seenInCall[base] = n + 1
 			key = "\x00" + base
-			id = ToolCallIDFor(tc.Function.Name, string(argsJSON))
+			id = ToolCallIDFor(tc.Function.Name, string(argsSeed))
 			if n > 0 {
 				key = "\x00" + base + "\x00#" + strconv.Itoa(n)
-				id = ToolCallIDFor(tc.Function.Name, string(argsJSON)+"#"+strconv.Itoa(n))
+				id = ToolCallIDFor(tc.Function.Name, string(argsSeed)+"#"+strconv.Itoa(n))
 			}
 			// A synthesized id must not land on an id another call in this
 			// same turn STATES: the two would reach the client under one id,
 			// and the non-stream twin of this body reads such a pair as one
 			// call restated (2026-09-27 audit, round 46, A46-4).
-			mintedKey := string(argsJSON)
+			mintedKey := string(argsSeed)
 			if n > 0 {
-				mintedKey = string(argsJSON) + "#" + strconv.Itoa(n)
+				mintedKey = string(argsSeed) + "#" + strconv.Itoa(n)
 			}
 			for k := 0; c.mintedIDs[id]; k++ {
 				id = ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
@@ -2474,6 +2497,14 @@ func conversationBytes(messages []MessageParam, system any) int {
 		// toolResults counts the blocks of this turn that become their OWN
 		// role-"tool" messages (see the rewrite's charge below).
 		toolResults int
+		// ownRuns counts the blocks of this turn that become a message carrying
+		// the client's OWN role, which for a system turn is what makes it a
+		// system message the hoist can join or delete. A system turn with no own
+		// run and a tool result writes no system message at all — only a
+		// role-"tool" one — so its empty text is not a blank system message and
+		// it is not the blank clause's business (2026-09-28 audit, round 66,
+		// F66-L1-1).
+		ownRuns int
 		// runAfterResult reports that a run of the turn's own blocks follows a
 		// tool result: the turn becomes [tool, system text] or [tool, system
 		// text, tool], so its system text lands after a message of another role
@@ -2571,6 +2602,7 @@ func conversationBytes(messages []MessageParam, system any) int {
 				bytes:            role + countAnyContent(msg.Content),
 				roleBytes:        role,
 				toolResults:      toolResults,
+				ownRuns:          ownRuns,
 				sep:              sep,
 				joinedSep:        shape.joinedSeparators,
 				runAfterResult:   shape.runAfterResult,
@@ -2624,8 +2656,27 @@ func conversationBytes(messages []MessageParam, system any) int {
 		// request's turns alone left a leading result-split system turn charged
 		// the as-is reading while its own converter wrote the joined one
 		// (2026-09-28 audit, round 64, F64-L1-3).
-		if seenNonSystem || strings.TrimSpace(e.text) == "" || e.runAfterResult {
-			rewrite = true
+		// Both clauses below ask a question ABOUT a system message the converter
+		// wrote — is it not first, is it blank — and a system turn holding
+		// nothing but tool results writes none: its text is empty because the
+		// converter wrote a role-"tool" message for it, not because the hoist
+		// found a blank one to delete. Reading its empty text as a blank system
+		// message took the joined branch for a conversation
+		// normalizeSystemFirst leaves alone, so the same 147-byte prompt was
+		// charged as one merged system message (42) when the client wrote the
+		// results-only turn as a system turn and as two (46) when it wrote the
+		// same turn as a user turn — and this estimate is the client's
+		// input_tokens and auto-compaction arithmetic whenever the upstream
+		// states no usage (2026-09-28 audit, round 66, F66-L1-1).
+		//
+		// A system turn writes a system message when it has a run of its own, or
+		// when it has no tool result to write as a message of another role — the
+		// latter being the role-only fallback message, which is blank and IS the
+		// hoist's to delete.
+		if e.ownRuns > 0 || e.toolResults == 0 {
+			if seenNonSystem || strings.TrimSpace(e.text) == "" || e.runAfterResult {
+				rewrite = true
+			}
 		}
 		// The turn the converter writes a tool message LAST for ends with a
 		// message of another role, so a system turn written after it is not
@@ -3860,14 +3911,19 @@ func callInputStatesNothing(input api.ToolCallFunctionArguments) bool {
 // OpenAI-compatible backend writes for a call with no arguments, and every leg
 // already answers it with {} — the non-stream converter folded input.Len()==0
 // to the empty object for exactly this shape (round 45, A45-4), the gateway's
-// callInput folds the literal (round 48, C-F5), and the client proxy's whole
-// document goes through that same fold. This converter was the site that did
-// not: it marshalled the null spelling into the tool_use block's own
+// callInput folds the literal (round 48, C-F5), and the client proxy's own
+// whole-list parser emits an empty Input for it. This converter was the site
+// that did not: it marshalled the null spelling into the tool_use block's own
 // input_json_delta, so the client accumulated `{}` from content_block_start
-// followed by `null` from the delta — JSON no SDK can parse — and the id it
-// minted for an id-less call was keyed on the literal as well, so the same call
-// answered with a different id depending on whether the client asked for
-// `stream` (2026-09-28 audit, round 65, F65-L2-1).
+// followed by `null` from the delta — JSON no SDK can parse (2026-09-28 audit,
+// round 65, F65-L2-1).
+//
+// The fold is of the VALUE ONLY. Round 65 also seeded the minted id from this
+// shape, on the belief that the proxy's whole document folds too — it does not:
+// its parser mints from the text it was handed, as the gateway does, and a
+// null-seeded hash from here split that leg against itself (round 66's
+// F66-L2-1). The seed is tc.Function.Arguments, unmarshalled and marshalled
+// back, which is `{}` for an empty text and `null` for the literal.
 func callArgumentsStated(args api.ToolCallFunctionArguments) api.ToolCallFunctionArguments {
 	if args.Len() == 0 {
 		return api.NewToolCallFunctionArguments()

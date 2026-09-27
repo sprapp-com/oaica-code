@@ -3265,8 +3265,18 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 					// whose bytes do NOT complete the open call is a call of its
 					// own — the vendor that opens a fresh call rather than closing
 					// one — and still opens its own block below.
+					//
+					// The open call must be MID-OBJECT for any of this: a call
+					// that has written nothing has an argument list that is already
+					// complete (an empty one), so a fragment stating a whole object
+					// is not its first arguments but a call of its own, and the
+					// frame arm folded it — answering the call it belonged to with
+					// `{"cmd":"rm -rf /"}` and the call that carried the fragment
+					// with nothing, where every other arm of the same body relays
+					// those bytes as text the client never runs (2026-09-28 audit,
+					// round 66, F66-L3-1).
 					if last := b.toolBlocks[b.lastToolKey]; b.lastToolKey != "" && b.lastToolKey != key && last != nil &&
-						!argsAreFinished(last.args.String()) &&
+						argsAreMidObject(last.args.String()) &&
 						json.Valid([]byte(strings.TrimSpace(last.args.String())+strings.TrimSpace(args))) {
 						key = b.lastToolKey
 					}
@@ -3401,7 +3411,8 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// upstream itself used; once content_block_start is out the client
 			// already holds the minted id and it is kept (2026-09-27 audit,
 			// round 45, B45-1).
-			if cur := b.toolBlocks[b.lastToolKey]; cur != nil && !cur.statedID {
+			if cur := b.toolBlocks[b.lastToolKey]; cur != nil &&
+				(!cur.statedID || (cur.id == id && callArgsExtend(cur.args.String(), args))) {
 				if !cur.started {
 					cur.id = ""
 				}
@@ -3413,13 +3424,24 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// A block in progress whose id the UPSTREAM stated is left where it
 			// is: the fall-through below keys this fragment's own new block by
 			// the id it states, which is what the client leg's
-			// startsANewToolCall answers the same wire with (a delta id over an
-			// accumulator that already carries one begins the next call, under
-			// the id the delta stated). A round-46 candidate that numbered this
-			// call instead was removed: it changed no wire but this one, and
-			// here it diverged — the second call's arguments were stranded on a
-			// block that could never be named, and the id the upstream stated
-			// was never the call's (2026-09-27 audit, round 46, G45-4).
+			// startsANewToolCall answers the same wire with when the id is a
+			// DIFFERENT one (a delta id over an accumulator that already carries
+			// one begins the next call, under the id the delta stated). A
+			// round-46 candidate that numbered this call instead was removed: it
+			// changed no wire but this one, and here it diverged — the second
+			// call's arguments were stranded on a block that could never be
+			// named, and the id the upstream stated was never the call's
+			// (2026-09-27 audit, round 46, G45-4).
+			//
+			// The same id is the other answer, and the branch above now takes it:
+			// startsANewToolCall splits on a fresh id only once the accumulator
+			// HAS one, so a fragment restating the call's OWN id with nothing to
+			// name is a continuation of it there and must be one here — read as a
+			// new call it opened a second block under an id already spent, with
+			// the object split across the two: the client accumulated `{"cmd` for
+			// the call and got the rest as prose, where the whole-document arm of
+			// the same body answers one call with `{"cmd":"ls"}` (2026-09-28
+			// audit, round 66, F66-L3-3).
 		}
 		if name != "" {
 			b.lastToolName = name
@@ -4008,11 +4030,20 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		return
 	}
 	if !tb.started {
-		if tb.name == "" {
+		if !namesItself(tb) {
 			// Nothing can open the block yet: content_block_start is the only
 			// event that carries the name, and a start that goes out without one
 			// can never be corrected. A fragment that states an id, or arguments,
 			// is held (2026-09-27 audit, round 38, B-F2 / round 39, B-F8).
+			//
+			// A name of whitespace is no more a name than an absent one — that
+			// is namesItself, the same test every whole-list arm and both folds
+			// use to decide whether an entry introduces a call. Reading a blank
+			// name as present opened a block named " " beside the call that did
+			// name itself under the very same id, so one upstream answer reached
+			// the client as two tool_use blocks sharing an id — the second of
+			// which no accumulator can route — where every other arm of that body
+			// answers one call (2026-09-28 audit, round 66, F66-L3-2).
 			return
 		}
 		if strings.TrimSpace(tb.args.String()) == "" {
@@ -4449,7 +4480,7 @@ func (b *anthropicBridge) finishStream() {
 	// Started before the nameless arm below, which is for calls that HAVE no
 	// name and so can never open a block at all.
 	for _, tb := range b.toolOrder {
-		if tb.started || tb.merged || tb.name == "" {
+		if tb.started || tb.merged || !namesItself(tb) {
 			continue
 		}
 		b.closeOpen()
@@ -5072,10 +5103,13 @@ func callInput(raw string, truncated bool) (map[string]any, bool) {
 	if in == nil {
 		// The text is the JSON literal null, which unmarshals into a nil map
 		// without an error. The block's input is a required object on this
-		// wire, and the id this bridge minted for the call says so already
-		// (canonicalCallArgs folds null into the empty object, as both other
-		// legs do): emitting "input":null contradicted the very id beside it
-		// (2026-09-27 audit, round 48, C-F5).
+		// wire, and all three legs fold the literal into the empty object HERE,
+		// in the value they write: emitting "input":null contradicted the id
+		// beside it (2026-09-27 audit, round 48, C-F5). The ID is a different
+		// question and is NOT folded — canonicalCallArgs returns the literal,
+		// and both other legs hash the text they were given, so `null` and `{}`
+		// are two calls as far as the number goes (round 49; round 66's
+		// F66-L2-1 fixed the local converter, which had folded the seed too).
 		in = map[string]any{}
 	}
 	return in, true
