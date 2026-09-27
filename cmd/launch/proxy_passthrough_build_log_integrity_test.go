@@ -62,7 +62,7 @@ func TestPassthroughRequestBuildFailureIsLogged(t *testing.T) {
 
 	// "://bad" has no scheme, so http.NewRequestWithContext fails before any
 	// network work — the branch under test.
-	status, relayed := anthropicPassthrough(w, r, body, "://bad", "x-api-key", "k", "")
+	status, relayed := anthropicPassthrough(w, r, body, "://bad", "x-api-key", "k", "", true)
 	if status != 0 || relayed {
 		t.Fatalf("anthropicPassthrough = (%d, %v), want (0, false) for a request that was never built", status, relayed)
 	}

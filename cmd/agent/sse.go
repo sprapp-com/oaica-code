@@ -38,7 +38,19 @@ type anthropicSSEAccumulator struct {
 	// was meant to revive stayed dead, and cache_read_input_tokens was dropped
 	// whenever the delta stated it).
 	startInput, startCache, startOutput int
-	input, cache, output               int
+	input, cache, output                int
+	// inputStated records that the closing frame SPOKE about input_tokens, even
+	// when it said zero. The Anthropic convention makes input_tokens the part of
+	// the prompt that was NOT served from cache, so a fully cached prompt states
+	// input_tokens:0 and puts the whole prompt in cache_read_input_tokens — the
+	// shape both local legs emit (llm/llama_server.go's promptEvalCount is
+	// CacheN+PromptN with PromptN=0 on a full hit; x/mlxrunner states the same
+	// split). Reading only positive counts as a statement treated that zero as
+	// silence and fell back to message_start's ESTIMATE, so the turn reported
+	// 1000+900 for a prompt of 900 and shouldCompact's "prompt_eval" trigger
+	// (agent/compactor.go) fired on a roughly doubled count (2026-09-28 audit,
+	// round 55).
+	inputStated bool
 }
 
 // usage is the api.Metrics the turn's stated counts add up to, in this
@@ -51,7 +63,10 @@ type anthropicSSEAccumulator struct {
 // zero.
 func (a *anthropicSSEAccumulator) usage() api.Metrics {
 	in, cacheTok, outTok := a.input, a.cache, a.output
-	if in == 0 {
+	if !a.inputStated {
+		// Only a frame that said NOTHING about the prompt falls back to the
+		// opening frame's estimate: a stated zero is a statement (see
+		// inputStated).
 		in = a.startInput
 	}
 	if cacheTok == 0 {
@@ -111,8 +126,19 @@ func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, false, fmt.Errorf("parse message_delta: %w", err)
 		}
-		if ev.Usage.InputTokens > 0 {
+		// Presence, not magnitude: a frame that states input_tokens at all has
+		// spoken about the prompt and its value stands even when it is zero (see
+		// inputStated). Decoded separately from the typed event because a plain
+		// int cannot tell "absent" from "stated 0".
+		var stated struct {
+			Usage struct {
+				InputTokens *int `json:"input_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(data, &stated) == nil && stated.Usage.InputTokens != nil &&
+			*stated.Usage.InputTokens >= 0 {
 			a.input = ev.Usage.InputTokens
+			a.inputStated = true
 		}
 		if cached := ev.Usage.CacheReadInputTokens; cached != nil && *cached > 0 {
 			a.cache = *cached

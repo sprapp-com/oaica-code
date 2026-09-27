@@ -29,8 +29,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/anthropic"
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/launch"
 )
 

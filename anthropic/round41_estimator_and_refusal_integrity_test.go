@@ -137,7 +137,7 @@ func TestAToolResultsTextIsChargedItsCharactersNotItsEscapes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := strings.Repeat(tc.ch, 1000)
-			esc, _ := json.Marshal(s)          // the spelling a JSON writer sends
+			esc, _ := json.Marshal(s)            // the spelling a JSON writer sends
 			inner := string(esc[1 : len(esc)-1]) // and the same text as it appears inside a body
 
 			asText := round41Estimate(t, fmt.Sprintf(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}]}`, inner))

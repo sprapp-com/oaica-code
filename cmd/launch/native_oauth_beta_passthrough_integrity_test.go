@@ -54,7 +54,7 @@ func TestANativeOAuthPassthroughCarriesTheOAuthBeta(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer proxy-token-not-the-upstream-credential")
 
-	status, _ := anthropicPassthrough(rec, req, body, srv.URL, "Authorization", "Bearer sk-ant-oat-notareal", "sess-native-beta")
+	status, _ := anthropicPassthrough(rec, req, body, srv.URL, "Authorization", "Bearer sk-ant-oat-notareal", "sess-native-beta", false)
 	if status != http.StatusOK {
 		t.Fatalf("premise: the stub upstream answered %d, want 200", status)
 	}
@@ -77,7 +77,7 @@ func TestANativeOAuthPassthroughKeepsTheClientsOwnBetas(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
 
-	if status, _ := anthropicPassthrough(rec, req, body, srv.URL, "Authorization", "Bearer sk-ant-oat-notareal", "sess-native-beta-merge"); status != http.StatusOK {
+	if status, _ := anthropicPassthrough(rec, req, body, srv.URL, "Authorization", "Bearer sk-ant-oat-notareal", "sess-native-beta-merge", false); status != http.StatusOK {
 		t.Fatalf("premise: the stub upstream answered %d, want 200", status)
 	}
 	if !strings.Contains(beta, "prompt-caching-2024-07-31") {
@@ -101,7 +101,7 @@ func TestAnApiKeyPassthroughGetsNoOAuthBeta(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
 
-	if status, _ := anthropicPassthrough(rec, req, body, srv.URL, "x-api-key", "sk-zai-notareal", "sess-apikey"); status != http.StatusOK {
+	if status, _ := anthropicPassthrough(rec, req, body, srv.URL, "x-api-key", "sk-zai-notareal", "sess-apikey", false); status != http.StatusOK {
 		t.Fatalf("premise: the stub upstream answered %d, want 200", status)
 	}
 	if beta != "" {

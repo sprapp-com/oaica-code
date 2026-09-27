@@ -177,7 +177,7 @@ func TestDeadNativeOversizeLegIsNotChosenForCrossover(t *testing.T) {
 		feedPassthroughRouteHealth(table, table.Oversize, "sess-1",
 			passthroughBreakerKey(table.Oversize, true), table.Oversize.BaseURL, 0, false, false) // transport failures
 	}
-	if _, ok := table.oversizeSwap(primary, 50_000, 0); ok {
+	if _, ok := table.oversizeSwap(primary, 50_000, 0, nil); ok {
 		t.Error("a native oversize leg with 3 consecutive transport failures was still chosen for the crossover — oversizeSwap checks nativeOversizeBreakerKey, so the feed has to write that same key")
 	}
 }

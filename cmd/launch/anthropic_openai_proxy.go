@@ -187,14 +187,13 @@ type openAIChatResponse struct {
 			// reasoningText() below for the field that call sites should
 			// actually read.
 			Reasoning string `json:"reasoning,omitempty"`
-			ToolCalls []struct {
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls,omitempty"`
+			// The named openAIToolCall, not an anonymous twin: the two
+			// round-55 helpers that read a nameless call's arguments take
+			// []openAIToolCall, and a structurally identical anonymous struct
+			// does not convert to it (slice element identity compares tags —
+			// the "tags are ignored" rule is for direct struct conversion
+			// only).
+			ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
@@ -785,14 +784,7 @@ func mapFinishReason(reason string) string {
 
 // parseOpenAIToolCalls builds api.ToolCall slice from an OpenAI message's
 // tool_calls. arguments is a JSON string; unmarshal it into the ordered map.
-func parseOpenAIToolCalls(tcs []struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
-}, truncated bool) []api.ToolCall {
+func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 	if len(tcs) == 0 {
 		return nil
 	}
@@ -1850,7 +1842,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", route.UpstreamModel, strings.TrimPrefix(route.Label, "remote:")))
 					return
 				}
-				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID)
+				status, relayed := anthropicPassthrough(w, r, rewritten, upstream, headerName, headerValue, table.SessionID, true)
 				feedPassthroughRouteHealth(table, route, table.SessionID, passthroughBreakerKey(route, false), route.BaseURL,
 					status, relayed, r.Context().Err() != nil)
 				return
@@ -2011,7 +2003,15 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 				// case near a 262k ceiling) and a strictly larger-context
 				// --oversize leg exists → serve on it instead of rejecting.
 				// Re-derive the budget against the new leg's window.
-				if over, swapped := table.oversizeSwap(route, estTokens, margin); swapped {
+				// Every leg is planned with its OWN calibration (see planFor):
+				// the swap decision judges the destination by the numbers its
+				// upstream earned, and so does the budget the request is
+				// actually sent with.
+				planFor := func(leg proxyRoute) (int, int) {
+					est, m, _ := contextFitPlan(calib, legCalibrationKey(table.SessionID, leg), promptBytes)
+					return est, m
+				}
+				if over, swapped := table.oversizeSwap(route, estTokens, margin, planFor); swapped {
 					// Every refusal inside this crossover is a judgement about
 					// the leg being swapped TO, so the row must name it.
 					if refusalRow != nil {
@@ -2090,7 +2090,11 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 								refuse(http.StatusUnauthorized, fmt.Sprintf("no credential for %s — run `oaica auth login %s`, or set the key's env var", over.UpstreamModel, strings.TrimPrefix(over.Label, "remote:")))
 								return
 							}
-							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID)
+							// over.BaseURL is the same discriminator the entitlement
+							// gate above uses: a plan row is a remote under a key
+							// oaica resolved, a native claude/* leg is the user's
+							// own credential (see credentialIsOurs).
+							status, relayed := anthropicPassthrough(w, r, nativeBody, upstream, headerName, headerValue, table.SessionID, over.BaseURL != "")
 							feedPassthroughRouteHealth(table, over, table.SessionID, passthroughBreakerKey(over, true),
 								crossoverEscalationLeg(route.BaseURL, over.BaseURL), status, relayed, r.Context().Err() != nil)
 							return
@@ -2124,6 +2128,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 						refuse(http.StatusForbidden, reason)
 						return
 					}
+					// The estimate is the DESTINATION's now, not the leg this
+					// request was planned on: the budget the request goes out
+					// with has to be the destination's honest count of these
+					// bytes, and so does the refusal message below if even that
+					// one is not enough (2026-09-28 audit, round 55).
+					estTokens, margin = planFor(route)
 					fitBudget = route.ContextWindow - estTokens - margin
 				}
 			}
@@ -2459,27 +2469,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// Dropped from the parsed list as they are harvested: the estimate below
 	// counts the arguments once, as the stream path counts them once
 	// (streamedText += unnamedText.Len(), plus the NAMED calls only).
-	{
-		var unnamed strings.Builder
-		named := chatResp.Message.ToolCalls[:0:0]
-		for _, tc := range choice.Message.ToolCalls {
-			if strings.TrimSpace(tc.Function.Name) != "" {
-				continue
-			}
-			if s := strings.TrimSpace(tc.Function.Arguments); s != "" {
-				unnamed.WriteString(s)
-			}
-		}
-		if unnamed.Len() > 0 {
-			chatResp.Message.Content += unnamed.String()
-		}
-		for _, tc := range chatResp.Message.ToolCalls {
-			if strings.TrimSpace(tc.Function.Name) != "" {
-				named = append(named, tc)
-			}
-		}
-		chatResp.Message.ToolCalls = named
-	}
+	relayUnnamedCallArguments(&chatResp.Message, choice.Message.ToolCalls)
 	namedCall := false
 	for _, tc := range choice.Message.ToolCalls {
 		if strings.TrimSpace(tc.Function.Name) != "" {
@@ -2675,6 +2665,32 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		var unnamedText strings.Builder
 		for _, i := range indices {
 			a := toolAccums[i]
+			if strings.TrimSpace(a.name) == "" {
+				// A call the upstream never named. This path used to emit it
+				// anyway, as a content_block_start with no "name" key at all and
+				// a stop_reason of "tool_use": the client was told to expect a
+				// call it could not name and could never run, and Claude Code
+				// reports such a block as pending forever. content_block_start
+				// is the only event that carries a name, so there is no second
+				// chance to correct it — the gateway leg holds the fragment for
+				// that reason (2026-09-27 audit, round 39, B-F8) and relays
+				// whatever arguments arrived as TEXT, which is what this does
+				// too: the model's raw output, readable, rather than a call the
+				// client cannot make. The non-streaming path answers the same
+				// wire the same way (round 54, A1).
+				//
+				// Asked BEFORE the argument JSON is parsed, because there is
+				// nothing here for a parse to decide: a fragment the model was
+				// still writing when it hit the token limit has unparseable
+				// arguments too, and the truncation gate below dropped it whole
+				// — so the same document's only output reached the client as
+				// text on the non-stream arm and on both of the gateway's arms,
+				// and vanished here (2026-09-28 audit, round 55).
+				if s := strings.TrimSpace(a.args.String()); s != "" {
+					unnamedText.WriteString(s)
+				}
+				continue
+			}
 			var args api.ToolCallFunctionArguments
 			raw := strings.TrimSpace(a.args.String())
 			if raw == "" {
@@ -2698,25 +2714,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// path deliberately does, so the call is not lost entirely.
 				args = api.NewToolCallFunctionArguments()
 				args.Set("_raw", raw)
-			}
-			if strings.TrimSpace(a.name) == "" {
-				// A call the upstream never named. This path used to emit it
-				// anyway, as a content_block_start with no "name" key at all and
-				// a stop_reason of "tool_use": the client was told to expect a
-				// call it could not name and could never run, and Claude Code
-				// reports such a block as pending forever. content_block_start
-				// is the only event that carries a name, so there is no second
-				// chance to correct it — the gateway leg holds the fragment for
-				// that reason (2026-09-27 audit, round 39, B-F8) and relays
-				// whatever arguments arrived as TEXT, which is what this does
-				// too: the model's raw output, readable, rather than a call the
-				// client cannot make. The non-streaming path already answers
-				// this wire with end_turn and no block
-				// (2026-09-27 audit, round 44, C44-4).
-				if s := strings.TrimSpace(a.args.String()); s != "" {
-					unnamedText.WriteString(s)
-				}
-				continue
 			}
 			tcs = append(tcs, api.ToolCall{
 				ID:       a.id,
@@ -3192,6 +3189,51 @@ func frameCarriesWholeCompletion(payload string) bool {
 	return m.Role != "" || m.Content != "" || m.ReasoningContent != "" || m.Reasoning != "" || len(m.ToolCalls) > 0
 }
 
+// unnamedCallArgumentsText is the concatenated arguments of every call the
+// upstream never named: the model's raw output, which no block of this leg's
+// can carry as a call (content_block_start is the only event that carries a
+// name) and which therefore reaches the client as text.
+func unnamedCallArgumentsText(calls []openAIToolCall) string {
+	var b strings.Builder
+	for _, tc := range calls {
+		if strings.TrimSpace(tc.Function.Name) != "" {
+			continue
+		}
+		if s := strings.TrimSpace(tc.Function.Arguments); s != "" {
+			b.WriteString(s)
+		}
+	}
+	return b.String()
+}
+
+// relayUnnamedCallArguments folds those arguments into the message's text and
+// drops the calls from its list — the estimate counts each argument once, as
+// the stream path counts them once (streamedText += unnamedText.Len(), plus the
+// NAMED calls only).
+//
+// One implementation for both arms of this leg, because a whole completion and
+// a stream of fragments must not answer the same document two ways: round 54's
+// A1 taught the non-stream arm to relay them and left the ADOPTION — the arm a
+// stream request to a non-streaming upstream actually takes — refusing 502 a
+// document whose only payload was such a fragment, while the byte-identical
+// stream answered it 200 with the arguments as prose (2026-09-28 audit, round
+// 55).
+func relayUnnamedCallArguments(msg *api.Message, upstreamCalls []openAIToolCall) string {
+	text := unnamedCallArgumentsText(upstreamCalls)
+	named := msg.ToolCalls[:0:0]
+	for _, tc := range msg.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			continue
+		}
+		named = append(named, tc)
+	}
+	msg.ToolCalls = named
+	if text != "" {
+		msg.Content += text
+	}
+	return text
+}
+
 // adoptNonSSECompletion handles a stream request the upstream answered with a
 // whole completion instead of SSE frames, and reports whether the body was one.
 //
@@ -3248,8 +3290,15 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			slot++
 		}
 		wroteCalls = len(wroteSlots) > 0
+		// A call the upstream never named is not a call — but its arguments are
+		// the model's output, this leg relays them as text on both of its arms,
+		// and the gateway's own says-something predicate counts them for that
+		// reason (round 53), so a document whose only payload is such a fragment
+		// does not say nothing (2026-09-28 audit, round 55; see
+		// relayUnnamedCallArguments).
+		unnamedText := unnamedCallArgumentsText(m.ToolCalls)
 		if m.Content == "" &&
-			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !wroteCalls {
+			firstNonEmpty(m.Reasoning, m.ReasoningContent) == "" && !wroteCalls && unnamedText == "" {
 			return false, true, false, nil
 		}
 	}
@@ -3261,6 +3310,9 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// Content and tool calls first, with Done unset, so the converter opens and
 	// closes their content blocks before the tail's done event.
 	chatResp := openAIResponseToChatResponse(oaiResp, upstreamModel)
+	// The same fold the non-stream arm makes of the same document, so the
+	// verdict here cannot depend on which shape the request had (round 55).
+	relayUnnamedCallArguments(&chatResp.Message, oaiResp.Choices[0].Message.ToolCalls)
 	emit(conv.Process(api.ChatResponse{Model: upstreamModel, Message: chatResp.Message}))
 
 	// The tool_use blocks this path relays are output too; see the streaming
@@ -3942,7 +3994,10 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 		// nothing about the leg's health (see the feed's switch).
 		return passthroughNotAttempted, false, false
 	}
-	status, relayed := anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value, sessionID)
+	// credentialIsOurs=false: this leg sends the user's own credential
+	// (resolveNativeAnthropicAuth above), and native_anthropic_auth.go's doc
+	// makes Anthropic's 401/403 theirs to see untouched.
+	status, relayed := anthropicPassthrough(w, r, body, nativeAnthropicUpstream, auth.Header, auth.Value, sessionID, false)
 	return status, relayed, true
 }
 
@@ -3963,7 +4018,22 @@ func nativeAnthropicPassthrough(w http.ResponseWriter, r *http.Request, body []b
 // is why the caller does not use the status alone: a body that dies after a 200
 // is a dead turn the client saw, and so is no body at all, and counting either
 // healthy is the same defect on this path (2026-09-26 audit).
-func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string) (int, bool) {
+//
+// credentialIsOurs says whose credential the request went out under, and it
+// is what decides how a 401/403 from the upstream is told to the client. On a
+// plan row (true) the key is the one oaica resolved for that remote, so a
+// refusal means OUR key is wrong and the translated path's rule applies: emit
+// it as a 502, because handing Claude Code an authentication_error would send
+// it into its own login flow over a credential it never had (writeUpstreamError).
+// On a native claude/* leg (false) the credential is the user's OWN —
+// ~/.claude/.credentials.json or ANTHROPIC_API_KEY, resolved fresh per request
+// — and native_anthropic_auth.go's doc states the contract exactly: "An
+// expired token simply gets Anthropic's own 401 back through the proxy
+// untouched, exactly what would happen running Claude Code natively with that
+// same stale token — the user re-runs `claude /login` as normal." Rewriting
+// that 401 to a 502 would hide the one instruction the client needs (2026-09-28
+// audit, round 55).
+func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, upstream, headerName, headerValue, sessionID string, credentialIsOurs bool) (int, bool) {
 	// Every outcome on this leg is logged (request_log.go), the way the
 	// translated path logs it. A plan row on the anthropic wire used to write
 	// a row only when its upstream refused the connection, so the leg was
@@ -4121,20 +4191,27 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	// split is the one this proxy already makes everywhere: failures are ours
 	// to sanitize, an answer is not.
 	if resp.StatusCode >= 300 {
-		// A 401/403 here is OUR credential failing, not the client's: this leg
-		// injected its own key into the request the client never authenticated
-		// with. The translated path re-emits that refusal as a 502 for exactly
-		// that reason (writeUpstreamError: "they mean OUR key for that remote is
-		// wrong, and handing Claude Code an authentication_error would send it
-		// into its own login flow"), and this branch relayed the vendor's raw
-		// authentication_error instead — so the same body against the same
-		// refusing upstream took the client into its login flow on one wire and
-		// told it the proxy was broken on the other. The status fed to route
-		// health stays the upstream's own, so a credential refusal is classified
-		// exactly as the translated path classifies it (a 4xx is the leg
-		// answering; nothing is recorded for it) rather than as a dead backend
-		// (2026-09-28 audit, round 54).
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// A 401/403 on a PLAN row is OUR credential failing, not the client's:
+		// this leg injected its own key into the request the client never
+		// authenticated with. The translated path re-emits that refusal as a
+		// 502 for exactly that reason (writeUpstreamError: "they mean OUR key
+		// for that remote is wrong, and handing Claude Code an
+		// authentication_error would send it into its own login flow"), and this
+		// branch relayed the vendor's raw authentication_error instead — so the
+		// same body against the same refusing upstream took the client into its
+		// login flow on one wire and told it the proxy was broken on the other.
+		// The status fed to route health stays the upstream's own, so a
+		// credential refusal is classified exactly as the translated path
+		// classifies it (a 4xx is the leg answering; nothing is recorded for it)
+		// rather than as a dead backend (2026-09-28 audit, round 54).
+		//
+		// On a NATIVE leg the same numbers mean the opposite thing and the
+		// refusal is relayed untouched — see credentialIsOurs on this function:
+		// the credential is the user's own, the doc's contract is that
+		// Anthropic's 401 reaches them as it would natively, and a 502 here
+		// swallowed the `claude /login` instruction the refusal carries
+		// (2026-09-28 audit, round 55).
+		if credentialIsOurs && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			text := strings.TrimSpace(string(httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the upstream error body")))
 			resp.Body.Close()
 			writeUpstreamError(w, resp, text, headerValue)

@@ -74,7 +74,7 @@ func TestAPassthroughLegImposesNoResponseDeadline(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 
-	status, relayed := anthropicPassthrough(rec, req, body, "http://anthropic.example", "x-api-key", "sk-ant-notarealkey", "sess-deadline")
+	status, relayed := anthropicPassthrough(rec, req, body, "http://anthropic.example", "x-api-key", "sk-ant-notarealkey", "sess-deadline", true)
 
 	if status != http.StatusOK || !relayed {
 		t.Fatalf("anthropicPassthrough = (%d, relayed=%t), want (200, true) — this leg's own client was bypassed or it cut the stream short", status, relayed)

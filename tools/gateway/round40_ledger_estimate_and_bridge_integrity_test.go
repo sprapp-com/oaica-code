@@ -382,8 +382,8 @@ func TestAUrlSourcedImageIsChargedTheAllowance(t *testing.T) {
 	// Both spellings of a remote image reach this walk: the Anthropic block,
 	// and the OpenAI content part the converter writes for it.
 	spellings := map[string]any{
-		"anthropic block": map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://e.test/a.png"}},
-		"openai part (map)": map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://e.test/a.png"}},
+		"anthropic block":      map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://e.test/a.png"}},
+		"openai part (map)":    map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://e.test/a.png"}},
 		"openai part (string)": map[string]any{"type": "image_url", "image_url": "https://e.test/a.png"},
 	}
 	for name, part := range spellings {

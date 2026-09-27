@@ -2106,6 +2106,21 @@ type bridgeSSE struct {
 	// completion document sent in answer to a stream request (see
 	// adoptWholeStream).
 	nonSSE bytes.Buffer
+	// adoptedDoc is whether this stream's turn IS a whole completion this
+	// bridge adopted (adoptWholeStream), rather than frames it relayed.
+	//
+	// It is what keeps noAnswer's round-42 arm — "frames arrived and said
+	// nothing, so refuse the turn" — out of the adopted path. An adopted
+	// document is the upstream's own COMPLETE answer, carrying its own
+	// finish_reason, and a document whose only payload is a call the token limit
+	// cut short relays nothing while still being an answer the sibling legs
+	// serve as 200 + stop_reason max_tokens (the client leg's non-stream and
+	// adopt arms, pinned by round 17); judged by the frames rule it was the one
+	// record of the turn that disagreed with itself — the client read an `error`
+	// event while the ledger row, asked the same question through
+	// documentSaysSomething, booked a metered 200 for it (2026-09-28 audit,
+	// round 55).
+	adoptedDoc bool
 }
 
 func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthropicBridge {
@@ -2259,7 +2274,7 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 			return http.StatusBadGateway, b.sse.upstreamErr
 		}
 		if b.sse.startSent {
-			if b.nothingRelayed() {
+			if b.nothingRelayed() && !b.sse.adoptedDoc {
 				// Frames arrived and said nothing: no block was opened, no text
 				// was held and no call was named. That is the same outcome as
 				// the `[DONE]`-only body below — a turn the client cannot use —
@@ -2271,6 +2286,16 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 				// finishStream emits it to the client as an `error` event, and
 				// this same predicate gives the ledger row its 502
 				// (2026-09-27 audit, round 42, B42-3).
+				//
+				// Not an ADOPTED document: that is not frames that said
+				// nothing but a whole completion the upstream finished, whose
+				// own finish_reason closes the turn. A document whose only
+				// payload is a call the token limit cut short relays nothing
+				// and is still the answer the sibling legs serve as 200 +
+				// max_tokens, so judging it by this arm gave one turn two
+				// readings — an `error` event to the client, a metered 200 to
+				// the ledger row, which asks documentSaysSomething instead
+				// (2026-09-28 audit, round 55; see adoptedDoc).
 				b.sse.upstreamErr = "upstream returned an empty stream"
 				return http.StatusBadGateway, b.sse.upstreamErr
 			}
@@ -3989,6 +4014,8 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// The document IS the turn's completion marker: it is the whole completion,
 	// so nothing is missing from it (round 45, B45-2's rule).
 	b.sse.finished = true
+	// This turn is a document, not frames — see adoptedDoc.
+	b.sse.adoptedDoc = true
 	b.emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -4030,13 +4057,46 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// COMPLETE call is still a call: the test is the arguments' parseability,
 	// exactly as callInput's other callers ask it.
 	truncated := choice.FinishReason == "length"
+	unnamedArgs := []string{}
 	for i, tc := range choice.Message.ToolCalls {
-		if _, ok := callInput(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments), truncated); !ok {
+		name := firstNonEmptyStr(tc.Function.Name, tc.Name)
+		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
+		if strings.TrimSpace(name) == "" {
+			// A call the upstream never named is not a call on this path either:
+			// content_block_start is the only event that carries a name and a
+			// start without one can never be corrected, so no block is opened and
+			// the arguments are relayed as TEXT — the model's raw output, the fate
+			// finishStream gives the same fragment on the frame path and finalize
+			// gives it on the non-stream path (round 39, B-F8; round 53). Adoption
+			// alone dropped them: it opened message_start, relayed nothing, and the
+			// round-42 arm then told the client the stream was empty while the row
+			// — reading the same document through documentSaysSomething, which
+			// counts these very bytes — booked a metered 200 (2026-09-28 audit,
+			// round 55).
+			//
+			// Not truncation-dependent: a nameless fragment is never executable,
+			// so the rule that drops a truncated NAMED call (below) has nothing to
+			// drop here — the bytes reach the client as prose either way, and the
+			// client leg's adopt arm relays them the same way (round 55).
+			if args != "" {
+				unnamedArgs = append(unnamedArgs, args)
+			}
+			continue
+		}
+		if _, ok := callInput(args, truncated); !ok {
 			continue
 		}
 		idx := i
-		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name),
-			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+		b.toolDelta(&idx, tc.ID, name, args)
+	}
+	// After the blocks that name themselves, which is where the other two arms
+	// relay the same fragments: finalize appends its unnamed arguments after its
+	// tool blocks, and finishStream hands an unnamed fragment's text over at the
+	// end of the turn. Emitting one mid-loop put a document carrying both kinds
+	// of call in a different block order depending on which arm relayed it
+	// (2026-09-28 audit, round 55).
+	for _, a := range unnamedArgs {
+		b.textDelta(a)
 	}
 	if choice.FinishReason != "" {
 		b.sse.stopMsg = choice.FinishReason

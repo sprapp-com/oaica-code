@@ -182,19 +182,19 @@ func TestOversizeSwapRules(t *testing.T) {
 	}
 	// 230k-est prompt against 262k with a margin: no fit on the small leg…
 	est, margin := 262000, 1000
-	if got, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, est, margin); !swapped || got.UpstreamModel != "big-m" {
+	if got, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, est, margin, nil); !swapped || got.UpstreamModel != "big-m" {
 		t.Errorf("overflow request should swap to the big leg (got %v, %v)", got, swapped)
 	}
 	// …but one that fits must stay on the small leg.
-	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 1000, 1000); swapped {
+	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 1000, 1000, nil); swapped {
 		t.Error("fitting request must not crossover")
 	}
 	// Same base URL = same leg, no swap.
-	if _, swapped := (&proxyRouteTable{Oversize: small, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000); swapped {
+	if _, swapped := (&proxyRouteTable{Oversize: small, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000, nil); swapped {
 		t.Error("same-base-URL oversize is a no-op")
 	}
 	// local-only pin must block the remote crossover.
-	if _, swapped := (&proxyRouteTable{Policy: RouteLocalOnly, Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000); swapped {
+	if _, swapped := (&proxyRouteTable{Policy: RouteLocalOnly, Oversize: big, breakers: &routeBreakers{}}).oversizeSwap(small, 262000, 1000, nil); swapped {
 		t.Error("local-only must not crossover to a remote oversize leg")
 	}
 	// OPEN breaker on the oversize leg blocks the swap (visible 400 instead).
@@ -202,7 +202,7 @@ func TestOversizeSwapRules(t *testing.T) {
 	for i := 0; i < breakerFailsToOpen; i++ {
 		rb.recordFail(big.BaseURL)
 	}
-	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: rb}).oversizeSwap(small, 262000, 1000); swapped {
+	if _, swapped := (&proxyRouteTable{Oversize: big, breakers: rb}).oversizeSwap(small, 262000, 1000, nil); swapped {
 		t.Error("OPEN oversize breaker must block the swap")
 	}
 }

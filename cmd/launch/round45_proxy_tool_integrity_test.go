@@ -102,8 +102,22 @@ func TestANamelessCallIsNotAToolUseOnEitherPath(t *testing.T) {
 		for _, b := range r45ToolUseBlocks(t, body) {
 			t.Errorf("a call the upstream never named reached the client as a tool_use block: %v\nthe block carries no name, so Claude Code reports it as pending forever and stop_reason tool_use stops it continuing in text", b)
 		}
-		if status != http.StatusBadGateway && !strings.Contains(body, `"error"`) {
-			t.Errorf("status=%d and no error event: a stream request answered with a document that says nothing was relayed as a finished turn:\n%s", status, body)
+		// Round 45 read this arm as "a document that says nothing" and refused
+		// it 502 with an error event. Round 55 overturns that the same way round
+		// 54 overturned the non-stream subtest above: the document's only
+		// payload is a nameless call WITH arguments, which the metered gateway
+		// counts as something on both of its arms (documentSaysSomething) and
+		// relays as text, so refusing it here made the verdict depend on which
+		// shape the upstream sent — and left this leg's adopt arm disagreeing
+		// with its own non-stream arm about one byte-identical document.
+		if status != http.StatusOK {
+			t.Fatalf("status=%d, want 200: the arguments ARE the model's output on this turn, and the non-stream twin of the same document answers 200 with them as text:\n%s", status, body)
+		}
+		if strings.Contains(body, `"error"`) {
+			t.Errorf("a stream request answered with a document that relays the model's own output carried an error event:\n%s", body)
+		}
+		if !strings.Contains(body, `\"q\":1`) && !strings.Contains(body, `{"q":1}`) {
+			t.Errorf("the arguments the upstream wrote did not reach the client as text:\n%s", body)
 		}
 	})
 

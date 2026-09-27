@@ -707,7 +707,18 @@ const minViableCompletionTokens = 16
 // primary itself) was never reachable as a compaction leg. Breaker/pin
 // checks use a fixed native-anthropic key (routeLocality has no meaning
 // for an empty BaseURL) rather than being skipped outright.
-func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (proxyRoute, bool) {
+// planFor, when non-nil, re-plans a leg with the numbers ITS OWN upstream
+// earned: tokens-per-byte is a property of the leg a request is sent to — its
+// tokenizer, its prompt building — and the calibration store is keyed per leg
+// for exactly that reason (legCalibrationKey). The destination leg used to be
+// judged with the SOURCE leg's estimate and margin, so a session whose serving
+// leg had measured a low ratio crossed over on a request the destination's own
+// default read as far past its window: the request was forwarded, the upstream
+// answered a context overflow after the round trip, and the client was billed
+// for a prompt nothing could hold. nil means "no per-leg planner" and keeps the
+// caller's numbers, which is what the routing tests below ask about
+// (2026-09-28 audit, round 55).
+func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int, planFor func(proxyRoute) (int, int)) (proxyRoute, bool) {
 	// Precondition: the current leg must actually be unable to hold the
 	// request (the handler's only caller guarantees this; kept inside so the
 	// function is honest standalone).
@@ -743,8 +754,12 @@ func (t proxyRouteTable) oversizeSwap(route proxyRoute, estTokens, margin int) (
 		t.Oversize.ContextWindow <= route.ContextWindow {
 		return route, false
 	}
-	if t.Oversize.ContextWindow-estTokens-margin < minViableCompletionTokens {
-		return route, false // even the oversized leg can't hold it
+	destEst, destMargin := estTokens, margin
+	if planFor != nil {
+		destEst, destMargin = planFor(t.Oversize)
+	}
+	if t.Oversize.ContextWindow-destEst-destMargin < minViableCompletionTokens {
+		return route, false // even the oversized leg can't hold it — by its own count
 	}
 	if pin := t.Policy.pinned(); pin != "" && routeLocality(t.Oversize.BaseURL) != pin {
 		return route, false

@@ -249,11 +249,23 @@ func (s *ImageSource) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	type alias ImageSource
-	var a alias
+	// The object form carries `ref` too: the converter's own search_result arm
+	// reads a `source` object's `ref` and then its `url` (round 37, A-F6 — the
+	// gateway leg reads the same two keys in that order, round 39, C-F8), but
+	// Ref is `json:"-"` so the object spelling never populated it and the
+	// converter's fallback found nothing to fall back FROM: a body of
+	// {"ref":"http://ref"} reached the model as its title and passages with the
+	// reference gone, where the gateway wrote it — the two legs disagreeing
+	// about the prompt bytes of one client body (2026-09-28 audit, round 55).
+	var a struct {
+		alias
+		Ref string `json:"ref"`
+	}
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
-	*s = ImageSource(a)
+	*s = ImageSource(a.alias)
+	s.Ref = a.Ref
 	return nil
 }
 
@@ -2398,7 +2410,6 @@ func countAnyContent(content any) int {
 		return 0
 	}
 
-
 	switch c := content.(type) {
 	case string:
 		return len(c)
@@ -2655,7 +2666,14 @@ func systemBytes(system any) int {
 				continue
 			}
 			text, ok := bm["text"].(string)
-			if !ok {
+			if !ok || text == "" {
+				// FromMessagesRequest writes nothing for a block whose text is
+				// empty (its own `text != ""` gate), so it contributes no bytes
+				// AND no separator: adding the separator before knowing whether
+				// the block had anything to say charged 5 bytes for a
+				// three-byte system prompt whose last block was empty
+				// (2026-09-28 audit, round 55; the round-49 B-F5 rule, applied
+				// one level up).
 				continue
 			}
 			if total > 0 {
@@ -2728,10 +2746,12 @@ func countContentItemIn(item any, ctx chargeContext) int {
 	}
 	switch blockType {
 	case "tool_use":
-		// The block's own JSON, exactly as the typed arm charges it — with the
+		// The CALL's own JSON, exactly as the typed arm charges it — with the
 		// inline binary held to the image allowance, so a nested payload the
-		// converter DESCRIBES is not billed as its transport encoding.
-		total += clampedJSONBytes(m)
+		// converter DESCRIBES is not billed as its transport encoding — and
+		// reduced to the fields the converter writes (round 55; see the typed
+		// arm above).
+		total += callBlockBytes(decodedCallBlock(m))
 	case "tool_result":
 		// Not clampedJSONBytes: the converter does not paste this block, it
 		// CONVERTS its content (convertToolResultContent), and the charge
@@ -2769,8 +2789,9 @@ func countContentItemIn(item any, ctx chargeContext) int {
 		// len(json.Marshal(m)) raw billed an identical call twice as much as
 		// its tool_use twin — 515 tokens against 1 017 for the same 4 112-byte
 		// prompt — and both arms sit in this same function, one of them routed
-		// through clampedJSONBytes (2026-09-27 audit, round 42, A42-5).
-		total += clampedJSONBytes(m)
+		// through clampedJSONBytes (2026-09-27 audit, round 42, A42-5). Same
+		// reduction to the converter's own fields as its twin (round 55).
+		total += callBlockBytes(decodedCallBlock(m))
 	case "web_search_tool_result":
 		// This arm is the DECODED-JSON reader, so the block here is a nested
 		// one — inside a tool result or a passage list, where the converter
@@ -3007,6 +3028,47 @@ func imageBlockBytes(source any) int {
 	return inlineImageByteAllowance
 }
 
+// callBlockBytes charges a tool call for the JSON the converter WRITES for it.
+//
+// convertMessage's tool_use and server_tool_use arms both build one
+// api.ToolCall out of the block's type, id, name and input; every other key the
+// block carries is read by nothing and reaches no prompt. Charging the block's
+// own JSON billed those keys, so an off-spec `text` beside a call — a shape the
+// decoded arms accept and the typed block models as ContentBlock.Text — made a
+// 41 000-byte stray key into 10 269 tokens of estimate for a call whose
+// converted form is unchanged, and the estimate seeds the client-visible
+// input_tokens and the compaction threshold (2026-09-28 audit, round 55; the
+// same rule round 54's B4 applied to a text block's `text` key).
+func callBlockBytes(block ContentBlock) int {
+	return clampedJSONBytes(block)
+}
+
+// decodedCallBlock reduces a DECODED tool_use / server_tool_use block to the
+// fields converter writes for it, key by key, so a key the body carries beside
+// them is not charged. Only the keys the body actually stated are kept: the
+// typed arm marshals a struct whose empty fields are omitted, so a key this
+// dropped would otherwise be a "name":"" the call never had and the two arms
+// would drift by exactly the keys the client did not write (see
+// callBlockBytes; round 42's twin-parity test is what keeps the two equal).
+func decodedCallBlock(m map[string]any) ContentBlock {
+	var block ContentBlock
+	if s, ok := m["type"].(string); ok {
+		block.Type = s
+	}
+	if s, ok := m["id"].(string); ok {
+		block.ID = s
+	}
+	if s, ok := m["name"].(string); ok {
+		block.Name = s
+	}
+	if v, ok := m["input"]; ok {
+		if raw, err := json.Marshal(v); err == nil {
+			_ = json.Unmarshal(raw, &block.Input)
+		}
+	}
+	return block
+}
+
 // clampedJSONBytes is len(json.Marshal(v)) with every inline binary payload in
 // it held to the image allowance. The converter DESCRIBES a nested payload
 // rather than pasting it (a 400 KB image nested in a tool_result is carried as
@@ -3176,8 +3238,15 @@ func countContentBlock(block ContentBlock) int {
 	switch block.Type {
 	case "tool_use":
 		// A tool CALL is carried as JSON arguments, so its own JSON is the
-		// prompt and the escapes in it are transport.
-		total += clampedJSONBytes(block)
+		// prompt and the escapes in it are transport. It is the CALL's JSON,
+		// though, not the block's: convertMessage reads a tool_use block's type,
+		// id, name and input and writes nothing else, so a key the block carries
+		// beside them — an off-spec `text` next to a call, which the converter
+		// never writes — is not prompt bytes and must not be billed. Serializing
+		// the whole block charged a 41 000-byte stray key as 10 269 tokens
+		// against a byte-identical call (2026-09-28 audit, round 55; the round-54
+		// B4 rule, one arm over).
+		total += callBlockBytes(ContentBlock{Type: block.Type, ID: block.ID, Name: block.Name, Input: block.Input})
 	case "tool_result":
 		// A tool RESULT is CONVERTED, not pasted (convertToolResultContent), so
 		// it is charged through that reader instead. The two arms shared one
@@ -3242,8 +3311,9 @@ func countContentBlock(block ContentBlock) int {
 		// for the same reason: the escapes in that JSON are transport the
 		// receiver decodes, so serializing raw billed a call of 2 000 quotes
 		// twice what the identical tool_use prompt cost (2026-09-27 audit,
-		// round 42, A42-5).
-		total += clampedJSONBytes(block)
+		// round 42, A42-5). Reduced to the fields the converter writes for it,
+		// exactly as its tool_use twin is (round 55).
+		total += callBlockBytes(ContentBlock{Type: block.Type, ID: block.ID, Name: block.Name, Input: block.Input})
 	case "web_search_tool_result":
 		// The same omission, and then the opposite error: the converter writes
 		// the HITS, one line each, and nothing else — while serializing the

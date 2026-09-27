@@ -145,7 +145,7 @@ func TestTheHealthProbeAsksTheLegsDeclaredModelsURL(t *testing.T) {
 	table := proxyRouteTable{
 		Default: proxyRoute{
 			Label: "remote:modelsurl", BaseURL: upstream.URL,
-			ModelsURL: upstream.URL + "/v1/models",
+			ModelsURL:     upstream.URL + "/v1/models",
 			UpstreamModel: "m", ContextWindow: 32768, Wire: "openai",
 		},
 		breakers: &routeBreakers{}, escalations: &routeEscalations{},

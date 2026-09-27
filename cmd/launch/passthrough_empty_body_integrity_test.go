@@ -46,7 +46,7 @@ func TestAnEmptyUpstreamBodyIsNotADeliveredTurn(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(body))
 
-	status, relayed := anthropicPassthrough(rec, req, body, empty.URL, "x-api-key", "sk-notareal", "sess-empty-body")
+	status, relayed := anthropicPassthrough(rec, req, body, empty.URL, "x-api-key", "sk-notareal", "sess-empty-body", true)
 	if status != http.StatusOK {
 		t.Fatalf("premise: upstream status relayed was %d, want 200 — this test is about a 200 that carried nothing", status)
 	}
