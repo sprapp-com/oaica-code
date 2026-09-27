@@ -76,6 +76,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -2197,6 +2198,28 @@ func inlineImageBytes(v any) (payload, images int) {
 			p, n := inlineImageBytes(e)
 			payload += p
 			images += n
+		}
+	default:
+		// A CONCRETE slice or array is walked exactly as []any is. The
+		// Anthropic bridge (messages.go) builds its message list as
+		// []map[string]any and hands the whole body to this walk as `any`:
+		// the outer map matches the case above, but the message slice is
+		// neither []any nor map[string]any, so every element under it fell
+		// through to the end of this switch and returned (0, 0). The bridge
+		// therefore charged a 1 MB inline image its whole base64 -- the
+		// client was told input_tokens=250023 for a turn the other two legs
+		// measure at ~1050 -- while the SAME body decoded from JSON, whose
+		// arrays ARE []any, measured correctly; which is why every test that
+		// built its body by unmarshalling JSON passed (2026-09-27 audit,
+		// round 42, C42-1).
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < rv.Len(); i++ {
+				p, n := inlineImageBytes(rv.Index(i).Interface())
+				payload += p
+				images += n
+			}
 		}
 	}
 	return payload, images

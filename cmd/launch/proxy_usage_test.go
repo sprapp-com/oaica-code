@@ -116,6 +116,11 @@ func TestProxyNonStream_NoUsageObjectStillReportsAUsableInputCount(t *testing.T)
 // with the details object present but zeroed has still told us 4096 tokens
 // were cached. Keying the fallback on the details object's presence read that
 // as 0% cached.
+//
+// It reads the stated hit through statedCacheHit(), which is the reader every
+// reporting site now uses: the round-42 fix removed cachedTokens(), whose
+// clamp was hiding the stated hit from one of the two legs (2026-09-27 audit,
+// round 42, A42-1).
 func TestCachedTokens_PrefersTheNonZeroSpelling(t *testing.T) {
 	u := &openAIUsage{
 		PromptTokens:         5000,
@@ -124,8 +129,8 @@ func TestCachedTokens_PrefersTheNonZeroSpelling(t *testing.T) {
 	u.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 0}
-	if got := u.cachedTokens(); got != 4096 {
-		t.Errorf("cachedTokens = %d, want 4096 (the sibling field the upstream did populate)", got)
+	if got := u.statedCacheHit(); got != 4096 {
+		t.Errorf("statedCacheHit = %d, want 4096 (the sibling field the upstream did populate)", got)
 	}
 
 	// The populated details object still wins — it is the more specific
@@ -134,7 +139,7 @@ func TestCachedTokens_PrefersTheNonZeroSpelling(t *testing.T) {
 	u2.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 1000}
-	if got := u2.cachedTokens(); got != 1000 {
-		t.Errorf("cachedTokens = %d, want the details object's 1000", got)
+	if got := u2.statedCacheHit(); got != 1000 {
+		t.Errorf("statedCacheHit = %d, want the details object's 1000", got)
 	}
 }

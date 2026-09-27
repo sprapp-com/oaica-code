@@ -431,6 +431,8 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		messages = append(messages, converted...)
 	}
 
+	messages = normalizeSystemFirst(messages)
+
 	options := make(map[string]any)
 
 	options["num_predict"] = r.MaxTokens
@@ -528,6 +530,77 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 	logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest))
 
 	return convertedRequest, nil
+}
+
+// normalizeSystemFirst hoists every system message to the front of the
+// conversation as one message. It is this leg's half of a rule the client-side
+// proxy states in full (cmd/launch's normalizeSystemFirst): a client can send a
+// top-level `system` beside a mid-conversation system message, so the
+// conversation reaches the backend as [system, user, system] — and a strict
+// chat template raises on that (KAT-Coder's apex GGUF answers "System message
+// must be at the beginning"), which the proxy repaired and this leg did not.
+// The same body was therefore answered by a 500 here and by an answer there,
+// and the two legs handed their backends different prompts for one request
+// (2026-09-27 audit, round 42, C42-5).
+//
+// An already-ordered conversation is returned untouched, byte for byte. The
+// rewrite is only needed for a system message that arrives AFTER a non-system
+// one, and applying it unconditionally re-rendered the common case — several
+// leading system messages concatenated into one string, so the prompt differed
+// from the one the client sent and from the previous turn's, defeating any
+// prefix cache keyed on the rendered text.
+//
+// A system message carrying anything but text (an image, a call, a tool-result
+// id, thinking) cannot be merged into that one string without dropping what it
+// carries, so a conversation holding one is returned exactly as it arrived.
+func normalizeSystemFirst(messages []api.Message) []api.Message {
+	ordered := true
+	blank := false
+	seenNonSystem := false
+	for _, m := range messages {
+		if m.Role == "system" {
+			if !systemMessageIsTextOnly(m) {
+				return messages
+			}
+			if seenNonSystem {
+				ordered = false
+				break
+			}
+			if strings.TrimSpace(m.Content) == "" {
+				blank = true
+			}
+			continue
+		}
+		seenNonSystem = true
+	}
+	if ordered && !blank {
+		return messages
+	}
+	var system []string
+	rest := make([]api.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == "system" {
+			if strings.TrimSpace(m.Content) != "" {
+				system = append(system, m.Content)
+			}
+			continue
+		}
+		rest = append(rest, m)
+	}
+	if len(system) == 0 {
+		return rest // all system messages were blank — drop them
+	}
+	out := make([]api.Message, 0, len(rest)+1)
+	out = append(out, api.Message{Role: "system", Content: strings.Join(system, "\n\n")})
+	return append(out, rest...)
+}
+
+// systemMessageIsTextOnly reports whether a system message carries nothing but
+// its text, and so can be merged into the single leading system message
+// normalizeSystemFirst builds.
+func systemMessageIsTextOnly(m api.Message) bool {
+	return len(m.Images) == 0 && len(m.ToolCalls) == 0 && m.ToolCallID == "" &&
+		m.ToolName == "" && m.Thinking == ""
 }
 
 // convertMessage converts an Anthropic MessageParam to Ollama api.Message(s)
@@ -1816,21 +1889,23 @@ func ptr(s string) *string {
 
 // CountTokensRequest represents an Anthropic count_tokens request
 type CountTokensRequest struct {
-	Model    string          `json:"model"`
-	Messages []MessageParam  `json:"messages"`
-	System   any             `json:"system,omitempty"`
-	Tools    []Tool          `json:"tools,omitempty"`
-	Thinking *ThinkingConfig `json:"thinking,omitempty"`
+	Model      string          `json:"model"`
+	Messages   []MessageParam  `json:"messages"`
+	System     any             `json:"system,omitempty"`
+	Tools      []Tool          `json:"tools,omitempty"`
+	ToolChoice *ToolChoice     `json:"tool_choice,omitempty"`
+	Thinking   *ThinkingConfig `json:"thinking,omitempty"`
 }
 
 // EstimateInputTokens estimates input tokens from a MessagesRequest (reuses CountTokensRequest logic)
 func EstimateInputTokens(req MessagesRequest) int {
 	return estimateTokens(CountTokensRequest{
-		Model:    req.Model,
-		Messages: req.Messages,
-		System:   req.System,
-		Tools:    req.Tools,
-		Thinking: req.Thinking,
+		Model:      req.Model,
+		Messages:   req.Messages,
+		System:     req.System,
+		Tools:      req.Tools,
+		ToolChoice: req.ToolChoice,
+		Thinking:   req.Thinking,
 	})
 }
 
@@ -1846,7 +1921,7 @@ func estimateTokens(req CountTokensRequest) int {
 	var totalLen int
 
 	// Count system prompt
-	totalLen += countAnyContent(req.System)
+	totalLen += systemBytes(req.System)
 
 	for _, msg := range req.Messages {
 		// Count role (always present)
@@ -1855,7 +1930,33 @@ func estimateTokens(req CountTokensRequest) int {
 		totalLen += countAnyContent(msg.Content)
 	}
 
+	// Charge the tools the CONVERTER forwards, not the ones the body carries.
+	// FromMessagesRequest drops every tool for tool_choice "none" and drops a
+	// user-defined tool that collides with the built-in web_search, so a body
+	// carrying a 400 KB schema it had just asked not to be given was charged
+	// ~100 000 tokens against a converted prompt of 97 bytes — the estimate
+	// seeds the client-visible input_tokens on the local leg, so the session's
+	// meter and auto-compaction read a tool surface the model never saw
+	// (2026-09-27 audit, round 42, A42-3).
+	//
+	// The predicates are the converter's own, spelled the same way: a
+	// tool_choice type is matched case- and space-insensitively, and the
+	// collision is a non-builtin tool NAMED web_search beside a builtin one.
+	dropTools := req.ToolChoice != nil && strings.EqualFold(strings.TrimSpace(req.ToolChoice.Type), "none")
+	hasBuiltinWebSearch := false
+	for _, t := range req.Tools {
+		if strings.HasPrefix(t.Type, "web_search") {
+			hasBuiltinWebSearch = true
+			break
+		}
+	}
 	for _, tool := range req.Tools {
+		if dropTools {
+			break
+		}
+		if hasBuiltinWebSearch && !strings.HasPrefix(tool.Type, "web_search") && tool.Name == "web_search" {
+			continue
+		}
 		totalLen += len(tool.Name) + len(tool.Description) + len(tool.InputSchema)
 	}
 
@@ -1895,6 +1996,43 @@ func countAnyContent(content any) int {
 	}
 }
 
+// systemBytes charges the system prompt for what the converter WRITES for it.
+// FromMessagesRequest reads a system string whole, and a system ARRAY for its
+// "text" blocks only — joined with a blank line — dropping every other block
+// and dropping a non-string, non-array system value entirely. Charging that
+// input through the general content reader billed the blocks the converter
+// discards: a 400 KB text document in the system array measured 100 002 tokens
+// against a converted system message of 2 bytes, and the estimate seeds the
+// client-visible input_tokens on the local leg, so the session compacted early
+// on a prompt that was never sent (2026-09-27 audit, round 42, A42-4).
+func systemBytes(system any) int {
+	switch sys := system.(type) {
+	case string:
+		return len(sys)
+	case []any:
+		// The separator is the converter's "\n\n": the blocks it joins are
+		// prompt bytes too, and leaving them out would let the two measures
+		// drift by two bytes per block.
+		total := 0
+		for _, block := range sys {
+			bm, ok := block.(map[string]any)
+			if !ok || bm["type"] != "text" {
+				continue
+			}
+			text, ok := bm["text"].(string)
+			if !ok {
+				continue
+			}
+			if total > 0 {
+				total += 2
+			}
+			total += len(text)
+		}
+		return total
+	}
+	return 0
+}
+
 // countContentItem charges one content item that arrived as decoded JSON.
 //
 // It used to marshal the item and unmarshal it into a ContentBlock, and
@@ -1906,23 +2044,58 @@ func countAnyContent(content any) int {
 // unconditionally by middleware/anthropic.go (2026-09-27 audit, round 38,
 // A-F1). This walks the decoded value directly — the same fields with the same
 // arithmetic as the typed path, in one pass.
-func countContentItem(item any) int {
+func countContentItem(item any) int { return countContentItemIn(item, chargeMessage) }
+
+// chargeContext is the carrier a content block travels in, because the
+// converter treats the same block differently in each one and the estimate has
+// to charge what that reader WRITES. A block's own JSON is the prompt only
+// where the converter pastes its JSON; where it describes the block, the
+// description is the prompt; where it carries the block, the carrier's unit is.
+type chargeContext int
+
+const (
+	// chargeMessage is a block in a message's (or a passage list's own) content
+	// array: the reader is convertMessage.
+	chargeMessage chargeContext = iota
+	// chargeToolResult is an element of a tool_result's content: the reader is
+	// convertToolResultContent, which carries an image, describes a binary
+	// document and drops a non-string text.
+	chargeToolResult
+	// chargeSearchResult is a passage in a search_result's content: the reader
+	// is searchResultText, which reads a "text" passage and DESCRIBES every
+	// other block — a picture among the passages is a one-line notice, not its
+	// payload.
+	chargeSearchResult
+)
+
+func countContentItemIn(item any, ctx chargeContext) int {
 	m, ok := item.(map[string]any)
 	if !ok {
 		// A non-object item has no block shape; the typed path charged it 0
 		// because it could not be decoded into one.
 		return 0
 	}
+	switch ctx {
+	case chargeToolResult:
+		return toolResultItemBytes(m)
+	case chargeSearchResult:
+		return searchResultItemBytes(m)
+	}
 	total := 0
 	if s, ok := m["text"].(string); ok {
 		total += len(s)
 	}
 	switch t, _ := m["type"].(string); t {
-	case "tool_use", "tool_result":
+	case "tool_use":
 		// The block's own JSON, exactly as the typed arm charges it — with the
 		// inline binary held to the image allowance, so a nested payload the
 		// converter DESCRIBES is not billed as its transport encoding.
 		total += clampedJSONBytes(m)
+	case "tool_result":
+		// Not clampedJSONBytes: the converter does not paste this block, it
+		// CONVERTS its content (convertToolResultContent), and the charge
+		// follows that reader (see toolResultBytes).
+		total += toolResultBytes(m)
 	case "document":
 		// What the converter WRITES for this block, which is not what the
 		// block carries: a nested document reaches the prompt as its text, or
@@ -1941,25 +2114,162 @@ func countContentItem(item any) int {
 		if title, ok := m["title"].(string); ok {
 			total += len(title)
 		}
-		total += countAnyContent(m["content"])
+		// The passages are read by searchResultText, whose own rule this walk
+		// uses (see chargeSearchResult): a nested picture among them is
+		// DESCRIBED, so charging it the image allowance billed ~4 100 bytes
+		// against a five-byte notice and the session's meter read a prompt the
+		// model was never sent (2026-09-27 audit, round 42, C42-1).
+		total += countItemsIn(m["content"], chargeSearchResult)
 		total += imageSourceBytes(m["source"])
 	case "server_tool_use":
-		if data, err := json.Marshal(m); err == nil {
-			total += len(data)
-		}
+		// Charged exactly as the tool_use arm above, because the converter
+		// writes the two the same way: this block's JSON IS the tool call, and
+		// the escapes in it are transport that the receiver decodes. Charging
+		// len(json.Marshal(m)) raw billed an identical call twice as much as
+		// its tool_use twin — 515 tokens against 1 017 for the same 4 112-byte
+		// prompt — and both arms sit in this same function, one of them routed
+		// through clampedJSONBytes (2026-09-27 audit, round 42, A42-5).
+		total += clampedJSONBytes(m)
 	case "web_search_tool_result":
-		// This arm is the DECODED-JSON reader, so the block here is either
-		// nested — where the converter falls through to
-		// describeToolResultBlock's JSON fallback, which is what is charged —
-		// or inside `system`, which the converter reads for text blocks only.
-		// The message-level spelling is the typed arm's business, and it is
-		// charged the formatted hits rather than this JSON (2026-09-27 audit,
-		// round 41, A41-3).
+		// This arm is the DECODED-JSON reader, so the block here is a nested
+		// one — inside a tool result or a passage list, where the converter
+		// falls through to describeToolResultBlock's JSON fallback, which is
+		// what the arms above charge for it. The message-level spelling is the
+		// typed arm's business, and it is charged the formatted hits rather
+		// than this JSON (2026-09-27 audit, round 41, A41-3). It is no longer
+		// said to be the `system` path: system content is charged by
+		// systemBytes for exactly the text blocks the converter reads
+		// (2026-09-27 audit, round 42, A42-4).
 		if data, err := json.Marshal(m); err == nil {
 			total += len(data)
 		}
 	}
 	return total
+}
+
+// countItemsIn charges a content array in the carrier named by ctx. It is the
+// one reader for both spellings the converter takes: it decodes a typed
+// []ContentBlock the way the converter does (through JSON, so the two cannot
+// drift) and walks the items with the carrier's own rule.
+func countItemsIn(content any, ctx chargeContext) int {
+	switch c := content.(type) {
+	case string:
+		// A bare string where a list is expected: searchResultText returns it
+		// whole, convertToolResultContent writes it whole.
+		return len(c)
+	case []ContentBlock:
+		items := make([]any, 0, len(c))
+		for i := range c {
+			raw, err := json.Marshal(c[i])
+			if err != nil {
+				continue
+			}
+			var m map[string]any
+			if json.Unmarshal(raw, &m) != nil {
+				continue
+			}
+			items = append(items, m)
+		}
+		return countItemsIn(items, ctx)
+	case []any:
+		total := 0
+		for _, item := range c {
+			total += countContentItemIn(item, ctx)
+		}
+		return total
+	}
+	return 0
+}
+
+// toolResultBytes charges one tool_result block for what
+// convertToolResultContent WRITES into the prompt for it: the block's own
+// frame — its type, its tool_use_id and its is_error flag — plus the converted
+// content.
+//
+// It does NOT charge clampedJSONBytes of the whole block, which is what the
+// tool_use arm beside it charges and what this arm used to charge. The
+// converter never pastes a tool_result's JSON: it converts the content, and a
+// nested attachment is the clearest case — a 400 KB PDF inside a tool_result
+// reaches the prompt as a 71-byte notice, so serializing the block billed the
+// base64 of a file the model is told about in seventy bytes, and the same shape
+// at 4 bytes measured 148 against a 156-byte wire, i.e. the charge tracked the
+// payload rather than the notice (2026-09-27 audit, round 42, A42-2/A42-6).
+func toolResultBytes(block map[string]any) int {
+	frame := make(map[string]any, len(block))
+	for k, v := range block {
+		if k != "content" {
+			frame[k] = v
+		}
+	}
+	total := 0
+	if data, err := json.Marshal(frame); err == nil {
+		total += len(data) - jsonEscapeOverhead(data)
+	}
+	return total + toolResultContentBytes(block["content"])
+}
+
+// toolResultContentBytes charges one tool_result's `content` field the way
+// convertToolResultContent converts it.
+func toolResultContentBytes(content any) int {
+	switch c := content.(type) {
+	case nil:
+		return 0
+	case string:
+		return len(c)
+	case []ContentBlock, []any:
+		// The converter joins the elements it converts with a newline and
+		// REFUSES an element that is not a JSON object (the whole request is
+		// answered 400 and no estimate is used for it), so a non-object item
+		// writes nothing here either.
+		return countItemsIn(c, chargeToolResult)
+	case map[string]any:
+		// A bare object is described, not carried: convertToolResultContent's
+		// default arm calls describeToolResultBlock, whose fallback is the
+		// block's own JSON — and that JSON is TEXT in the prompt, so its
+		// escapes are prompt bytes and are charged in full. Subtracting them
+		// (as clampedJSONBytes does for a JSON *string field*, where the
+		// receiver decodes the escapes away) charged half the wire for the
+		// shape round 41 added support for (2026-09-27 audit, round 42, A42-6).
+		return len(describeToolResultBlock(c))
+	}
+	if data, err := json.Marshal(content); err == nil && len(data) > 0 && string(data) != "null" {
+		return len(data)
+	}
+	return 0
+}
+
+// toolResultItemBytes charges one element of a tool_result's content, arm for
+// arm with convertToolResultContent: a text element is its text when that text
+// IS a string (the converter's case has no else, so a non-string text writes
+// nothing), a document is described, an image is CARRIED — it is appended to
+// the message's images, so it is charged the allowance this product's other two
+// measures charge — and every other element is whatever
+// describeToolResultBlock renders for it, which is exactly what the converter
+// writes for it too.
+func toolResultItemBytes(m map[string]any) int {
+	switch t, _ := m["type"].(string); t {
+	case "text":
+		text, _ := m["text"].(string)
+		return len(text)
+	case "document":
+		return len(describeToolResultDocument(m["source"]))
+	case "image":
+		return imageBlockBytes(m["source"])
+	}
+	return len(describeToolResultBlock(m))
+}
+
+// searchResultItemBytes charges one passage of a search_result's content, the
+// way searchResultText reads it: a "text" block is its text — and a text that
+// is not a string is no passage and is skipped — while any other block is
+// DESCRIBED, so a picture among the passages is its one-line notice and not its
+// payload.
+func searchResultItemBytes(m map[string]any) int {
+	if t, _ := m["type"].(string); t == "text" {
+		text, _ := m["text"].(string)
+		return len(text)
+	}
+	return len(describeToolResultBlock(m))
 }
 
 // imageSourceBytes is the content a block's `source` carries, in either
@@ -2175,8 +2485,22 @@ func countContentBlock(block ContentBlock) int {
 	// render `.Thinking` is out of scope for this fallback, and the upstream's
 	// own count corrects the estimate whenever it states one).
 	switch block.Type {
-	case "tool_use", "tool_result":
+	case "tool_use":
+		// A tool CALL is carried as JSON arguments, so its own JSON is the
+		// prompt and the escapes in it are transport.
 		total += clampedJSONBytes(block)
+	case "tool_result":
+		// A tool RESULT is CONVERTED, not pasted (convertToolResultContent), so
+		// it is charged through that reader instead. The two arms shared one
+		// case until the reader below existed: the same treatment billed a
+		// nested attachment's base64 against a wire that holds a notice for it,
+		// and billed a nested image nothing at all where the converter carries
+		// it (2026-09-27 audit, round 42, A42-2/C42-1).
+		total += toolResultBytes(map[string]any{
+			"type":        block.Type,
+			"tool_use_id": block.ToolUseID,
+			"content":     block.Content,
+		})
 	case "document":
 		// A text source's data is written into the prompt by the converter and
 		// was charged nothing here, so a turn whose newest message was a large
@@ -2197,8 +2521,11 @@ func countContentBlock(block ContentBlock) int {
 		}
 	case "search_result":
 		// Same omission, same consequence: the passages and the label above
-		// them are prompt content the converter now forwards.
-		total += len(block.Title) + countAnyContent(block.Content)
+		// them are prompt content the converter now forwards. They are read by
+		// searchResultText, so they are charged through that reader's rule
+		// (chargeSearchResult) rather than through the message-level one — a
+		// picture among the passages is described there, not carried.
+		total += len(block.Title) + countItemsIn(block.Content, chargeSearchResult)
 		if block.Source != nil {
 			// Both spellings of a source are charged, because the converter
 			// writes whichever one the body carried (A-F6): a URL stated in the
@@ -2222,10 +2549,12 @@ func countContentBlock(block ContentBlock) int {
 		// The same omission, one type over: a server tool call reaches the
 		// prompt as a tool call — id, name and arguments — which is this
 		// block's own JSON within a couple of dozen bytes, and it was charged
-		// nothing.
-		if data, err := json.Marshal(block); err == nil {
-			total += len(data)
-		}
+		// nothing. Charged exactly as the tool_use arm charges its twin, and
+		// for the same reason: the escapes in that JSON are transport the
+		// receiver decodes, so serializing raw billed a call of 2 000 quotes
+		// twice what the identical tool_use prompt cost (2026-09-27 audit,
+		// round 42, A42-5).
+		total += clampedJSONBytes(block)
 	case "web_search_tool_result":
 		// The same omission, and then the opposite error: the converter writes
 		// the HITS, one line each, and nothing else — while serializing the

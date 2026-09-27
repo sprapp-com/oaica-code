@@ -9,12 +9,19 @@ import (
 	"testing"
 )
 
-// TestAStatedCacheHitSurvivesAnUnstatedPrompt is A-F4. cachedTokens clamps the
+// TestAStatedCacheHitSurvivesAnUnstatedPrompt is A-F4. The reader clamped the
 // hit to the prompt size, and an upstream that narrates the hit while never
 // stating prompt_tokens (or stating it negative, which is no statement either)
 // clamped it to 0: the client believed the whole prompt was fresh input while
 // the ledger row for the same turn recorded the hit — the round-38 B-F1
 // disagreement, one chunk ordering away from the case that was fixed.
+//
+// The reader is statedCacheHit() since round 42, which is UNCLAMPED: the third
+// case below used to expect the clamp, and it now expects the stated 4096, the
+// same value the gateway's row records for the identical usage object — the
+// prompt total is raised to the hit instead of the hit being cut down to a size
+// the upstream never stated (2026-09-27 audit, round 40 A40-3 / round 42
+// A42-1).
 func TestAStatedCacheHitSurvivesAnUnstatedPrompt(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -32,9 +39,9 @@ func TestAStatedCacheHitSurvivesAnUnstatedPrompt(t *testing.T) {
 			want:  900,
 		},
 		{
-			name:  "hit above a stated prompt is clamped to it",
+			name:  "hit above a stated prompt is reported as stated, not cut to the prompt",
 			usage: openAIUsage{PromptTokens: 1000, PromptCacheHitTokens: 4096},
-			want:  1000,
+			want:  4096,
 		},
 		{
 			name:  "nothing stated is nothing",
@@ -45,8 +52,8 @@ func TestAStatedCacheHitSurvivesAnUnstatedPrompt(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			u := tt.usage
-			if got := u.cachedTokens(); got != tt.want {
-				t.Errorf("cachedTokens() = %d, want %d\nreturning 0 threw a stated hit away: the client reads a full-prompt fresh input for a turn the cache served", got, tt.want)
+			if got := u.statedCacheHit(); got != tt.want {
+				t.Errorf("statedCacheHit() = %d, want %d\nreturning 0 threw a stated hit away: the client reads a full-prompt fresh input for a turn the cache served", got, tt.want)
 			}
 		})
 	}

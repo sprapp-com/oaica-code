@@ -264,11 +264,13 @@ func TestProxyStream_OneIndexLessCallWithFragmentedArgumentsStaysOne(t *testing.
 }
 
 // F5: the clamp target is itself unvalidated, so a malformed NEGATIVE
-// prompt_tokens produced a negative cache-read count nobody stated.
+// prompt_tokens produced a negative cache-read count nobody stated. The reader
+// is statedCacheHit() now (round 42 removed the clamped one), and the guard is
+// the same: a prompt count that is no measurement cannot become a cache read.
 func TestCachedTokensNeverGoesNegativeWithAMalformedPromptCount(t *testing.T) {
 	u := &openAIUsage{PromptTokens: -5}
-	if got := u.cachedTokens(); got != 0 {
-		t.Errorf("cachedTokens() = %d for prompt_tokens=-5, want 0: the clamp returns the prompt count itself, so a malformed negative prompt made the client's cache_read_input_tokens negative — a count the upstream never stated", got)
+	if got := u.statedCacheHit(); got != 0 {
+		t.Errorf("statedCacheHit() = %d for prompt_tokens=-5 with no hit stated, want 0: a malformed negative prompt count is no measurement, and it must not reach the client as a cache_read_input_tokens the upstream never stated", got)
 	}
 }
 

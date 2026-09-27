@@ -143,8 +143,40 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	if !ok {
 		return nil, "max_tokens is required"
 	}
-	if n, isNum := mt.(float64); isNum && n <= 0 {
+	// A JSON null and a JSON string are not a positive count, and the sibling
+	// converter's typed field refuses both at decode (null becomes 0, a string
+	// fails to decode) — so forwarding them was the same body answered two
+	// ways, and the upstream read a null or a quoted number as an output cap.
+	// The rule beside this one, on the sampling fields below, already states it:
+	// a value that is not the shape this wire means is not a statement
+	// (2026-09-27 audit, round 42, B42-6).
+	//
+	// Both numeric shapes are accepted. A client's number arrives as float64,
+	// but a body this process built itself (the clamps below rewrite req[k]
+	// with a Go int — see outputBudget's doc) carries a plain int, and reading
+	// only float64 refused a body that says exactly what this wire means: the
+	// same mistake the round-32 budget reader had already recorded
+	// (2026-09-27 audit, round 42, verification).
+	n, isNum := 0.0, false
+	switch v := mt.(type) {
+	case float64:
+		n, isNum = v, true
+	case int:
+		n, isNum = float64(v), true
+	case int64:
+		n, isNum = float64(v), true
+	}
+	if !isNum {
+		return nil, "max_tokens is required and must be a positive number"
+	}
+	if n <= 0 {
 		return nil, "max_tokens is required and must be positive"
+	}
+	if n != float64(int64(n)) {
+		// The sibling's field is an int: 16.5 does not decode, so the request is
+		// refused there. Sending 16.5 upstream would be this leg inventing an
+		// answer the other leg refuses.
+		return nil, "max_tokens is required and must be a positive integer"
 	}
 	out["max_tokens"] = mt
 	// top_k is carried by the sibling converter (options["top_k"]) and was
@@ -242,7 +274,7 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	if sys := systemToMessage(req["system"]); sys != nil {
 		msgs = append([]map[string]any{sys}, msgs...)
 	}
-	out["messages"] = msgs
+	out["messages"] = normalizeSystemFirst(msgs)
 
 	// tool_choice is read BEFORE the tools, because "none" means the model is
 	// given no tool surface at all: the sibling converter drops every tool for
@@ -257,13 +289,23 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		tc = c
 		choiceType, _ = c["type"].(string)
 	}
+	// The type is normalized exactly as the sibling normalizes it before it
+	// reads it (EqualFold over a trimmed value): matching the literal "none"
+	// let `"NONE"` and `" none "` forward the whole tool surface, so the body
+	// that says "do not call a tool" reached the model with every tool defined
+	// on this leg and none on the other (2026-09-27 audit, round 42, B42-4).
+	choiceType = strings.ToLower(strings.TrimSpace(choiceType))
 	if choiceType != "none" {
 		if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
 			var oai []map[string]any
-			for _, t := range tools {
+			for i, t := range tools {
 				tm, _ := t.(map[string]any)
 				if tm == nil {
-					continue
+					// The sibling's typed list refuses the whole request on the
+					// same element, so skipping it served a turn with a tool
+					// missing — the model was given a surface the client did not
+					// send (2026-09-27 audit, round 42, B42-8).
+					return nil, "tools element is not an object (index " + strconv.Itoa(i) + ")"
 				}
 				fn := map[string]any{"name": tm["name"]}
 				if d, ok := tm["description"]; ok {
@@ -289,6 +331,87 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		out["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
 	return out, ""
+}
+
+// normalizeSystemFirst hoists every system message to the front of the
+// conversation as one message — this bridge's half of a rule the client-side
+// proxy states in full (cmd/launch's normalizeSystemFirst) and the local leg
+// applies too (anthropic.FromMessagesRequest). A client that sends a top-level
+// `system` beside a mid-conversation system message reaches the backend as
+// [system, user, system], and a strict chat template raises on that
+// (KAT-Coder's apex GGUF answers "System message must be at the beginning"):
+// the same body was answered here by the template's 500 and, through the
+// proxy, by an answer (2026-09-27 audit, round 42, C42-5).
+//
+// An already-ordered conversation is returned untouched, byte for byte. The
+// rewrite is only needed for a system message that arrives AFTER a non-system
+// one, and applying it unconditionally re-rendered the common case — several
+// leading system messages concatenated into one string, so the prompt differed
+// from the one the client sent and from the previous turn's, defeating any
+// prefix cache keyed on the rendered text.
+//
+// A system message carrying anything but text — a part array, a tool call, a
+// tool-result id, any key but role and content — cannot be merged into that one
+// string without dropping what it carries, so a conversation holding one is
+// returned exactly as it arrived.
+func normalizeSystemFirst(msgs []map[string]any) []map[string]any {
+	ordered := true
+	blank := false
+	seenNonSystem := false
+	for _, m := range msgs {
+		if role, _ := m["role"].(string); role == "system" {
+			if !systemMessageIsTextOnly(m) {
+				return msgs
+			}
+			if seenNonSystem {
+				ordered = false
+				break
+			}
+			if s, _ := m["content"].(string); strings.TrimSpace(s) == "" {
+				blank = true
+			}
+			continue
+		}
+		seenNonSystem = true
+	}
+	if ordered && !blank {
+		return msgs
+	}
+	var system []string
+	rest := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		if role, _ := m["role"].(string); role == "system" {
+			if s, _ := m["content"].(string); strings.TrimSpace(s) != "" {
+				system = append(system, s)
+			}
+			continue
+		}
+		rest = append(rest, m)
+	}
+	if len(system) == 0 {
+		return rest // all system messages were blank — drop them
+	}
+	out := make([]map[string]any, 0, len(rest)+1)
+	out = append(out, map[string]any{"role": "system", "content": strings.Join(system, "\n\n")})
+	return append(out, rest...)
+}
+
+// systemMessageIsTextOnly reports whether a system message carries nothing but
+// its text: role and a string content, and no other key at all. Only such a
+// message can be merged into the single leading system message
+// normalizeSystemFirst builds.
+func systemMessageIsTextOnly(m map[string]any) bool {
+	if _, ok := m["content"].(string); !ok {
+		return false
+	}
+	for k := range m {
+		switch k {
+		case "role", "content":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // systemToMessage flattens Anthropic's system field (string or content
@@ -381,13 +504,19 @@ func toolResultText(content any, carryImages bool) (string, string) {
 				// An empty text block is no text: joined as an empty part it
 				// put a blank line in front of the real content, where the
 				// client leg's copy skips it (2026-09-27 audit, round 39,
-				// A-F6).
-				if s, ok := bm["text"].(string); ok {
-					if s != "" {
-						parts = append(parts, s)
-					}
+				// A-F6). A text that is not a string is no text either — the
+				// sibling's reader writes nothing for it and the describer
+				// below would have pasted `{"text":42,"type":"text"}` into the
+				// prompt as though the tool had returned that JSON
+				// (2026-09-27 audit, round 42, B42-7/C42-3).
+				s, ok := bm["text"].(string)
+				if !ok {
 					continue
 				}
+				if s != "" {
+					parts = append(parts, s)
+				}
+				continue
 			case "image":
 				if carryImages {
 					continue
@@ -444,8 +573,13 @@ func toolResultImageParts(content any) (parts []any, notices []string, refuse st
 		case "base64", "":
 			data, _ := src["data"].(string)
 			if data == "" {
-				notices = append(notices, describeBlock(cb))
-				continue
+				// A base64 image with no data is not an image this wire can
+				// express or describe: the sibling's resolveImageSource refuses
+				// the whole request in words ("base64 with no data"), and the
+				// local leg's comment says this leg refuses it too while this
+				// leg answered 200 with a placeholder the model read as the
+				// tool's answer (2026-09-27 audit, round 42, C42-4).
+				return nil, nil, "invalid image source: base64 with no data"
 			}
 			if _, refuse := base64ImagePayload(data); refuse != "" {
 				return nil, nil, refuse
@@ -457,7 +591,12 @@ func toolResultImageParts(content any) (parts []any, notices []string, refuse st
 					"url": "data:" + inlineImageMediaType(media, data) + ";base64," + data,
 				}})
 		default:
-			notices = append(notices, describeBlock(cb))
+			// Same rule for a source type neither leg can carry: the sibling
+			// refuses it outright ("invalid image source type: weird. Only
+			// base64 images are supported.") rather than passing a notice to
+			// the model as the tool's answer (2026-09-27 audit, round 42,
+			// C42-4).
+			return nil, nil, "invalid image source type: " + st + ". Only base64 images are supported."
 		}
 	}
 	return parts, notices, ""
@@ -603,13 +742,20 @@ func searchResultText(content any) string {
 				// describer and put `{"text":"","type":"text"}` in the prompt as
 				// though the search had returned it, which the sibling converter
 				// has skipped since round 38 (2026-09-27 audit, round 39,
-				// C-F7/A-F6).
-				if s, ok := bm["text"].(string); ok {
-					if s != "" {
-						parts = append(parts, s)
-					}
+				// C-F7/A-F6). A passage whose text is not a STRING is no
+				// passage either, and the sibling skips it in both places it
+				// reads a passage list — a null or a number was described here,
+				// so the model read `{"text":null,"type":"text"}` as a search
+				// hit on this leg and nothing at all on the others
+				// (2026-09-27 audit, round 42, B42-7/C42-3).
+				s, ok := bm["text"].(string)
+				if !ok {
 					continue
 				}
+				if s != "" {
+					parts = append(parts, s)
+				}
+				continue
 			}
 			if desc := describeBlock(cb); desc != "" {
 				parts = append(parts, desc)
@@ -617,7 +763,17 @@ func searchResultText(content any) string {
 		}
 		return strings.Join(parts, "\n")
 	default:
-		return describeBlock(c)
+		// A block OBJECT is described — the sibling's reader has no arm for a
+		// passage list stated as an object and drops it, which is the one
+		// divergence this leg keeps in the model's favour. A bare scalar is not
+		// a block and not a passage: describing it put the number or the boolean
+		// in the prompt as though the search had returned it, where the sibling
+		// writes nothing for a value of that shape (2026-09-27 audit, round 42,
+		// C42-3).
+		if bm, ok := c.(map[string]any); ok {
+			return describeBlock(bm)
+		}
+		return ""
 	}
 }
 
@@ -766,7 +922,17 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 	}
 	blocks, ok := content.([]any)
 	if !ok {
-		return []map[string]any{{"role": role, "content": ""}}, ""
+		// A content that is neither a string nor a block array is a shape this
+		// wire cannot carry, and the sibling's typed field refuses it at decode
+		// — an object or a number was answered 200 here with content:"" , so the
+		// model was handed an empty user turn and the client read a successful
+		// answer to a prompt it never sent. `null` is NOT this case: the sibling
+		// decodes it to empty content too, which is what the caller does
+		// (2026-09-27 audit, round 42, B42-5/C42-6).
+		if content == nil {
+			return []map[string]any{{"role": role, "content": ""}}, ""
+		}
+		return nil, "message content is neither a string nor an array of content blocks"
 	}
 	var out []map[string]any
 	var parts []map[string]any // text/image parts of THIS message
@@ -898,6 +1064,17 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				}
 				if name == "" {
 					return nil, "tool_use block missing required 'name' field"
+				}
+				// The sibling decodes this field into a JSON object and fails
+				// the whole request on anything else; re-marshalling it here
+				// wrote the raw string back as a JSON string, so a call whose
+				// arguments the client leg refuses reached the model here with
+				// arguments no tool can parse (2026-09-27 audit, round 42,
+				// C42-6).
+				if in, present := bm["input"]; present && in != nil {
+					if _, isObj := in.(map[string]any); !isObj {
+						return nil, "tool_use block 'input' must be a JSON object"
+					}
 				}
 			}
 			args, _ := json.Marshal(bm["input"])
@@ -1339,6 +1516,21 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 			return http.StatusBadGateway, b.sse.upstreamErr
 		}
 		if b.sse.startSent {
+			if b.nothingRelayed() {
+				// Frames arrived and said nothing: no block was opened, no text
+				// was held and no call was named. That is the same outcome as
+				// the `[DONE]`-only body below — a turn the client cannot use —
+				// and it used to be booked as a 200 success and metered, while
+				// the byte-identical outcome with no frame at all was a 502.
+				// A client that reads a completed empty turn never retries,
+				// which is exactly what the 502 is for. It is recorded as this
+				// stream's own failure so the two readers of one turn agree:
+				// finishStream emits it to the client as an `error` event, and
+				// this same predicate gives the ledger row its 502
+				// (2026-09-27 audit, round 42, B42-3).
+				b.sse.upstreamErr = "upstream returned an empty stream"
+				return http.StatusBadGateway, b.sse.upstreamErr
+			}
 			return 0, ""
 		}
 		if _, ok := b.bufferedCompletion(); ok {
@@ -1586,8 +1778,14 @@ func (b *anthropicBridge) finalize() {
 	in, out := promptTotal-cached, u.CompletionTokens
 	// The answer's size, in the unit the stream path counts it in, so the
 	// fallback below is one rule for both paths (2026-09-27 audit, round 39,
-	// C-F3).
-	b.sse.outBytes = len(content)
+	// C-F3). Counted through documentRelayedBytes, the same helper the ledger's
+	// documentOutputEstimate and the adopted-stream arm use: counting the
+	// content alone made this leg's output_tokens and its own row's
+	// completion_tokens two different numbers for any answer carrying reasoning
+	// or a tool call — a tool-only turn was relayed to the client as
+	// output_tokens:0 while the row recorded 5, and the same document delivered
+	// as SSE frames agreed with itself (2026-09-27 audit, round 42, B42-1).
+	b.sse.outBytes = documentRelayedBytes(msg)
 	if out <= 0 {
 		out = b.outputEstimate()
 	}
@@ -2210,11 +2408,17 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// output_tokens and the row's completion_tokens for one adopted answer
 	// cannot drift (2026-09-27 audit, round 41, B41-2).
 	b.sse.outBytes += documentRelayedBytes(choice.Message)
-	if choice.Message.Content != nil && *choice.Message.Content != "" {
-		b.textDelta(*choice.Message.Content)
-	}
+	// Reasoning FIRST, then the answer — the order relayDelta emits them in,
+	// and the order the Anthropic wire puts a thinking block in. This path
+	// hand-writes its deltas rather than going through relayDelta, and writing
+	// the answer first meant one upstream document produced two different
+	// client-visible block orders depending on whether it arrived as frames or
+	// as a single body (2026-09-27 audit, round 42, B42-2).
 	if r := firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent); r != "" {
 		b.textDelta(r)
+	}
+	if choice.Message.Content != nil && *choice.Message.Content != "" {
+		b.textDelta(*choice.Message.Content)
 	}
 	for i, tc := range choice.Message.ToolCalls {
 		idx := i

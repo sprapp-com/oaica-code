@@ -223,15 +223,12 @@ func toolCallArgumentsSize(calls []api.ToolCall) int {
 	return n
 }
 
-// cachedTokens returns the prefix-cache hit count, clamped to the prompt
-// size so a malformed upstream can never yield a negative input_tokens.
 // statedCacheHit reports the cache-read count the upstream actually stated,
 // with no clamp against the prompt total: a stated hit is evidence ABOUT the
 // prompt, so a hit larger than the total means the total is short, not that the
 // hit is wrong (2026-09-27 audit, round 40, A40-3). Details win over the
-// sibling name and each keeps its own last positive statement; a negative count
-// is no statement at all. cachedTokens() is this value clamped for cost
-// arithmetic — see its note.
+// sibling name and each keeps its own last positive statement; a non-positive
+// count is no statement at all.
 func (u *openAIUsage) statedCacheHit() int {
 	if u == nil {
 		return 0
@@ -249,7 +246,13 @@ func (u *openAIUsage) statedCacheHit() int {
 	// fully uncached prompt while its own sibling field said 4096 cached
 	// tokens. The user's cache-efficiency read-out was 0% for a real hit
 	// (2026-09-26 audit).
-	if c == 0 {
+	// A NON-positive details value is no statement either, and it must not
+	// suppress the sibling that does state the hit: testing `== 0` here let an
+	// explicit cached_tokens: -5 short-circuit the fallback and then be
+	// discarded, so a body the gateway leg reports as 900 cached tokens was
+	// reported by this leg as 0 — the same usage object answered two ways,
+	// decided by which leg served it (2026-09-27 audit, round 42, C42-2).
+	if c <= 0 {
 		c = u.PromptCacheHitTokens
 	}
 	if c < 0 {
@@ -258,43 +261,20 @@ func (u *openAIUsage) statedCacheHit() int {
 	return c
 }
 
-// cachedTokens is the stated cache hit clamped to a stated prompt, for the
-// arithmetic that subtracts a hit from a total. Reporting goes through
-// statedCacheHit() and raises the total to the hit instead.
-func (u *openAIUsage) cachedTokens() int {
-	if u == nil {
-		return 0
-	}
-	c := u.statedCacheHit()
-	if c == 0 {
-		return 0
-	}
-	if u.PromptTokens <= 0 {
-		// The prompt was never stated (or was stated as a negative, which is
-		// no statement either), so there is no measurement to clamp against —
-		// and returning 0 here threw a stated hit away. "0" is silence, not a
-		// measurement (see statedPromptTokens): an upstream that narrates the
-		// hit while never stating the prompt size made the client believe the
-		// whole prompt was fresh input, while the gateway's ledger for the
-		// same turn recorded the hit — the round-38 B-F1 disagreement, one
-		// chunk ordering away from the case that was fixed (2026-09-27 audit,
-		// round 39, A-F4).
-		//
-		// No consumer can turn this into a negative input_tokens: each one
-		// either raises its prompt total to the hit before deriving the uncached
-		// count from it (the non-stream leg, the streaming tail, the gateway's
-		// entry), or patches the hit onto a delta whose prompt it only touches
-		// when the upstream stated one. The clamp inside UsageFromMetrics is the
-		// one arithmetic left that could still flatten a hit, which is why every
-		// call site now raises the total to it first (2026-09-27 audit, round
-		// 41, C41-1).
-		return c
-	}
-	if c > u.PromptTokens {
-		return u.PromptTokens
-	}
-	return c
-}
+// cachedTokens used to be the stated hit clamped to a stated prompt, and it had
+// exactly one job left after round 41: the arithmetic that subtracted a hit
+// from a total. It is gone, because that arithmetic never needed the clamp —
+// every site that reports the hit raises its prompt total to the UNCLAMPED one
+// first (the non-stream leg's PromptEvalCachedCount, the streaming tail's
+// message_delta patch), which is the round-40 rule: a stated hit is evidence
+// ABOUT the prompt, so the total is raised to it and never the hit clamped down
+// to a size the upstream never stated. The one clamp left that could flatten a
+// hit is UsageFromMetrics' own (cache_read against input_tokens), and by then
+// the total has already been raised. Two readers for one usage object was how
+// round 41's divergence stayed hidden: the streaming tail took the clamped one
+// and the non-stream leg the unclamped one, so the same upstream object was
+// answered input=0/cache_read=100 streamed and input=4900/cache_read=100 whole
+// (2026-09-27 audit, round 42, A42-1).
 
 // statedPromptTokens / statedCompletionTokens report whether the usage object
 // actually STATES that particular count. The presence of the object is not a
@@ -325,7 +305,13 @@ func cacheReadPtr(u *openAIUsage) *int {
 	if u == nil || (u.PromptTokensDetails == nil && u.PromptCacheHitTokens == 0) {
 		return nil
 	}
-	return intPtr(u.cachedTokens())
+	// UNCLAMPED: this is a reporting site, and the prompt total above it has
+	// already been raised to the hit. Clamping here reported
+	// cache_read=100/input=4900 for an upstream that stated 5000 cached of a
+	// 100-token prompt, while the streaming leg reported 0/100 for the same
+	// object and the gateway's own row reported 0/5000 — three answers to one
+	// usage object (2026-09-27 audit, round 42, A42-1).
+	return intPtr(u.statedCacheHit())
 }
 
 // intPtr is a fresh *int per call: handing out the address of a loop variable
@@ -570,6 +556,13 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 // apex GGUF: "System message must be at the beginning"), 500ing every request.
 // Concatenate all system content into ONE leading system message and keep the
 // non-system messages in their original order.
+//
+// A system message that carries anything BUT text — an image part, a tool call
+// — cannot be merged into that one string, and the rewrite would silently drop
+// what it carries: the same rule the other two legs apply (the local leg's
+// anthropic.FromMessagesRequest and the gateway's /v1/messages bridge), and the
+// reason all three return a conversation holding one exactly as it arrived
+// (2026-09-27 audit, round 42, C42-5).
 func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 	// Leave an already-ordered conversation byte-for-byte alone. The rewrite
 	// below is only needed for a system message that arrives AFTER a non-system
@@ -583,6 +576,9 @@ func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 	seenNonSystem := false
 	for _, m := range msgs {
 		if m.Role == "system" {
+			if !systemMessageIsTextOnly(m) {
+				return msgs
+			}
 			if seenNonSystem {
 				ordered = false
 				break
@@ -614,6 +610,14 @@ func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 	out := make([]openAIMessage, 0, len(msgs))
 	out = append(out, openAIMessage{Role: "system", Content: strings.Join(system, "\n\n")})
 	return append(out, rest...)
+}
+
+// systemMessageIsTextOnly reports whether a system message carries nothing but
+// its text: no image part, no tool call, no tool-result id. Only such a message
+// can be merged into the single leading system string normalizeSystemFirst
+// builds.
+func systemMessageIsTextOnly(m openAIMessage) bool {
+	return len(m.Images) == 0 && len(m.ToolCalls) == 0 && m.ToolCallID == ""
 }
 
 // imageDataURL sniffs the image magic bytes for the data-URL MIME type
@@ -2685,7 +2689,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	statedPrompt := finalUsage.statedPromptTokens()
 	statedCompletion := finalUsage.statedCompletionTokens()
 	if finalUsage != nil {
-		cached = finalUsage.cachedTokens()
+		// The UNCLAMPED hit, exactly as the non-stream leg and the gateway's
+		// entry() read it: `total` below is raised to this value, so clamping
+		// it here would first hide the evidence and then report the turn as
+		// fresh input the upstream never billed (2026-09-27 audit, round 42,
+		// A42-1).
+		cached = finalUsage.statedCacheHit()
 	}
 	if statedPrompt {
 		doneResp.Metrics.PromptEvalCount = finalUsage.PromptTokens - cached
