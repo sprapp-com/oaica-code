@@ -177,14 +177,21 @@ func TestTheUnitDoesNotChargeAnyJSONEscaping(t *testing.T) {
 		"tab":          "\t",
 		"control-0x01": "\x01",
 		"line-sep":     "\u2028",
+		"para-sep":     "\u2029",
 	} {
 		body := round34MessagesBody(t, "user", []map[string]any{
 			{"type": "text", "text": strings.Repeat(ch, n)},
 		}, 4096)
+		// The unit is the DECODED prompt: n copies of this character at its own
+		// width, not n bytes. U+2028 and U+2029 are six bytes on the wire and
+		// three decoded, and charging them one measured a prompt made of line
+		// separators at a third of its size (2026-09-27 audit, round 37,
+		// A-F4/B-F6).
+		want := baseline + (len(ch)-1)*n
 		got := clientPromptBytes(body)
-		if got > baseline+64 || got < baseline-64 {
-			t.Errorf("%d %s characters measure %d bytes against %d for the same number of plain characters: the upstream JSON-decodes the body before tokenizing anything, so a two- or six-byte escape for a one-byte character is the transport's cost and not the prompt's — and the same unit feeds the calibration ratio and the estInputTokens fallback",
-				n, name, got, baseline)
+		if got > want+64 || got < want-64 {
+			t.Errorf("%d %s characters measure %d bytes where the decoded prompt is %d: the upstream JSON-decodes the body before tokenizing anything, so the bytes an escape spends on the wire are the transport's cost and not the prompt's — and the same unit feeds the calibration ratio and the estInputTokens fallback",
+				n, name, got, want)
 		}
 	}
 }

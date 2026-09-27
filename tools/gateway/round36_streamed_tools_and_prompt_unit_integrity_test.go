@@ -156,20 +156,42 @@ func TestAnImagePartInTheStringSpellingIsChargedAsAnImage(t *testing.T) {
 	}
 }
 
-// TestThePromptUnitDoesNotChargeJSONEscaping is A-F4: the round-35 client leg
-// stopped charging Go's HTML escaping; this leg still charged it, so the same
-// prompt measured differently depending on which leg served it.
+// TestThePromptUnitDoesNotChargeJSONEscaping is A-F4 and B-F5: the round-35
+// client leg stopped charging Go's HTML escaping; this leg still charged it, so
+// the same prompt measured differently depending on which leg served it. The
+// table also covers the two-character escapes (`"`, `\`, newline, tab — a
+// quote, a path or a line break appears in nearly every real prompt) and the
+// `\u` forms, each measured against the size of the character it decodes to
+// rather than against another spelling: the unit's contract is the DECODED
+// prompt, so a six-byte escape standing for a three-byte character is worth
+// three bytes, not one and not six (2026-09-27 audit, round 37, B-F5/B-F6).
 func TestThePromptUnitDoesNotChargeJSONEscaping(t *testing.T) {
 	const n = 100000
 	plain := map[string]any{"messages": []any{map[string]any{
 		"role": "user", "content": strings.Repeat("a", n),
 	}}}
-	markup := map[string]any{"messages": []any{map[string]any{
-		"role": "user", "content": strings.Repeat("<", n),
-	}}}
-	plainBytes, markupBytes := messagesBytes(plain), messagesBytes(markup)
-	if markupBytes > plainBytes+1024 {
-		t.Errorf("two prompts of the same length measure %d and %d bytes: the upstream JSON-decodes the body before tokenizing anything, so the six bytes json.Marshal spends on each `<` are the transport's cost — and the two legs of this product must measure the same quantity, or a prompt the client admits is refused here", plainBytes, markupBytes)
+	baseline := messagesBytes(plain)
+	for name, ch := range map[string]string{
+		"quote":        `"`,
+		"backslash":    `\`,
+		"newline":      "\n",
+		"tab":          "\t",
+		"less-than":    "<",
+		"ampersand":    "&",
+		"control-0x01": "\x01",
+		"line-sep":     "\u2028",
+		"para-sep":     "\u2029",
+	} {
+		body := map[string]any{"messages": []any{map[string]any{
+			"role": "user", "content": strings.Repeat(ch, n),
+		}}}
+		// What the upstream decodes the prompt to: the same n characters, at
+		// this character's own width.
+		want := baseline + (len(ch)-1)*n
+		if got := messagesBytes(body); got > want+64 || got < want-64 {
+			t.Errorf("%d %s characters measure %d bytes where the decoded prompt is %d: the upstream JSON-decodes the body before tokenizing anything, so the bytes an escape spends on the wire are the transport's cost and not the prompt's — and the same unit feeds the fit clamp, the calibration ratio and the estInputTokens fallback",
+				n, name, got, want)
+		}
 	}
 }
 

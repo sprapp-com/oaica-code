@@ -253,6 +253,36 @@ func toolResultText(content any) string {
 	}
 }
 
+// searchResultText flattens a search_result's content — the passages a search
+// returned — into the text the model is asked about. Same reading as
+// toolResultText: a text block is its passage, and a block of another type is
+// described rather than read for a "text" key it may happen to carry, so a
+// nested block whose passage sits under another key is not silently dropped
+// (2026-09-27 audit, round 37, A-F1/A-F3).
+func searchResultText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		parts := make([]string, 0, len(c))
+		for _, cb := range c {
+			bm, ok := cb.(map[string]any)
+			if ok && bm["type"] == "text" {
+				if s, ok := bm["text"].(string); ok && s != "" {
+					parts = append(parts, s)
+					continue
+				}
+			}
+			if desc := describeBlock(cb); desc != "" {
+				parts = append(parts, desc)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return describeBlock(c)
+	}
+}
+
 // describeBlock renders one non-text tool_result block: an image as its media
 // type and payload size, a document as its text or its size, anything else as
 // its JSON. The base64 of an image is deliberately NOT inlined — a screenshot
@@ -526,6 +556,37 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 				return nil, `document block with source.type "text" and no data`
 			}
 			parts = append(parts, map[string]any{"type": "text", "text": data})
+		case "search_result":
+			// A passage the search returned, carried in the turn the model is
+			// asked about: its title, where it came from, and the text itself.
+			// The sibling client-side converter gained this case and the two
+			// legs must not disagree about whether the model received it — the
+			// same body was 200-with-content through `oaica launch` and a 400
+			// here, which is the disagreement that case exists to close
+			// (2026-09-27 audit, round 37, A-F1). A source is a bare URL string
+			// in the documented spelling and an object in the other; the client
+			// leg reads both, so this one does too.
+			var label []string
+			if title, _ := bm["title"].(string); title != "" {
+				label = append(label, title)
+			}
+			switch src := bm["source"].(type) {
+			case string:
+				if src != "" {
+					label = append(label, src)
+				}
+			case map[string]any:
+				if u, _ := src["url"].(string); u != "" {
+					label = append(label, u)
+				}
+			}
+			content := searchResultText(bm["content"])
+			if content != "" {
+				label = append(label, content)
+			}
+			if len(label) > 0 {
+				parts = append(parts, map[string]any{"type": "text", "text": strings.Join(label, "\n")})
+			}
 		default:
 			// A block this bridge cannot represent is REFUSED in words, never
 			// dropped: the switch had no default and no "document" case, so an
@@ -571,6 +632,9 @@ type anthropicBridge struct {
 	// upstream that sends the index-less fragments this wire permits (an
 	// arguments-only continuation) keeps writing into the block it opened.
 	lastToolKey string
+	// lastToolName is the name that opened that block, so a later fragment
+	// naming a DIFFERENT tool is understood to be introducing one.
+	lastToolName string
 	// synthSeq mints keys for calls whose upstream states neither an index nor
 	// an id, so two such calls cannot share a block.
 	synthSeq int
@@ -790,11 +854,14 @@ func (b *anthropicBridge) finalize() {
 	}
 	for _, tc := range msg.ToolCalls {
 		var input any = map[string]any{}
-		if tc.Function.Arguments != "" {
-			_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
+		if args != "" {
+			_ = json.Unmarshal([]byte(args), &input)
 		}
 		respBlocks = append(respBlocks, map[string]any{
-			"type": "tool_use", "id": tc.ID, "name": tc.Function.Name, "input": input,
+			"type": "tool_use", "id": tc.ID,
+			"name":  firstNonEmptyStr(tc.Function.Name, tc.Name),
+			"input": input,
 		})
 	}
 	if len(respBlocks) == 0 {
@@ -999,23 +1066,46 @@ func (b *anthropicBridge) textDelta(s string) {
 // its name and arguments were written into the first call's block, so a turn
 // that chose two tools reached the client as one (2026-09-27 audit, round 36,
 // B-F2).
-func (b *anthropicBridge) toolKey(upIdx *int, id string) string {
+//
+// EVERY branch records the block it answers with, because the fragment that
+// follows may omit everything but the arguments. Recording it only for an
+// id-bearing delta sent that continuation to a freshly minted block with no
+// name and no id — one call became two, the first holding half its own JSON and
+// the second nothing, and the turn still reported stop_reason tool_use
+// (2026-09-27 audit, round 37, B-F1). And a fragment that carries a NAME can
+// only be introducing a call (an argument continuation carries arguments
+// alone), so a name that differs from the one that opened the current block
+// starts a new one: keyed by the block the previous delta opened, two calls in
+// a stream that states neither an index nor an id shared one block, the second
+// name discarded and its arguments concatenated onto the first's input
+// (2026-09-27 audit, round 37, B-F2).
+func (b *anthropicBridge) toolKey(upIdx *int, id, name string) string {
 	if upIdx != nil {
-		return "#" + strconv.Itoa(*upIdx)
+		if name != "" {
+			b.lastToolName = name
+		}
+		b.lastToolKey = "#" + strconv.Itoa(*upIdx)
+		return b.lastToolKey
 	}
 	if id != "" {
+		if name != "" {
+			b.lastToolName = name
+		}
 		b.lastToolKey = "!" + id
 		return b.lastToolKey
 	}
-	if b.lastToolKey == "" {
+	if (name != "" && name != b.lastToolName) || b.lastToolKey == "" {
 		b.synthSeq++
 		b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+		if name != "" {
+			b.lastToolName = name
+		}
 	}
 	return b.lastToolKey
 }
 
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
-	key := b.toolKey(upIdx, id)
+	key := b.toolKey(upIdx, id, name)
 	block, ok := b.toolBlocks[key]
 	if !ok {
 		if b.textOpen {
@@ -1152,11 +1242,19 @@ type openAICompletion struct {
 			// round).
 			ReasoningContent *string `json:"reasoning_content"`
 			ToolCalls        []struct {
-				ID       string `json:"id"`
+				ID string `json:"id"`
+				// The nested spelling is the one the OpenAI wire documents,
+				// and the flat one is what several backends actually write.
+				// The streaming reader in this same file reads both, so a
+				// non-streaming client of the identical upstream bytes must
+				// not be the only one that works (2026-09-27 audit, round 37,
+				// B-F3).
 				Function struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
 				} `json:"function"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
 			} `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`

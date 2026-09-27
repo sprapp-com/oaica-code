@@ -2,6 +2,7 @@ package launch
 
 import (
 	"encoding/json"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/anthropic"
 )
@@ -120,9 +121,9 @@ func marshalPrompt(v any) (int, error) {
 }
 
 // jsonEscapeOverhead counts the bytes json.Marshal spends writing a character
-// as an escape sequence. Every escape it writes is one it will decode back to a
-// single character, so each two-character escape carries one extra byte and
-// each six-character `\uXXXX` five. Round 35 undid only the three HTML escapes
+// as an escape sequence. Every escape it writes decodes back to fewer bytes
+// than it occupies — one fewer for the two-character forms, and as many as the
+// rune it stands for for a `\uXXXX`. Round 35 undid only the three HTML escapes
 // (`<`, `>`, `&`), which left `"`, `\`, `\n`, `\t` — two bytes each, in every
 // prompt holding a quote, a path, or a line break — and every control character
 // charged to the prompt at up to six times their size (2026-09-27 audit, round
@@ -144,12 +145,42 @@ func jsonEscapeOverhead(b []byte) int {
 			i++
 		case 'u':
 			if i+5 < len(b) && isHex4(b[i+2:i+6]) {
-				extra += 5
+				extra += 6 - escapedRuneLen(b[i+2:i+6])
 				i += 5
 			}
 		}
 	}
 	return extra
+}
+
+// escapedRuneLen is the UTF-8 length of what a `\uXXXX` escape decodes to. The
+// escapes json.Marshal writes are for characters a JSON writer must escape —
+// U+0000 to U+001F, U+2028 and U+2029 — and the last two are three bytes
+// decoded: crediting every `\u` escape the one byte of a control escape
+// measured a prompt made of line separators at a third of its size, so the fit
+// clamp and the calibration ratio saw a prompt the upstream would have to
+// refuse, or truncated the turn to fit a length it never had (2026-09-27
+// audit, round 37, B-F6/A-F4). A lone surrogate decodes to U+FFFD, three bytes.
+func escapedRuneLen(p []byte) int {
+	var v rune
+	for _, c := range p {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			v |= rune(c-'a') + 10
+		default:
+			v |= rune(c-'A') + 10
+		}
+	}
+	if v >= 0xD800 && v <= 0xDFFF {
+		return 3
+	}
+	if n := utf8.RuneLen(v); n > 0 {
+		return n
+	}
+	return 3
 }
 
 // isHex4 reports whether a four-character `\u` payload is hex — every escape of

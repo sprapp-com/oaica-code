@@ -706,9 +706,19 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				sb.WriteString(block.Title)
 				sb.WriteString("\n")
 			}
-			if block.Source != nil && block.Source.Ref != "" {
-				sb.WriteString(block.Source.Ref)
-				sb.WriteString("\n")
+			if block.Source != nil {
+				// The bare string is the documented spelling of a
+				// search_result's source; the object form is off-spec but
+				// accepted by UnmarshalJSON, and reading only Ref dropped a URL
+				// the body did state (2026-09-27 audit, round 37, A-F6).
+				ref := block.Source.Ref
+				if ref == "" {
+					ref = block.Source.URL
+				}
+				if ref != "" {
+					sb.WriteString(ref)
+					sb.WriteString("\n")
+				}
 			}
 			sb.WriteString(searchResultText(block.Content))
 			if sb.Len() > 0 {
@@ -1360,10 +1370,32 @@ func describeToolResultDocument(raw any) string {
 	return fmt.Sprintf("[document tool result omitted: %s, %d bytes of base64]", media, size)
 }
 
+// describeToolResultBlock renders a block nested in a tool result (or a search
+// result's passage list) whose type this converter does not name: a document
+// through the describer above, anything else as its JSON. The gateway leg's
+// describeBlock does the same, and this is a copy rather than an import because
+// the two modules cannot see each other's helpers — the same nested block used
+// to be skipped here and described there, so the model was asked about content
+// that only reached it on one of the two legs (2026-09-27 audit, round 37,
+// A-F2/A-F3).
+func describeToolResultBlock(bm map[string]any) string {
+	if t, _ := bm["type"].(string); t == "document" {
+		return describeToolResultDocument(bm["source"])
+	}
+	if b, err := json.Marshal(bm); err == nil {
+		return string(b)
+	}
+	return "[tool result block that could not be represented]"
+}
+
 // searchResultText flattens a search_result's content — the passages a search
-// returned — into the text the model is asked about. Its content is text
-// blocks; a block of any other type is described rather than pasted, the way a
-// tool result's unrecognised block is.
+// returned — into the text the model is asked about. A text block is its
+// passage; a block of any OTHER type is described rather than read for a
+// "text" key it may happen to carry, which is what this did: the type was
+// never consulted, so text from a block of an unknown type was pasted into the
+// prompt while a block holding its passage under another key (a nested
+// search_result) was silently dropped — the same silent omission the caller's
+// case exists to close, one level down (2026-09-27 audit, round 37, A-F3).
 func searchResultText(content any) string {
 	switch c := content.(type) {
 	case string:
@@ -1371,11 +1403,18 @@ func searchResultText(content any) string {
 	case []ContentBlock:
 		var sb strings.Builder
 		for _, b := range c {
-			if b.Text != nil && *b.Text != "" {
+			if b.Type == "text" && b.Text != nil && *b.Text != "" {
 				if sb.Len() > 0 {
-					sb.WriteString("\n\n")
+					sb.WriteString("\n")
 				}
 				sb.WriteString(*b.Text)
+				continue
+			}
+			if desc := describeSearchBlock(b); desc != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(desc)
 			}
 		}
 		return sb.String()
@@ -1386,18 +1425,37 @@ func searchResultText(content any) string {
 			if !ok {
 				continue
 			}
-			t, _ := m["text"].(string)
-			if t == "" {
+			var desc string
+			if t, _ := m["type"].(string); t == "text" {
+				desc, _ = m["text"].(string)
+			} else {
+				desc = describeToolResultBlock(m)
+			}
+			if desc == "" {
 				continue
 			}
 			if sb.Len() > 0 {
-				sb.WriteString("\n\n")
+				sb.WriteString("\n")
 			}
-			sb.WriteString(t)
+			sb.WriteString(desc)
 		}
 		return sb.String()
 	}
 	return ""
+}
+
+// describeSearchBlock renders a non-text passage block given as a typed block
+// rather than a decoded map: to the same wording as its map form.
+func describeSearchBlock(b ContentBlock) string {
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return "[tool result block that could not be represented]"
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return string(raw)
+	}
+	return describeToolResultBlock(m)
 }
 
 func convertToolResultContent(content any) (string, []api.ImageData, error) {
@@ -1419,13 +1477,14 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 			switch cbMap["type"] {
 			case "text":
 				if t, ok := cbMap["text"].(string); ok {
-					// Joined like every other text segment in this file;
-					// concatenating turned two sentences into one whenever the
-					// first did not end in punctuation — "first line" +
-					// "second line" = "first linesecond line" (2026-09-26
-					// audit, sixteenth round).
+					// Separated so two blocks do not read as one sentence —
+					// "first line" + "second line" = "first linesecond line"
+					// (2026-09-26 audit, sixteenth round). The separator is the
+					// gateway leg's toolResultText join: the two legs assemble
+					// the same blocks, so the assembled text has to be the same
+					// bytes (2026-09-27 audit, round 37, A-F7).
 					if text.Len() > 0 {
-						text.WriteString("\n\n")
+						text.WriteString("\n")
 					}
 					text.WriteString(t)
 				}
@@ -1444,7 +1503,7 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 				// read.
 				if desc := describeToolResultDocument(cbMap["source"]); desc != "" {
 					if text.Len() > 0 {
-						text.WriteString("\n\n")
+						text.WriteString("\n")
 					}
 					text.WriteString(desc)
 				}
@@ -1470,6 +1529,21 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 					return "", nil, err
 				}
 				images = append(images, img)
+			default:
+				// A nested block of a type this switch does not name is
+				// DESCRIBED, not dropped — the same defect the document arm
+				// above closed, one type over: a nested search_result carries
+				// passages the model is asked about, and it was counted and
+				// silently discarded here while the gateway leg put the same
+				// block in the prompt. The turn was answered 200 about text the
+				// model never received, on this leg only (2026-09-27 audit,
+				// round 37, A-F2).
+				if desc := describeToolResultBlock(cbMap); desc != "" {
+					if text.Len() > 0 {
+						text.WriteString("\n")
+					}
+					text.WriteString(desc)
+				}
 			}
 		}
 
@@ -1601,7 +1675,11 @@ func countContentBlock(block ContentBlock) int {
 		// them are prompt content the converter now forwards.
 		total += len(block.Title) + countAnyContent(block.Content)
 		if block.Source != nil {
-			total += len(block.Source.Ref)
+			// Both spellings of a source are charged, because the converter
+			// writes whichever one the body carried (A-F6): a URL stated in the
+			// object form reached the prompt and was never counted, so the
+			// estimate lagged the prompt it is supposed to seed.
+			total += len(block.Source.Ref) + len(block.Source.URL)
 		}
 	}
 	return total

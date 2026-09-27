@@ -151,7 +151,13 @@ func TestAnEmptyConversationIsNotSentAsNull(t *testing.T) {
 
 	body := round34MessagesBody(t, "user", []map[string]any{
 		{"type": "some_future_block", "text": "unrepresentable"},
-		{"type": "search_result", "title": "a result the converter does not carry"},
+		// A second block the converter does not forward. This used to be a
+		// search_result, which the round-36 converter gained a case for: its
+		// title now reaches the prompt, so the turn was no longer the
+		// all-unrepresentable one this test is named for and both of its
+		// assertions passed for a reason unrelated to the guard (2026-09-27
+		// audit, round 37, A-F5).
+		{"type": "another_future_block", "text": "also unrepresentable"},
 	}, 4096)
 
 	var anthReq anthropic.MessagesRequest

@@ -83,6 +83,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Legal/status pages are embedded so they ship with the binary and are
@@ -274,8 +275,26 @@ func (m gwModel) acceptsImages() bool {
 	return false
 }
 
+// partIsImage reports whether a chat content part carries an image: either by
+// the type the schema names, or by the payload key alone, which is the way the
+// walk in inlineImageBytes recognises one. The part's type is optional on this
+// wire and clients do omit it; the gate and the meter have to answer the same
+// question about the same part, or a body holding a 1 MB screenshot is charged
+// the 4 KB image allowance by the walk and seen as text by the gate that
+// decides whether a text-only model must refuse it (2026-09-27 audit, round
+// 37, B-F7).
+func partIsImage(p map[string]any) bool {
+	switch p["type"] {
+	case "image_url", "input_image", "image":
+		return true
+	}
+	_, ok := p["image_url"]
+	return ok
+}
+
 // hasImageContent reports whether any message carries an image part in the
-// OpenAI chat schema ({"type":"image_url"} or {"type":"input_image"}).
+// OpenAI chat schema ({"type":"image_url"} or {"type":"input_image"}, and the
+// payload-key-only spelling partIsImage also accepts).
 func hasImageContent(req map[string]any) bool {
 	msgs, _ := req["messages"].([]any)
 	for _, mi := range msgs {
@@ -285,9 +304,7 @@ func hasImageContent(req map[string]any) bool {
 			continue
 		}
 		for _, pi := range parts {
-			p, _ := pi.(map[string]any)
-			switch p["type"] {
-			case "image_url", "input_image", "image":
+			if p, ok := pi.(map[string]any); ok && partIsImage(p) {
 				return true
 			}
 		}
@@ -1892,9 +1909,9 @@ func jsonMeasuredBytes(v any) (int, bool) {
 }
 
 // jsonEscapeOverhead counts the bytes json.Marshal spends writing a character
-// as an escape sequence. Every escape it writes is one it will decode back to a
-// single character, so each two-character escape carries one extra byte and
-// each six-character `\uXXXX` five.
+// as an escape sequence. Every escape it writes decodes back to fewer bytes
+// than it occupies — one fewer for the two-character forms, and as many as the
+// rune it stands for for a `\uXXXX`.
 //
 // The scan follows backslashes the way a JSON reader does, so text holding the
 // literal characters `\n` is not miscounted: its backslash is consumed as the
@@ -1911,12 +1928,44 @@ func jsonEscapeOverhead(b []byte) int {
 			i++
 		case 'u':
 			if i+5 < len(b) && isHex4(b[i+2:i+6]) {
-				extra += 5
+				extra += 6 - escapedRuneLen(b[i+2:i+6])
 				i += 5
 			}
 		}
 	}
 	return extra
+}
+
+// escapedRuneLen is the UTF-8 length of what a `\uXXXX` escape decodes to. The
+// escapes json.Marshal writes are for characters a JSON writer must escape —
+// U+0000 to U+001F, U+2028 and U+2029 — and the last two are three bytes
+// decoded: crediting every `\u` escape the one byte of a control escape
+// measured a prompt made of line separators at a third of its size, so the fit
+// clamp and the calibration ratio saw a prompt the upstream would have to
+// refuse, or truncated the turn to fit a length it never had (2026-09-27
+// audit, round 37, B-F6/A-F4). A lone surrogate decodes to U+FFFD, three bytes.
+// This is the client leg's function too; the two legs have to measure the same
+// quantity.
+func escapedRuneLen(p []byte) int {
+	var v rune
+	for _, c := range p {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			v |= rune(c-'a') + 10
+		default:
+			v |= rune(c-'A') + 10
+		}
+	}
+	if v >= 0xD800 && v <= 0xDFFF {
+		return 3
+	}
+	if n := utf8.RuneLen(v); n > 0 {
+		return n
+	}
+	return 3
 }
 
 // isHex4 reports whether a four-character `\u` payload is hex — every escape of
