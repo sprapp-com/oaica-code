@@ -130,7 +130,11 @@ func anthropicToOpenAI(req map[string]any) (map[string]any, string) {
 			continue
 		}
 		role, _ := m["role"].(string)
-		msgs = append(msgs, contentBlocksToOpenAI(role, m["content"])...)
+		converted, convErr := contentBlocksToOpenAI(role, m["content"])
+		if convErr != "" {
+			return nil, convErr
+		}
+		msgs = append(msgs, converted...)
 	}
 	// out["messages"] may already hold the system message; append.
 	if sys := systemToMessage(req["system"]); sys != nil {
@@ -271,13 +275,17 @@ func describeBlock(raw any) string {
 // block array) into one-or-more OpenAI messages: text/images ride the same
 // message, tool_use becomes assistant tool_calls, tool_result becomes a
 // separate role:"tool" message (the OpenAI wire has no other spelling).
-func contentBlocksToOpenAI(role string, content any) []map[string]any {
+// The second return is the input this wire cannot represent, propagated to
+// anthropicToOpenAI's own error string so the client gets a 400 naming the
+// block instead of an answer to a silently altered prompt (2026-09-27 audit,
+// round 33, B-F2).
+func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) {
 	if s, ok := content.(string); ok {
-		return []map[string]any{{"role": role, "content": s}}
+		return []map[string]any{{"role": role, "content": s}}, ""
 	}
 	blocks, ok := content.([]any)
 	if !ok {
-		return []map[string]any{{"role": role, "content": ""}}
+		return []map[string]any{{"role": role, "content": ""}}, ""
 	}
 	var out []map[string]any
 	var parts []map[string]any // text/image parts of THIS message
@@ -313,13 +321,41 @@ func contentBlocksToOpenAI(role string, content any) []map[string]any {
 			txt, _ := bm["text"].(string)
 			parts = append(parts, map[string]any{"type": "text", "text": txt})
 		case "image":
-			if src, ok := bm["source"].(map[string]any); ok {
+			// The source's TYPE decides what the OpenAI wire can carry, and
+			// reading only media_type/data read an Anthropic url source as two
+			// empty strings: the model was sent the literal blank image
+			// "data:;base64," and the client read a 200 about a picture it never
+			// sent (2026-09-27 audit, round 33, B-F2). A source this wire
+			// cannot express is refused instead — a silent blank is a lie the
+			// answer is built on.
+			src, _ := bm["source"].(map[string]any)
+			if src == nil {
+				return nil, "image block without a source"
+			}
+			switch st, _ := src["type"].(string); st {
+			case "url":
+				u, _ := src["url"].(string)
+				if u == "" {
+					return nil, `image block with source.type "url" and no url`
+				}
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": u},
+				})
+			case "base64", "":
+				// "" keeps the clients that spell a source as media_type+data
+				// with no type, which this case read before the type existed.
 				media, _ := src["media_type"].(string)
 				data, _ := src["data"].(string)
+				if data == "" {
+					return nil, "image block with no inline data"
+				}
 				parts = append(parts, map[string]any{
 					"type":      "image_url",
 					"image_url": map[string]any{"url": "data:" + media + ";base64," + data},
 				})
+			default:
+				return nil, fmt.Sprintf("image source.type %q cannot be represented on the OpenAI wire", st)
 			}
 		case "tool_use":
 			flushText()
@@ -362,7 +398,7 @@ func contentBlocksToOpenAI(role string, content any) []map[string]any {
 	if len(out) == 0 {
 		out = append(out, map[string]any{"role": role, "content": ""})
 	}
-	return out
+	return out, ""
 }
 
 // --- response bridge -----------------------------------------------------
@@ -701,10 +737,15 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			// was zero — replacing the whole usage lost a stated hit on both
 			// the client's message_delta and the ledger row (2026-09-27 audit,
 			// round 24).
-			if chunk.Usage.PromptTokens != 0 {
+			// Only a positive count is a statement: a chunk that states a
+			// negative one has said nothing this gateway can bill or report
+			// (2026-09-27 audit, round 33, sub-bar). A negative left to
+			// overwrite a stated count turned the client's message_delta and
+			// the ledger row into a credit.
+			if chunk.Usage.PromptTokens > 0 {
 				b.sse.inTok = chunk.Usage.PromptTokens
 			}
-			if chunk.Usage.CompletionTokens != 0 {
+			if chunk.Usage.CompletionTokens > 0 {
 				b.sse.outTok = chunk.Usage.CompletionTokens
 			}
 			if c := (usage{
@@ -771,6 +812,29 @@ func (b *anthropicBridge) toolDelta(upIdx int, id, name, args string) {
 	}
 }
 
+// promptSplit returns the uncached and cached parts of the prompt as the
+// closing message_delta states them, clamped to the partition the Anthropic
+// contract requires: the two are parts of ONE prompt and sum to it. Subtracting
+// the cache counter raw emitted input_tokens=-800 with
+// cache_read_input_tokens=900 on a stream that stated a hit and then restated a
+// smaller prompt — numbers that do not add up to any prompt, one of them
+// negative, and per-field usage merging is what keeps the larger hit
+// (2026-09-27 audit, round 33, B-F3).
+func (b *anthropicBridge) promptSplit() (fresh, cached int) {
+	cached = b.sse.cacheTok
+	if cached < 0 {
+		cached = 0
+	}
+	if cached > b.sse.inTok {
+		cached = b.sse.inTok
+	}
+	if cached < 0 {
+		// The prompt itself was stated negative; nothing of it is cached.
+		cached = 0
+	}
+	return b.sse.inTok - cached, cached
+}
+
 // finishStream closes any open block and emits message_delta/message_stop.
 // Called when the upstream stream ends WITHOUT a usage chunk too ([DONE] is
 // the normal terminator) — the client must always get a well-formed end.
@@ -788,12 +852,13 @@ func (b *anthropicBridge) finishStream() {
 	// which is reported separately: the two partition prompt_tokens and sum to
 	// it, so a client that adds them sees the real prompt and one that bills
 	// input_tokens bills only the uncached part (2026-09-27 audit, round 23).
+	fresh, cachedTok := b.promptSplit()
 	b.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReasonOpenAIToAnthropic(b.sse.stopMsg), "stop_sequence": nil},
 		"usage": map[string]any{
-			"input_tokens":            b.sse.inTok - b.sse.cacheTok,
-			"cache_read_input_tokens": b.sse.cacheTok,
+			"input_tokens":            fresh,
+			"cache_read_input_tokens": cachedTok,
 			"output_tokens":           b.sse.outTok,
 		},
 	})

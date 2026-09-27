@@ -1629,22 +1629,49 @@ func (u usage) cachedTokens() int {
 // round 24). A value the chunk does state wins, including one that replaces an
 // earlier larger value; only silence preserves what an earlier chunk stated.
 func (u *usage) merge(next usage) {
-	if next.PromptTokens != 0 {
+	// Only a POSITIVE count is a statement (2026-09-27 audit, round 33): a
+	// malformed upstream reporting a negative one said nothing this gateway can
+	// bill, and letting it win overwrote a stated count with a credit.
+	if next.PromptTokens > 0 {
 		u.PromptTokens = next.PromptTokens
 	}
-	if next.CompletionTokens != 0 {
+	if next.CompletionTokens > 0 {
 		u.CompletionTokens = next.CompletionTokens
 	}
-	if next.PromptCacheHitTokens != 0 {
+	if next.PromptCacheHitTokens > 0 {
 		u.PromptCacheHitTokens = next.PromptCacheHitTokens
 	}
 	if next.PromptTokensDetails != nil {
 		if u.PromptTokensDetails == nil {
 			u.PromptTokensDetails = next.PromptTokensDetails
-		} else if next.PromptTokensDetails.CachedTokens != 0 {
+		} else if next.PromptTokensDetails.CachedTokens > 0 {
 			u.PromptTokensDetails.CachedTokens = next.PromptTokensDetails.CachedTokens
 		}
 	}
+}
+
+// nonNegative is the usage as a ledger row can state it. A negative count is
+// not a count: the non-stream path assigns the upstream's usage object whole
+// (usageRecorder.finish), and billing one recorded prompt_tokens=-400 with
+// cost_usd=-2.06e-05 — a credit for tokens nobody served, in the one record
+// kept of the request (2026-09-27 audit, round 33, sub-bar). Clamped here, at
+// the row, so both the streaming merge and the whole-object path are covered.
+func (u usage) nonNegative() usage {
+	if u.PromptTokens < 0 {
+		u.PromptTokens = 0
+	}
+	if u.CompletionTokens < 0 {
+		u.CompletionTokens = 0
+	}
+	if u.PromptCacheHitTokens < 0 {
+		u.PromptCacheHitTokens = 0
+	}
+	if d := u.PromptTokensDetails; d != nil && d.CachedTokens < 0 {
+		u.PromptTokensDetails = &struct {
+			CachedTokens int `json:"cached_tokens"`
+		}{CachedTokens: 0}
+	}
+	return u
 }
 
 // ledgerStatusWriter lets a writer that TRANSLATES the upstream's answer state
@@ -1807,19 +1834,33 @@ func estimateMessageTokens(req map[string]any) int {
 // two prompt guards are in this one handler, but they read "messages" only, so
 // a `{"prompt": ...}` request skipped admission control and the context-fit
 // clamp entirely and reached the upstream as a raw prefill.
+// A tool schema is prompt too (2026-09-27 audit, round 33, B-F1): the chat
+// template renders req["tools"]/req["functions"] into the turn the replica
+// prefills, and the upstream counts it in prompt_tokens. Measuring only the
+// messages priced a tools-borne payload at zero, so it was admitted while the
+// large-context pool was full, skipped the context-fit clamp, and its real
+// measurement was discarded by the calibrator as bogus (a ratio above
+// calibMaxRatio). Charged in the same byte unit as the messages, by length --
+// no image and no inline payload can ride a tool schema.
 func messagesBytes(req map[string]any) int {
+	total := 0
 	if msgs, ok := req["messages"]; ok {
 		if b, err := json.Marshal(msgs); err == nil {
-			return promptPayloadBytes(len(b), msgs)
+			total = promptPayloadBytes(len(b), msgs)
 		}
-		return 0
-	}
-	if p, ok := req["prompt"]; ok {
+	} else if p, ok := req["prompt"]; ok {
 		if b, err := json.Marshal(p); err == nil {
-			return len(b)
+			total = len(b)
 		}
 	}
-	return 0
+	for _, k := range []string{"tools", "functions"} {
+		if v, ok := req[k]; ok {
+			if b, err := json.Marshal(v); err == nil {
+				total += len(b)
+			}
+		}
+	}
+	return total
 }
 
 // imagePartByteAllowance is what one inline image is charged to the prompt-size
@@ -2281,8 +2322,9 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 
 // entry builds the ledger row for one completion.
 func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, stream bool, start time.Time, aborted bool, backend, sessionID string, overage bool) ledgerEntry {
-	cached := rec.usage.cachedTokens()
-	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, rec.usage.PromptTokens, cached, rec.usage.CompletionTokens)
+	u := rec.usage.nonNegative()
+	cached := u.cachedTokens()
+	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
 	// The status the CLIENT will read, when the writer knows better than the
 	// upstream's own header: the /v1/messages bridge answers an untranslatable
 	// 200 with 502 and that decision is made after this row is built (see
@@ -2300,8 +2342,8 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		Path:             path,
 		Stream:           stream,
 		Status:           status,
-		PromptTokens:     rec.usage.PromptTokens,
-		CompletionTokens: rec.usage.CompletionTokens,
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
 		CachedTokens:     cached,
 		LatencyMS:        time.Since(start).Milliseconds(),
 		UsageSeen:        rec.seen,

@@ -36,7 +36,7 @@ func asMap(t *testing.T, v any) map[string]any {
 // G1: text between two tool_use blocks must not duplicate a call, and no
 // tool_calls may land on the text message.
 func TestToolCallsAreNotDuplicatedByInterleavedText(t *testing.T) {
-	out := contentBlocksToOpenAI("assistant", []any{
+	out, _ := contentBlocksToOpenAI("assistant", []any{
 		map[string]any{"type": "tool_use", "id": "call_1", "name": "a", "input": map[string]any{"x": 1}},
 		map[string]any{"type": "text", "text": "thinking out loud"},
 		map[string]any{"type": "tool_use", "id": "call_2", "name": "b", "input": map[string]any{"y": 2}},
@@ -74,9 +74,13 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 		"type": "base64", "media_type": "image/png", "data": strings.Repeat("A", 400),
 	}}
 
-	only := asMap(t, contentBlocksToOpenAI("user", []any{
+	onlyBlocks, onlyErr := contentBlocksToOpenAI("user", []any{
 		map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": []any{img}},
-	})[0])
+	})
+	if onlyErr != "" {
+		t.Fatalf("a tool_result image must still be representable as text: %s", onlyErr)
+	}
+	only := asMap(t, onlyBlocks[0])
 	if s, _ := only["content"].(string); s == "" {
 		t.Error("an image-only tool_result converted to content:\"\" — the model cannot tell that from a tool that returned nothing")
 	} else if !strings.Contains(s, "image/png") {
@@ -85,12 +89,16 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 		t.Errorf("the base64 payload was inlined into the text tool result (%d bytes) — it is charged against the context window and tokenizes as noise", len(s))
 	}
 
-	mixed := asMap(t, contentBlocksToOpenAI("user", []any{
+	mixedBlocks, mixedErr := contentBlocksToOpenAI("user", []any{
 		map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": []any{
 			map[string]any{"type": "text", "text": "screenshot attached"},
 			img,
 		}},
-	})[0])
+	})
+	if mixedErr != "" {
+		t.Fatalf("a mixed tool_result must still be representable: %s", mixedErr)
+	}
+	mixed := asMap(t, mixedBlocks[0])
 	s, _ := mixed["content"].(string)
 	if !strings.Contains(s, "screenshot attached") {
 		t.Errorf("the text block was lost: %q", s)
@@ -100,9 +108,13 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 	}
 
 	// A plain string result is still passed through untouched.
-	str := asMap(t, contentBlocksToOpenAI("user", []any{
+	strBlocks, strErr := contentBlocksToOpenAI("user", []any{
 		map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": "42"},
-	})[0])
+	})
+	if strErr != "" {
+		t.Fatalf("a plain string tool_result must convert: %s", strErr)
+	}
+	str := asMap(t, strBlocks[0])
 	if s, _ := str["content"].(string); s != "42" {
 		t.Errorf("string tool_result = %q, want 42", s)
 	}

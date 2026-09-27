@@ -968,12 +968,25 @@ func hermesManagedCurrentModel(cfg map[string]any) string {
 		return ""
 	}
 	remoteName := ""
+	var remote userRemote
 	if hermesNormalizeURL(configBaseURL) != hermesNormalizeURL(hermesBaseURL()) {
-		remote, ok := hermesConfiguredRemoteForBase(configBaseURL)
+		var ok bool
+		remote, ok = hermesConfiguredRemoteForBase(configBaseURL)
 		if !ok {
 			return ""
 		}
 		remoteName = remote.Name
+		// The credential the writer stores beside that endpoint
+		// (hermesKeyFor -> the remote's token): a config still holding one the
+		// remote has replaced is not the state a write would leave (round 32
+		// for droid, round 33 here). Hermes' child inherits os.Environ()
+		// untouched and ~/.hermes/.env is the messaging-only file, so this
+		// field is the only credential it gets -- a rotated key meant every
+		// request 401ed with the dead bearer until the user forced a
+		// reconfigure.
+		if key, _ := modelCfg["api_key"].(string); key != remote.key() {
+			return ""
+		}
 	}
 
 	current, _ := modelCfg["default"].(string)

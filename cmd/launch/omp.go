@@ -526,7 +526,8 @@ func ompProviderHealthy(provider map[string]any) bool {
 
 	// A remote base URL is ours only when a configured remote actually serves
 	// it; anything else is a config oaica did not write.
-	if _, ok := ompConfiguredRemoteForBase(baseURL); !ok {
+	remote, ok := ompConfiguredRemoteForBase(baseURL)
+	if !ok {
 		return false
 	}
 	if api != "openai-completions" || discoveryType == "ollama" {
@@ -536,6 +537,14 @@ func ompProviderHealthy(provider map[string]any) bool {
 	if strings.TrimSpace(key) == "" {
 		// A remote with no credential: the only honest scheme.
 		return auth == "none"
+	}
+	// The credential the remote issues NOW: a store still holding one the
+	// remote has replaced is not the state a write would leave (round 32 for
+	// droid; round 33 here). OMP.Run passes the environment through untouched,
+	// so this key is the only credential the child gets -- a rotated key meant
+	// every request 401ed with no rewrite and no message.
+	if key != remote.key() {
+		return false
 	}
 	return auth == "apiKey"
 }

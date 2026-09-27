@@ -1438,6 +1438,12 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			refuse(http.StatusBadRequest, "invalid Anthropic request: "+err.Error())
 			return
 		}
+		// promptBytes is the unit the context-fit clamp below and every
+		// calibration read/write in this handler share: the serialized body
+		// with an inline image's transport encoding charged as an image
+		// (prompt_payload_bytes.go). Computed once, so the ratio a sample
+		// records is exactly the ratio a later estimate is scaled by.
+		promptBytes := clientPromptBytes(body)
 		// The body-derived features the report classifies on, filled in for a
 		// refusal that happens after this point (a denied entitlement, a prompt
 		// too long). A refusal BEFORE it — the token check, the body cap — had
@@ -1636,7 +1642,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// measured tokens-per-byte for this session, contextFitPlan uses
 			// it with a 3% margin instead, and that whole failure mode goes
 			// away.
-			estTokens, margin, _ := contextFitPlan(calib, calibKey, len(body))
+			estTokens, margin, _ := contextFitPlan(calib, calibKey, promptBytes)
 			fitBudget := route.ContextWindow - estTokens - margin
 			// minViableCompletion: a real 2026-08-30 recurrence proved the
 			// OLD unconditional "floor fitBudget at 256" rule was itself
@@ -1937,7 +1943,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			// the very next request gets a measured budget.
 			if resp.StatusCode == http.StatusBadRequest {
 				if promptTokens, maxTokens, ok := parseUpstreamContextOverflow(text); ok {
-					calib.record(calibKey, len(body), promptTokens)
+					calib.record(calibKey, promptBytes, promptTokens)
 					writeAnthropicError(w, http.StatusBadRequest, promptTooLongMessage(promptTokens, maxTokens))
 					return
 				}
@@ -1956,7 +1962,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// Record the REAL prompt size for this session -- only from a usage
 		// object the upstream actually sent on a 200 (see
 		// context_calibration.go). Never from an error, never a guess.
-		recordUsage := func(promptTokens int) { calib.record(calibKey, len(body), promptTokens) }
+		recordUsage := func(promptTokens int) { calib.record(calibKey, promptBytes, promptTokens) }
 
 		// The response echoes DisplayModel when the route sets one (see its
 		// doc — native+split session restore) instead of the real
@@ -1976,7 +1982,7 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 		// fallback since it was written (anthropic.go's "use actual metrics
 		// if available, otherwise use estimate"); the call site hard-wired
 		// the estimate to 0, which disabled it (2026-09-26 audit).
-		estInputTokens, _, _ := contextFitPlan(calib, calibKey, len(body))
+		estInputTokens, _, _ := contextFitPlan(calib, calibKey, promptBytes)
 		if anthReq.Stream {
 			delivered = handleStreamResponse(w, resp.Body, displayModel, recordUsage, estInputTokens, route.resolveKey())
 		} else {
