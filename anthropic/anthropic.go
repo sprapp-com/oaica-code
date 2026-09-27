@@ -757,11 +757,31 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	var messages []api.Message
 	role := strings.ToLower(msg.Role)
 
-	var textContent strings.Builder
-	var images []api.ImageData
-	var toolCalls []api.ToolCall
-	var thinking string
-	var toolResults []api.Message
+	// The turn's own blocks — text, documents, images, calls, replayed
+	// reasoning — are written back in the order the client wrote them, split
+	// into runs by the tool results between them. One aggregated own message,
+	// placed before or after ALL the results by a single flag, hoisted the
+	// client's text past the results it followed: [text, result, text] reached
+	// the model as [text, result] with the second text moved into the first, and
+	// [result, text, result] deferred the text past both — so one client body
+	// was two different conversations, and the metered gateway leg writes the
+	// same blocks in the order they arrived (tools/gateway/messages.go, the
+	// text flushed before each tool message) (2026-09-27 audit, round 52).
+	type ownRun struct {
+		text      strings.Builder
+		images    []api.ImageData
+		toolCalls []api.ToolCall
+		thinking  string
+	}
+	var parts []any // *ownRun, or an api.Message for a tool result
+	var cur *ownRun
+	own := func() *ownRun {
+		if cur == nil {
+			cur = &ownRun{}
+			parts = append(parts, cur)
+		}
+		return cur
+	}
 	textBlocks := 0
 	imageBlocks := 0
 	toolUseBlocks := 0
@@ -775,15 +795,7 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	documentBinaryBlocks := 0
 	searchResultBlocks := 0
 	searchResultTextBlocks := 0
-	// contentBeforeResults is whether the turn stated anything of its own before
-	// its first tool result, so the two can be written back in the order the
-	// client wrote them (see the append below).
-	contentBeforeResults := false
-
 	for _, block := range msg.Content {
-		if len(toolResults) == 0 && block.Type != "tool_result" && block.Type != "web_search_tool_result" {
-			contentBeforeResults = true
-		}
 		switch block.Type {
 		case "text":
 			textBlocks++
@@ -793,10 +805,11 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				// side of a tool call is two blocks, and gluing them turns
 				// "read the file." + "Now run the tests." into one sentence
 				// whenever the first does not end in punctuation.
-				if textContent.Len() > 0 {
-					textContent.WriteString("\n\n")
+				r := own()
+				if r.text.Len() > 0 {
+					r.text.WriteString("\n\n")
 				}
-				textContent.WriteString(*block.Text)
+				r.text.WriteString(*block.Text)
 			}
 
 		case "image":
@@ -811,7 +824,8 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				logutil.Trace("anthropic: unsupported image source", "role", role, "source_type", block.Source.Type, "error", err)
 				return nil, err
 			}
-			images = append(images, decoded)
+			r := own()
+			r.images = append(r.images, decoded)
 
 		case "tool_use":
 			toolUseBlocks++
@@ -823,7 +837,8 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				logutil.Trace("anthropic: tool_use block missing name", "role", role)
 				return nil, errors.New("tool_use block missing required 'name' field")
 			}
-			toolCalls = append(toolCalls, api.ToolCall{
+			r := own()
+			r.toolCalls = append(r.toolCalls, api.ToolCall{
 				ID: block.ID,
 				Function: api.ToolCallFunction{
 					Name:      block.Name,
@@ -839,12 +854,15 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				return nil, err
 			}
 
-			toolResults = append(toolResults, api.Message{
+			parts = append(parts, api.Message{
 				Role:       "tool",
 				Content:    resultContent,
 				Images:     resultImages,
 				ToolCallID: block.ToolUseID,
 			})
+			// The next own block, if the turn has one, is a run of its own:
+			// it came after this result and is written after it.
+			cur = nil
 
 		case "thinking":
 			thinkingBlocks++
@@ -856,10 +874,11 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				// dropped every earlier run from the prompt the client echoed
 				// back. The text blocks beside it are joined for the same
 				// reason (2026-09-26 audit, sixteenth round).
-				if thinking != "" {
-					thinking += "\n\n"
+				r := own()
+				if r.thinking != "" {
+					r.thinking += "\n\n"
 				}
-				thinking += *block.Thinking
+				r.thinking += *block.Thinking
 			}
 
 		case "redacted_thinking":
@@ -907,12 +926,13 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				// file." + "Now run the tests.\n" = "read the file.Now run
 				// the tests."), which is the failure the text-block branch
 				// above documents (2026-09-26 audit, sixteenth round).
-				if textContent.Len() > 0 {
-					textContent.WriteString("\n\n")
+				r := own()
+				if r.text.Len() > 0 {
+					r.text.WriteString("\n\n")
 				}
-				textContent.WriteString(block.Source.Data)
+				r.text.WriteString(block.Source.Data)
 				if !strings.HasSuffix(block.Source.Data, "\n") {
-					textContent.WriteString("\n")
+					r.text.WriteString("\n")
 				}
 				documentTextBlocks++
 			} else {
@@ -924,7 +944,8 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 
 		case "server_tool_use":
 			serverToolUseBlocks++
-			toolCalls = append(toolCalls, api.ToolCall{
+			r := own()
+			r.toolCalls = append(r.toolCalls, api.ToolCall{
 				ID: block.ID,
 				Function: api.ToolCallFunction{
 					Name:      block.Name,
@@ -934,11 +955,12 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 
 		case "web_search_tool_result":
 			webSearchToolResultBlocks++
-			toolResults = append(toolResults, api.Message{
+			parts = append(parts, api.Message{
 				Role:       "tool",
 				Content:    formatWebSearchToolResultContent(block.Content),
 				ToolCallID: block.ToolUseID,
 			})
+			cur = nil
 
 		case "search_result":
 			// A passage the search returned, carried in the turn the model is
@@ -973,12 +995,13 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 			}
 			sb.WriteString(searchResultText(block.Content))
 			if sb.Len() > 0 {
-				if textContent.Len() > 0 {
-					textContent.WriteString("\n\n")
+				r := own()
+				if r.text.Len() > 0 {
+					r.text.WriteString("\n\n")
 				}
-				textContent.WriteString(sb.String())
+				r.text.WriteString(sb.String())
 				if !strings.HasSuffix(sb.String(), "\n") {
-					textContent.WriteString("\n")
+					r.text.WriteString("\n")
 				}
 				searchResultTextBlocks++
 			}
@@ -996,32 +1019,24 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		}
 	}
 
-	// The blocks of one turn are written back in the order the client wrote
-	// them: a tool_result that arrives after the turn's own text is written
-	// after it, and one that arrives before it is written before it. Hoisting
-	// EVERY result ahead of the text moved the client's own instruction from
-	// before its result to after it and made one client body two prompts — the
-	// metered gateway leg writes them in the order the blocks arrived
-	// (tools/gateway/messages.go, flushText before a tool message), which is the
-	// order round 50 established for a turn's parts (2026-09-27 audit, round
-	// 51).
-	var own *api.Message
-	if textContent.Len() > 0 || len(images) > 0 || len(toolCalls) > 0 || thinking != "" {
-		own = &api.Message{
-			Role:      role,
-			Content:   textContent.String(),
-			Images:    images,
-			ToolCalls: toolCalls,
-			Thinking:  thinking,
-		}
-	}
-	if own != nil && contentBeforeResults {
-		messages = append(messages, *own)
-		messages = append(messages, toolResults...)
-	} else {
-		messages = append(messages, toolResults...)
-		if own != nil {
-			messages = append(messages, *own)
+	// The parts are written back in the order the client wrote them: each run
+	// of the turn's own blocks where it stood, each tool result where it stood
+	// (2026-09-27 audit, round 52).
+	for _, part := range parts {
+		switch p := part.(type) {
+		case *ownRun:
+			if p.text.Len() == 0 && len(p.images) == 0 && len(p.toolCalls) == 0 && p.thinking == "" {
+				continue // a run that states nothing is not a message
+			}
+			messages = append(messages, api.Message{
+				Role:      role,
+				Content:   p.text.String(),
+				Images:    p.images,
+				ToolCalls: p.toolCalls,
+				Thinking:  p.thinking,
+			})
+		case api.Message:
+			messages = append(messages, p)
 		}
 	}
 	logutil.Trace("anthropic: converted block message",
@@ -1838,11 +1853,61 @@ func isURLText(s string) bool {
 	return true
 }
 
+// imageDataURLBytes decodes the `data:` URL forms this product's OpenAI door
+// carries into raw image bytes — data:;base64,… and
+// data:image/{jpeg,jpg,png,webp};base64,… — the same four media types and the
+// same blank-type spelling openai.decodeImageURL accepts, so a URL one leg
+// carries is not an address another leg refuses.
+//
+// handled is false for a string that is not one of those forms: the caller
+// keeps its own reading of it (a fetchable address, or text that is not
+// url-shaped at all). handled is true with an error for one of those forms that
+// does not decode — a payload that is not base64, and a payload that decodes to
+// a URL rather than to image bytes, which the door refuses in words too
+// (openai.decodeImageURL, 2026-09-27 audit, round 52).
+func imageDataURLBytes(url string) (decoded api.ImageData, handled bool, err error) {
+	payload, isData := "", false
+	if rest, ok := strings.CutPrefix(url, "data:;base64,"); ok {
+		payload, isData = rest, true
+	} else {
+		for _, mediaType := range []string{"jpeg", "jpg", "png", "webp"} {
+			if rest, ok := strings.CutPrefix(url, "data:image/"+mediaType+";base64,"); ok {
+				payload, isData = rest, true
+				break
+			}
+		}
+	}
+	if !isData {
+		return nil, false, nil
+	}
+	img, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return nil, true, errors.New("data URL payload is not base64")
+	}
+	if isURLText(string(img)) {
+		return nil, true, errors.New("data URL decodes to a URL, not image bytes")
+	}
+	return img, true, nil
+}
+
 func resolveImageSource(source *ImageSource) (api.ImageData, error) {
 	switch source.Type {
 	case "url":
 		if source.URL == "" {
 			return nil, errors.New(`invalid image source type: url, with no url`)
+		}
+		if decoded, isData, err := imageDataURLBytes(source.URL); isData {
+			// A `data:` URL is not an address to fetch: it IS the image, and
+			// the OpenAI door both other legs hand it to carries exactly these
+			// forms (openai.decodeImageURL). Left as url TEXT it was refused by
+			// the caller's url-source check — a 400 for a body the metered
+			// gateway leg serves 200 and the door decodes — while this leg's own
+			// model, given image bytes, was never asked to fetch anything
+			// (2026-09-27 audit, round 52).
+			if err != nil {
+				return nil, fmt.Errorf("invalid image source: %w", err)
+			}
+			return decoded, nil
 		}
 		if !isURLText(source.URL) {
 			// A source DECLARED as a url is carried as its text, and the only
@@ -2289,7 +2354,23 @@ func estimateTokens(req CountTokensRequest) int {
 		if hasBuiltinWebSearch && !strings.HasPrefix(tool.Type, "web_search") && tool.Name == "web_search" {
 			continue
 		}
-		totalLen += len(tool.Name) + len(tool.Description) + len(tool.InputSchema)
+		// Charged as the CONVERTED tool, in the same unit as everything else
+		// this function measures (clampedJSONBytes: the bytes of the object that
+		// is sent, with the transport's escapes subtracted). Charging the
+		// client's own bytes made the measure depend on the client's JSON
+		// FORMATTING: the same tool put byte-identical parameters on the wire
+		// whether it was written compactly or pretty-printed, and the estimate
+		// read 35 against 41 tokens for it — the number that seeds the
+		// client-visible input_tokens, and that a session's auto-compaction is
+		// sized on, moved 17% on whitespace the model was never shown
+		// (2026-09-27 audit, round 52).
+		converted, _, err := convertTool(tool)
+		if err != nil {
+			// The converter refuses the whole request in words on this error,
+			// so nothing is sent and there is nothing to charge.
+			continue
+		}
+		totalLen += clampedJSONBytes(converted)
 	}
 
 	// Return len/4 as rough token estimate, minimum 1 if there's any content

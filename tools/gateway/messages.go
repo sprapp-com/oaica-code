@@ -75,6 +75,14 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "body is not valid JSON")
 		return
 	}
+	// An integer field written as `64.0` or `6.4e1` is a body the sibling legs
+	// refuse at decode and this map read has already forgiven by the time it is
+	// a float64 — the literal is the only place that distinction survives
+	// (2026-09-27 audit, round 52).
+	if mismatch := integerLiteralMismatch(body); mismatch != "" {
+		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", mismatch)
+		return
+	}
 	// Whether a nested tool_result image reaches the model is a property of the
 	// MODEL, not of the block: the translation has to know before it flattens
 	// the content, so the roster is read here — under the same lock the
@@ -131,6 +139,74 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	bridge.promptEstimate = messagesBytes(openai) / 4
 	g.completionHandler(bridge, r)
 	bridge.finalize()
+}
+
+// integerLiteralMismatch reports the first integer field of the request that is
+// written as a JSON number with a fraction or an exponent, or "" when every
+// integer field is written as an integer literal.
+//
+// shapeMismatch above reads the DECODED value: it asks whether a number is a
+// whole number of the right size, and 64.0, 6.4e1 and 64 all pass it, because
+// all three decode to a float64 that is a whole number. The sibling leg decodes
+// into a Go int, and its decoder refuses `64.0` and `6.4e1` at the LITERAL:
+// "cannot unmarshal number 64.0 into Go struct field … of type int". One client
+// body was therefore a 400 on both sibling legs and a metered 200 here, with a
+// different output cap, sampling distribution and thinking budget on the two
+// (2026-09-27 audit, round 52).
+//
+// Integrality of the literal is not integrality of the value: this is the one
+// distinction only the raw bytes carry, so it is read from them here, with the
+// same four field names the sibling decodes as int (anthropic.MessagesRequest's
+// MaxTokens and TopK, ThinkingConfig.BudgetTokens, Tool.MaxUses).
+func integerLiteralMismatch(body []byte) string {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var root map[string]any
+	if err := dec.Decode(&root); err != nil {
+		return "" // the caller has already refused a body that is not JSON
+	}
+	// integral reports whether the literal is spelled with no fraction and no
+	// exponent. Only a json.Number is judged: a string, a bool or a null is not
+	// a number in any spelling, and the checks beside this one own those.
+	integral := func(v any) (bool, bool) {
+		n, ok := v.(json.Number)
+		if !ok {
+			return false, false
+		}
+		s := n.String()
+		return !strings.ContainsAny(s, ".eE"), true
+	}
+	if v, present := root["max_tokens"]; present {
+		if ok, isNum := integral(v); isNum && !ok {
+			return "max_tokens is required and must be a positive integer"
+		}
+	}
+	if v, present := root["top_k"]; present {
+		if ok, isNum := integral(v); isNum && !ok {
+			return "top_k must be an integer"
+		}
+	}
+	if th, ok := root["thinking"].(map[string]any); ok {
+		if v, present := th["budget_tokens"]; present {
+			if ok, isNum := integral(v); isNum && !ok {
+				return "thinking.budget_tokens must be an integer"
+			}
+		}
+	}
+	if tools, ok := root["tools"].([]any); ok {
+		for i, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, present := tm["max_uses"]; present {
+				if ok, isNum := integral(v); isNum && !ok {
+					return "tools[" + strconv.Itoa(i) + "].max_uses must be an integer"
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // shapeMismatch reports the first field of the request whose JSON shape the
@@ -224,11 +300,27 @@ func shapeMismatch(req map[string]any) string {
 					return where + ".tool_use_id must be a string"
 				}
 			}
-			if src, ok := bm["source"].(map[string]any); ok {
-				if fv, present := src["media_type"]; present && fv != nil {
-					if _, ok := fv.(string); !ok {
-						return where + ".source.media_type must be a string"
+			if raw, present := bm["source"]; present && raw != nil {
+				switch src := raw.(type) {
+				case map[string]any:
+					if fv, present := src["media_type"]; present && fv != nil {
+						if _, ok := fv.(string); !ok {
+							return where + ".source.media_type must be a string"
+						}
 					}
+				case string:
+					// A source stated as bare TEXT is how a search_result or a
+					// document reference writes it, and the sibling leg's typed
+					// decode accepts a string for exactly that shape
+					// (anthropic.ImageSource.UnmarshalJSON). Not a mismatch.
+				default:
+					// A source of any other kind — a number, an array, a bool —
+					// is a value the sibling leg's typed field cannot hold, and
+					// it refused the whole request at decode. This leg dropped
+					// the field and served the turn, so one client body got two
+					// verdicts and the model was asked a question the client
+					// never wrote (2026-09-27 audit, round 52).
+					return where + ".source must be an object"
 				}
 			}
 		}
@@ -480,6 +572,21 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		if convErr != "" {
 			return nil, convErr
 		}
+		if len(converted) == 0 {
+			if blocks, ok := content.([]any); ok && len(blocks) > 0 {
+				// A turn the client sent whose every block is one this wire has
+				// no shape for — reasoning, most often, which is dropped
+				// deliberately below — is still a turn: the sibling legs keep it
+				// as an empty message of the same role (the local converter
+				// counts a replayed thought as content, and the client proxy
+				// forwards `{"role":"assistant","content":""}`). Dropping the
+				// message here left a conversation of one empty turn, which the
+				// fallback below rewrote as a USER turn — the client asked for an
+				// assistant turn and the model was given a user one
+				// (2026-09-27 audit, round 52).
+				msgs = append(msgs, map[string]any{"role": role, "content": ""})
+			}
+		}
 		msgs = append(msgs, converted...)
 	}
 	// out["messages"] may already hold the system message; append.
@@ -499,7 +606,7 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	// same reason the local leg asks it that way: a list of blank messages is
 	// empty whatever its length (2026-09-27 audit, round 44, B44-4; round 43,
 	// C43-1).
-	if !wireMessagesCarryContent(out["messages"]) {
+	if !wireMessagesCarryContent(out["messages"]) && !requestStatesReasoning(req["messages"]) {
 		out["messages"] = []map[string]any{{"role": "user", "content": ""}}
 	}
 
@@ -677,6 +784,37 @@ func ensureTrailingNewline(s string) string {
 // away on this leg exactly as it did on the local one — the upstream was asked
 // a bare empty user turn instead of the question the client wrote
 // (2026-09-27 audit, round 44).
+// requestStatesReasoning reports whether the CLIENT stated a reasoning block —
+// the one kind this leg drops that the sibling legs count as content for the
+// turn they arrived in (the local converter keeps m.Thinking and
+// anyMessageCarriesContent counts it). A turn carrying only reasoning is a turn
+// on all three legs, so the empty-conversation fallback must not rewrite its
+// role: asked of the client's own blocks, because by the time the question is
+// asked of the converted messages the reasoning is already gone (2026-09-27
+// audit, round 52).
+func requestStatesReasoning(v any) bool {
+	msgs, _ := v.([]any)
+	for _, rm := range msgs {
+		m, _ := rm.(map[string]any)
+		if m == nil {
+			continue
+		}
+		blocks, _ := m["content"].([]any)
+		for _, b := range blocks {
+			bm, _ := b.(map[string]any)
+			if bm == nil {
+				continue
+			}
+			if t, _ := bm["type"].(string); t == "thinking" {
+				if s, _ := bm["thinking"].(string); s != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func wireMessagesCarryContent(v any) bool {
 	messages, _ := v.([]map[string]any)
 	for _, m := range messages {
@@ -1872,6 +2010,13 @@ type toolBlock struct {
 	// trails args.Len() while the block is held, so the fragments that arrived
 	// before the name are delivered — in one delta — the moment the block opens.
 	emitted int
+	// delivered is the argument text the CLIENT was actually handed, in the
+	// bytes it read. args (above) is everything the upstream stated, including
+	// fragments that arrived after the block closed and could not be delivered;
+	// the turn's verdict is a statement about the call the client was given, so
+	// it is taken over these bytes (see countedToolBlocks) (2026-09-27 audit,
+	// round 52).
+	delivered strings.Builder
 }
 
 // openBlock is the block currently open on the wire: index, and the tool call it
@@ -3304,6 +3449,7 @@ func (b *anthropicBridge) flushToolArgs(tb *toolBlock) {
 			pending = wrapped
 		}
 	}
+	tb.delivered.WriteString(pending)
 	b.emit("content_block_delta", map[string]any{
 		"type": "content_block_delta", "index": tb.index,
 		"delta": map[string]any{"type": "input_json_delta", "partial_json": pending},
@@ -3322,10 +3468,27 @@ func rawArgsObject(s string) (string, bool) {
 		return "", false
 	}
 	t := strings.TrimSpace(s)
-	if t == "" || strings.HasPrefix(t, "{") {
+	if strings.HasPrefix(t, "{") {
 		return "", false
 	}
 	if t == "null" {
+		return "{}", true
+	}
+	if t == "" {
+		if s == "" {
+			// Nothing stated and nothing to deliver: the block opened with an
+			// empty input and there is no argument text to hand over.
+			return "", false
+		}
+		// Whitespace the upstream stated as a call's whole argument text: the
+		// call states no arguments, and the empty object is what this leg's
+		// non-stream path hands the client for the same bytes (callInput) and
+		// what both other legs parse an argument-less call into. Delivered as
+		// it stands ("   ") the client accumulated a text that is not JSON
+		// under a stop_reason of tool_use — the same unrunnable-but-billed turn
+		// the freeform wrap below exists to prevent, and whitespace is not the
+		// half-written object that is left forwarded as it is (2026-09-27
+		// audit, round 52).
 		return "{}", true
 	}
 	return rawFallbackArgs(t), true
@@ -3479,7 +3642,14 @@ func (b *anthropicBridge) countedToolBlocks() int {
 		if !tb.started {
 			continue
 		}
-		if _, ok := callInput(tb.args.String(), b.sse.stopMsg == "length"); !ok {
+		// The count is taken over the bytes the CLIENT was handed, not over
+		// everything the upstream stated: a fragment that arrives after its
+		// block closed is logged and dropped (toolDelta), yet it kept appending
+		// to args, so the accumulated bytes parsed into a call the client never
+		// received — the turn was reported as tool_use, and the upstream's
+		// max_tokens truncation was erased with it, while the client held an
+		// unterminated input the model never wrote (2026-09-27 audit, round 52).
+		if _, ok := callInput(tb.delivered.String(), b.sse.stopMsg == "length"); !ok {
 			continue
 		}
 		n++

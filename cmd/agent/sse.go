@@ -99,11 +99,19 @@ func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []
 		}
 		if b.kind == "tool_use" && b.tool != nil {
 			if s := strings.TrimSpace(b.text.String()); s != "" {
-				var args map[string]any
+				// Decoded into an order-preserving container, in the order the
+				// upstream wrote: a plain map here kept none of it, and Go
+				// randomizes map iteration, so one upstream stream was
+				// re-emitted as three different argument orders across runs.
+				// This agent loop writes the call straight back into the next
+				// request body, so the next turn's prompt bytes differed run to
+				// run for the same conversation and every prefix cache keyed on
+				// them was recomputed (2026-09-27 audit, round 52).
+				args := api.NewToolCallFunctionArguments()
 				if err := json.Unmarshal([]byte(s), &args); err != nil {
 					return nil, false, fmt.Errorf("parse accumulated tool_use input: %w", err)
 				}
-				for k, v := range args {
+				for k, v := range args.All() {
 					b.tool.Function.Arguments.Set(k, v)
 				}
 			}

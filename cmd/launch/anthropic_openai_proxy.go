@@ -4172,7 +4172,8 @@ func (s *statusCapturingWriter) status() int {
 // writeUpstreamError re-emits a non-200 upstream response. It keeps the
 // upstream's OWN retry contract for the statuses Claude Code understands --
 // 429 (rate_limit_error) with Retry-After, 503/529 (overloaded_error) -- and
-// collapses everything else to a 502.
+// passes the upstream's own 4xx verdict through, because that is the class
+// every SDK reads as terminal.
 //
 // Every non-200 used to become an unconditional 502 with no Retry-After, so a
 // rate-limited or draining replica looked to Claude Code like a broken proxy:
@@ -4183,19 +4184,30 @@ func (s *statusCapturingWriter) status() int {
 // Claude Code an authentication_error would send it into its own login flow.
 // (2026-09-26 audit.)
 //
+// A 400 keeps its own status for the same reason the 429 does. The upstream is
+// oaica's own door, its 400 names the field the client got wrong, and the
+// sibling legs answer the same body 400 — while a 502 is a class every SDK
+// RETRIES and reads as an outage, so a body that can never succeed was re-sent
+// with the whole prompt each time and the client could not tell the cause
+// (2026-09-27 audit, round 52).
+//
 // secret is the credential this leg injected upstream and is what lets the
 // re-emitted text lose it: an upstream refusing the call names the key it
 // refused, and that is prose no shape rule recognises (2026-09-26 audit, ninth
 // round).
 func writeUpstreamError(w http.ResponseWriter, resp *http.Response, text, secret string) {
-	switch resp.StatusCode {
-	case http.StatusTooManyRequests, http.StatusServiceUnavailable, 529:
-		if v := resp.Header.Get("Retry-After"); v != "" {
-			w.Header().Set("Retry-After", v)
-		}
-		writeAnthropicError(w, resp.StatusCode, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactUpstreamDiagnosis(text, secret)))
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		w.Header().Set("Retry-After", v)
+	}
+	msg := fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactUpstreamDiagnosis(text, secret))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		writeAnthropicError(w, http.StatusBadGateway, msg)
+	case resp.StatusCode >= 400 && resp.StatusCode < 500,
+		resp.StatusCode == http.StatusServiceUnavailable, resp.StatusCode == 529:
+		writeAnthropicError(w, resp.StatusCode, msg)
 	default:
-		writeAnthropicError(w, http.StatusBadGateway, fmt.Sprintf("upstream HTTP %d: %s", resp.StatusCode, redactUpstreamDiagnosis(text, secret)))
+		writeAnthropicError(w, http.StatusBadGateway, msg)
 	}
 }
 

@@ -3,6 +3,8 @@ package tools
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -142,8 +144,19 @@ func (p *Parser) parseToolCall() *api.ToolCall {
 	}
 
 	args := api.NewToolCallFunctionArguments()
-	for k, v := range argsMap {
-		args.Set(k, v)
+	// The keys are set in sorted order, because the map this call came out of
+	// kept none of the order the model wrote and Go randomizes map iteration:
+	// one model output rendered three different argument JSONs across runs. The
+	// parsed call becomes the assistant turn of the conversation, and for a
+	// renderer-backed model that turn is part of the next prompt — whose bytes
+	// then differed run to run, so every prefix cache keyed on the rendered
+	// prompt was recomputed and the model was asked the same question in
+	// different bytes. Sorted rather than as written: the order is not
+	// recoverable from the decoded map (the template leg normalizes the same
+	// way), and what the rule needs is that one output renders one prompt
+	// (2026-09-27 audit, round 52).
+	for _, k := range slices.Sorted(maps.Keys(argsMap)) {
+		args.Set(k, argsMap[k])
 	}
 
 	tc := &api.ToolCall{
