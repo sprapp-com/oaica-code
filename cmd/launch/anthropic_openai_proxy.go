@@ -225,7 +225,14 @@ func toolCallArgumentsSize(calls []api.ToolCall) int {
 
 // cachedTokens returns the prefix-cache hit count, clamped to the prompt
 // size so a malformed upstream can never yield a negative input_tokens.
-func (u *openAIUsage) cachedTokens() int {
+// statedCacheHit reports the cache-read count the upstream actually stated,
+// with no clamp against the prompt total: a stated hit is evidence ABOUT the
+// prompt, so a hit larger than the total means the total is short, not that the
+// hit is wrong (2026-09-27 audit, round 40, A40-3). Details win over the
+// sibling name and each keeps its own last positive statement; a negative count
+// is no statement at all. cachedTokens() is this value clamped for cost
+// arithmetic — see its note.
+func (u *openAIUsage) statedCacheHit() int {
 	if u == nil {
 		return 0
 	}
@@ -248,6 +255,20 @@ func (u *openAIUsage) cachedTokens() int {
 	if c < 0 {
 		return 0
 	}
+	return c
+}
+
+// cachedTokens is the stated cache hit clamped to a stated prompt, for the
+// arithmetic that subtracts a hit from a total. Reporting goes through
+// statedCacheHit() and raises the total to the hit instead.
+func (u *openAIUsage) cachedTokens() int {
+	if u == nil {
+		return 0
+	}
+	c := u.statedCacheHit()
+	if c == 0 {
+		return 0
+	}
 	if u.PromptTokens <= 0 {
 		// The prompt was never stated (or was stated as a negative, which is
 		// no statement either), so there is no measurement to clamp against —
@@ -260,10 +281,13 @@ func (u *openAIUsage) cachedTokens() int {
 		// round 39, A-F4).
 		//
 		// No consumer can turn this into a negative input_tokens: each one
-		// either fills the unknown prompt with its own estimate and clamps the
-		// hit against that (UsageFromMetrics, and the non-stream leg's call
-		// site), or patches the hit onto a delta whose prompt it only touches
-		// when the upstream stated one (the streaming tail).
+		// either raises its prompt total to the hit before deriving the uncached
+		// count from it (the non-stream leg, the streaming tail, the gateway's
+		// entry), or patches the hit onto a delta whose prompt it only touches
+		// when the upstream stated one. The clamp inside UsageFromMetrics is the
+		// one arithmetic left that could still flatten a hit, which is why every
+		// call site now raises the total to it first (2026-09-27 audit, round
+		// 41, C41-1).
 		return c
 	}
 	if c > u.PromptTokens {
@@ -2197,6 +2221,18 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		// upstream did not count, and it keeps the client's context
 		// accounting moving — see the note at the streaming call site.
 		chatResp.Metrics.PromptEvalCount = estInputTokens
+	}
+	// A stated cache hit is evidence ABOUT the prompt: it says at least this
+	// many tokens were there. Left alone, ToMessagesResponse derived
+	// input_tokens from the estimate and UsageFromMetrics clamped the hit back
+	// down to it, so an upstream that stated "900 of this prompt came from
+	// cache" and no prompt size was reported to the client as 8 cached tokens
+	// of an 8-token prompt — while the streaming leg, given the identical
+	// usage object, reported 900. Same turn, two answers, decided by `stream`
+	// (2026-09-27 audit, round 41: A41-1, C41-1). Raise the total to the hit,
+	// exactly as the streaming tail and the gateway's entry() do.
+	if hit := oaiResp.Usage.statedCacheHit(); hit > chatResp.Metrics.PromptEvalCount {
+		chatResp.Metrics.PromptEvalCount = hit
 	}
 	// The estimate counts what was relayed to the client, and a reasoning
 	// model's thinking is relayed as thinking deltas and billed as output just

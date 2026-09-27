@@ -133,19 +133,83 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 // cannot represent).
 func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, string) {
 	out := map[string]any{"model": req["model"]}
-	if v, ok := req["max_tokens"]; ok {
-		out["max_tokens"] = v
-	} else {
-		// Anthropic requires max_tokens; OpenAI backends want one too.
-		out["max_tokens"] = 4096
+	// max_tokens is REQUIRED on this wire, and the sibling converter's handler
+	// refuses a body that omits it or states a non-positive one — this gateway
+	// invented 4096 instead, so the same body was answered with a different
+	// output cap depending on which leg served it, and a client that wrote
+	// max_tokens:0 (asking for a refusal) got a 4096-token answer
+	// (2026-09-27 audit, round 41, C41-8).
+	mt, ok := req["max_tokens"]
+	if !ok {
+		return nil, "max_tokens is required"
 	}
-	for _, k := range []string{"temperature", "top_p", "stream"} {
-		if v, ok := req[k]; ok {
+	if n, isNum := mt.(float64); isNum && n <= 0 {
+		return nil, "max_tokens is required and must be positive"
+	}
+	out["max_tokens"] = mt
+	// top_k is carried by the sibling converter (options["top_k"]) and was
+	// dropped here, so one body asked for one sampling distribution and got two
+	// (2026-09-27 audit, round 41, C41-8). A JSON null is not a statement — the
+	// sibling omits it — and forwarding it read as 0 on the backend, which is
+	// greedy decoding for a client that sent `"temperature":null` to mean
+	// "unset" (2026-09-27 audit, round 41, C41-14b).
+	for _, k := range []string{"temperature", "top_p", "top_k", "stream"} {
+		if v, ok := req[k]; ok && v != nil {
 			out[k] = v
 		}
 	}
 	if ss, ok := req["stop_sequences"].([]any); ok && len(ss) > 0 {
 		out["stop"] = ss
+	}
+	// The thinking control, in the spelling this product's own llama-server
+	// takes for the same control (llm.llamaServerChatTemplateKwargs): the
+	// sibling converter maps thinking.enabled/disabled to Think and an effort
+	// level to Think=level, and that field becomes exactly these kwargs on the
+	// wire the fleet's backends read. This gateway forwarded NEITHER, so a
+	// client that asked for thinking OFF had it defaulted on and paid for
+	// reasoning it had ruled out, and a client that asked for a level got the
+	// model's own default — the same body answered two ways depending on which
+	// leg served the turn (2026-09-27 audit, round 41, C41-3). Only a control
+	// the client actually stated is sent: no thinking field and no effort
+	// means no kwargs at all, as the sibling sends no Think.
+	normalizedEffort := ""
+	if oc, ok := req["output_config"].(map[string]any); ok {
+		if e, ok := oc["effort"].(string); ok {
+			normalizedEffort = strings.ToLower(strings.TrimSpace(e))
+			if normalizedEffort == "xhigh" {
+				normalizedEffort = "high"
+			}
+		}
+	}
+	thinkState := 0 // 0 = unstated, 1 = enabled, -1 = disabled
+	if th, ok := req["thinking"].(map[string]any); ok {
+		switch t, _ := th["type"].(string); t {
+		case "enabled":
+			thinkState = 1
+		case "disabled":
+			thinkState = -1
+		}
+	}
+	effortLevel := ""
+	switch normalizedEffort {
+	case "high", "medium", "low", "max":
+		effortLevel = normalizedEffort
+	}
+	explicitThinking := thinkState != 0
+	if thinkState == 0 && effortLevel != "" {
+		// An effort with no explicit switch turns thinking ON, which is what
+		// the sibling's Think=level does (a string value is a true value).
+		thinkState = 1
+	}
+	if thinkState != 0 {
+		kwargs := map[string]any{"enable_thinking": thinkState == 1}
+		if !explicitThinking && effortLevel != "" {
+			// The effort rides the level only when no switch was stated: the
+			// sibling's thinking field takes precedence over output_config, so
+			// a body carrying both is a switch and no level.
+			kwargs["reasoning_effort"] = effortLevel
+		}
+		out["chat_template_kwargs"] = kwargs
 	}
 	var msgs []map[string]any
 	rawMsgs, _ := req["messages"].([]any)
@@ -155,9 +219,19 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	for _, rm := range rawMsgs {
 		m, _ := rm.(map[string]any)
 		if m == nil {
-			continue
+			// The sibling converter's decode fails on the same element and its
+			// handler 400s, so skipping it here served a turn with one message
+			// missing — the model was asked about a conversation it was not
+			// given, and the client read 200 (2026-09-27 audit, round 41,
+			// C41-14d).
+			return nil, "messages element is not an object"
 		}
+		// Roles are lower-cased as the sibling converter lower-cases them: the
+		// same body then reaches two backends with two spellings of its role,
+		// and a backend that matches exactly rejects one of them
+		// (2026-09-27 audit, round 41, C41-14a).
 		role, _ := m["role"].(string)
+		role = strings.ToLower(role)
 		converted, convErr := contentBlocksToOpenAI(role, m["content"], acceptsImages)
 		if convErr != "" {
 			return nil, convErr
@@ -170,36 +244,49 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	}
 	out["messages"] = msgs
 
-	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
-		var oai []map[string]any
-		for _, t := range tools {
-			tm, _ := t.(map[string]any)
-			if tm == nil {
-				continue
+	// tool_choice is read BEFORE the tools, because "none" means the model is
+	// given no tool surface at all: the sibling converter drops every tool for
+	// that type, and this gateway forwarded all of them with no choice field,
+	// so the same body had the model calling tools a client had just said not
+	// to call (2026-09-27 audit, round 41, C41-2). Dropping the definitions
+	// rather than stating "none" is the shape that backend validates without
+	// objection, and it is the shape the other leg sends.
+	choiceType := ""
+	var tc map[string]any
+	if c, ok := req["tool_choice"].(map[string]any); ok {
+		tc = c
+		choiceType, _ = c["type"].(string)
+	}
+	if choiceType != "none" {
+		if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+			var oai []map[string]any
+			for _, t := range tools {
+				tm, _ := t.(map[string]any)
+				if tm == nil {
+					continue
+				}
+				fn := map[string]any{"name": tm["name"]}
+				if d, ok := tm["description"]; ok {
+					fn["description"] = d
+				}
+				if sc, ok := tm["input_schema"]; ok {
+					fn["parameters"] = sc
+				}
+				oai = append(oai, map[string]any{"type": "function", "function": fn})
 			}
-			fn := map[string]any{"name": tm["name"]}
-			if d, ok := tm["description"]; ok {
-				fn["description"] = d
+			if len(oai) > 0 {
+				out["tools"] = oai
 			}
-			if sc, ok := tm["input_schema"]; ok {
-				fn["parameters"] = sc
-			}
-			oai = append(oai, map[string]any{"type": "function", "function": fn})
-		}
-		if len(oai) > 0 {
-			out["tools"] = oai
 		}
 	}
-	if tc, ok := req["tool_choice"].(map[string]any); ok {
-		switch t, _ := tc["type"].(string); t {
-		case "auto":
-			out["tool_choice"] = "auto"
-		case "any":
-			out["tool_choice"] = "required"
-		case "tool":
-			name, _ := tc["name"].(string)
-			out["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
-		}
+	switch choiceType {
+	case "auto":
+		out["tool_choice"] = "auto"
+	case "any":
+		out["tool_choice"] = "required"
+	case "tool":
+		name, _ := tc["name"].(string)
+		out["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
 	return out, ""
 }
@@ -222,7 +309,13 @@ func systemToMessage(v any) map[string]any {
 			}
 		}
 		if len(parts) > 0 {
-			return map[string]any{"role": "system", "content": strings.Join(parts, "\n")}
+			// Blocks are joined with a BLANK LINE, the separator the sibling
+			// converter uses for the same array (anthropic.FromMessagesRequest,
+			// and normalizeSystemFirst on the other wire). A system array is how
+			// an appended instruction arrives; one newline glued it to the
+			// preceding one whenever that did not end in punctuation
+			// (2026-09-27 audit, round 41, C41-11).
+			return map[string]any{"role": "system", "content": strings.Join(parts, "\n\n")}
 		}
 	}
 	return nil
@@ -497,7 +590,15 @@ func searchResultText(content any) string {
 		parts := make([]string, 0, len(c))
 		for _, cb := range c {
 			bm, ok := cb.(map[string]any)
-			if ok && bm["type"] == "text" {
+			if !ok {
+				// A passage list holds BLOCKS. A bare element is not one, and
+				// describing it put the literal `"x"` — quotes and all — in the
+				// prompt as though the search had returned that passage. The
+				// sibling converter skips it, and both legs now read the list
+				// the same way (2026-09-27 audit, round 41, C41-10).
+				continue
+			}
+			if bm["type"] == "text" {
 				// An empty passage is no passage: it fell through to the
 				// describer and put `{"text":"","type":"text"}` in the prompt as
 				// though the search had returned it, which the sibling converter
@@ -681,12 +782,32 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 		if len(parts) == 0 {
 			return
 		}
-		if len(parts) == 1 {
-			if t, ok := parts[0]["text"].(string); ok {
-				out = append(out, map[string]any{"role": role, "content": t})
-				parts = nil
-				return
+		// A message of text blocks alone is assembled into ONE string, with the
+		// blank line the sibling converter puts between them: sent as separate
+		// text parts, each backend chose its own separator for the same prompt
+		// (vLLM joins with a newline, and a reader that concatenates parts
+		// would glue two sentences together — "first linesecond line"), so one
+		// body became two prompts depending on which leg served it and which
+		// backend it reached (2026-09-27 audit, round 41, C41-12). Parts are
+		// kept only when something other than text rides the message — an image
+		// part has to stay a part.
+		allText := true
+		for _, p := range parts {
+			if p["type"] != "text" {
+				allText = false
+				break
 			}
+		}
+		if allText {
+			texts := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if t, ok := p["text"].(string); ok {
+					texts = append(texts, t)
+				}
+			}
+			out = append(out, map[string]any{"role": role, "content": strings.Join(texts, "\n\n")})
+			parts = nil
+			return
 		}
 		out = append(out, map[string]any{"role": role, "content": parts})
 		parts = nil
@@ -694,7 +815,14 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 	for _, b := range blocks {
 		bm, ok := b.(map[string]any)
 		if !ok {
-			continue
+			// A content array holds BLOCKS. The sibling converter's decode fails
+			// on an element of any other shape and its handler 400s; skipping it
+			// here answered a turn with that element missing from the prompt, so
+			// the model was asked about text the client had sent and never
+			// received, and the client read a 200 (2026-09-27 audit, round 41,
+			// C41-5). Refused by name rather than dropped in silence, which is
+			// the rule the rest of this gateway keeps.
+			return nil, "message content element is not an object"
 		}
 		switch t, _ := bm["type"].(string); t {
 		case "text":
@@ -717,6 +845,15 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				u, _ := src["url"].(string)
 				if u == "" {
 					return nil, `image block with source.type "url" and no url`
+				}
+				if !imageURLText(u) {
+					// A source declared as a url carries text a reader must be
+					// able to FETCH; text with no scheme is not fetchable, and
+					// forwarding it told the backend to go and get an address
+					// that names no protocol. The sibling converter refuses the
+					// same block in words, and the two legs answer one body one
+					// way (2026-09-27 audit, round 41, A41-5).
+					return nil, `image block with source.type "url" whose url is not url-shaped`
 				}
 				parts = append(parts, map[string]any{
 					"type":      "image_url",
@@ -748,6 +885,21 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			}
 			id, _ := bm["id"].(string)
 			name, _ := bm["name"].(string)
+			// A tool_use without its id or its name is a call the client cannot
+			// be answered about: the sibling converter refuses both in words
+			// ("tool_use block missing required 'id' field"), where this leg put
+			// `"id":""` on the wire and the backend answered a malformed call —
+			// the client then read a tool result for a call it never made
+			// (2026-09-27 audit, round 41, C41-6). server_tool_use is exempt:
+			// the sibling carries it with whatever fields it has.
+			if t == "tool_use" {
+				if id == "" {
+					return nil, "tool_use block missing required 'id' field"
+				}
+				if name == "" {
+					return nil, "tool_use block missing required 'name' field"
+				}
+			}
 			args, _ := json.Marshal(bm["input"])
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   id,
@@ -1027,9 +1179,20 @@ type bridgeSSE struct {
 	// it: the closing message_delta reports inTok-cacheTok as input_tokens and
 	// cacheTok as cache_read_input_tokens, because Anthropic's input_tokens is
 	// the UNCACHED prompt (2026-09-27 audit, round 23).
-	inTok    int
-	cacheTok int
-	outTok   int
+	inTok int
+	// cacheTok is the hit as the upstream stated it, resolved by cacheHit().
+	// The two spellings are kept apart rather than in one last-writer-wins
+	// slot, because that is how the ledger's recorder resolves them (details
+	// over sibling, each keeping its own last positive statement): a stream
+	// that stated the hit as details in one chunk and in the sibling spelling
+	// in another reported 900 to the ledger and 100 to the client
+	// (2026-09-27 audit, round 41, B41-3). It is the UNCLAMPED hit — every
+	// reporting site raises the prompt to it, per round 40's rule — so a
+	// whole-completion answer stores the same number the frame path does
+	// (2026-09-27 audit, round 41, B41-1).
+	cacheDetails int
+	cacheSibling int
+	outTok       int
 	// statedPrompt and statedCompletion are whether the upstream STATED each
 	// count, which is not the same as stating a non-zero one: a fully-cached turn
 	// reports prompt_tokens>0 with all of it cached, and its uncached count is
@@ -1245,7 +1408,11 @@ func (b *anthropicBridge) LedgerStatus(upstream int) int {
 func (b *anthropicBridge) EstimatedUsage() (usage, bool) {
 	if doc, ok := b.bufferedCompletion(); ok {
 		u := doc.Usage.nonNegative()
-		cached := u.cachedTokens()
+		// The UNCLAMPED hit: the prompt is raised to it below, and reading it
+		// through cachedTokens() first clamped it to the stated prompt, so this
+		// arm and the frame arm reported different hits for one usage object
+		// (2026-09-27 audit, round 41, B41-1).
+		cached := u.statedCacheHit()
 		prompt := u.PromptTokens
 		if prompt <= 0 {
 			prompt = b.promptEstimate
@@ -1393,8 +1560,11 @@ func (b *anthropicBridge) finalize() {
 	// hit being clamped down to a size the upstream never stated — which here
 	// would have reported input_tokens = the estimate, cache_read = the
 	// estimate, or (with the subtraction below unraised) input_tokens = -900
-	// (2026-09-27 audit, round 40, A40-3).
-	cached := u.cachedTokens()
+	// (2026-09-27 audit, round 40, A40-3). The hit is the UNCLAMPED one for the
+	// same reason: reading it through cachedTokens() clamped it to the stated
+	// prompt, so this path reported a smaller hit than the streaming path did
+	// for one identical usage object (2026-09-27 audit, round 41, B41-1).
+	cached := u.statedCacheHit()
 	promptTotal := u.PromptTokens
 	if promptTotal < cached {
 		promptTotal = cached
@@ -1412,7 +1582,7 @@ func (b *anthropicBridge) finalize() {
 		b.sse.outTok = u.CompletionTokens
 		b.sse.statedCompletion = true
 	}
-	b.sse.cacheTok = cached
+	b.stateCacheHit(u.detailsCachedTokens(), u.PromptCacheHitTokens)
 	in, out := promptTotal-cached, u.CompletionTokens
 	// The answer's size, in the unit the stream path counts it in, so the
 	// fallback below is one rule for both paths (2026-09-27 audit, round 39,
@@ -1560,16 +1730,11 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			// prompt size, so a real hit was thrown away and the client was told
 			// cache_read_input_tokens=0 for a turn the ledger row for the same
 			// request recorded 900 (2026-09-27 audit, round 39, B-F4/C-F4).
-			hit := 0
+			details := 0
 			if chunk.Usage.PromptTokensDetails != nil {
-				hit = chunk.Usage.PromptTokensDetails.CachedTokens
+				details = chunk.Usage.PromptTokensDetails.CachedTokens
 			}
-			if hit <= 0 {
-				hit = chunk.Usage.PromptCacheHitTokens
-			}
-			if hit > 0 {
-				b.sse.cacheTok = hit
-			}
+			b.stateCacheHit(details, chunk.Usage.PromptCacheHitTokens)
 		}
 		for _, ch := range chunk.Choices {
 			// A whole completion inside a frame carries the same fields as a
@@ -1837,6 +2002,37 @@ func (b *anthropicBridge) openToolBlocks() int {
 	return n
 }
 
+// cacheHit is the hit the upstream stated for this turn, UNCLAMPED and resolved
+// the way the ledger's recorder resolves the same two fields (details over
+// sibling, each keeping its own last positive statement). Unclamped because
+// every site that reports it raises the prompt to it instead of clamping it
+// down (round 40's rule, and the reason a whole-document answer and the same
+// usage over frames must not disagree — 2026-09-27 audit, round 41, B41-1 and
+// B41-3).
+func (b *anthropicBridge) cacheHit() int {
+	if b.sse.cacheDetails > 0 {
+		return b.sse.cacheDetails
+	}
+	if b.sse.cacheSibling > 0 {
+		return b.sse.cacheSibling
+	}
+	return 0
+}
+
+// stateCacheHit records one usage object's cache hit in both spellings it can
+// arrive in, keeping each spelling's last POSITIVE statement. A chunk that
+// states only the sibling spelling must not erase a details count an earlier
+// chunk stated, which is what one last-writer-wins slot did (2026-09-27 audit,
+// round 41, B41-3).
+func (b *anthropicBridge) stateCacheHit(details, sibling int) {
+	if details > 0 {
+		b.sse.cacheDetails = details
+	}
+	if sibling > 0 {
+		b.sse.cacheSibling = sibling
+	}
+}
+
 // promptSplit returns the uncached and cached parts of the prompt as the
 // closing message_delta states them, clamped to the partition the Anthropic
 // contract requires: the two are parts of ONE prompt and sum to it. Subtracting
@@ -1846,7 +2042,7 @@ func (b *anthropicBridge) openToolBlocks() int {
 // negative, and per-field usage merging is what keeps the larger hit
 // (2026-09-27 audit, round 33, B-F3).
 func (b *anthropicBridge) promptSplit() (fresh, cached int) {
-	cached = b.sse.cacheTok
+	cached = b.cacheHit()
 	if cached < 0 {
 		cached = 0
 	}
@@ -2009,19 +2205,21 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// with output_tokens:0, and the ledger row recorded completion=0 for it
 	// (2026-09-27 audit, round 40, B40-3).
 	choice := resp.Choices[0]
+	// Counted through documentRelayedBytes, the same terms (and the same
+	// helper) the ledger's documentOutputEstimate uses, so the client's
+	// output_tokens and the row's completion_tokens for one adopted answer
+	// cannot drift (2026-09-27 audit, round 41, B41-2).
+	b.sse.outBytes += documentRelayedBytes(choice.Message)
 	if choice.Message.Content != nil && *choice.Message.Content != "" {
-		b.sse.outBytes += len(*choice.Message.Content)
 		b.textDelta(*choice.Message.Content)
 	}
 	if r := firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent); r != "" {
-		b.sse.outBytes += len(r)
 		b.textDelta(r)
 	}
 	for i, tc := range choice.Message.ToolCalls {
 		idx := i
-		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
-		b.sse.outBytes += len(args)
-		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name), args)
+		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name),
+			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
 	}
 	if choice.FinishReason != "" {
 		b.sse.stopMsg = choice.FinishReason
@@ -2035,7 +2233,12 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		b.sse.outTok = u.CompletionTokens
 		b.sse.statedCompletion = true
 	}
-	b.sse.cacheTok = u.cachedTokens()
+	// The UNCLAMPED hit, exactly as the frame path stores it: the clamped one
+	// made one upstream usage object report 1000 when the answer arrived as
+	// frames and 1000 when it arrived as one whole document, and 5000 the other
+	// way round -- the two framings of one answer disagreeing about the hit
+	// (2026-09-27 audit, round 41, B41-1).
+	b.stateCacheHit(u.detailsCachedTokens(), u.PromptCacheHitTokens)
 	return true
 }
 
@@ -2123,28 +2326,41 @@ func (b *anthropicBridge) outputEstimate() int {
 	return b.sse.outBytes/4 + 1
 }
 
+// documentRelayedBytes is every answer byte ADOPTING this document relays, in
+// the same three terms adoptWholeStream counts: content, reasoning, and each
+// tool call's argument JSON. One function for both, because the two must be the
+// same number — the ledger's estimate read only content (falling back to
+// reasoning when content was empty), so a tool-call answer and a
+// content-beside-reasoning answer were booked with completion_tokens=0 and 2
+// while the client was told 13 for the same turn (2026-09-27 audit, round 41,
+// B41-2).
+func documentRelayedBytes(msg oaDelta) int {
+	bytes := 0
+	if msg.Content != nil {
+		bytes += len(*msg.Content)
+	}
+	bytes += len(firstNonEmpty(msg.Reasoning, msg.ReasoningContent))
+	for _, tc := range msg.ToolCalls {
+		bytes += len(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+	}
+	return bytes
+}
+
 // documentOutputEstimate is outputEstimate's arm for a document the bridge is
 // still holding: the same number finalize() will put in the client's
 // output_tokens for it, worked out from the document's own text rather than
 // from a counter that is only written later (2026-09-27 audit, round 40,
 // B40-2). Empty text is no answer to measure, and reports 0 — finalize()'s
-// outBytes is len(content), so the two agree there too.
+// outBytes is the same sum, so the two agree there too.
 func (b *anthropicBridge) documentOutputEstimate(doc openAICompletion) int {
 	if len(doc.Choices) == 0 {
 		return 0
 	}
-	msg := doc.Choices[0].Message
-	content := ""
-	if msg.Content != nil {
-		content = *msg.Content
-	}
-	if content == "" {
-		content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent)
-	}
-	if content == "" {
+	bytes := documentRelayedBytes(doc.Choices[0].Message)
+	if bytes <= 0 {
 		return 0
 	}
-	return len(content)/4 + 1
+	return bytes/4 + 1
 }
 
 // nothingRelayed reports whether the stream has said nothing yet — no block
@@ -2222,31 +2438,14 @@ type openAICompletion struct {
 	ID      string `json:"id"`
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
-		Message      struct {
-			Content   *string `json:"content"`
-			Reasoning *string `json:"reasoning"`
-			// reasoning_content is the same field under the spelling
-			// DeepSeek and several vLLM builds use. Unmodelled, it vanished
-			// on the way in, and a backend that puts its whole answer there
-			// produced an empty Anthropic reply (2026-09-26 audit, fourth
-			// round).
-			ReasoningContent *string `json:"reasoning_content"`
-			ToolCalls        []struct {
-				ID string `json:"id"`
-				// The nested spelling is the one the OpenAI wire documents,
-				// and the flat one is what several backends actually write.
-				// The streaming reader in this same file reads both, so a
-				// non-streaming client of the identical upstream bytes must
-				// not be the only one that works (2026-09-27 audit, round 37,
-				// B-F3).
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"tool_calls"`
-		} `json:"message"`
+		// Message is the streaming reader's own type for one assistant turn
+		// (oaDelta), not a second anonymous struct with the same fields: the
+		// wire states a whole completion's message and a streamed delta with
+		// the same names and both spellings of a tool call, and one type is
+		// what keeps the two readings from drifting -- the ledger's estimate of
+		// an adopted answer has to be the same number the client is told
+		// (2026-09-27 audit, round 41, B41-2).
+		Message oaDelta `json:"message"`
 	} `json:"choices"`
 	Usage usage `json:"usage"`
 }

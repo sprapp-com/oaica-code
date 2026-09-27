@@ -1623,20 +1623,7 @@ type usage struct {
 //     sibling function in cmd/launch's client proxy has carried exactly this
 //     branch since round 39 (A-F4).
 func (u usage) cachedTokens() int {
-	c := 0
-	if u.PromptTokensDetails != nil {
-		c = u.PromptTokensDetails.CachedTokens
-	}
-	// A malformed details value (<=0) must not suppress a sibling that does
-	// state the hit: the clamp used to run AFTER this fallback, so a negative
-	// details count short-circuited the sibling and then clamped to zero,
-	// billing the whole prompt at the fresh rate — the outcome the fallback
-	// exists to prevent (2026-09-27 audit, round 24).
-	if c <= 0 {
-		if sibling := u.PromptCacheHitTokens; sibling > 0 {
-			c = sibling
-		}
-	}
+	c := u.statedCacheHit()
 	if c < 0 {
 		return 0
 	}
@@ -1649,6 +1636,44 @@ func (u usage) cachedTokens() int {
 		return u.PromptTokens
 	}
 	return c
+}
+
+// statedCacheHit is the cache hit the upstream stated, UNCLAMPED: details over
+// sibling spelling, and zero when neither was stated. cachedTokens() clamps it
+// to a stated prompt for the cost arithmetic, but every site that REPORTS the
+// hit applies the round-40 rule instead -- a stated hit is evidence about the
+// prompt, so the total is raised to the hit rather than the hit clamped down to
+// a size the upstream never stated. The clamp inside cachedTokens() ran BEFORE
+// the ledger row's own raise, which made that raise unreachable whenever the
+// prompt was stated: the client read 5000 for a turn whose row recorded 1000,
+// the exact disagreement the rule exists to prevent (2026-09-27 audit, round
+// 41, B41-1).
+func (u usage) statedCacheHit() int {
+	c := u.detailsCachedTokens()
+	// A malformed details value (<=0) must not suppress a sibling that does
+	// state the hit: the clamp used to run AFTER this fallback, so a negative
+	// details count short-circuited the sibling and then clamped to zero,
+	// billing the whole prompt at the fresh rate -- the outcome the fallback
+	// exists to prevent (2026-09-27 audit, round 24).
+	if c <= 0 {
+		if sibling := u.PromptCacheHitTokens; sibling > 0 {
+			c = sibling
+		}
+	}
+	if c < 0 {
+		return 0
+	}
+	return c
+}
+
+// detailsCachedTokens is the prompt_tokens_details.cached_tokens count on its
+// own, zero when the object carries no details block: one reading of the
+// pointer for every site that resolves the two cache spellings.
+func (u usage) detailsCachedTokens() int {
+	if u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
 }
 
 // merge folds a later chunk's usage into this one field by field. SSE usage
@@ -2116,11 +2141,19 @@ func inlineImageBytes(v any) (payload, images int) {
 				switch x := e.(type) {
 				case map[string]any:
 					if u, _ := x["url"].(string); u != "" {
+						// The URL text is REPLACED by the allowance, not
+						// charged beside it: the other two measures in this
+						// product charge a url-sourced image the allowance
+						// alone, so counting the address as well made the same
+						// body measure larger on this leg than on either of
+						// the others (2026-09-27 audit, round 41, B41-4).
+						payload += len(u)
 						images++
 						continue
 					}
 				case string:
 					if x != "" {
+						payload += len(x)
 						images++
 						continue
 					}
@@ -2150,6 +2183,10 @@ func inlineImageBytes(v any) (payload, images int) {
 							u, _ := m["url"].(string)
 							r, _ := m["ref"].(string)
 							if u != "" || r != "" {
+								// The allowance replaces the reference, the
+								// same rule the sibling measures apply
+								// (2026-09-27 audit, round 41, B41-4).
+								payload += len(u) + len(r)
 								images++
 								continue
 							}
@@ -2602,17 +2639,23 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 			}
 		}
 	}
-	cached := u.cachedTokens()
 	// A hit the upstream stated is a statement about the prompt: tokens served
 	// from its prefix cache are tokens OF this prompt, so a row that recorded
-	// prompt_tokens below its own cached_tokens would be recording a fact that
-	// cannot hold, and the fresh count its cost math derives from the two
+	// prompt_tokens below its own cached_tokens would record a fact that cannot
+	// hold, and the fresh count the cost math derives from the two
 	// (prompt - cached) would be negative. Raised here rather than left to the
 	// estimate, so a path with no translating writer to ask still books a
 	// coherent row (2026-09-27 audit, round 40, A40-3).
-	if cached > u.PromptTokens {
-		u.PromptTokens = cached
+	//
+	// Read through statedCacheHit() and not cachedTokens(): the latter clamps
+	// the hit to a stated prompt, which made this raise unreachable for the
+	// shape it is about — the one where the prompt WAS stated and the hit
+	// exceeded it — so the client was told a 5000-token cache read for a turn
+	// this row booked at 1000 (2026-09-27 audit, round 41, B41-1).
+	if hit := u.statedCacheHit(); hit > u.PromptTokens {
+		u.PromptTokens = hit
 	}
+	cached := u.cachedTokens()
 	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
 	return ledgerEntry{
 		TS:               start.UTC().Format(time.RFC3339Nano),

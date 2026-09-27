@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/auth"
@@ -1438,6 +1439,22 @@ func resolveImageSource(source *ImageSource) (api.ImageData, error) {
 		if source.URL == "" {
 			return nil, errors.New(`invalid image source type: url, with no url`)
 		}
+		if !isURLText(source.URL) {
+			// A source DECLARED as a url is carried as its text, and the only
+			// thing that makes it an image rather than a string is that a
+			// reader can fetch it. Text with no scheme is not fetchable: it
+			// used to reach the media sniffer as plain characters, which it
+			// labelled text/plain and forced to image/jpeg, so a client that
+			// wrote "example.com/shot.png" had the model shown a picture of
+			// the address while the picture itself was never requested — and
+			// the gateway leg, given the same block, forwards the string as a
+			// URL and lets the backend fail to fetch it. Refusing in words is
+			// the same verdict both legs give a source this wire cannot
+			// express (2026-09-27 audit, round 41, A41-5).
+			// The value is not echoed: it can be as long as the client likes,
+			// and an error message is not a place to paste a megabyte.
+			return nil, errors.New(`invalid image source: url source carries text that is not url-shaped`)
+		}
 		return api.ImageData(source.URL), nil
 	case "base64", "":
 		// "" is the source a client spells as media_type+data with no type.
@@ -1771,6 +1788,23 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 
 		return text.String(), images, nil
 	default:
+		// Any other shape — a bare object such as
+		// {"type":"text","text":"hi"} where the spec asks for a one-element
+		// array, a scalar, an SDK-typed result list — converted to an EMPTY
+		// tool message with no error: the model was told the tool returned
+		// nothing while the client read a 200, and the gateway leg, given the
+		// same block, put its JSON in the prompt (describeBlock). Both legs
+		// now DESCRIBE it the same way rather than one of them erasing the
+		// tool's answer (2026-09-27 audit, round 41, C41-9).
+		if m, ok := c.(map[string]any); ok {
+			if desc := describeToolResultBlock(m); desc != "" {
+				return desc, nil, nil
+			}
+			return "", nil, nil
+		}
+		if data, err := json.Marshal(c); err == nil && len(data) > 0 && string(data) != "null" {
+			return string(data), nil, nil
+		}
 		return "", nil, nil
 	}
 }
@@ -1890,11 +1924,17 @@ func countContentItem(item any) int {
 		// converter DESCRIBES is not billed as its transport encoding.
 		total += clampedJSONBytes(m)
 	case "document":
-		if src, ok := m["source"].(map[string]any); ok {
-			data, _ := src["data"].(string)
-			ref, _ := src["ref"].(string)
-			total += len(data) + len(ref)
-		}
+		// What the converter WRITES for this block, which is not what the
+		// block carries: a nested document reaches the prompt as its text, or
+		// as the one-line notice naming the media type and the base64 size
+		// (describeToolResultDocument — the very function the converter calls
+		// for this arm). Charging the source's data plus ref billed the
+		// transport encoding of a file the model is told about in sixty bytes:
+		// a 400 KB PDF nested in a tool result measured 546 000 bytes against
+		// a 74-byte wire, and since the estimate seeds the client-visible
+		// input_tokens, a session carrying one attachment read as a prompt six
+		// figures long and compacted early (2026-09-27 audit, round 41, A41-2).
+		total += len(describeToolResultDocument(m["source"]))
 	case "image":
 		total += imageBlockBytes(m["source"])
 	case "search_result":
@@ -1908,6 +1948,13 @@ func countContentItem(item any) int {
 			total += len(data)
 		}
 	case "web_search_tool_result":
+		// This arm is the DECODED-JSON reader, so the block here is either
+		// nested — where the converter falls through to
+		// describeToolResultBlock's JSON fallback, which is what is charged —
+		// or inside `system`, which the converter reads for text blocks only.
+		// The message-level spelling is the typed arm's business, and it is
+		// charged the formatted hits rather than this JSON (2026-09-27 audit,
+		// round 41, A41-3).
 		if data, err := json.Marshal(m); err == nil {
 			total += len(data)
 		}
@@ -1991,9 +2038,86 @@ func clampedJSONBytes(v any) int {
 	}
 	var decoded any
 	if json.Unmarshal(data, &decoded) != nil {
-		return len(data)
+		return len(data) - jsonEscapeOverhead(data)
 	}
-	return len(data) - binaryOverflow(decoded)
+	// The escapes come off for the same reason the base64 does: the upstream
+	// JSON-decodes this text before anything is tokenized, so an escape
+	// describes the transport and not the prompt. Without this a tool result
+	// holding markup — every quote, backslash and newline in a file — was
+	// charged six bytes per character where the product's other two measures
+	// (cmd/launch/prompt_payload_bytes.go and tools/gateway/main.go, both of
+	// which subtract this same quantity) charged the decoded text
+	// (2026-09-27 audit, round 41, A41-4).
+	return len(data) - binaryOverflow(decoded) - jsonEscapeOverhead(data)
+}
+
+// jsonEscapeOverhead counts the bytes json.Marshal spends writing a character
+// as an escape sequence: one fewer than the escape occupies for the
+// two-character forms, and as many as the rune it stands for for a `\uXXXX`.
+// This is the gateway's function and cmd/launch's (which share the wording) —
+// the three prompt-size measures of this product have to count the same bytes.
+// The scan follows backslashes the way a JSON reader does, so text holding the
+// literal characters `\n` is not miscounted.
+func jsonEscapeOverhead(b []byte) int {
+	extra := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			continue
+		}
+		switch c := b[i+1]; c {
+		case '\\', '"', '/', 'b', 'f', 'n', 'r', 't':
+			extra++
+			i++
+		case 'u':
+			if i+5 < len(b) && isHex4(b[i+2:i+6]) {
+				extra += 6 - escapedRuneLen(b[i+2:i+6])
+				i += 5
+			}
+		}
+	}
+	return extra
+}
+
+// escapedRuneLen is the UTF-8 length of what a `\uXXXX` escape decodes to. The
+// escapes json.Marshal writes stand for characters a JSON writer must escape —
+// U+0000 to U+001F, U+2028 and U+2029 — and the last two are three bytes
+// decoded; crediting every `\u` escape the single byte of a control escape
+// measures a prompt made of line separators at a third of its size. A lone
+// surrogate decodes to U+FFFD, three bytes.
+func escapedRuneLen(p []byte) int {
+	var v rune
+	for _, c := range p {
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			v |= rune(c-'a') + 10
+		default:
+			v |= rune(c-'A') + 10
+		}
+	}
+	if v >= 0xD800 && v <= 0xDFFF {
+		return 3
+	}
+	if n := utf8.RuneLen(v); n > 0 {
+		return n
+	}
+	return 3
+}
+
+// isHex4 reports whether a four-character `\u` payload is hex — every escape of
+// that shape is a character json.Marshal escaped, whatever it is.
+func isHex4(p []byte) bool {
+	if len(p) != 4 {
+		return false
+	}
+	for _, c := range p {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 // binaryOverflow is the length by which serializing v overstates the prompt:
@@ -2061,8 +2185,15 @@ func countContentBlock(block ContentBlock) int {
 		// input_tokens with when the upstream states no usage, so the session's
 		// context meter never grew and its auto-compaction never fired
 		// (2026-09-27 audit, round 36, A-F3).
-		if block.Source != nil {
-			total += len(block.Source.Data) + len(block.Source.Ref)
+		if block.Source != nil && block.Source.Type == "text" {
+			// Only a TEXT source is written into the prompt (convertMessage's
+			// document arm); any other source.type fails the conversion
+			// outright, so that body never reaches a model to have a prompt at
+			// all. Charging data PLUS ref billed the transport encoding of a
+			// PDF that is not carried, and charged a `ref` the converter never
+			// reads even on the text path it does carry (2026-09-27 audit,
+			// round 41, A41-2).
+			total += len(block.Source.Data)
 		}
 	case "search_result":
 		// Same omission, same consequence: the passages and the label above
@@ -2087,13 +2218,25 @@ func countContentBlock(block ContentBlock) int {
 				"ref":  block.Source.Ref,
 			})
 		}
-	case "server_tool_use", "web_search_tool_result":
-		// The same omission, two types over: a server tool call and its
-		// results (titles, URLs and encrypted content) are all prompt content
-		// the converter carries and the estimate charged nothing for.
+	case "server_tool_use":
+		// The same omission, one type over: a server tool call reaches the
+		// prompt as a tool call — id, name and arguments — which is this
+		// block's own JSON within a couple of dozen bytes, and it was charged
+		// nothing.
 		if data, err := json.Marshal(block); err == nil {
 			total += len(data)
 		}
+	case "web_search_tool_result":
+		// The same omission, and then the opposite error: the converter writes
+		// the HITS, one line each, and nothing else — while serializing the
+		// block pasted its encrypted_content back in. A search result carrying
+		// a few hundred kilobytes of opaque blob was billed in full against a
+		// wire holding a title, a URL and a newline per hit, and the estimate
+		// seeds the client-visible input_tokens, so the session's context meter
+		// and auto-compaction read a prompt the model was never sent
+		// (2026-09-27 audit, round 41, A41-3). Charge what the converter
+		// writes, through the very function that writes it.
+		total += len(formatWebSearchToolResultContent(block.Content))
 	}
 	return total
 }

@@ -883,6 +883,27 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// A url-sourced image cannot be carried to this leg's backend, which
+		// takes image BYTES: the address travelled through api.Message.Images as
+		// its own characters, and llm.NewMediaData sniffed those characters as
+		// text/plain, forced them to image/jpeg and base64'd them — the model was
+		// shown a picture of the URL text while the client had pointed at a
+		// screenshot it never sent, and the turn was answered 200. The client
+		// leg and the gateway both hand a url source to their backend as a URL;
+		// this one has no fetcher, so it refuses in words, the same verdict the
+		// converter gives any source the wire cannot express. A client that
+		// wants a local model to see a url image has to send its bytes
+		// (2026-09-27 audit, round 41, C41-13).
+		for _, m := range chatReq.Messages {
+			for _, img := range m.Images {
+				if anthropic.IsImageURL(img) {
+					c.AbortWithStatusJSON(http.StatusBadRequest, anthropic.NewError(http.StatusBadRequest,
+						`image source.type "url" cannot be represented on this leg: the model is given image bytes, and this url arrived as the address text. Send the image as a base64 source instead.`))
+					return
+				}
+			}
+		}
+
 		// Set think to nil when being used with Anthropic API to connect to tools like claude code
 		c.Set("relax_thinking", true)
 
