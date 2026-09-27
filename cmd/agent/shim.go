@@ -245,8 +245,22 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 		if data == "[DONE]" {
 			// An explicit end-of-stream marker: a proxy that sends this
 			// instead of message_stop has finished, so it is not the
-			// truncation case below.
-			acc.done = true
+			// truncation case below. It is fed to the accumulator as the
+			// message_stop it stands for, so the turn closes the same way on
+			// both spellings: the terminal delta (with the usage the upstream
+			// stated) reaches the engine, which stores only the last delta of a
+			// turn — setting the flag here and breaking emitted no delta at
+			// all, and a [DONE]-terminated turn was metered on the estimate
+			// while its own count was thrown away (2026-09-27 audit, round 53).
+			_, done, err := acc.Feed("message_stop", []byte(`{"type":"message_stop"}`))
+			if err != nil {
+				return err
+			}
+			if done {
+				if err := fn(api.ChatResponse{Done: true, Metrics: acc.usage}); err != nil {
+					return err
+				}
+			}
 			break
 		}
 		var envelope struct {

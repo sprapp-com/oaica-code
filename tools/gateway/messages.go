@@ -2479,13 +2479,15 @@ func (b *anthropicBridge) finalize() {
 	if msg.Content != nil {
 		content = *msg.Content
 	}
-	// Backends that put the answer in a reasoning field (content null) — see
-	// the file header; an empty text reply would be worse than surfacing it.
-	// Both spellings are honoured: which one a backend uses is not something
-	// the client can see or control.
-	if content == "" {
-		content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent)
-	}
+	// Reasoning is content on this wire — see the file header — and it is
+	// relayed FIRST, which is the order relayDelta and adoptWholeStream both
+	// write it in. Reading it here only as a fallback for an empty content hid it
+	// from this path alone: the client was shown `answer` and charged
+	// output_tokens for `thoughtanswer`, while the same document arriving as
+	// frames or as one whole body showed both texts to the client (2026-09-27
+	// audit, round 53). Both spellings are honoured: which one a backend uses is
+	// not something the client can see or control.
+	content = firstNonEmpty(msg.Reasoning, msg.ReasoningContent) + content
 	respBlocks := []map[string]any{}
 	// A text is content whatever it says: relayDelta relays a content of
 	// whitespace as a text block, so trimming here dropped the text from a
@@ -2512,15 +2514,22 @@ func (b *anthropicBridge) finalize() {
 		}
 	}
 	toolBlocks := 0
+	// A call the upstream never named: content_block_start is the only event
+	// that carries a name, so there is no block to open, and the stream path
+	// holds it for that reason (2026-09-27 audit, round 39, B-F8). Answering it
+	// here with a block whose "name" is empty told the client to expect a call it
+	// could not name or run, which is the same false claim in the non-streaming
+	// shape (2026-09-27 audit, round 44, C44-4) — so its arguments are relayed as
+	// TEXT, the fate the stream path gives the same fragment, which is at least
+	// the model's readable output. Dropped instead, the bytes the upstream wrote
+	// and billed for reached no client at all on this arm, and the turn was
+	// refused as an empty completion (2026-09-27 audit, round 53).
+	unnamedArgs := []string{}
 	for _, tc := range msg.ToolCalls {
 		if strings.TrimSpace(firstNonEmptyStr(tc.Function.Name, tc.Name)) == "" {
-			// A call the upstream never named: content_block_start is the only
-			// event that carries a name, so there is no block to open, and the
-			// stream path holds it for that reason (2026-09-27 audit, round 39,
-			// B-F8). Answering it here with a block whose "name" is empty told
-			// the client to expect a call it could not name or run, which is the
-			// same false claim in the non-streaming shape
-			// (2026-09-27 audit, round 44, C44-4).
+			if a := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments); a != "" {
+				unnamedArgs = append(unnamedArgs, a)
+			}
 			continue
 		}
 		input, ok := callInput(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments), truncated)
@@ -2606,6 +2615,13 @@ func (b *anthropicBridge) finalize() {
 			"name":  name,
 			"input": input,
 		})
+	}
+	// After the blocks that name themselves, which is where the stream path
+	// relays the same fragments: finishStream opens the calls it can name first
+	// and hands whatever an unnamed fragment carried to the client as text at the
+	// end of the turn.
+	for _, a := range unnamedArgs {
+		respBlocks = append(respBlocks, map[string]any{"type": "text", "text": a})
 	}
 	// Anthropic's contract — the one this bridge translates INTO — is that
 	// input_tokens is the UNCACHED prompt and cache_read_input_tokens the
@@ -3004,6 +3020,17 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		// (2026-09-27 audit, round 43, B43-3). An id no block carries yet is a
 		// new call outright, which is why this asks only about a key already
 		// accumulated.
+		if tb := b.toolBlocks[key]; tb != nil && restatesCarriedCall(tb, id, name, args) {
+			// The call this block carries, restated under its own stated id: not
+			// a second call, so the split below must not fire and the fragment's
+			// text is not more of the call's arguments. Keyed back to the block
+			// it repeats, where toolDelta drops it (round 53's F4).
+			if name != "" {
+				b.lastToolName = name
+			}
+			b.lastToolKey = key
+			return b.lastToolKey
+		}
 		if b.toolBlocks[key] != nil && b.splitFromCurrent(key, name, args) {
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
@@ -3164,6 +3191,40 @@ func toolCallIdentity(name, args string) string {
 	return "\x00" + name + "\x00" + canonicalCallArgs(args)
 }
 
+// restatesCarriedCall reports whether one fragment is the call the block already
+// carries, restated: the same stated id, the same name, and the same arguments,
+// complete on both sides.
+//
+// An argument text that is already a finished call and a fragment that states
+// that very call again are not a continuation — the concatenation of the two is
+// not JSON — so the only reading that leaves the client a runnable call is that
+// the upstream listed the same call twice. The non-stream list already answers
+// that wire with ONE block (statedIDOwner: a repeat of the same identity under
+// the same stated id is dropped), and both other legs do the same; the stream
+// path appended the fragment as more of the same object, so the client held
+// `{"a":1}{"a":1}` under a stop_reason of tool_use (round 53's F2), and the
+// index-less arm split it into a SECOND block with a minted id — the model's one
+// call, delivered twice, and run twice (round 53's F4).
+//
+// The stated id is what separates the two readings, exactly as it does in the
+// non-stream list: a fragment that repeats the same name and arguments under an
+// id the block does not hold is a second call the upstream numbered itself (the
+// wire round 43's B43-3 splits on), and one that states none is a bare repeat,
+// which is a second call outright (round 39's B-F9).
+func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
+	if tb == nil || tb.name == "" || id == "" || !tb.statedID || id != tb.id {
+		return false
+	}
+	if name != "" && name != tb.name {
+		return false
+	}
+	acc := tb.args.String()
+	if !argsAreFinished(acc) || !argsAreFinished(args) {
+		return false
+	}
+	return canonicalCallArgs(acc) == canonicalCallArgs(args)
+}
+
 // canonicalCallArgs re-encodes a tool call's argument text the way both other
 // legs hash it — anthropic.go's `json.Marshal(tc.Function.Arguments)` and the
 // proxy's mintedKey are the same re-encoding of the parsed arguments: the
@@ -3321,6 +3382,17 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// (releaseHeldToolBlocks).
 			b.releaseHeldToolBlocks(tb)
 		}
+	}
+	if restatesCarriedCall(tb, id, name, args) {
+		// The call already carried, listed again under its own id: its arguments
+		// are on the wire and complete, so this fragment is neither more of them
+		// nor a second call. The non-stream list drops the repeat (statedIDOwner)
+		// and both other legs answer it with one block; appended, it left the
+		// client accumulating `{"a":1}{"a":1}` under a stop_reason of tool_use
+		// (round 53's F2). Asked before the writes, because a text appended here
+		// is a text already delivered — this is the only point where the
+		// fragment's own bytes can still be left off the call.
+		return
 	}
 	if name != "" && tb.name == "" {
 		tb.name = name
@@ -3650,6 +3722,19 @@ func (b *anthropicBridge) countedToolBlocks() int {
 		// max_tokens truncation was erased with it, while the client held an
 		// unterminated input the model never wrote (2026-09-27 audit, round 52).
 		if _, ok := callInput(tb.delivered.String(), b.sse.stopMsg == "length"); !ok {
+			continue
+		}
+		// And over the bytes the MODEL stated, because the two are not the same
+		// text on this wire: freeform arguments are handed to the client inside a
+		// wrapper (`{"_raw":…}`, flushToolArgs) that always parses, so a fragment
+		// the model was still writing when the upstream stopped it for length
+		// counted as a call the client could run — under a stop_reason of
+		// tool_use, which is exactly what the non-stream path and the client leg
+		// refuse for the same turn (they ask their parse of the model's own bytes,
+		// and drop the fragment). The verdict is a statement about the call the
+		// client was given, and that call has to be one the model WROTE
+		// (2026-09-27 audit, round 53).
+		if _, ok := callInput(tb.args.String(), b.sse.stopMsg == "length"); !ok {
 			continue
 		}
 		n++
@@ -4165,6 +4250,18 @@ func documentSaysSomething(doc openAICompletion) bool {
 	}
 	for _, tc := range m.ToolCalls {
 		if strings.TrimSpace(firstNonEmptyStr(tc.Function.Name, tc.Name)) != "" {
+			return true
+		}
+		if firstNonEmptyStr(tc.Function.Arguments, tc.Arguments) != "" {
+			// A call the upstream never named, whose arguments this bridge relays
+			// as TEXT on both of its arms (finalize, finishStream): the bytes
+			// reach the client, so the document is not one that says nothing.
+			// Counting names alone answered one identical body two ways — the
+			// stream relayed the fragment as prose and ended the turn, while this
+			// predicate refused the same document with 502 through noAnswer, and
+			// a 5xx invites a retry that re-bills the whole prompt (2026-09-27
+			// audit, round 53; the stream's reading is round 39's B-F8, pinned by
+			// callsCarryingOutput, which counts the same bytes).
 			return true
 		}
 	}

@@ -19,6 +19,11 @@ import (
 type anthropicSSEAccumulator struct {
 	blocks map[int]*anthropicBlockAccum
 	done   bool
+	// usage is the token count the upstream STATED for this turn, accumulated
+	// across the frames that carry it (message_start's input_tokens,
+	// message_delta's output_tokens) and delivered on the message_stop delta —
+	// the only delta the engine stores as the turn's last one.
+	usage api.Metrics
 }
 
 type anthropicBlockAccum struct {
@@ -38,7 +43,33 @@ func newAnthropicSSEAccumulator() *anthropicSSEAccumulator {
 // treats an empty message as a stream-end sentinel.
 func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []api.ChatResponse, done bool, err error) {
 	switch eventType {
-	case "message_start", "ping", "message_delta":
+	case "message_start":
+		// The prompt the upstream counted, dropped on the floor until round 53:
+		// the engine stores only the LAST delta of a turn (agent/session.go,
+		// *latest = response), and the frames that state a usage are the first
+		// and the second-to-last, so nothing the engine kept ever carried one.
+		// shouldCompact reads that number for its "prompt_eval" trigger
+		// (agent/compactor.go), so the trigger was dead on this leg and every
+		// session compacted on the character estimate instead — the local
+		// model's own count of the prompt was available and never reached it
+		// (2026-09-27 audit, round 53).
+		var ev anthropic.MessageStartEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, false, fmt.Errorf("parse message_start: %w", err)
+		}
+		a.usage.PromptEvalCount = ev.Message.Usage.InputTokens
+		if cached := ev.Message.Usage.CacheReadInputTokens; cached != nil {
+			a.usage.PromptEvalCachedCount = cached
+		}
+		return nil, false, nil
+	case "ping":
+		return nil, false, nil
+	case "message_delta":
+		var ev anthropic.MessageDeltaEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, false, fmt.Errorf("parse message_delta: %w", err)
+		}
+		a.usage.EvalCount = ev.Usage.OutputTokens
 		return nil, false, nil
 	case "content_block_start":
 		var ev anthropic.ContentBlockStartEvent
@@ -123,7 +154,11 @@ func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []
 			return nil, false, nil
 		}
 		a.done = true
-		return []api.ChatResponse{{Done: true}}, true, nil
+		// The stated usage rides the terminal delta: this is the one the engine
+		// keeps for the turn (its Message is empty, so the engine's delta
+		// handler stores it as *latest), and a turn whose count is only stated
+		// is a turn whose meter and compaction read a guess instead.
+		return []api.ChatResponse{{Done: true, Metrics: a.usage}}, true, nil
 	case "error":
 		var ev anthropic.StreamErrorEvent
 		if err := json.Unmarshal(data, &ev); err != nil {

@@ -736,6 +736,47 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 			}); err != nil {
 				return err
 			}
+		} else if block.Type == "tool_use" {
+			// A tool_use block opens with an EMPTY input and its arguments
+			// arrive as an input_json_delta — the framing the converter one
+			// branch over in this file emits for the same block
+			// (anthropic.StreamConverter). Written whole inside
+			// content_block_start, as this arm did, the arguments reached only
+			// a client that reads the start event's input as the base object:
+			// the agent shim accumulates a call from input_json_delta alone
+			// (cmd/agent/sse.go, the rule the SDKs use too), so a web-search
+			// turn handed the engine a tool call with the arguments gone, while
+			// the same block served through this handler's passthrough path
+			// carried them (2026-09-27 audit, round 53).
+			argsJSON, err := json.Marshal(block.Input)
+			if err != nil {
+				return err
+			}
+			if err := writeSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
+				Type:  "content_block_start",
+				Index: index,
+				ContentBlock: anthropic.ContentBlock{
+					Type: "tool_use",
+					ID:   block.ID,
+					Name: block.Name,
+					// The empty input the client accumulates onto: a start with
+					// no input key at all is a block shape Claude Code parses
+					// differently, and the converter above emits this one.
+					Input: api.NewToolCallFunctionArguments(),
+				},
+			}); err != nil {
+				return err
+			}
+			if err := writeSSE(w.ResponseWriter, "content_block_delta", anthropic.ContentBlockDeltaEvent{
+				Type:  "content_block_delta",
+				Index: index,
+				Delta: anthropic.Delta{
+					Type:        "input_json_delta",
+					PartialJSON: string(argsJSON),
+				},
+			}); err != nil {
+				return err
+			}
 		} else {
 			if err := writeSSE(w.ResponseWriter, "content_block_start", anthropic.ContentBlockStartEvent{
 				Type:         "content_block_start",

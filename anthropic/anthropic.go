@@ -2176,6 +2176,18 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 			switch cbMap["type"] {
 			case "text":
 				if t, ok := cbMap["text"].(string); ok {
+					// An empty text block is no text, and writing it — with the
+					// separator this join puts in front of it — left a blank
+					// line the gateway leg's toolResultText join does not write:
+					// ["one",""] reached the model as "one\n" here and "one"
+					// there, and a tool result that ends in a blank line reads
+					// as an unfinished answer (2026-09-27 audit, round 53).
+					// The sibling's rule is the one this arm follows: only a
+					// string that carries bytes becomes a part (tools/gateway/
+					// messages.go, the text case of its tool_result join).
+					if t == "" {
+						continue
+					}
 					// Separated so two blocks do not read as one sentence —
 					// "first line" + "second line" = "first linesecond line"
 					// (2026-09-26 audit, sixteenth round). The separator is the
@@ -2386,6 +2398,7 @@ func countAnyContent(content any) int {
 		return 0
 	}
 
+
 	switch c := content.(type) {
 	case string:
 		return len(c)
@@ -2394,19 +2407,85 @@ func countAnyContent(content any) int {
 		for _, block := range c {
 			total += countContentBlock(block)
 		}
-		return total
+		return total + messageJoinSeparatorBytes(c)
 	case []any:
 		total := 0
 		for _, item := range c {
 			total += countContentItem(item)
 		}
-		return total
+		return total + messageJoinSeparatorBytes(c)
 	default:
 		if data, err := json.Marshal(content); err == nil {
 			return len(data)
 		}
 		return 0
 	}
+}
+
+// messageJoinSeparatorBytes charges the blank line convertMessage writes in
+// front of each further text block of one message's content — the separator
+// that keeps "read the file." and "Now run the tests." from reading as one
+// sentence (the text case of convertMessage). Nothing charged it: a message of
+// three text blocks reached the model as 20 bytes and was charged 12, and the
+// shortfall is two bytes per block on a body whose every other byte is
+// measured. The estimate seeds the client-visible input_tokens on the local
+// leg, so the session's meter and its auto-compaction read a prompt smaller
+// than the one that was sent (2026-09-27 audit, round 53).
+//
+// The walk is the converter's own, run by run: a tool_result and a
+// web_search_tool_result end the run of own blocks the separator counts within
+// (convertMessage sets cur = nil for both), and a text block after one of them
+// opens a run of its own and takes no separator. A text block whose text is
+// empty still opens one in the converter — it is written, and the separator in
+// front of it is written with it — so it is counted here too, exactly as the
+// converter writes it.
+func messageJoinSeparatorBytes(content any) int {
+	separators, run := 0, 0
+	text := func(blockType, blockText string) {
+		switch blockType {
+		case "tool_result", "web_search_tool_result":
+			run = 0
+		case "text":
+			if run > 0 {
+				separators += 2
+			}
+			run += len(blockText)
+		}
+	}
+
+	switch c := content.(type) {
+	case []ContentBlock:
+		for i := range c {
+			// A text block with no text pointer writes nothing at all — the
+			// converter's case guards on block.Text != nil — so it is not a
+			// block this walk may charge a separator for.
+			if c[i].Type == "text" && c[i].Text == nil {
+				continue
+			}
+			var s string
+			if c[i].Text != nil {
+				s = *c[i].Text
+			}
+			text(c[i].Type, s)
+		}
+	case []any:
+		for _, item := range c {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			blockType, _ := m["type"].(string)
+			if blockType == "text" && m["text"] == nil {
+				// The same block the typed arm above skips: null and absent
+				// both decode to no text pointer, and the converter writes
+				// nothing for either.
+				continue
+			}
+			blockText, _ := m["text"].(string)
+			text(blockType, blockText)
+		}
+	}
+	return separators
 }
 
 // systemBytes charges the system prompt for what the converter WRITES for it.
@@ -2586,10 +2665,34 @@ func countItemsIn(content any, ctx chargeContext) int {
 		return countItemsIn(items, ctx)
 	case []any:
 		total := 0
+		// The parts a tool_result's join assembles are separated by a newline
+		// (convertToolResultContent, round 37 A-F7), and those separators are
+		// prompt bytes like any other: nothing charged them, so a result of two
+		// text blocks reached the model as seven bytes and was charged six, and
+		// the shortfall grows by one per block (2026-09-27 audit, round 53).
+		// The walk is the converter's own: a separator in front of every part
+		// after the first that carried bytes, and none for the part that
+		// carried none.
+		written, separators := 0, 0
 		for _, item := range c {
 			total += countContentItemIn(item, ctx)
+			if ctx != chargeToolResult {
+				continue
+			}
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			text := toolResultItemText(m)
+			if text == "" {
+				continue
+			}
+			if written > 0 {
+				separators++
+			}
+			written += len(text)
 		}
-		return total
+		return total + separators
 	}
 	return 0
 }
@@ -2660,16 +2763,33 @@ func toolResultContentBytes(content any) int {
 // describeToolResultBlock renders for it, which is exactly what the converter
 // writes for it too.
 func toolResultItemBytes(m map[string]any) int {
+	if t, _ := m["type"].(string); t == "image" {
+		return imageBlockBytes(m["source"])
+	}
+	return len(toolResultItemText(m))
+}
+
+// toolResultItemText is the text convertToolResultContent WRITES for one
+// element of a tool_result's content — the one reader both the charge above and
+// the join separator below measure, so the two cannot drift apart:
+//
+//   - a text element is its text when that text IS a string, and an empty text
+//     is no text at all (the converter skips it rather than writing a blank
+//     line);
+//   - an image writes no text — it is carried as the message's image;
+//   - a document and every other block are DESCRIBED, and a description that
+//     comes back empty writes nothing.
+func toolResultItemText(m map[string]any) string {
 	switch t, _ := m["type"].(string); t {
 	case "text":
 		text, _ := m["text"].(string)
-		return len(text)
-	case "document":
-		return len(describeToolResultDocument(m["source"]))
+		return text
 	case "image":
-		return imageBlockBytes(m["source"])
+		return ""
+	case "document":
+		return describeToolResultDocument(m["source"])
 	}
-	return len(describeToolResultBlock(m))
+	return describeToolResultBlock(m)
 }
 
 // searchResultItemBytes charges one passage of a search_result's content, the
