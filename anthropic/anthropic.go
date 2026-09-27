@@ -2474,6 +2474,13 @@ func conversationBytes(messages []MessageParam, system any) int {
 		// toolResults counts the blocks of this turn that become their OWN
 		// role-"tool" messages (see the rewrite's charge below).
 		toolResults int
+		// splitsAfterResult reports that the last thing the converter writes for
+		// this turn is a run of the turn's own blocks AND that a tool result came
+		// before it: the turn becomes [system text, tool, system text], so its
+		// system text lands after a message of another role and the hoist's
+		// orderedness test — which reads the CONVERTED list, not the request's
+		// turn order — fails on it (2026-09-28 audit, round 64, F64-L1-3).
+		splitsAfterResult bool
 	}
 	entries := make([]entry, 0, len(messages)+1)
 	if text, present := topLevelSystemText(system); present {
@@ -2489,7 +2496,7 @@ func conversationBytes(messages []MessageParam, system any) int {
 	mergeable := true
 	carriesContent := false
 	for _, msg := range messages {
-		sep, ownRuns, toolResults, resultsStated, joinedSep := messageShapeBytes(msg.Content)
+		sep, ownRuns, toolResults, resultsStated, joinedSep, lastRunStated := messageShapeBytes(msg.Content)
 		role := messageRoleBytesFor(msg.Role, ownRuns, toolResults)
 		if strings.EqualFold(msg.Role, "system") {
 			textOnly := systemContentIsTextOnly(msg.Content)
@@ -2527,13 +2534,14 @@ func conversationBytes(messages []MessageParam, system any) int {
 				carriesContent = true
 			}
 			entries = append(entries, entry{
-				system:      true,
-				text:        text,
-				bytes:       role + countAnyContent(msg.Content),
-				roleBytes:   role,
-				toolResults: toolResults,
-				sep:         sep,
-				joinedSep:   joinedSep,
+				system:            true,
+				text:              text,
+				bytes:             role + countAnyContent(msg.Content),
+				roleBytes:         role,
+				toolResults:       toolResults,
+				sep:               sep,
+				joinedSep:         joinedSep,
+				splitsAfterResult: toolResults > 0 && lastRunStated,
 			})
 			continue
 		}
@@ -2572,7 +2580,15 @@ func conversationBytes(messages []MessageParam, system any) int {
 			seenNonSystem = true
 			continue
 		}
-		if seenNonSystem || strings.TrimSpace(e.text) == "" {
+		// The hoist's own test, run over the shape the converter WRITES: a turn
+		// whose last own run follows a tool result is written [system, tool,
+		// system], so its system text is not first whichever turn the client
+		// wrote it in, and normalizeSystemFirst rewrites that conversation
+		// (see the entry's splitsAfterResult). Deciding the branch over the
+		// request's turns alone left a leading result-split system turn charged
+		// the as-is reading while its own converter wrote the joined one
+		// (2026-09-28 audit, round 64, F64-L1-3).
+		if seenNonSystem || strings.TrimSpace(e.text) == "" || e.splitsAfterResult {
 			rewrite = true
 		}
 	}
@@ -2882,7 +2898,7 @@ func countAnyContent(content any) int {
 // front of it is written with it — so it is counted here too, exactly as the
 // converter writes it.
 func messageJoinSeparatorBytes(content any) int {
-	separators, _, _, _, _ := messageShapeBytes(content)
+	separators, _, _, _, _, _ := messageShapeBytes(content)
 	return separators
 }
 
@@ -2923,7 +2939,7 @@ func messageRoleBytesFor(role string, ownRuns, toolResults int) int {
 
 // messageRolesBytes is messageRoleBytesFor over one client message's content.
 func messageRolesBytes(role string, content any) int {
-	_, ownRuns, results, _, _ := messageShapeBytes(content)
+	_, ownRuns, results, _, _, _ := messageShapeBytes(content)
 	return messageRoleBytesFor(role, ownRuns, results)
 }
 
@@ -2961,12 +2977,15 @@ func toolResultStatesSomething(blockType, toolUseID string, content any) bool {
 	return written != "" || len(images) > 0
 }
 
-// messageShapeBytes is messageJoinSeparatorBytes' walk, reporting the three
-// other things it knows on the way: how many messages convertMessage writes for
-// this content carrying the CLIENT's own role, how many it writes carrying
-// "tool", and how many of those tool messages state anything (the question
+// messageShapeBytes is messageJoinSeparatorBytes' walk, reporting the five other
+// things it knows on the way: how many messages convertMessage writes for this
+// content carrying the CLIENT's own role, how many it writes carrying "tool",
+// how many of those tool messages state anything (the question
 // FromMessagesRequest's fallback asks of every message it built — see
-// toolResultStatesSomething).
+// toolResultStatesSomething), the same blank lines read for the text the REWRITE
+// joins, and whether the last message the converter writes for this turn carries
+// the client's own role (which, with a tool result beside it, is what makes the
+// hoist rewrite — see messageShapeBytes' caller in conversationBytes).
 //
 // A run is one of the former only when it states something the converter
 // writes — text bytes, an image, a call, or reasoning; a lone text block
@@ -2978,7 +2997,7 @@ func toolResultStatesSomething(blockType, toolUseID string, content any) bool {
 // caller that charges roles (messageRolesBytes) reads these two counts, so the
 // rule about what the converter writes stays in ONE walk (2026-09-28 audit,
 // round 57, F57-L1-3).
-func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsStated, joinedSeparators int) {
+func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsStated, joinedSeparators int, lastRunStated bool) {
 	run, stated := false, false
 	// jrun is this same walk read for the JOINED text — what the rewrite writes
 	// when it merges the turn's surviving text into one system message. The
@@ -2991,14 +3010,31 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 	// the walk had left it out of, so the turn's result messages were billed two
 	// bytes less for every text the result split off (2026-09-28 audit, round
 	// 63, F63-L1-1).
+	//
+	// jrun is the CURRENT run's reading and jruns counts the runs already closed
+	// that survived: the merged string is the surviving runs joined by that same
+	// blank line, so the boundary between two of them is worth two bytes and the
+	// boundary in front of a run the merge DROPS is worth none. Carrying jrun
+	// across the boundary instead charged every block after a result the two
+	// bytes of a run that never reached the prompt: ["S1", result, ""] is
+	// written "S1" — the empty run states nothing and is dropped — and was
+	// charged "S1\n\n" (2026-09-28 audit, round 64, F64-L1-2).
 	jrun := false
+	jruns := 0
 	// flush closes the run the walk is inside: a run that stated anything is a
-	// message of the client's own role.
+	// message of the client's own role, and a run whose joined text is non-empty
+	// is one of the runs the merge joins.
 	flush := func() {
 		if stated {
 			ownRuns++
 		}
-		run, stated = false, false
+		if jrun {
+			if jruns > 0 {
+				joinedSeparators += 2
+			}
+			jruns++
+		}
+		run, stated, jrun = false, false, false
 	}
 	// write is the converter's join, run by run: the separator in front of a
 	// block is written when the run ALREADY holds text, and the block is what
@@ -3090,7 +3126,17 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 			if jrun {
 				joinedSeparators += 2
 			}
+			// The extra this arm writes beyond what the content chargers bill —
+			// the newline a document takes when its data lacks one, the title and
+			// reference a search result states — is written into the JOINED text
+			// as well as into the run, and joinedMessageText carries it, so the
+			// joined reading has to carry it too: the term that turns the per-run
+			// reading into the joined one is their difference, and charging the
+			// bytes that differ for a reason the merge has nothing to do with
+			// billed a result-split turn its document and its search result
+			// backwards (2026-09-28 audit, round 64, F64-L1-1).
 			separators += chunk - billed
+			joinedSeparators += chunk - billed
 			run, stated, jrun = true, true, true
 		}
 	}
@@ -3235,9 +3281,17 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults, resultsSt
 		// Content of a shape the converter does not walk (nil, a map) writes no
 		// message.
 	}
-	// The last run is a message too, if it said anything.
+	// The last run is a message too, if it said anything. Whether it is also the
+	// LAST thing the converter writes for this turn — a run that follows a tool
+	// message — is what the hoist's orderedness test turns on, because such a
+	// turn is written [system, tool, system]: the system text lands after a
+	// message of another role whatever the request's own turn order says, so the
+	// rewrite moves it and the estimate has to charge the turn the way the
+	// rewrite writes it (conversationBytes' rewrite; 2026-09-28 audit, round 64,
+	// F64-L1-3).
+	lastRunStated = stated
 	flush()
-	return separators, ownRuns, toolResults, resultsStated, joinedSeparators
+	return separators, ownRuns, toolResults, resultsStated, joinedSeparators, lastRunStated
 }
 
 // systemBytes charges the system prompt for what the converter WRITES for it.

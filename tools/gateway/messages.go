@@ -540,13 +540,19 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	var msgs []map[string]any
 	rawMsgs, _ := req["messages"].([]any)
 	if len(rawMsgs) == 0 {
-		// A conversation with no turns at all — the key absent, or stated as an
-		// empty array — is one empty user turn on both sibling legs: their
-		// converter writes a message carrying the client's role and no content,
-		// and the request is served. Refusing it here made the same body a 400
-		// on this leg and a 200 on the other two, for a turn whose cost is one
-		// word (2026-09-28 audit, round 63, F63-L3-6).
-		rawMsgs = []any{map[string]any{"role": "user", "content": ""}}
+		// A conversation with no turns at all — the key absent, stated as an
+		// empty array, or stated as a value that is not an array at all — is
+		// refused here, and refused by both sibling hands: the local server's
+		// middleware answers an empty turn list with this same 400 before its
+		// converter runs, and the client proxy refuses `len(messages) == 0` with
+		// it too (middleware/anthropic.go, cmd/launch/anthropic_openai_proxy.go
+		// — both citing this leg). Round 63 read one sibling's CONVERTER instead
+		// of its handler, on the reading that a turn-less body is "one empty
+		// user turn" there, and served it: that made the same body a 400 on two
+		// legs and a metered 200 here, for a malformed body as well as an empty
+		// one, which is the round-49 B-F1 class this leg's refusals exist to
+		// keep (2026-09-28 audit, round 64, F64-L3-1).
+		return nil, "messages is required"
 	}
 	for _, rm := range rawMsgs {
 		m, _ := rm.(map[string]any)
@@ -3098,8 +3104,30 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// the split below — which is what tells a vendor reusing one id
 			// for the turn's calls (round 43's B43-3) from this wire
 			// (2026-09-28 audit, round 63, F63-L3-3).
+			//
+			// A fragment that states a DIFFERENT name is not that
+			// continuation: an argument continuation carries arguments alone,
+			// so a second name introduces a second call whatever id it states
+			// (round 40's A40-8), and the client leg asks the name as well
+			// (openSlotStating routes by the id and then splits on the name).
+			// Without the name the reroute reached a fragment that introduces
+			// the NEXT call — the second call of the turn, whole on the wire,
+			// written while the first was still mid-object — and appended it to
+			// the first's unfinished arguments: the client held one call whose
+			// input was `{"a":{"b":2}1}`, JSON no tool parses, under a
+			// stop_reason of tool_use, and the model's second call did not exist
+			// (2026-09-28 audit, round 64, F64-L3-2).
+			//
+			// The index is recorded like every other branch of this arm: a
+			// vendor that numbers its fragments itself states neither id nor
+			// name on the chunk that finishes the call, and leaving the index
+			// unnamed sent that chunk to a freshly minted block — the call
+			// reached the client unterminated and the byte that finished it was
+			// relayed as prose (2026-09-28 audit, round 64, F64-L3-3).
 			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
+				(name == "" || carried.name == "" || name == carried.name) &&
 				!argsAreFinished(carried.args.String()) {
+				b.noteIndexKey(*upIdx, carried.key)
 				b.lastToolKey = carried.key
 				return carried.key
 			}

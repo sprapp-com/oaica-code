@@ -13,15 +13,16 @@ package main
 //     the reading that server_tool_use is carried "with whatever fields it
 //     has". Its input reached the model as the bare scalar, arguments no tool
 //     can parse, under a 200.
-//   - F63-L3-6: a conversation with no turns at all. The sibling's converter
-//     writes one message carrying the client's role and no content and serves
-//     the turn; this leg refused the body "messages is required", so the same
-//     request was a 200 on two legs and a 400 here.
+//   - F63-L3-6: a conversation with no turns at all. Round 63 read the sibling's
+//     CONVERTER (which writes one message carrying the client's role and no
+//     content) rather than its handler, served the turn here, and so made the
+//     same body a 400 on two legs and a 200 on this one. Round 64's F64-L3-1
+//     reversed it; the test below is the reversed pin, and round 64's own file
+//     carries the finding.
 //
-// Each is fail-first: RED against the tree before this round's fix.
+// F63-L3-5 is fail-first: RED against the tree before this round's fix.
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -52,38 +53,28 @@ func TestANonObjectInputIsRefusedWhateverTheBlockIsCalled(t *testing.T) {
 	}
 }
 
-// TestAnEmptyConversationIsOneEmptyTurn is F63-L3-6: the messages key stated as
-// an empty array, and left out entirely.
-func TestAnEmptyConversationIsOneEmptyTurn(t *testing.T) {
+// TestATurnlessConversationIsRefusedWhateverTheKeySays is F63-L3-6 REVERSED by
+// round 64's F64-L3-1. Round 63 read one sibling's CONVERTER — which does write
+// one message carrying the client's role and no content for a turn-less body —
+// and served the turn here, on the reading that the other two legs served it
+// too. They do not: both HANDLERS refuse an empty turn list with this same 400
+// before their converters run (middleware/anthropic.go's `len(req.Messages) ==
+// 0`, cmd/launch/anthropic_openai_proxy.go's `len(anthReq.Messages) == 0`, each
+// citing this leg), so the round-63 change made one body a 400 on two legs and
+// a metered 200 here — and served a `messages` that is not an array at all,
+// which both siblings fail to decode.
+func TestATurnlessConversationIsRefusedWhateverTheKeySays(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"empty-array", `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":[]}`},
 		{"absent", `{"model":"kat-awq","max_tokens":64,"stream":true}`},
+		{"null", `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":null}`},
+		{"string", `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":"oops"}`},
+		{"number", `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":7}`},
+		{"object", `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":{"a":1}}`},
 	} {
 		code, out := r63Ask(t, tc.body)
-		if code != 200 {
-			t.Errorf("a conversation with no turns (%s) is answered %d, want 200:\n%s\nboth sibling legs write one message carrying the client's role and no content and serve the turn, so this body is a 400 on this leg alone (2026-09-28 audit, round 63, F63-L3-6)", tc.name, code, out)
+		if code != 400 {
+			t.Errorf("a body whose messages is %s is answered %d, want 400:\n%s\nthe sibling hands refuse an empty turn list with this same 400 and neither decodes a messages that is not an array, so serving it here makes one body a 400 on two legs and a metered 200 on this one (2026-09-28 audit, round 64, F64-L3-1)", tc.name, code, out)
 		}
-	}
-}
-
-// TestTheEmptyTurnReachesTheModelAsOneUserMessage holds the SHAPE the served
-// turn takes: the message the sibling writes is a user message with no content,
-// not an empty conversation the upstream would have to invent.
-func TestTheEmptyTurnReachesTheModelAsOneUserMessage(t *testing.T) {
-	cap := &round44Capture{}
-	up := round44Upstream(t, cap, "text/event-stream", `data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`+"\n\n"+`data: [DONE]`+"\n\n")
-	srv, _ := round39Gateway(t, up, nil)
-	code, _ := round45Ask(t, srv, `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":[]}`)
-	if code != 200 {
-		t.Fatalf("PREMISE: the empty conversation is answered %d, want 200", code)
-	}
-	var sent struct {
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(cap.take()), &sent); err != nil {
-		t.Fatalf("the upstream request is not JSON: %v", err)
-	}
-	if len(sent.Messages) != 1 || sent.Messages[0]["role"] != "user" {
-		t.Errorf("the empty conversation reaches the model as %v, want one user message", sent.Messages)
 	}
 }
