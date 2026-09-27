@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -440,7 +441,7 @@ func (t *ToolProperty) UnmarshalJSON(data []byte) error {
 	var p plain
 	_ = json.Unmarshal(data, &p)
 	*t = ToolProperty(p)
-	if json.Valid(data) {
+	if json.Valid(data) && !isJSONNull(data) {
 		t.raw = append(json.RawMessage(nil), data...)
 	}
 	return nil
@@ -596,7 +597,10 @@ func (t ToolFunctionParameters) SchemaJSON() json.RawMessage { return t.raw }
 // typed view is filled on a best-effort basis, so a schema this struct cannot
 // model (a `required` holding a number, a `properties` holding a string) is
 // still delivered to the model as the caller wrote it rather than refusing the
-// whole request.
+// whole request. The one non-object that is NOT refused is `null`: a client
+// that states no schema and a client that states `null` mean the same thing,
+// and both put the zero value's `{"type":"","properties":null}` on the wire
+// (2026-09-27 audit, round 51).
 func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -606,8 +610,24 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	var p plain
 	_ = json.Unmarshal(data, &p)
 	*t = ToolFunctionParameters(p)
+	if isJSONNull(data) {
+		// A schema stated as `null` is a schema not stated: the two spellings
+		// mean the same thing to a client, so they have to put the same tool
+		// signature on the wire, and a backend that requires an object is
+		// handed the empty one rather than the JSON literal `null`
+		// (2026-09-27 audit, round 51). Go's decoder reads `null` into a map as
+		// a no-op that reports no error, which is exactly what made it survive
+		// the object check below and be re-emitted verbatim.
+		return nil
+	}
 	t.raw = append(json.RawMessage(nil), data...)
 	return nil
+}
+
+// isJSONNull reports whether the bytes are the JSON literal null, which every
+// arm of a decoder reads as "not stated" rather than as a value.
+func isJSONNull(data []byte) bool {
+	return string(bytes.TrimSpace(data)) == "null"
 }
 
 // MarshalJSON states the schema as it arrived; see the type's comment.

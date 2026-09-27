@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/internal/orderedmap"
 )
 
 var (
@@ -21,19 +22,31 @@ func (r *Qwen3CoderRenderer) LeadingBOS() string {
 // renderAdditionalKeys renders all JSON fields except the ones in handledKeys
 // This follows the same approach from the reference implementation, which gives
 // a particular key ordering
+//
+// The keys are rendered in the order the schema STATES them. They used to be
+// ranged straight out of a map[string]any, and Go randomizes map iteration, so
+// the same tool schema rendered two different prompts on two turns: a schema
+// with two extra keys (`required` beside `additionalProperties` — the strict
+// mode shape — or `enum` beside `default`) flipped a coin on their order. The
+// tools block sits at the TOP of this prompt, so either order invalidates the
+// whole cached prefix for llama.cpp's prefix cache and for any provider that
+// keys a cache on the rendered prompt: the model was asked the same question in
+// different bytes and the cache was recomputed every turn (2026-09-27 audit,
+// round 51). A decoded schema marshals as the bytes the client wrote, so the
+// order a client states is the order the model is shown.
 func renderAdditionalKeys(obj any, handledKeys map[string]bool) string {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return ""
 	}
 
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
+	m := orderedmap.New[string, any]()
+	if err := json.Unmarshal(data, m); err != nil {
 		return ""
 	}
 
 	var sb strings.Builder
-	for key, value := range m {
+	for key, value := range m.All() {
 		if handledKeys[key] {
 			continue
 		}

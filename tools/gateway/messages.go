@@ -133,11 +133,117 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	bridge.finalize()
 }
 
+// shapeMismatch reports the first field of the request whose JSON shape the
+// sibling legs do not decode, or "" when every field this function looks at is
+// the shape the wire means.
+//
+// Both sibling legs decode the client body into ONE typed struct
+// (anthropic.MessagesRequest, through the middleware's ShouldBindJSON and the
+// client proxy's json.Unmarshal) and answer 400 when that decode fails. This
+// leg reads the same body as a map with type assertions, so a field stated in
+// the wrong shape is silently dropped, defaulted or forwarded: a tool whose
+// `name` is a number became a nameless function, a `tools` object deleted the
+// whole tool surface and asked the model a tool-less question the client was
+// still billed for, and a `role` of 5 reached the backend as the empty role.
+// One client body was a 400 on two legs and a metered 200 here, and in three of
+// those cases the backend was handed a value its own validator rejects
+// (2026-09-27 audit, round 51).
+//
+// The fields checked here are the ones whose typed decode can FAIL — a number
+// where a string belongs, a string where a bool belongs, an object where an
+// array belongs. A JSON null is never one of them: Go's decoder reads null into
+// any field as a no-op, so a null field is the same body as an absent one on
+// every leg, which is why each check below skips it.
+func shapeMismatch(req map[string]any) string {
+	if v, present := req["tools"]; present && v != nil {
+		arr, ok := v.([]any)
+		if !ok {
+			return "tools must be an array"
+		}
+		for i, t := range arr {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				// Includes the null element: `tools:[null]` is not a tool, and
+				// the sibling's list refuses it (anthropic.Tool.UnmarshalJSON)
+				// rather than serving a function the client never defined.
+				return "tools element is not an object (index " + strconv.Itoa(i) + ")"
+			}
+			for _, k := range []string{"type", "name", "description"} {
+				if fv, present := tm[k]; present && fv != nil {
+					if _, ok := fv.(string); !ok {
+						return "tools[" + strconv.Itoa(i) + "]." + k + " must be a string"
+					}
+				}
+			}
+			if fv, present := tm["max_uses"]; present && fv != nil {
+				// The sibling's MaxUses is a typed int, so a string, a bool or
+				// a fractional number does not decode there.
+				f, ok := jsonNumber(fv)
+				if !ok || f != float64(int64(f)) {
+					return "tools[" + strconv.Itoa(i) + "].max_uses must be an integer"
+				}
+			}
+		}
+	}
+	if v, present := req["metadata"]; present && v != nil {
+		mm, ok := v.(map[string]any)
+		if !ok {
+			return "metadata must be an object"
+		}
+		if fv, present := mm["user_id"]; present && fv != nil {
+			if _, ok := fv.(string); !ok {
+				return "metadata.user_id must be a string"
+			}
+		}
+	}
+	rawMsgs, _ := req["messages"].([]any)
+	for i, rm := range rawMsgs {
+		m, ok := rm.(map[string]any)
+		if !ok {
+			continue // the caller refuses this element in words (round 41, C41-14d)
+		}
+		if fv, present := m["role"]; present && fv != nil {
+			if _, ok := fv.(string); !ok {
+				return "messages[" + strconv.Itoa(i) + "].role must be a string"
+			}
+		}
+		blocks, _ := m["content"].([]any)
+		for j, b := range blocks {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue // the caller refuses this block's type in words
+			}
+			where := "messages[" + strconv.Itoa(i) + "].content[" + strconv.Itoa(j) + "]"
+			if fv, present := bm["is_error"]; present && fv != nil {
+				if _, ok := fv.(bool); !ok {
+					return where + ".is_error must be a boolean"
+				}
+			}
+			if fv, present := bm["tool_use_id"]; present && fv != nil {
+				if _, ok := fv.(string); !ok {
+					return where + ".tool_use_id must be a string"
+				}
+			}
+			if src, ok := bm["source"].(map[string]any); ok {
+				if fv, present := src["media_type"]; present && fv != nil {
+					if _, ok := fv.(string); !ok {
+						return where + ".source.media_type must be a string"
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // anthropicToOpenAI converts a decoded Anthropic messages request into the
 // OpenAI chat-completions map. Returns a non-empty error string on
 // structurally impossible input (no messages, non-array content pieces we
 // cannot represent).
 func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, string) {
+	if mismatch := shapeMismatch(req); mismatch != "" {
+		return nil, mismatch
+	}
 	out := map[string]any{"model": req["model"]}
 	// max_tokens is REQUIRED on this wire, and the sibling converter's handler
 	// refuses a body that omits it or states a non-positive one — this gateway
@@ -262,9 +368,22 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 	// the client actually stated is sent: no thinking field and no effort
 	// means no kwargs at all, as the sibling sends no Think.
 	normalizedEffort := ""
-	if oc, ok := req["output_config"].(map[string]any); ok {
-		if e, ok := oc["effort"].(string); ok {
-			normalizedEffort = strings.ToLower(strings.TrimSpace(e))
+	if raw, present := req["output_config"]; present && raw != nil {
+		oc, ok := raw.(map[string]any)
+		if !ok {
+			// The sibling's OutputConfig is a typed pointer: a number, a string
+			// or an array does not decode there and the request is refused, where
+			// this leg read nothing and served the turn with the control
+			// dropped — the same rule as `thinking` and `tool_choice` below
+			// (2026-09-27 audit, round 51).
+			return nil, "output_config must be an object"
+		}
+		if e, present := oc["effort"]; present && e != nil {
+			s, ok := e.(string)
+			if !ok {
+				return nil, "output_config.effort must be a string"
+			}
+			normalizedEffort = strings.ToLower(strings.TrimSpace(s))
 			if normalizedEffort == "xhigh" {
 				normalizedEffort = "high"
 			}
@@ -292,6 +411,16 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 				thinkState = 1
 			case "disabled":
 				thinkState = -1
+			}
+		}
+		// The sibling's ThinkingConfig carries this as a typed int, so a string
+		// or a fractional number fails its decode and the request is refused
+		// there; this leg read neither the field nor its absence
+		// (2026-09-27 audit, round 51).
+		if raw, present := thm["budget_tokens"]; present && raw != nil {
+			f, ok := jsonNumber(raw)
+			if !ok || f != float64(int64(f)) {
+				return nil, "thinking.budget_tokens must be an integer"
 			}
 		}
 	}
@@ -404,6 +533,14 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 		if raw, present := c["name"]; present && raw != nil {
 			if _, ok := raw.(string); !ok {
 				return nil, "tool_choice.name must be a string"
+			}
+		}
+		// The sibling's ToolChoice carries this as a typed bool, so a string or
+		// a number fails its decode and the request is refused there; this leg
+		// never read the field at all (2026-09-27 audit, round 51).
+		if raw, present := c["disable_parallel_tool_use"]; present && raw != nil {
+			if _, ok := raw.(bool); !ok {
+				return nil, "tool_choice.disable_parallel_tool_use must be a boolean"
 			}
 		}
 	}
@@ -1722,6 +1859,11 @@ type toolBlock struct {
 	// cannot be reopened: a fragment of its arguments that arrives afterwards can
 	// no longer be delivered (see toolDelta).
 	closed bool
+	// closing is whether the block's content_block_stop is being written right
+	// now. The call's arguments are over whatever they look like, so a text held
+	// for the end of the call is delivered at this moment — before the stop that
+	// ends its block (2026-09-27 audit, round 51).
+	closing bool
 	// args is every argument fragment the upstream has stated so far, kept so
 	// toolKey can tell a repeat of the current call's name from the next call's
 	// (see startsANewToolCall's rule, mirrored from the client leg).
@@ -2624,8 +2766,14 @@ func (b *anthropicBridge) closeOpen() {
 	if b.cur == nil {
 		return
 	}
-	if b.cur.tool != nil {
-		b.cur.tool.closed = true
+	if tb := b.cur.tool; tb != nil {
+		// Everything the call holds is delivered before the client is told the
+		// call is finished: a text held for the end of the call (see
+		// flushToolArgs) has no other moment to arrive, and the delta has to
+		// precede the stop that ends its block.
+		tb.closing = true
+		b.flushToolArgs(tb)
+		tb.closed = true
 	}
 	b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.cur.index})
 	b.cur = nil
@@ -3129,17 +3277,30 @@ func (b *anthropicBridge) flushToolArgs(tb *toolBlock) {
 	if tb.emitted >= tb.args.Len() {
 		return
 	}
-	// The whole call arrived in one fragment, so the text is the block's input
-	// entire: if it is not a JSON object — freeform arguments — it is delivered
-	// as the single-key "_raw" object that both other legs deliver it as, and
-	// that this bridge's own non-stream path puts in the same call's block. A
-	// text already delivered in pieces cannot be re-wrapped, and stays as the
-	// model wrote it (the freeform call the upstream split across fragments).
+	whole := tb.args.String()
+	// A text that begins an object is delivered as it arrives: its fragments are
+	// the object's own bytes, and what the client accumulates is the object the
+	// model wrote. A text that is not an object at all — freeform arguments —
+	// is delivered ONCE, when the call's arguments are over: the wrapper this
+	// wire gives it (`{"_raw":…}`) is a prefix AND a suffix, so a fragment
+	// delivered on its own left the client accumulating
+	// `{"_raw":"echo hel"}lo world` — JSON that cannot be parsed, under a
+	// stop_reason of tool_use, so the turn was billed and unusable, and the
+	// agent either errored it or ran a call whose input it invented. Both other
+	// legs deliver a call's arguments once, whole (the client leg wraps the
+	// whole text it accumulated, and this bridge's own non-stream path wraps the
+	// whole document) (2026-09-27 audit, round 51).
+	if !strings.HasPrefix(strings.TrimSpace(whole), "{") && !tb.closing {
+		return
+	}
+	// The wrap is decided on the whole text, never on a fragment of it: this is
+	// the one place a text that is not an object becomes the single-key object
+	// the client parses.
 	first := tb.emitted == 0
-	pending := tb.args.String()[tb.emitted:]
+	pending := whole[tb.emitted:]
 	tb.emitted = tb.args.Len()
 	if first {
-		if wrapped, ok := rawArgsObject(pending); ok {
+		if wrapped, ok := rawArgsObject(whole); ok {
 			pending = wrapped
 		}
 	}

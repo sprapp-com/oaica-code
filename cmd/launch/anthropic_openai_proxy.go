@@ -1872,6 +1872,29 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 
+		// A url-source image is carried through api.ImageData as its own URL
+		// text (anthropic.resolveImageSource), and imageDataURL hands it to the
+		// upstream as it stands. This leg's upstream is oaica's OWN OpenAI door,
+		// and that door carries exactly four image types in a `data:` URL and no
+		// URL scheme at all: every http(s) address and every other data URL came
+		// back 400 "invalid image input" / "image URLs are not currently
+		// supported", which this proxy reported to the client as a 502 — a 5xx,
+		// which clients retry, so an image-by-URL turn could neither succeed nor
+		// be told apart from an upstream outage, while the local leg's own
+		// /v1/messages handler refuses the same body in words
+		// (middleware/anthropic.go, round 41, C41-13). The verdict is the same
+		// one: this leg's model is given image BYTES, and a URL is not one
+		// (2026-09-27 audit, round 51).
+		for _, m := range chatReq.Messages {
+			for _, img := range m.Images {
+				if anthropic.IsImageURL(img) {
+					refuse(http.StatusBadRequest,
+						`image source.type "url" cannot be represented on this leg: the model is given image bytes, and this url arrived as the address text. Send the image as a base64 source instead.`)
+					return
+				}
+			}
+		}
+
 		// Tier-aware routing: Claude Code's opusplan mode (and its normal
 		// Opus/Sonnet/Haiku tiering) sends a DIFFERENT model id per request
 		// depending which ANTHROPIC_DEFAULT_*_MODEL env var it's currently

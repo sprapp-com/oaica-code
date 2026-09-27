@@ -278,6 +278,29 @@ type Tool struct {
 	MaxUses int `json:"max_uses,omitempty"`
 }
 
+// UnmarshalJSON refuses a tool stated as JSON null.
+//
+// Go's decoder reads `null` into a struct as a no-op that reports no error, so
+// `tools:[null]` decoded to exactly the same value as `tools:[{}]` — a tool
+// with no name — and the turn was served with a function the client never
+// defined. The metered gateway leg refuses that element in words ("tools
+// element is not an object"), so one client body was a 200 here and a 400
+// there (2026-09-27 audit, round 51). This is the same rule the stop-sequence
+// list already applies to its elements: an element of an array the client
+// wrote is a value, and `null` is not one of the shapes this wire defines.
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		return errors.New("tools element is not an object")
+	}
+	type plain Tool
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*t = Tool(p)
+	return nil
+}
+
 // ToolChoice controls how the model uses tools
 type ToolChoice struct {
 	Type                   string `json:"type"` // "auto", "any", "tool", "none"
@@ -752,8 +775,15 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	documentBinaryBlocks := 0
 	searchResultBlocks := 0
 	searchResultTextBlocks := 0
+	// contentBeforeResults is whether the turn stated anything of its own before
+	// its first tool result, so the two can be written back in the order the
+	// client wrote them (see the append below).
+	contentBeforeResults := false
 
 	for _, block := range msg.Content {
+		if len(toolResults) == 0 && block.Type != "tool_result" && block.Type != "web_search_tool_result" {
+			contentBeforeResults = true
+		}
 		switch block.Type {
 		case "text":
 			textBlocks++
@@ -966,24 +996,33 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		}
 	}
 
-	if role == "user" && len(toolResults) > 0 {
-		messages = append(messages, toolResults...)
-	}
-
+	// The blocks of one turn are written back in the order the client wrote
+	// them: a tool_result that arrives after the turn's own text is written
+	// after it, and one that arrives before it is written before it. Hoisting
+	// EVERY result ahead of the text moved the client's own instruction from
+	// before its result to after it and made one client body two prompts — the
+	// metered gateway leg writes them in the order the blocks arrived
+	// (tools/gateway/messages.go, flushText before a tool message), which is the
+	// order round 50 established for a turn's parts (2026-09-27 audit, round
+	// 51).
+	var own *api.Message
 	if textContent.Len() > 0 || len(images) > 0 || len(toolCalls) > 0 || thinking != "" {
-		m := api.Message{
+		own = &api.Message{
 			Role:      role,
 			Content:   textContent.String(),
 			Images:    images,
 			ToolCalls: toolCalls,
 			Thinking:  thinking,
 		}
-		messages = append(messages, m)
 	}
-
-	// Add tool results as separate messages.
-	if role != "user" || len(toolResults) == 0 {
+	if own != nil && contentBeforeResults {
+		messages = append(messages, *own)
 		messages = append(messages, toolResults...)
+	} else {
+		messages = append(messages, toolResults...)
+		if own != nil {
+			messages = append(messages, *own)
+		}
 	}
 	logutil.Trace("anthropic: converted block message",
 		"role", role,
