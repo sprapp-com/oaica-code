@@ -2392,6 +2392,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 		}
 		var tcs []api.ToolCall
+		var unnamedText strings.Builder
 		for _, i := range indices {
 			a := toolAccums[i]
 			var args api.ToolCallFunctionArguments
@@ -2418,10 +2419,34 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				args = api.NewToolCallFunctionArguments()
 				args.Set("_raw", raw)
 			}
+			if a.name == "" {
+				// A call the upstream never named. This path used to emit it
+				// anyway, as a content_block_start with no "name" key at all and
+				// a stop_reason of "tool_use": the client was told to expect a
+				// call it could not name and could never run, and Claude Code
+				// reports such a block as pending forever. content_block_start
+				// is the only event that carries a name, so there is no second
+				// chance to correct it — the gateway leg holds the fragment for
+				// that reason (2026-09-27 audit, round 39, B-F8) and relays
+				// whatever arguments arrived as TEXT, which is what this does
+				// too: the model's raw output, readable, rather than a call the
+				// client cannot make. The non-streaming path already answers
+				// this wire with end_turn and no block
+				// (2026-09-27 audit, round 44, C44-4).
+				if s := strings.TrimSpace(a.args.String()); s != "" {
+					unnamedText.WriteString(s)
+				}
+				continue
+			}
 			tcs = append(tcs, api.ToolCall{
 				ID:       a.id,
 				Function: api.ToolCallFunction{Name: a.name, Arguments: args},
 			})
+		}
+		if unnamedText.Len() > 0 {
+			// Emitted before the calls that follow it, in the order the
+			// fragments arrived: it is the same turn's output either way.
+			emit(conv.Process(api.ChatResponse{Model: upstreamModel, Message: api.Message{Content: unnamedText.String()}}))
 		}
 		// Counted HERE, on the calls about to be emitted, not where the
 		// fragments accumulated: a truncated unparseable fragment is dropped

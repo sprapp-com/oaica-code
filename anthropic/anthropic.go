@@ -428,25 +428,47 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 			logutil.Trace("anthropic: message conversion failed", "index", i, "role", msg.Role, "err", err)
 			return nil, err
 		}
+		if len(converted) == 0 {
+			// A turn this leg cannot represent — an Anthropic message whose
+			// content array is empty, or an assistant turn holding nothing but
+			// a replayed redacted_thinking block — used to be DELETED, which
+			// silently rewrote the conversation the client sent: a contentless
+			// assistant turn between two user turns vanished and left two user
+			// turns in a row, and a leading one left a prompt whose first role
+			// the client never chose. The gateway leg keeps the turn, empty of
+			// content and of its own role, and one body must not become two
+			// different prompts depending on which leg served it. The turn
+			// carries nothing; that its role was stated is still part of the
+			// conversation (2026-09-27 audit, round 44, C44-2).
+			converted = []api.Message{{Role: strings.ToLower(msg.Role)}}
+		}
 		messages = append(messages, converted...)
 	}
 
-	if len(messages) == 0 {
-		// Every message converted to nothing — an empty content array, or an
-		// assistant turn holding only a redacted thinking block, which Claude
-		// Code replays. The conversation marshals as "messages":null, and the
-		// server answers that body with a synthetic 200 (server/routes.go: no
-		// messages, no generation) while the client is told a successful turn
-		// and charged the middleware's estimate for a prompt no model ever read.
-		// The other two legs both keep a turn here — the client proxy
-		// substitutes {"role":"user"}, the gateway substitutes an empty message
-		// of the last role — so one body was answered two ways, and this leg's
-		// was the one that answered without calling the model at all
+	messages = normalizeSystemFirst(messages)
+
+	if !anyMessageCarriesContent(messages) {
+		// Nothing in this conversation asks the model for anything: every turn
+		// either converted to nothing or was a blank system message. The body
+		// used to reach the wire as "messages":null, and the server answers a
+		// turn-less body with a synthetic 200 (server/routes.go: no messages,
+		// no generation) while the client is told a successful turn and charged
+		// the middleware's estimate for a prompt no model ever read
 		// (2026-09-27 audit, round 43, C43-1).
+		//
+		// The question has to be asked of CONTENT, and asked of the list the
+		// wire receives rather than of the list that enters the hoist above.
+		// Round 43 asked it of the length of the list before normalization, and
+		// a blank system message is exactly what that step drops: a body whose
+		// surviving turn was a whitespace-only system message arrived here as
+		// [system "   "] — non-empty, so the guard did not fire — and then left
+		// the rewrite as an empty rest, which marshals as "messages":[] and
+		// takes the same synthetic-200 path as null (2026-09-27 audit, round
+		// 44, A44-1). A conversation of blank system messages is empty whatever
+		// its length, so this is a question about the messages, not about how
+		// many of them there are.
 		messages = []api.Message{{Role: "user"}}
 	}
-
-	messages = normalizeSystemFirst(messages)
 
 	options := make(map[string]any)
 
@@ -616,6 +638,33 @@ func normalizeSystemFirst(messages []api.Message) []api.Message {
 	out := make([]api.Message, 0, len(rest)+1)
 	out = append(out, api.Message{Role: "system", Content: strings.Join(system, "\n\n")})
 	return append(out, rest...)
+}
+
+// anyMessageCarriesContent reports whether any converted message asks the model
+// for anything at all — text, an image, a call, a tool result, or a replayed
+// thought. It is asked of the conversation AFTER the system hoist, which can
+// drop messages: a turn that survives this check cannot be the one the hoist
+// removes, because the hoist only ever removes blank system text.
+//
+// The five fields it reads are all of api.Message's payload: the same five
+// systemMessageIsTextOnly walks, for the mirror-image question.
+//
+// A text is content whatever it says. Whitespace is not nothing on this wire:
+// a prompt of a hundred thousand newlines is a prompt the model can be asked,
+// it is what the client sent and what the estimate charges, and treating it as
+// empty threw the whole turn away — the body collapsed to one bare user turn
+// with no text in it, so the upstream was asked a different question from the
+// one the client wrote, and the calibration unit measured 66 bytes for a
+// hundred-kilobyte prompt (2026-09-27 audit, round 44, the round-36 estimator
+// test caught it).
+func anyMessageCarriesContent(messages []api.Message) bool {
+	for _, m := range messages {
+		if m.Content != "" || len(m.Images) > 0 || len(m.ToolCalls) > 0 ||
+			m.ToolCallID != "" || m.ToolName != "" || m.Thinking != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // systemMessageIsTextOnly reports whether a system message carries nothing but
