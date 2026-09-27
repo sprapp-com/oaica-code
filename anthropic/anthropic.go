@@ -2062,6 +2062,37 @@ func describeToolResultBlock(bm map[string]any) string {
 	return "[tool result block that could not be represented]"
 }
 
+// searchResultPromptText is the string convertMessage writes for one
+// search_result block — its title, the reference it came from and its passages,
+// each of the first two followed by a newline, and the whole followed by one
+// when it does not already end in one — and the empty string for a block that
+// states none of the three. The converter writes NOTHING for that block, which
+// is why both the estimator's text-only question and its separator/chunk walk
+// ask it here instead of rebuilding the arm: a search_result carrying no title,
+// no source and no passage is a block a system message loses nothing by having,
+// and the two readings disagreed — the rewrite that DELETES a blank system
+// message was suppressed while the walk charged its 6-byte role, two tokens for
+// a message the model never read (2026-09-28 audit, round 59, F59-L1-2).
+func searchResultPromptText(title, ref string, content any) string {
+	var sb strings.Builder
+	if title != "" {
+		sb.WriteString(title)
+		sb.WriteString("\n")
+	}
+	if ref != "" {
+		sb.WriteString(ref)
+		sb.WriteString("\n")
+	}
+	sb.WriteString(searchResultText(content))
+	if sb.Len() == 0 {
+		return ""
+	}
+	if !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 // searchResultText flattens a search_result's content — the passages a search
 // returned — into the text the model is asked about. A text block is its
 // passage; a block of any OTHER type is described rather than read for a
@@ -2447,15 +2478,36 @@ func conversationBytes(messages []MessageParam, system any) int {
 		_, ownRuns, toolResults := messageShapeBytes(msg.Content)
 		role := messageRoleBytesFor(msg.Role, ownRuns, toolResults)
 		if strings.EqualFold(msg.Role, "system") {
-			if !systemContentIsTextOnly(msg.Content) {
+			textOnly := systemContentIsTextOnly(msg.Content)
+			if !textOnly {
 				// Only a system message that is nothing but text can be merged
 				// into the one system string, so a conversation holding one that
 				// is not is left exactly as it arrived (normalizeSystemFirst).
 				mergeable = false
 			}
+			text := joinedMessageText(msg.Content)
+			// A system message is a message like any other to the question the
+			// early return below asks, and this arm used to be the one place the
+			// answer was not taken: a body whose ONLY turn was a system message
+			// carrying a payload — a document, a search result, an image, a
+			// replayed call, a tool result — was read as carrying nothing, and
+			// the whole conversation was charged as the one bare user message
+			// the rewrite writes for a conversation of nothing. A 4034-byte
+			// document prompt billed 1 token against 1001 for the same bytes
+			// written as text, and an image-only one 1 against 1025, on the
+			// estimate that seeds the client-visible input_tokens and sizes
+			// auto-compaction (2026-09-28 audit, round 59, F59-L1-1).
+			//
+			// What counts is what SURVIVES the hoist, which deletes a system
+			// message only when it is text-only and its text is blank: a
+			// whitespace-only one is dropped (and is not content), while one
+			// carrying an image or a call is kept whatever its text says.
+			if (ownRuns > 0 || toolResults > 0) && (strings.TrimSpace(text) != "" || !textOnly) {
+				carriesContent = true
+			}
 			entries = append(entries, entry{
 				system: true,
-				text:   joinedMessageText(msg.Content),
+				text:   text,
 				bytes:  role + countAnyContent(msg.Content),
 			})
 			continue
@@ -2602,6 +2654,18 @@ func blockWritesNothing(block ContentBlock) bool {
 		// The converter joins this block's text into the run only when the
 		// pointer is set, and drops a run whose thinking is empty.
 		return block.Thinking == nil || *block.Thinking == ""
+	case "search_result":
+		// The arm writes its built passage only when there is one: a block with
+		// no title, no source and no passage leaves the run untouched, exactly
+		// as the two above do (2026-09-28 audit, round 59, F59-L1-2).
+		ref := ""
+		if block.Source != nil {
+			ref = block.Source.Ref
+			if ref == "" {
+				ref = block.Source.URL
+			}
+		}
+		return searchResultPromptText(block.Title, ref, block.Content) == ""
 	}
 	return false
 }
@@ -2783,29 +2847,12 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 		}
 		return len(data)
 	}
-	// searchResultChunk is the string the converter builds for a passage: the
-	// title, the reference and the passage text, each of the first two followed
-	// by a newline, and a trailing newline when the result does not end in one.
-	// The reference is written Ref first, then URL, exactly as the arm reads
-	// them.
-	searchResultChunk := func(title, ref, passage string) int {
-		var sb strings.Builder
-		if title != "" {
-			sb.WriteString(title)
-			sb.WriteString("\n")
-		}
-		if ref != "" {
-			sb.WriteString(ref)
-			sb.WriteString("\n")
-		}
-		sb.WriteString(passage)
-		if sb.Len() == 0 {
-			return 0
-		}
-		if !strings.HasSuffix(sb.String(), "\n") {
-			return sb.Len() + 1
-		}
-		return sb.Len()
+	// searchResultChunk is the length of the string the converter builds for a
+	// passage, which is searchResultPromptText's own — the same builder the
+	// converter's arm and the text-only question read, so the three cannot
+	// disagree about whether a block states anything.
+	searchResultChunk := func(title, ref string, content any) int {
+		return len(searchResultPromptText(title, ref, content))
 	}
 	// The bytes already billed by countContentBlock/countContentItemIn for each
 	// of those two arms, so the extra this walk charges is exactly what the
@@ -2873,7 +2920,7 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 						ref = b.Source.URL
 					}
 				}
-				chunk := searchResultChunk(b.Title, ref, searchResultText(b.Content))
+				chunk := searchResultChunk(b.Title, ref, b.Content)
 				billed := len(b.Title) + countItemsIn(b.Content, chargeSearchResult)
 				if b.Source != nil {
 					billed += len(b.Source.Ref) + len(b.Source.URL)
@@ -2941,7 +2988,7 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 					// source, which UnmarshalJSON reads as Ref.
 					ref = src
 				}
-				chunk := searchResultChunk(title, ref, searchResultText(m["content"]))
+				chunk := searchResultChunk(title, ref, m["content"])
 				billed := len(title) + countItemsIn(m["content"], chargeSearchResult)
 				if src, ok := m["source"].(map[string]any); ok {
 					if r, _ := src["ref"].(string); r != "" {

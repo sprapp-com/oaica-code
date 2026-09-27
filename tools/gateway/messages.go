@@ -3090,7 +3090,39 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			if name != "" {
 				b.lastToolName = name
 			}
+			// The slot names THIS call now: the index is reused rather than
+			// renumbered, so a fragment stating it again — the arguments of the
+			// call just split off, stated at the index the vendor writes for
+			// every call — continues the call it was split into and not the one
+			// it was split from. Recording it only once, at the slot's first
+			// block, sent that continuation to the first call and folded a
+			// second call's arguments onto the first's: unparseable JSON under a
+			// stop_reason of tool_use, while the same fragment with the index
+			// omitted was routed correctly (2026-09-28 audit, round 59,
+			// F59-L3-1). The index is the wire's own slot identity, and the slot
+			// holds the newest call written into it — there is no other reading
+			// under which the second call's own fragments are reachable.
+			if b.indexKeys == nil {
+				b.indexKeys = map[int]string{}
+			}
+			b.indexKeys[*upIdx] = b.lastToolKey
 			return b.lastToolKey
+		}
+		if tb := b.toolBlocks[key]; tb != nil && id == "" && name == "" &&
+			argsAreFinished(tb.args.String()) {
+			// An argument-only fragment whose block already holds a FINISHED
+			// argument list is not more of that call: two finished objects do
+			// not concatenate into JSON, and the document arm reads them as two
+			// calls. It continues the call this bridge last wrote to, when that
+			// one is still open — the wire whose continuations state an index
+			// the vendor did not update. A call whose arguments are still open
+			// is left where the index put it, which is the ordinary
+			// interleaved-parallel order (2026-09-28 audit, round 59,
+			// F59-L3-1's second shape).
+			if last := b.toolBlocks[b.lastToolKey]; b.lastToolKey != "" && b.lastToolKey != key && last != nil &&
+				!argsAreFinished(last.args.String()) {
+				return b.lastToolKey
+			}
 		}
 		if name != "" {
 			b.lastToolName = name
@@ -3098,9 +3130,6 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		if b.indexKeys == nil {
 			b.indexKeys = map[int]string{}
 		}
-		// Only the slot's FIRST block is what the index names: a later call
-		// split off this slot above is numbered, not indexed, and a fragment
-		// stating the index again continues the call the index introduced.
 		if _, taken := b.indexKeys[*upIdx]; !taken {
 			b.indexKeys[*upIdx] = key
 		}
@@ -3109,6 +3138,38 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	}
 	if id != "" {
 		key := "!" + id
+		// The call this block carries, restated under its own stated id: not a
+		// second call, so the split below must not fire and the fragment's text is
+		// not more of the call's arguments. Keyed back to the block it repeats,
+		// where toolDelta drops it (round 53's F4).
+		//
+		// The block that carries the id is not always the one at the id's own key:
+		// a call the upstream split off a repeated index, and then stated the id
+		// for, sits under the synthetic key the split minted — the mint below takes
+		// the id there and never renames the block. Asked of the key alone, that
+		// restatement opened a THIRD block repeating the second call's name and
+		// arguments whole while the call it repeated stayed beside it: two calls
+		// reached the client where the whole-list arm and the client leg both keep
+		// two, but one of them was a duplicate the model never wrote, under a
+		// second id a tool_result cannot answer (2026-09-28 audit, round 59,
+		// F59-L3-5). `blockCarrying` is the same question the mint's guard below
+		// asks, so one wire cannot be answered two ways — and it is asked BEFORE
+		// that guard, because a block the bridge minted an id for is exactly one
+		// `idHeldByAnotherCall` reports, so the guard would otherwise answer this
+		// restatement with a synthetic key of its own. The carrying block's id must
+		// be a STATED one, though: an id this bridge minted is a pure function of
+		// the call, so an upstream that states that string for a separately
+		// listed entry is naming a SECOND call — the reading startToolBlock's sweep
+		// already makes (round 46's G45-1 and round 57's F57-L3-1 are pinned by
+		// tests this clause would otherwise fold into one block).
+		if tb := b.blockCarrying(id, nil); tb != nil && (tb.statedID || tb.key == "!"+id) &&
+			restatesCarriedCall(tb, id, name, args) {
+			if name != "" {
+				b.lastToolName = name
+			}
+			b.lastToolKey = tb.key
+			return b.lastToolKey
+		}
 		if b.toolBlocks[key] == nil && name != "" && b.idHeldByAnotherCall(id) {
 			// The upstream states an id this bridge has already given to a
 			// DIFFERENT call — most often the id it minted for an id-less call,
@@ -3141,17 +3202,6 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		// (2026-09-27 audit, round 43, B43-3). An id no block carries yet is a
 		// new call outright, which is why this asks only about a key already
 		// accumulated.
-		if tb := b.toolBlocks[key]; tb != nil && restatesCarriedCall(tb, id, name, args) {
-			// The call this block carries, restated under its own stated id: not
-			// a second call, so the split below must not fire and the fragment's
-			// text is not more of the call's arguments. Keyed back to the block
-			// it repeats, where toolDelta drops it (round 53's F4).
-			if name != "" {
-				b.lastToolName = name
-			}
-			b.lastToolKey = key
-			return b.lastToolKey
-		}
 		if b.toolBlocks[key] != nil && b.splitFromCurrent(key, name, args) {
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
@@ -3297,6 +3347,31 @@ func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
 	return false
 }
 
+// idHeldByASeparateCall reports whether handing id to tb would put two blocks
+// under one id for two DIFFERENT calls. A block that already carries the id and
+// is this call restated — same name, same finished arguments — under the id the
+// UPSTREAM itself stated is not a second call: taking the id there is what lets
+// startToolBlock's sweep recognise the repeat and keep one block (round 48's
+// C-F1 and A-F1, round 49's A-F3). Every other holder is a separate call the id
+// may not be handed to, most often the mint of an id-less call, whose string is
+// reproducible and therefore one an upstream can state for a call of its own
+// (round 46's G45-1).
+func (b *anthropicBridge) idHeldByASeparateCall(tb *toolBlock, id string) bool {
+	mine, settled := settledIdentity(tb)
+	for _, other := range b.toolOrder {
+		if other == tb || other.merged || other.key == "!"+id || other.id != id {
+			continue
+		}
+		if settled && other.statedID {
+			if theirs, ok := settledIdentity(other); ok && theirs == mine {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // blockCarrying returns the block other than tb that already carries id, or nil
 // when no block does.
 func (b *anthropicBridge) blockCarrying(id string, tb *toolBlock) *toolBlock {
@@ -3383,7 +3458,19 @@ func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
 	if tb == nil || tb.name == "" {
 		return false
 	}
-	if id != "" && (!tb.statedID || id != tb.id) {
+	if id != "" && id != tb.id && tb.key != "!"+id {
+		// A stated id must be the id this block carries, or the id its key names.
+		// The second spelling is a block the upstream re-keyed to an id it stated
+		// later (the B45-1 re-key): it keeps the MINTED id it already sent the
+		// client when it had already opened (see toolKey), so its own id and its
+		// key disagree for the rest of the stream. Without it a restatement of the
+		// call under the id the upstream itself stated — complete arguments,
+		// listed again — was appended to the finished arguments already
+		// accumulated, and the client got `{"a":1}{"a":1}`, JSON no tool can
+		// parse, under a stop_reason of tool_use (2026-09-28 audit, round 59,
+		// F59-L3-3). The equality of name and of finished arguments below is what
+		// keeps this from reading a SECOND call that happens to state the id the
+		// key names as a repeat of the first.
 		return false
 	}
 	if name != "" && name != tb.name {
@@ -3546,6 +3633,30 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		tb = &toolBlock{key: key, index: -1}
 		b.toolBlocks[key] = tb
 		b.toolOrder = append(b.toolOrder, tb)
+		if upIdx == nil && len(b.toolOrder) == 1 {
+			// The stream's FIRST call, opened with no index at all, is the call
+			// the client leg parks at slot 0 — an index-less delta goes to the
+			// slot the accumulator's counter is at, which for the turn's first
+			// call is 0, and every fragment that LATER states index 0 reaches it
+			// there (2026-09-28 audit, round 59). Recording it is what lets this
+			// bridge reach the same call: a wire that introduces a call
+			// index-less and then names it index 0 — the id-bearing restatement
+			// of it, or the continuation of its arguments — landed on key "#0",
+			// found nothing, and opened a SECOND block beside it, so the client
+			// was handed the model's one call twice under two ids (and ran the
+			// tool twice), or a truncated tool_use with the tail of its arguments
+			// relayed as prose, while the client leg delivered one runnable call
+			// (round 59, F59-C-1 and F59-C-2). The claim is taken only when the
+			// index names no block yet and only for the first call: a later
+			// index-less call belongs to the slot the counter had reached, and a
+			// stated index is the upstream's own answer, which is left alone.
+			if b.indexKeys == nil {
+				b.indexKeys = map[int]string{}
+			}
+			if _, taken := b.indexKeys[0]; !taken {
+				b.indexKeys[0] = key
+			}
+		}
 		if name != "" {
 			// This fragment introduces a call, so the calls before it will not
 			// state another argument: any of them still waiting to be numbered
@@ -3574,7 +3685,19 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	if tb.id == "" {
 		// The id is decided after the fragment's name and arguments are in, so
 		// the fallback below has the call's own identity to work from.
-		if id != "" && !strings.HasPrefix(tb.key, "?") {
+		if id != "" && !b.idHeldByASeparateCall(tb, id) {
+			// The question is whether ANY other block already answers to this
+			// id, not whether this block was numbered: a call split off a
+			// repeated index is exactly the call the upstream then states its id
+			// for, and refusing it there minted a hash the upstream never wrote
+			// — the same body's second call reached the client as
+			// `call_f4b1f0d2` here and as the stated id on every other arm, so
+			// the tool_result correlation id depended on which arm answered, and
+			// a restatement of that call was never recognised as one (round 59,
+			// F59-L3-4 and F59-L3-2). `idHeldByAnotherCall` is what the id's own
+			// arm splits on, so one wire cannot be answered two ways; a block
+			// minted for a fragment that repeated an id another block carries
+			// still mints (round 44, B44-1).
 			tb.id = id
 			tb.statedID = true
 			// The upstream's own id, stated for this very call (the ordinary

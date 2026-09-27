@@ -2622,6 +2622,13 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// whichever call happened to start at slot zero (2026-09-28 audit, round
 	// 58, F58-L3-1).
 	lastToolSlot := -1
+	// indexSlot maps each index the stream has stated to the slot of the call
+	// that index currently holds (see the indexed arm below): a vendor that
+	// writes one index for every call of the turn leaves that index naming the
+	// NEWEST call written into it, so a later fragment stating the index
+	// continues that call rather than the first one (2026-09-28 audit, round
+	// 59, F59-L2-1).
+	indexSlot := map[int]int{}
 
 	// argsFinished reports whether an argument text is a call's own finished
 	// argument list: a complete JSON object — the one spelling the wire has for
@@ -3067,6 +3074,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				indexed := tc.Index != nil
 				if indexed {
 					slot = *tc.Index
+					if cur, ok := indexSlot[slot]; ok {
+						// The index names the SLOT; the call that slot holds is
+						// what a fragment stating the index continues. A vendor
+						// that writes one index for every call of the turn
+						// leaves the index naming the newest call written into
+						// it — there is no other reading under which the second
+						// call's own fragments are reachable at all — so the
+						// split below re-points the index at the call it mints
+						// (2026-09-28 audit, round 59, F59-L2-1).
+						slot = cur
+					}
 					if slot >= nextFreeToolSlot {
 						nextFreeToolSlot = slot + 1
 					}
@@ -3094,6 +3112,35 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// under its own id at its own index.
 						slot = nextFreeToolSlot
 						nextFreeToolSlot++
+						// The slot now names this call: the index is reused
+						// rather than renumbered, so a fragment stating it again
+						// — the arguments of the call just split off, stated at
+						// the index the vendor writes for every call — must land
+						// here and not on the call it was split from. That was
+						// the one field apart failure: the split kept the calls
+						// apart only when the continuation omitted the index, so
+						// the same three frames with the index stated folded the
+						// second call's arguments onto the first's — a real Read
+						// executed with an empty input, or a single call carrying
+						// a {"_raw":…} blob no tool accepts, under a stop_reason
+						// of tool_use (2026-09-28 audit, round 59, F59-L2-1).
+						indexSlot[*tc.Index] = slot
+					} else if acc, exists := toolAccums[slot]; exists &&
+						tc.ID == "" && tc.Function.Name == "" && argsFinished(acc.args.String()) {
+						// An argument-only fragment whose slot already holds a
+						// FINISHED argument list is not more of that call: two
+						// finished objects do not concatenate into JSON, and the
+						// whole-list arm would read them as two calls. It is the
+						// call this stream last wrote to, when that one is still
+						// open — the wire whose continuations state an index the
+						// vendor did not update. A call whose arguments are still
+						// open is left where the index put it, which is the
+						// ordinary interleaved-parallel order (2026-09-28 audit,
+						// round 59, F59-L2-1).
+						if last, ok := toolAccums[lastToolSlot]; lastToolSlot >= 0 && lastToolSlot != slot && ok &&
+							!argsFinished(last.args.String()) {
+							slot = lastToolSlot
+						}
 					}
 				} else {
 					// The upstream sent no index, so there is nothing to key
