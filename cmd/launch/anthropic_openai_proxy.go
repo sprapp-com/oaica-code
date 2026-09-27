@@ -433,6 +433,16 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 		}
 		oai.Messages = append(oai.Messages, om)
 	}
+	if len(oai.Messages) == 0 {
+		// A turn whose every block the conversion does not forward leaves no
+		// message at all, and the wire spelling for that is `"messages":null`
+		// — a malformed body, answered by the upstream with a 400 worded for
+		// an OpenAI client and matched by no recovery path this proxy has. The
+		// conversation the client sent really is empty of representable
+		// content, so the honest request is an empty turn (2026-09-27 audit,
+		// round 35: the client-leg half of A-F2's leads).
+		oai.Messages = []openAIMessage{{Role: "user"}}
+	}
 	oai.Messages = normalizeSystemFirst(oai.Messages)
 	return oai
 }
@@ -1439,8 +1449,10 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 		// promptBytes is the unit the context-fit clamp below and every
-		// calibration read/write in this handler share: the serialized body
-		// with an inline image's transport encoding charged as an image
+		// calibration read/write in this handler share: the CONVERTED body —
+		// the OpenAI-wire request the upstream is handed, which is where every
+		// block the conversion does not forward stops being charged — with an
+		// inline image's transport encoding charged as an image
 		// (prompt_payload_bytes.go). Computed once, so the ratio a sample
 		// records is exactly the ratio a later estimate is scaled by.
 		promptBytes := clientPromptBytes(body)

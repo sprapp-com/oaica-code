@@ -462,7 +462,14 @@ func qwenEndpointIsLoopback(model string) bool {
 	if !ok {
 		return false
 	}
-	u, err := url.Parse(ep.BaseURL)
+	return qwenBaseURLLoopback(ep.BaseURL)
+}
+
+// qwenBaseURLLoopback is the same decision taken from a base URL, so the
+// read-back can ask it about the remote it already resolved instead of
+// re-resolving a model name (2026-09-27 audit, round 35, A-F3).
+func qwenBaseURLLoopback(baseURL string) bool {
+	u, err := url.Parse(baseURL)
 	if err != nil {
 		return false
 	}
@@ -749,16 +756,32 @@ func (q *Qwen) CurrentModel() string {
 // blanks it for another host, round 19/20/21), so the key is not a field it
 // writes either way.
 func qwenConfigHoldsLiveRemoteKey(cfg map[string]any, remote userRemote) bool {
+	envCfg, _ := cfg["env"].(map[string]any)
+	stored := ""
+	if envCfg != nil {
+		stored, _ = envCfg[qwenOllamaEnvKey].(string)
+	}
+	stored = strings.TrimSpace(stored)
+
 	live := strings.TrimSpace(remote.key())
 	if live == "" {
-		return true
+		// The writer's keyless branch, read back exactly: a loopback endpoint
+		// keeps whatever is stored (it cannot leave the box), and any other
+		// endpoint is blanked, so a value still sitting there is a bearer the
+		// writer would have removed — the provider entry's baseUrl is that
+		// other host (round 20), and qwen sends the variable as that entry's
+		// credential the next time it runs without oaica. Reading this as
+		// "current" left the launch skipped and the stale token in place
+		// (2026-09-27 audit, round 35, A-F3).
+		if qwenBaseURLLoopback(remote.openAIBase()) {
+			return true
+		}
+		return stored == ""
 	}
-	envCfg, _ := cfg["env"].(map[string]any)
 	if envCfg == nil {
 		return false
 	}
-	stored, _ := envCfg[qwenOllamaEnvKey].(string)
-	return strings.TrimSpace(stored) == live
+	return stored == live
 }
 
 func (q *Qwen) Onboard() error {

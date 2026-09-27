@@ -2011,8 +2011,12 @@ func TestConvertMessage_TextDocumentKeptRedactedThinkingDropped(t *testing.T) {
 		t.Errorf("the redacted thinking payload must not reach the prompt: %q", got[0].Content)
 	}
 
-	// A base64 document has no representation on this wire — it must still
-	// produce the surrounding text rather than fail the whole request.
+	// A base64 document has no representation on this wire. It used to be
+	// counted and dropped while the surrounding text was answered, so a
+	// question about an attached PDF reached a model that never saw it and the
+	// client read a 200 for the answer to the question alone. It is refused
+	// instead, naming the source — the same body the gateway leg refuses
+	// (2026-09-27 audit, round 35, A-F2).
 	b64msg := MessageParam{
 		Role: "user",
 		Content: []ContentBlock{
@@ -2020,15 +2024,15 @@ func TestConvertMessage_TextDocumentKeptRedactedThinkingDropped(t *testing.T) {
 			{Type: "text", Text: strPtrT("summarise this")},
 		},
 	}
-	got2, err := convertMessage(b64msg)
-	if err != nil {
-		t.Fatal(err)
+	_, err = convertMessage(b64msg)
+	if err == nil {
+		t.Fatalf("a binary document converted with no error: the prompt becomes the question with no attachment and the client is answered 200, while the gateway leg refuses the same turn")
 	}
-	if len(got2) != 1 || !strings.Contains(got2[0].Content, "summarise this") {
-		t.Fatalf("want the text kept alongside a binary document, got %+v", got2)
+	if !strings.Contains(err.Error(), "document") {
+		t.Errorf("the refusal does not name the block it could not represent: %v", err)
 	}
-	if strings.Contains(got2[0].Content, "JVBERi0=") {
-		t.Errorf("base64 document bytes must not be pasted into the prompt: %q", got2[0].Content)
+	if strings.Contains(err.Error(), "JVBERi0=") {
+		t.Errorf("the refusal carries the base64 payload: %v", err)
 	}
 }
 

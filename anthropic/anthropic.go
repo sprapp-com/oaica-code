@@ -580,28 +580,39 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 			// nothing about a file the user can see in the transcript, and the
 			// client keeps sending it on later turns, so the prompt grows
 			// without ever gaining the content. Keep a text source; a base64
-			// document (PDF and friends) still has no representation here and
-			// is counted, not silently ignored.
+			// document (PDF and friends) has no representation here at all and
+			// is REFUSED, not dropped: this converter used to count it and
+			// answer the turn, so a question about an attached PDF reached a
+			// model that never saw it and the client read a 200 for the
+			// confident answer to the question alone. The gateway leg of this
+			// same product refuses the body instead of answering it, and the
+			// two legs must not disagree about whether the model was given the
+			// document (2026-09-27 audit, round 35, A-F2).
 			documentBlocks++
-			if block.Source != nil {
-				if block.Source.Type == "text" && block.Source.Data != "" {
-					// The leading separator matters as much as the trailing
-					// one: a trailing newline alone left the PREVIOUS block's
-					// last sentence glued to this one's first ("read the
-					// file." + "Now run the tests.\n" = "read the file.Now run
-					// the tests."), which is the failure the text-block branch
-					// above documents (2026-09-26 audit, sixteenth round).
-					if textContent.Len() > 0 {
-						textContent.WriteString("\n\n")
-					}
-					textContent.WriteString(block.Source.Data)
-					if !strings.HasSuffix(block.Source.Data, "\n") {
-						textContent.WriteString("\n")
-					}
-					documentTextBlocks++
-				} else {
-					documentBinaryBlocks++
+			if block.Source == nil {
+				logutil.Trace("anthropic: document block without a source", "role", role)
+				return nil, errors.New("document block without a source")
+			}
+			if block.Source.Type == "text" && block.Source.Data != "" {
+				// The leading separator matters as much as the trailing
+				// one: a trailing newline alone left the PREVIOUS block's
+				// last sentence glued to this one's first ("read the
+				// file." + "Now run the tests.\n" = "read the file.Now run
+				// the tests."), which is the failure the text-block branch
+				// above documents (2026-09-26 audit, sixteenth round).
+				if textContent.Len() > 0 {
+					textContent.WriteString("\n\n")
 				}
+				textContent.WriteString(block.Source.Data)
+				if !strings.HasSuffix(block.Source.Data, "\n") {
+					textContent.WriteString("\n")
+				}
+				documentTextBlocks++
+			} else {
+				documentBinaryBlocks++
+				logutil.Trace("anthropic: unrepresentable document source",
+					"role", role, "source_type", block.Source.Type, "media_type", block.Source.MediaType)
+				return nil, fmt.Errorf("document source.type %q cannot be represented on the OpenAI wire", block.Source.Type)
 			}
 
 		case "server_tool_use":

@@ -1919,10 +1919,20 @@ func inlineImageBytes(v any) (payload, images int) {
 			}
 			if k == "source" {
 				if m, ok := e.(map[string]any); ok {
-					if d, ok := m["data"].(string); ok && d != "" {
-						payload += len(d)
-						images++
-						continue
+					// Only an IMAGE's source is a transport encoding. This
+					// branch read any map keyed "source" holding a "data"
+					// string, so a document block with a TEXT source — prompt
+					// content, not an encoding — was discounted to the image
+					// allowance, the same over-discount the client leg carried
+					// until round 34 (A-F2, measured there as a 900 KB
+					// attachment charged 4 KB). The block has to say it is an
+					// image for the discount to apply.
+					if bt, _ := t["type"].(string); bt == "image" {
+						if d, ok := m["data"].(string); ok && d != "" {
+							payload += len(d)
+							images++
+							continue
+						}
 					}
 				}
 			}

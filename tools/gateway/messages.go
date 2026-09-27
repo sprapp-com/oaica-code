@@ -241,10 +241,15 @@ func toolResultText(content any) string {
 }
 
 // describeBlock renders one non-text tool_result block: an image as its media
-// type and payload size, anything else as its JSON. The base64 of an image is
-// deliberately NOT inlined — a screenshot pasted into a text field is charged
-// against the context window in tokens and every backend tokenizes it as
-// noise, so the size is the useful part.
+// type and payload size, a document as its text or its size, anything else as
+// its JSON. The base64 of an image is deliberately NOT inlined — a screenshot
+// pasted into a text field is charged against the context window in tokens and
+// every backend tokenizes it as noise, so the size is the useful part. A
+// document used to fall to the JSON fallback and took its whole payload with
+// it: a tool returning a 393 KB PDF put the base64 in the prompt, charged as
+// ~98k estimated tokens, for a model that cannot read it — while the same
+// block at message level is refused and the same-sized image is summarised
+// (2026-09-27 audit, round 35, B-F2).
 func describeBlock(raw any) string {
 	bm, ok := raw.(map[string]any)
 	if !ok {
@@ -253,7 +258,8 @@ func describeBlock(raw any) string {
 		}
 		return "[tool result block that could not be represented]"
 	}
-	if t, _ := bm["type"].(string); t == "image" {
+	switch t, _ := bm["type"].(string); t {
+	case "image":
 		media, size := "unknown", 0
 		if src, ok := bm["source"].(map[string]any); ok {
 			if m, ok := src["media_type"].(string); ok && m != "" {
@@ -264,11 +270,87 @@ func describeBlock(raw any) string {
 			}
 		}
 		return fmt.Sprintf("[image tool result omitted: %s, %d bytes of base64]", media, size)
+	case "document":
+		src, _ := bm["source"].(map[string]any)
+		if src == nil {
+			return "[document tool result omitted: no source]"
+		}
+		if st, _ := src["type"].(string); st == "text" {
+			// A text source carries content the prompt can hold, and the
+			// message-level case above forwards it for the same reason: the
+			// model was asked about a file it can be shown.
+			if d, _ := src["data"].(string); d != "" {
+				return d
+			}
+			return `[document tool result omitted: source.type "text" with no data]`
+		}
+		media, size := "unknown", 0
+		if m, ok := src["media_type"].(string); ok && m != "" {
+			media = m
+		}
+		if d, ok := src["data"].(string); ok {
+			size = len(d)
+		}
+		return fmt.Sprintf("[document tool result omitted: %s, %d bytes of base64]", media, size)
 	}
 	if b, err := json.Marshal(bm); err == nil {
 		return string(b)
 	}
 	return "[tool result block that could not be represented]"
+}
+
+// webSearchResultText renders a web_search_tool_result's payload as the text
+// the OpenAI tool wire carries: one "- title: url" line per result, the
+// provider's error code when the search failed, and the JSON for anything
+// else. The sibling client-side converter renders the same list the same way
+// (anthropic.formatWebSearchToolResultContent); this is a copy rather than an
+// import because tools/gateway is its own module, and the two must not drift —
+// the same turn is served by either leg depending on how the user connects.
+func webSearchResultText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, item := range c {
+			im, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch im["type"] {
+			case "web_search_result":
+				title, _ := im["title"].(string)
+				url, _ := im["url"].(string)
+				fmt.Fprintf(&b, "- %s: %s\n", title, url)
+			case "web_search_tool_result_error":
+				return webSearchErrorText(im["error_code"])
+			}
+		}
+		return b.String()
+	case map[string]any:
+		if c["type"] == "web_search_tool_result_error" {
+			return webSearchErrorText(c["error_code"])
+		}
+		if b, err := json.Marshal(c); err == nil {
+			return string(b)
+		}
+		return ""
+	default:
+		if b, err := json.Marshal(c); err == nil {
+			return string(b)
+		}
+		return ""
+	}
+}
+
+// webSearchErrorText names a failed search, with the provider's code when it
+// sent one.
+func webSearchErrorText(code any) string {
+	s, _ := code.(string)
+	if s == "" {
+		return "web_search_tool_result_error"
+	}
+	return "web_search_tool_result_error: " + s
 }
 
 // contentBlocksToOpenAI converts one Anthropic message's content (string or
@@ -357,7 +439,7 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 			default:
 				return nil, fmt.Sprintf("image source.type %q cannot be represented on the OpenAI wire", st)
 			}
-		case "tool_use":
+		case "tool_use", "server_tool_use":
 			flushText()
 			if toolMsg < 0 {
 				out = append(out, map[string]any{"role": role, "content": "", "tool_calls": []map[string]any{}})
@@ -375,7 +457,7 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 				},
 			})
 			out[toolMsg]["tool_calls"] = toolCalls
-		case "tool_result":
+		case "tool_result", "web_search_tool_result":
 			flushText()
 			// The tool's answer rides back as a role:"tool" message. The
 			// content may itself be a block array (tool_result allows text
@@ -384,7 +466,20 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 			// dropped, so an image-only result reached the model as
 			// content:"" — indistinguishable from "the tool returned
 			// nothing" (2026-09-26 audit, fourth round).
-			msg := map[string]any{"role": "tool", "content": toolResultText(bm["content"])}
+			//
+			// web_search_tool_result is the same message with the provider's
+			// own search payload: the client's transcript records the results
+			// of the search its server_tool_use asked for, so it is rendered
+			// as the titles and URLs it holds. Both types were refused by the
+			// default case below, which 400s a turn this gateway answered
+			// before that case existed and every turn after it — the blocks
+			// are in the client's history from the moment it is answered
+			// (2026-09-27 audit, round 35, B-F1/A-F4).
+			content := toolResultText(bm["content"])
+			if t == "web_search_tool_result" {
+				content = webSearchResultText(bm["content"])
+			}
+			msg := map[string]any{"role": "tool", "content": content}
 			if id, ok := bm["tool_use_id"].(string); ok && id != "" {
 				msg["tool_call_id"] = id
 			}
