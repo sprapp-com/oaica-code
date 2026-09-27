@@ -1733,8 +1733,16 @@ func TestEstimateTokens_EmptyContent(t *testing.T) {
 
 	tokens := estimateTokens(req)
 
-	if tokens != 0 {
-		t.Errorf("expected 0 tokens for empty content, got %d", tokens)
+	// One, not zero: an empty message list is not an empty PROMPT.
+	// FromMessagesRequest replaces a conversation no turn carries anything in
+	// with one user message — the guard that keeps a turn-less body off the
+	// wire, where the server would answer it with a synthetic 200 the client
+	// reads as a generation (round 43 C43-1, round 44 A44-1) — so the estimate
+	// charges the four bytes of that turn's role. The estimate seeds the
+	// client-visible input_tokens whenever the upstream states no usage, and
+	// the model does read that turn (2026-09-28 audit, round 58, F58-L1-1).
+	if tokens != 1 {
+		t.Errorf("expected 1 token for an empty message list (the one-word user turn it becomes), got %d", tokens)
 	}
 }
 

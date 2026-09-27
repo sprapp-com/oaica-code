@@ -358,7 +358,26 @@ func redactQuotedQueryCredentials(text string) string {
 // Nothing shorter than 8 characters is replaced: a leg configured with a
 // placeholder ("none", "sk") would otherwise have that substring cut out of
 // ordinary prose, mangling a diagnosis to hide nothing.
+//
+// A credential injected as "Bearer <token>" is two things, and only one of them
+// is the secret: an upstream that names the token it refused writes it bare
+// ("invalid token eyJ…"), and matching the whole header value left the token in
+// the diagnosis this proxy hands the client — the scheme-prefixed form is
+// redacted beside the bare one for that reason (2026-09-28 audit, round 58,
+// F58-L2-2). The reverse needs no rule: a bare secret's own occurrence is
+// already a substring of its scheme-prefixed spelling.
 func redactSecret(text, secret string) string {
+	trimmed := strings.TrimSpace(secret)
+	text = redactOneSecret(text, trimmed)
+	if _, token, ok := strings.Cut(trimmed, " "); ok {
+		text = redactOneSecret(text, token)
+	}
+	return text
+}
+
+// redactOneSecret is redactSecret's single-secret rule: exact, case-sensitive,
+// and skipped entirely for anything too short to be a credential.
+func redactOneSecret(text, secret string) string {
 	secret = strings.TrimSpace(secret)
 	if len(secret) < 8 || !strings.Contains(text, secret) {
 		return text

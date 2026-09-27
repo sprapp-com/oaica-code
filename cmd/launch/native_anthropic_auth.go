@@ -43,6 +43,22 @@ type claudeCredentialsFile struct {
 	} `json:"claudeAiOauth"`
 }
 
+// nativeAnthropicKeyEnv is the variable Claude Code itself reads for the
+// user's own Anthropic API key — the credential `claude` uses unproxied, and
+// the first one resolveNativeAnthropicAuth takes. A catalog row that names it
+// in api_key_env is naming the USER's key, not one of oaica's, which is what
+// userOwnAnthropicKeyEnv decides (2026-09-28 audit, round 58, F58-L2-1).
+const nativeAnthropicKeyEnv = "ANTHROPIC_API_KEY"
+
+// userOwnAnthropicKeyEnv reports whether this route's resolved credential is
+// the user's own key rather than one oaica issued for the row: true only when
+// the row declares nativeAnthropicKeyEnv AND that variable is actually set in
+// this process. A row that declares it but finds it empty falls back to
+// route.Key — a key stored by `oaica provider login`, which IS the row's own.
+func (route proxyRoute) userOwnAnthropicKeyEnv() bool {
+	return route.KeyEnv == nativeAnthropicKeyEnv && strings.TrimSpace(os.Getenv(nativeAnthropicKeyEnv)) != ""
+}
+
 // resolveNativeAnthropicAuth picks the credential exactly as native mode's
 // own environment would have: ANTHROPIC_API_KEY wins when set (matches
 // Claude Code's own precedence — an explicit key beats a stored login),
@@ -50,7 +66,7 @@ type claudeCredentialsFile struct {
 // Empty Value with ok=false means neither is available — the caller must
 // fail the request rather than send an empty credential upstream.
 func resolveNativeAnthropicAuth() (nativeAnthropicAuth, bool) {
-	if key := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); key != "" {
+	if key := strings.TrimSpace(os.Getenv(nativeAnthropicKeyEnv)); key != "" {
 		return nativeAnthropicAuth{Header: "x-api-key", Value: key}, true
 	}
 	token, ok := readClaudeOAuthAccessToken()

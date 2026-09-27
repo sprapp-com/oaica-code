@@ -93,24 +93,40 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 	if err != nil {
 		return 0
 	}
-	if route.Key != "" {
+	// The credential this row sends with a message is the one its /models list
+	// is fetched with: resolveKey (which reads the row's key env as well as the
+	// key oaica stored), plus — for api.anthropic.com itself — the user's own
+	// native credential, exactly as the passthrough resolves it. Reading
+	// route.Key alone left every spelling of that row unauthenticated: a row
+	// whose key lives in api_key_env has no route.Key at all, so the probe
+	// 401'd and the launch ran with no real window, no
+	// CLAUDE_CODE_MAX_CONTEXT_TOKENS hint and no context-fit clamp ceiling
+	// (2026-09-28 audit, round 58, F58-L2-3).
+	if key := route.resolveKey(); key != "" {
 		// An Anthropic-wire row authenticates with x-api-key +
 		// anthropic-version, not a Bearer: this probe was the one consumer of
 		// a remote's /models that still sent "Authorization: Bearer" to every
 		// route, so zai-coding-plan, minimax-coding-plan and a raw
 		// api.anthropic.com row answered 401 and the launch ran with no real
-		// window — no CLAUDE_CODE_MAX_CONTEXT_TOKENS hint and no context-fit
-		// clamp ceiling in the proxy (2026-09-26 audit, tenth round). The
-		// branch below is the one fetchRemoteModels (user_remotes.go) and
-		// probeRemote (doctor.go) already take for the same URL, and
-		// x-api-key is the header the proxy's own passthrough injects for
-		// these rows (proxyRoute.anthropicPassthroughTarget,
-		// anthropic_openai_proxy.go).
+		// window (2026-09-26 audit, tenth round). The branch below is the one
+		// fetchRemoteModels (user_remotes.go) and probeRemote (doctor.go)
+		// already take for the same URL, and x-api-key is the header the
+		// proxy's own passthrough injects for these rows
+		// (proxyRoute.anthropicPassthroughTarget, anthropic_openai_proxy.go).
 		if route.Wire == "anthropic" {
-			req.Header.Set("x-api-key", route.Key)
+			req.Header.Set("x-api-key", key)
 			req.Header.Set("anthropic-version", "2023-06-01")
 		} else {
-			req.Header.Set("Authorization", "Bearer "+route.Key)
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+	} else if route.Wire == "anthropic" && isAnthropicAPIBase(route.BaseURL) {
+		// The keyless spelling of api.anthropic.com: a user who signed in with
+		// `claude /login` (or exported ANTHROPIC_API_KEY) has a credential for
+		// this host and none for the row. A keyless row on any OTHER vendor
+		// still goes out bare and fails closed, as it does in the passthrough.
+		if auth, found := resolveNativeAnthropicAuth(); found {
+			applyNativeAnthropicAuth(req, auth)
+			req.Header.Set("anthropic-version", "2023-06-01")
 		}
 	}
 	resp, err := http.DefaultClient.Do(req)

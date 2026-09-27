@@ -1148,11 +1148,14 @@ const oaicaDisplayModelSuffix = "-oaica"
 //
 // credentialIsOurs reports WHOSE credential the resolved header carries: true
 // when it is a key oaica resolved for this row, false when it is the user's
-// own — which happens on a native claude/* leg AND on the keyless
-// api.anthropic.com row below. It is returned here, rather than left for the
-// caller to infer from BaseURL, because the inference was wrong for exactly
-// that row: its keyless fallback sends the user's credential, so a 401 under it
-// was rewritten as if oaica's own key had been refused (round 57, F57-L2-1).
+// own — which happens on a native claude/* leg, on the keyless
+// api.anthropic.com row below, and on any row that declares the user's own
+// ANTHROPIC_API_KEY. It is returned here, rather than left for the caller to
+// infer from BaseURL, because the inference was wrong for exactly that row: its
+// keyless fallback sends the user's credential, so a 401 under it was rewritten
+// as if oaica's own key had been refused (round 57, F57-L2-1) — and reading
+// "some key resolved" as oaica's own did the same to the row's keyed spelling
+// (round 58, F58-L2-1).
 func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, headerValue string, credentialIsOurs, ok bool) {
 	if route.Wire != "anthropic" {
 		return "", "", "", false, false
@@ -1175,7 +1178,16 @@ func (route proxyRoute) anthropicPassthroughTarget() (upstream, headerName, head
 			// The user's own credential, on a row that has none of oaica's.
 			return strings.TrimRight(route.BaseURL, "/") + "/messages", auth.Header, auth.Value, false, true
 		}
-		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, true, true
+		// Whose key is it? A row that names ANTHROPIC_API_KEY in api_key_env
+		// resolved the USER's own credential — the same variable, and the same
+		// bytes on the wire, as the keyless branch above and the native
+		// claude/* leg. Its 401 means the user re-runs `claude /login`, so it
+		// is relayed, not rewritten as an oaica-side fault; deciding by "a key
+		// was resolved" read the row's key source as its owner and sent the
+		// user into a 502 retry loop over their own refused key (2026-09-28
+		// audit, round 58, F58-L2-1). A key oaica stored for the row is still
+		// ours.
+		return strings.TrimRight(route.BaseURL, "/") + "/messages", "x-api-key", key, !route.userOwnAnthropicKeyEnv(), true
 	}
 	auth, found := resolveNativeAnthropicAuth()
 	if !found {
@@ -2598,10 +2610,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		args strings.Builder
 	}
 	toolAccums := map[int]*toolAccum{}
-	// syntheticToolSlot is the accumulator slot for streams whose upstream
-	// omits tool-call indices; it advances when a delta starts a new call
-	// (see the accumulation loop below).
-	syntheticToolSlot := 0
+	// nextFreeToolSlot is the slot for a call the upstream gave none: one that
+	// omits the index entirely, or one that states an index already carrying a
+	// different call. It is kept above every index the stream has stated, so a
+	// numbered call can never land on a slot another call owns, and
+	// flushToolCalls' ascending-slot order stays the order the model wrote the
+	// calls in (2026-09-28 audit, round 58, F58-L3-2).
+	nextFreeToolSlot := 0
+	// lastToolSlot is the slot of the call this stream last named, so an
+	// index-less argument continuation is written into THAT call and not into
+	// whichever call happened to start at slot zero (2026-09-28 audit, round
+	// 58, F58-L3-1).
+	lastToolSlot := -1
 
 	// argsFinished reports whether an argument text is a call's own finished
 	// argument list: a complete JSON object — the one spelling the wire has for
@@ -3047,6 +3067,34 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				indexed := tc.Index != nil
 				if indexed {
 					slot = *tc.Index
+					if slot >= nextFreeToolSlot {
+						nextFreeToolSlot = slot + 1
+					}
+					if acc, exists := toolAccums[slot]; exists &&
+						!restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) &&
+						((tc.ID != "" && acc.id != "" && tc.ID != acc.id) ||
+							(tc.Function.Name != "" && acc.name != "" && tc.Function.Name != acc.name)) {
+						// A call the upstream stated this slot for a SECOND time
+						// begins the next one: a stated id this slot does not
+						// hold (round 43's B43-3) or a name it does not carry
+						// (round 40's A40-8, an argument continuation carries
+						// arguments alone). That is round 36's B-F2 — every call
+						// after the first filed into one block, its id discarded
+						// and its arguments concatenated onto the first's — for
+						// the vendor that writes index 0 for every call of the
+						// turn, which keying by id could not cure because the
+						// index it repeats is STATED, not absent. The gateway
+						// leg's toolKey splits the same wire the same way, and
+						// both arms that hold a whole list — this leg's adoption
+						// and the gateway's document arm — already keep the two
+						// calls apart (2026-09-28 audit, round 58, F58-L3-2).
+						//
+						// The call the slot already carries, restated, is asked
+						// first and stays that call: round 56's F1 lists it again
+						// under its own id at its own index.
+						slot = nextFreeToolSlot
+						nextFreeToolSlot++
+					}
 				} else {
 					// The upstream sent no index, so there is nothing to key
 					// on but the calls' own sequence: a delta that carries a
@@ -3057,12 +3105,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// the client got ONE tool_use named after the last call,
 					// with all the calls' arguments concatenated into
 					// {"_raw": ...} (2026-09-26 audit, fifteenth round).
-					if acc, exists := toolAccums[syntheticToolSlot]; exists &&
+					//
+					// The fragment continues the call this stream last NAMED,
+					// which need not be the one that started at slot zero: an
+					// upstream that states the index on the fragment introducing
+					// a call and omits it on the argument continuations — the
+					// wire round 37's B-F1 is about — sent every continuation to
+					// slot zero, so a call introduced at any other slot got no
+					// arguments at all and a second, empty one appeared at the
+					// slot that was not the call's (2026-09-28 audit, round 58,
+					// F58-L3-1).
+					if acc, exists := toolAccums[lastToolSlot]; lastToolSlot >= 0 && exists &&
 						startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name, tc.Function.Arguments) {
-						syntheticToolSlot++
+						slot = nextFreeToolSlot
+						nextFreeToolSlot++
+					} else if lastToolSlot >= 0 {
+						slot = lastToolSlot
+					} else {
+						slot = nextFreeToolSlot
+						nextFreeToolSlot++
 					}
-					slot = syntheticToolSlot
 				}
+				lastToolSlot = slot
 				if adoptedWhole && adoptedCalls {
 					// A call the adoption already wrote in full (see above): its
 					// block is closed on the client's side, so these arguments

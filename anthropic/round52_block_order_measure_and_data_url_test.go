@@ -118,7 +118,11 @@ func TestAToolIsChargedAsTheToolTheConverterForwards(t *testing.T) {
 		if err != nil {
 			t.Fatalf("convertTool: %v", err)
 		}
-		want := clampedJSONBytes(converted) / 4
+		// The tool's own term is the exact one this test is about. The request
+		// carries no messages, and that is not an empty prompt: it becomes one
+		// user turn (FromMessagesRequest's guard), four bytes, one token,
+		// charged beside the tool (2026-09-28 audit, round 58, F58-L1-1).
+		want := clampedJSONBytes(converted)/4 + 1
 		got := estimateTokens(CountTokensRequest{Tools: []Tool{tool}})
 		if got != want {
 			t.Errorf("a tool whose converted form is %d bytes was charged %d tokens, want %d\nthe charge is the bytes of the object that is sent, the unit every other measure in this function uses",

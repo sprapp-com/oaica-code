@@ -2442,7 +2442,10 @@ func conversationBytes(messages []MessageParam, system any) int {
 		entries = append(entries, entry{system: true, text: text, bytes: len("system") + systemBytes(system)})
 	}
 	mergeable := true
+	carriesContent := false
 	for _, msg := range messages {
+		_, ownRuns, toolResults := messageShapeBytes(msg.Content)
+		role := messageRoleBytesFor(msg.Role, ownRuns, toolResults)
 		if strings.EqualFold(msg.Role, "system") {
 			if !systemContentIsTextOnly(msg.Content) {
 				// Only a system message that is nothing but text can be merged
@@ -2453,11 +2456,36 @@ func conversationBytes(messages []MessageParam, system any) int {
 			entries = append(entries, entry{
 				system: true,
 				text:   joinedMessageText(msg.Content),
-				bytes:  messageRolesBytes(msg.Role, msg.Content) + countAnyContent(msg.Content),
+				bytes:  role + countAnyContent(msg.Content),
 			})
 			continue
 		}
-		entries = append(entries, entry{bytes: messageRolesBytes(msg.Role, msg.Content) + countAnyContent(msg.Content)})
+		if ownRuns > 0 || toolResults > 0 {
+			carriesContent = true
+		}
+		entries = append(entries, entry{bytes: role + countAnyContent(msg.Content)})
+	}
+
+	// A conversation no turn carries anything in reaches the wire as ONE user
+	// message: FromMessagesRequest's last step replaces the whole list, because
+	// every turn either converted to nothing — the fallback's role-only message
+	// above — or was a blank system message the rewrite deletes, and a
+	// turn-less body is answered by a synthetic 200 the client reads as a
+	// successful generation (anyMessageCarriesContent; round 44, A44-1). The
+	// estimate has to charge that replacement rather than the messages it
+	// replaced: a client that sends one contentless assistant turn is billed
+	// for a one-word prompt, not for a role it never reached the model
+	// (2026-09-28 audit, round 58, F58-L1-1).
+	if !carriesContent {
+		survivingSystemText := false
+		for _, e := range entries {
+			if e.system && strings.TrimSpace(e.text) != "" {
+				survivingSystemText = true
+			}
+		}
+		if !survivingSystemText {
+			return len("user")
+		}
 	}
 
 	rewrite := false
@@ -2539,13 +2567,43 @@ func topLevelSystemText(system any) (string, bool) {
 // text — the question normalizeSystemFirst asks of the CONVERTED message
 // (systemMessageIsTextOnly, over its images, calls and thinking) and this asks
 // of the blocks the converter reads them from.
+//
+// A block the converter writes NOTHING for is not an answer to that question:
+// redacted_thinking never reaches the run at all and a textless thinking block
+// leaves its run empty, so both leave a converted message with no images, no
+// calls and no reasoning — text-only, whatever the client's block type says.
+// Asking the client's types instead suppressed the rewrite for such a message,
+// and the rewrite is what DELETES it: a system message holding only a replayed
+// redacted_thinking block stayed in the conversation the estimate charged
+// while the prompt the converter wrote had already lost it — six bytes of
+// "system" for a message the model never read, on an estimate that seeds the
+// client-visible input_tokens (2026-09-28 audit, round 58, F58-L1-3).
 func systemContentIsTextOnly(content []ContentBlock) bool {
 	for _, block := range content {
-		if block.Type != "text" {
-			return false
+		if block.Type == "text" || blockWritesNothing(block) {
+			continue
 		}
+		return false
 	}
 	return true
+}
+
+// blockWritesNothing reports whether convertMessage writes no part of a run for
+// this block — the blocks whose presence in a message says nothing about what
+// that message carries, and so cannot be why a system message is not text-only
+// (see systemContentIsTextOnly).
+func blockWritesNothing(block ContentBlock) bool {
+	switch block.Type {
+	case "redacted_thinking":
+		// Dropped whole: api.Message.Thinking is not emitted on any wire this
+		// fork speaks and the payload is opaque.
+		return true
+	case "thinking":
+		// The converter joins this block's text into the run only when the
+		// pointer is set, and drops a run whose thinking is empty.
+		return block.Thinking == nil || *block.Thinking == ""
+	}
+	return false
 }
 
 // joinedMessageText is the text convertMessage writes for one message's text
@@ -2616,30 +2674,45 @@ func messageJoinSeparatorBytes(content any) int {
 	return separators
 }
 
-// messageRolesBytes charges the ROLE bytes of every message convertMessage
-// WRITES for one client message: one message carrying the client's own role —
-// lower-cased, as the converter writes it (convertMessage's `role :=
-// strings.ToLower(msg.Role)`) — per run of the turn's own blocks that states
-// something, and one message carrying "tool" per tool_result /
-// web_search_tool_result block.
+// messageRoleBytesFor charges the ROLE bytes of every message the converter
+// WRITES for one client message, from the counts messageShapeBytes reports: one
+// message carrying the client's own role — lower-cased, as the converter writes
+// it (convertMessage's `role := strings.ToLower(msg.Role)`) — per run of the
+// turn's own blocks that states something, and one message carrying "tool" per
+// tool_result / web_search_tool_result block.
+//
+// A message the converter writes NOTHING for is not absent from the prompt:
+// FromMessagesRequest's own fallback writes one message carrying the client's
+// role and no content, and the model reads that turn. Leaving its role off
+// billed a body whose turn was an empty text block, an empty content array, or
+// a replayed redacted_thinking one to two tokens against the three the same
+// prompt written without the turn was charged — on an estimate that seeds the
+// client-visible input_tokens and the auto-compaction threshold (2026-09-28
+// audit, round 58, F58-L1-1).
 //
 // The message-level charge billed the client's own role once for the whole
 // message instead: a message whose result blocks became a tool message was
 // charged 9 bytes ("assistant") where the converter writes 4 ("tool"), and a
 // message split into two own runs around a result was charged one role for two
-// messages. The estimate seeds the client-visible input_tokens whenever the
-// upstream states no usage, so the session's meter and its auto-compaction read
-// a prompt the model was never sent (2026-09-28 audit, round 57, F57-L1-3).
+// messages (2026-09-28 audit, round 57, F57-L1-3).
 //
 // The counts come from messageShapeBytes, the walk that already knows what the
 // converter writes here — the same one that charges the join separators.
-func messageRolesBytes(role string, content any) int {
-	_, ownRuns, results := messageShapeBytes(content)
-	total := results * len("tool")
+func messageRoleBytesFor(role string, ownRuns, toolResults int) int {
+	if ownRuns == 0 && toolResults == 0 {
+		return len(strings.ToLower(role))
+	}
+	total := toolResults * len("tool")
 	if ownRuns > 0 {
 		total += ownRuns * len(strings.ToLower(role))
 	}
 	return total
+}
+
+// messageRolesBytes is messageRoleBytesFor over one client message's content.
+func messageRolesBytes(role string, content any) int {
+	_, ownRuns, results := messageShapeBytes(content)
+	return messageRoleBytesFor(role, ownRuns, results)
 }
 
 // messageShapeBytes is messageJoinSeparatorBytes' walk, reporting the two other
@@ -2747,11 +2820,15 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 			toolResults++
 		default:
 			switch blockType {
-			case "image", "tool_use", "server_tool_use", "thinking", "redacted_thinking":
+			case "image", "tool_use", "server_tool_use":
 				// The converter writes each of these into the run beside the
 				// text, and the run is a message whether or not it holds any
 				// text: an image-only turn is written, and a lone empty text is
-				// not (see this function's header).
+				// not (see this function's header). A thinking block is NOT one
+				// of them — it joins this list only when it carries text, which
+				// the arms below ask before coming here — and redacted_thinking
+				// never reaches the run at all (convertMessage drops it whole)
+				// (2026-09-28 audit, round 58, F58-L1-2).
 				stated = true
 			}
 			if chunk <= 0 {
@@ -2802,6 +2879,20 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 					billed += len(b.Source.Ref) + len(b.Source.URL)
 				}
 				join(b.Type, chunk, billed)
+			case "thinking":
+				// A thinking block joins the run only when it carries text
+				// (convertMessage's own `block.Thinking != nil` guard, and the
+				// run-drop test beside it): a textless one leaves the run empty
+				// and the converter drops it, so charging a message for it
+				// billed a role the prompt does not contain — 9 bytes of
+				// "assistant" on a turn written as a bare tool message
+				// (2026-09-28 audit, round 58, F58-L1-2). A block with text
+				// writes no SEPARATOR of its own here (it lands in the run's
+				// thinking, not its text) and no billed bytes (no wire this
+				// fork speaks renders it), which is what the chunk-0 join does.
+				if b.Thinking != nil && *b.Thinking != "" {
+					stated = true
+				}
 			default:
 				join(b.Type, 0, 0)
 			}
@@ -2863,6 +2954,12 @@ func messageShapeBytes(content any) (separators, ownRuns, toolResults int) {
 					billed += len(ref)
 				}
 				join(blockType, chunk, billed)
+			case "thinking":
+				// The typed arm's rule, over the decoded spelling: a thinking
+				// block joins the run only when it carries a non-empty text.
+				if text, ok := m["thinking"].(string); ok && text != "" {
+					stated = true
+				}
 			default:
 				join(blockType, 0, 0)
 			}

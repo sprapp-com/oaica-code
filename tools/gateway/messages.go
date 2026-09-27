@@ -1956,6 +1956,15 @@ type anthropicBridge struct {
 	// lastToolName is the name that opened that block, so a later fragment
 	// naming a DIFFERENT tool is understood to be introducing one.
 	lastToolName string
+	// indexKeys maps each upstream index this bridge has seen to the key of the
+	// block that index opened, so a fragment stating the index again finds that
+	// block even after the block was re-keyed to an id the upstream stated for
+	// it (toolKey's B45-1 re-key). Without it, the index named a key the map no
+	// longer held and the next fragment opened a SECOND block for a call the
+	// bridge was already writing — its arguments split across two blocks, half
+	// of them relayed to the client as prose beside a truncated tool_use
+	// (2026-09-28 audit, round 58, F58-L3-1).
+	indexKeys map[int]string
 	// synthSeq mints keys for calls whose upstream states neither an index nor
 	// an id, so two such calls cannot share a block.
 	synthSeq int
@@ -3039,10 +3048,63 @@ func (b *anthropicBridge) flushHeldText() {
 // (2026-09-27 audit, round 37, B-F2).
 func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	if upIdx != nil {
+		key := "#" + strconv.Itoa(*upIdx)
+		if rekeyed, ok := b.indexKeys[*upIdx]; ok && b.toolBlocks[rekeyed] != nil {
+			// The block this index opened, under the key it was moved to when
+			// a fragment stated its id (the B45-1 re-key below). The index is
+			// the same slot identity either way.
+			key = rekeyed
+		}
+		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
+			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name)) {
+			// A fragment at an OCCUPIED slot that introduces a distinct call
+			// begins the next one. Two things can say so, and only these two: a
+			// stated id this block does not hold (round 43's B43-3, the shape
+			// an upstream that reuses one id for the turn's second call
+			// produces), or a name the block does not carry — round 40's A40-8,
+			// an argument continuation carries arguments alone, so a second
+			// name is a second call.
+			//
+			// splitFromCurrent's other clause is deliberately NOT asked here:
+			// it treats a re-stated name over arguments that are already a
+			// complete object as the next call, which is the right reading of
+			// an index-less fragment but the WRONG one of a fragment that
+			// states this slot — the ordinary OpenAI chunk order restates the
+			// name on a chunk of its own after the arguments, and round 56's F1
+			// pins that wire as one call whose trailing fragments are repeats.
+			//
+			// The index alone used to decide, and it answered the common
+			// sloppy wire — one upstream that states index 0 for every call of
+			// the turn — by folding every call after the first into the first
+			// one's block: the second id discarded, its name dropped and its
+			// arguments concatenated onto the first's partial_json, so a turn
+			// that chose two tools reached the client as one call it could not
+			// run, its input unparseable JSON. That is round 36's B-F2 exactly,
+			// which keying by id was meant to cure and cannot, because an index
+			// that is STATED and repeated is not the same as an absent one
+			// (2026-09-28 audit, round 58, F58-L3-2). The restatement of a call
+			// the slot already carries is asked first and stays a repeat
+			// (round 56's F1/F2).
+			b.synthSeq++
+			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+			if name != "" {
+				b.lastToolName = name
+			}
+			return b.lastToolKey
+		}
 		if name != "" {
 			b.lastToolName = name
 		}
-		b.lastToolKey = "#" + strconv.Itoa(*upIdx)
+		if b.indexKeys == nil {
+			b.indexKeys = map[int]string{}
+		}
+		// Only the slot's FIRST block is what the index names: a later call
+		// split off this slot above is numbered, not indexed, and a fragment
+		// stating the index again continues the call the index introduced.
+		if _, taken := b.indexKeys[*upIdx]; !taken {
+			b.indexKeys[*upIdx] = key
+		}
+		b.lastToolKey = key
 		return b.lastToolKey
 	}
 	if id != "" {
@@ -3125,8 +3187,7 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 				if !cur.started {
 					cur.id = ""
 				}
-				delete(b.toolBlocks, b.lastToolKey)
-				b.toolBlocks[key] = cur
+				b.rekeyToolBlock(b.lastToolKey, key)
 				cur.key = key
 				b.lastToolKey = key
 				return key
@@ -3199,6 +3260,28 @@ func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
 	return name != b.lastToolName ||
 		(acc != "" && json.Valid([]byte(acc))) ||
 		(acc == "" && strings.TrimSpace(args) == "")
+}
+
+// rekeyToolBlock moves the block accumulated under oldKey to newKey, keeping
+// every index that named it pointing at where it went: an upstream that opens a
+// call with its index, states the id on a later fragment (the B45-1 re-key) and
+// then states the index again must still be writing into ONE block
+// (2026-09-28 audit, round 58, F58-L3-1).
+func (b *anthropicBridge) rekeyToolBlock(oldKey, newKey string) {
+	if oldKey == newKey {
+		return
+	}
+	cur := b.toolBlocks[oldKey]
+	if cur == nil {
+		return
+	}
+	delete(b.toolBlocks, oldKey)
+	b.toolBlocks[newKey] = cur
+	for idx, k := range b.indexKeys {
+		if k == oldKey {
+			b.indexKeys[idx] = newKey
+		}
+	}
 }
 
 // idHeldByAnotherCall reports whether a call block other than the one keyed by
