@@ -1332,17 +1332,45 @@ func shortToolCallID(key string) string {
 	return strconv.FormatUint(uint64(h), 16)
 }
 
+// IsImageURL reports whether an api.ImageData produced by resolveImageSource
+// carries a URL to fetch rather than image bytes. An Anthropic image source of
+// type "url" is carried through api.ImageData as its own URL text, because the
+// wire this converter feeds (OpenAI's `image_url`) takes a URL as readily as a
+// data URL — refusing the block instead was a divergence from the gateway leg,
+// which forwards the same source, so one body was answered with a 400 here and
+// with a request the model could see there (2026-09-27 audit, round 38, A-F3).
+// The prefixes cannot collide with decoded image bytes: every format this
+// converter meets starts with a magic number (PNG's 0x89, JPEG's 0xFF, GIF's
+// 'G', RIFF's "RIFF"), never with an ASCII scheme.
+func IsImageURL(img api.ImageData) bool {
+	s := string(img)
+	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "data:")
+}
+
 func resolveImageSource(source *ImageSource) (api.ImageData, error) {
-	if source.Type != "base64" {
+	switch source.Type {
+	case "url":
+		if source.URL == "" {
+			return nil, errors.New(`invalid image source type: url, with no url`)
+		}
+		return api.ImageData(source.URL), nil
+	case "base64":
+		if source.Data == "" {
+			// An empty payload decodes to zero bytes with no error, and the
+			// blank image was carried into the request as a part the upstream
+			// cannot decode — the client was told the turn succeeded. The
+			// gateway leg refuses the same body in words (2026-09-27 audit,
+			// round 38, A-F6).
+			return nil, errors.New("invalid image source: base64 with no data")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(source.Data)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 image data: %w", err)
+		}
+		return decoded, nil
+	default:
 		return nil, fmt.Errorf("invalid image source type: %s. Only base64 images are supported.", source.Type)
 	}
-
-	decoded, err := base64.StdEncoding.DecodeString(source.Data)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 image data: %w", err)
-	}
-
-	return decoded, nil
 }
 
 // describeToolResultDocument renders a document block nested in a tool result:
@@ -1379,8 +1407,58 @@ func describeToolResultDocument(raw any) string {
 // that only reached it on one of the two legs (2026-09-27 audit, round 37,
 // A-F2/A-F3).
 func describeToolResultBlock(bm map[string]any) string {
-	if t, _ := bm["type"].(string); t == "document" {
+	switch t, _ := bm["type"].(string); t {
+	case "document":
 		return describeToolResultDocument(bm["source"])
+	case "image":
+		// An image reached through a path with no carrier for it — a passage
+		// inside a search_result, say, where the tool_result reader that owns a
+		// nested image is not the one walking this block. The JSON fallback
+		// below pasted the whole base64 payload into the prompt as prose: a
+		// 600 KB screenshot was billed to the model as the transport encoding
+		// of a picture it cannot read, where the gateway leg sends this same
+		// one-line notice and where the document arm beside this one exists for
+		// exactly that reason (2026-09-27 audit, round 38, A-F4).
+		media, size := "unknown", 0
+		if src, ok := bm["source"].(map[string]any); ok {
+			if m, ok := src["media_type"].(string); ok && m != "" {
+				media = m
+			}
+			if d, ok := src["data"].(string); ok {
+				size = len(d)
+			}
+		}
+		return fmt.Sprintf("[image tool result omitted: %s, %d bytes of base64]", media, size)
+	case "search_result":
+		// A passage list nested inside a tool result (or inside another
+		// passage list): its title, its origin and the passages themselves,
+		// rendered through the flattener the message-level case uses. Without
+		// this arm the block fell to the JSON fallback below, so a screenshot
+		// sitting in one of its passages took its whole base64 payload into the
+		// prompt — the image arm above describes the identical block one level
+		// up (2026-09-27 audit, round 38, A-F4).
+		var label []string
+		if title, _ := bm["title"].(string); title != "" {
+			label = append(label, title)
+		}
+		switch src := bm["source"].(type) {
+		case string:
+			if src != "" {
+				label = append(label, src)
+			}
+		case map[string]any:
+			ref, _ := src["ref"].(string)
+			if ref == "" {
+				ref, _ = src["url"].(string)
+			}
+			if ref != "" {
+				label = append(label, ref)
+			}
+		}
+		if body := searchResultText(bm["content"]); body != "" {
+			label = append(label, body)
+		}
+		return strings.Join(label, "\n")
 	}
 	if b, err := json.Marshal(bm); err == nil {
 		return string(b)
@@ -1403,7 +1481,15 @@ func searchResultText(content any) string {
 	case []ContentBlock:
 		var sb strings.Builder
 		for _, b := range c {
-			if b.Type == "text" && b.Text != nil && *b.Text != "" {
+			if b.Type == "text" {
+				// An empty passage is no passage: it used to fall through to
+				// the describer and put `{"text":"","type":"text"}` in the
+				// prompt as though the search had returned it, where the same
+				// block JSON-decoded is skipped (2026-09-27 audit, round 38,
+				// A-F8).
+				if b.Text == nil || *b.Text == "" {
+					continue
+				}
 				if sb.Len() > 0 {
 					sb.WriteString("\n")
 				}
@@ -1464,6 +1550,29 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 		return "", nil, nil
 	case string:
 		return c, nil, nil
+	case []ContentBlock:
+		// The package's own typed content: the SDK's `content` field is a
+		// `[]ContentBlock` in one spelling and decoded JSON in the other, and
+		// only the decoded shape had a case — so a tool_result written with
+		// typed blocks fell to the default and converted to an EMPTY tool
+		// message with no error. The model was told the tool returned nothing
+		// and the client read a 200, while the same logical content written as
+		// JSON reached the model in full (2026-09-27 audit, round 38, A-F5).
+		// Each block is re-read through the decoded path below so both
+		// spellings are assembled by one implementation and cannot drift.
+		items := make([]any, 0, len(c))
+		for i := range c {
+			raw, err := json.Marshal(c[i])
+			if err != nil {
+				continue
+			}
+			var m map[string]any
+			if json.Unmarshal(raw, &m) != nil {
+				continue
+			}
+			items = append(items, m)
+		}
+		return convertToolResultContent(items)
 	case []any:
 		var text strings.Builder
 		var images []api.ImageData
@@ -1628,14 +1737,7 @@ func countAnyContent(content any) int {
 	case []any:
 		total := 0
 		for _, item := range c {
-			data, err := json.Marshal(item)
-			if err != nil {
-				continue
-			}
-			var block ContentBlock
-			if err := json.Unmarshal(data, &block); err == nil {
-				total += countContentBlock(block)
-			}
+			total += countContentItem(item)
 		}
 		return total
 	default:
@@ -1644,6 +1746,79 @@ func countAnyContent(content any) int {
 		}
 		return 0
 	}
+}
+
+// countContentItem charges one content item that arrived as decoded JSON.
+//
+// It used to marshal the item and unmarshal it into a ContentBlock, and
+// countContentBlock re-entered countAnyContent for a search_result's nested
+// content — so every nesting level re-marshalled the whole remaining subtree
+// and the total was quadratic in the depth. A 147 KB body nested 3000 deep
+// (under encoding/json's own nesting limit) cost six seconds of CPU on
+// /v1/messages BEFORE any upstream call, and the estimate is computed
+// unconditionally by middleware/anthropic.go (2026-09-27 audit, round 38,
+// A-F1). This walks the decoded value directly — the same fields with the same
+// arithmetic as the typed path, in one pass.
+func countContentItem(item any) int {
+	m, ok := item.(map[string]any)
+	if !ok {
+		// A non-object item has no block shape; the typed path charged it 0
+		// because it could not be decoded into one.
+		return 0
+	}
+	total := 0
+	if s, ok := m["text"].(string); ok {
+		total += len(s)
+	}
+	if s, ok := m["thinking"].(string); ok {
+		total += len(s)
+	}
+	switch t, _ := m["type"].(string); t {
+	case "tool_use", "tool_result":
+		// The block's own JSON, exactly as the typed arm charges it.
+		if data, err := json.Marshal(m); err == nil {
+			total += len(data)
+		}
+	case "document":
+		if src, ok := m["source"].(map[string]any); ok {
+			data, _ := src["data"].(string)
+			ref, _ := src["ref"].(string)
+			total += len(data) + len(ref)
+		}
+	case "image":
+		total += imageSourceBytes(m["source"])
+	case "search_result":
+		if title, ok := m["title"].(string); ok {
+			total += len(title)
+		}
+		total += countAnyContent(m["content"])
+		total += imageSourceBytes(m["source"])
+	case "server_tool_use":
+		if data, err := json.Marshal(m); err == nil {
+			total += len(data)
+		}
+	case "web_search_tool_result":
+		if data, err := json.Marshal(m); err == nil {
+			total += len(data)
+		}
+	}
+	return total
+}
+
+// imageSourceBytes is the content a block's `source` carries, in either
+// spelling: a base64 payload, a bare-string reference (a search_result's URL),
+// or the url field of the object form.
+func imageSourceBytes(source any) int {
+	switch s := source.(type) {
+	case string:
+		return len(s)
+	case map[string]any:
+		data, _ := s["data"].(string)
+		url, _ := s["url"].(string)
+		ref, _ := s["ref"].(string)
+		return len(data) + len(url) + len(ref)
+	}
+	return 0
 }
 
 func countContentBlock(block ContentBlock) int {
@@ -1680,6 +1855,23 @@ func countContentBlock(block ContentBlock) int {
 			// object form reached the prompt and was never counted, so the
 			// estimate lagged the prompt it is supposed to seed.
 			total += len(block.Source.Ref) + len(block.Source.URL)
+		}
+	case "image":
+		// The payload of an image the converter CARRIES (as request bytes, not
+		// as prompt text) is content the session pays for: it seeds the
+		// estimate, and an estimate of 1 token for a 400 KB screenshot left the
+		// context meter still and auto-compaction unfired while the prompt
+		// walked into the upstream's real limit. The decoded path charged the
+		// same omission (2026-09-27 audit, round 38, A-F2).
+		if block.Source != nil {
+			total += len(block.Source.Data) + len(block.Source.URL) + len(block.Source.Ref)
+		}
+	case "server_tool_use", "web_search_tool_result":
+		// The same omission, two types over: a server tool call and its
+		// results (titles, URLs and encrypted content) are all prompt content
+		// the converter carries and the estimate charged nothing for.
+		if data, err := json.Marshal(block); err == nil {
+			total += len(data)
 		}
 	}
 	return total

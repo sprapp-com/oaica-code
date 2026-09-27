@@ -40,7 +40,7 @@ func TestToolCallsAreNotDuplicatedByInterleavedText(t *testing.T) {
 		map[string]any{"type": "tool_use", "id": "call_1", "name": "a", "input": map[string]any{"x": 1}},
 		map[string]any{"type": "text", "text": "thinking out loud"},
 		map[string]any{"type": "tool_use", "id": "call_2", "name": "b", "input": map[string]any{"y": 2}},
-	})
+	}, false)
 
 	var calls []string
 	var textMsgs []map[string]any
@@ -76,7 +76,7 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 
 	onlyBlocks, onlyErr := contentBlocksToOpenAI("user", []any{
 		map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": []any{img}},
-	})
+	}, false)
 	if onlyErr != "" {
 		t.Fatalf("a tool_result image must still be representable as text: %s", onlyErr)
 	}
@@ -94,7 +94,7 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 			map[string]any{"type": "text", "text": "screenshot attached"},
 			img,
 		}},
-	})
+	}, false)
 	if mixedErr != "" {
 		t.Fatalf("a mixed tool_result must still be representable: %s", mixedErr)
 	}
@@ -110,7 +110,7 @@ func TestToolResultWithAnImageIsNotEmptied(t *testing.T) {
 	// A plain string result is still passed through untouched.
 	strBlocks, strErr := contentBlocksToOpenAI("user", []any{
 		map[string]any{"type": "tool_result", "tool_use_id": "call_1", "content": "42"},
-	})
+	}, false)
 	if strErr != "" {
 		t.Fatalf("a plain string tool_result must convert: %s", strErr)
 	}

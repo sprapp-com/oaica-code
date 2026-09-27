@@ -49,6 +49,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -74,7 +75,19 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "body is not valid JSON")
 		return
 	}
-	openai, convErr := anthropicToOpenAI(req)
+	// Whether a nested tool_result image reaches the model is a property of the
+	// MODEL, not of the block: the translation has to know before it flattens
+	// the content, so the roster is read here — under the same lock the
+	// forwarding path takes — rather than in completionHandler, where the
+	// image bytes have already been replaced by a description (2026-09-27
+	// audit, round 38, B-F5).
+	modelID, _ := req["model"].(string)
+	g.mu.RLock()
+	gm, known := g.byID[modelID]
+	g.mu.RUnlock()
+	acceptsImages := known && gm.acceptsImages()
+
+	openai, convErr := anthropicToOpenAI(req, acceptsImages)
 	if convErr != "" {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", convErr)
 		return
@@ -104,7 +117,7 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 // OpenAI chat-completions map. Returns a non-empty error string on
 // structurally impossible input (no messages, non-array content pieces we
 // cannot represent).
-func anthropicToOpenAI(req map[string]any) (map[string]any, string) {
+func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, string) {
 	out := map[string]any{"model": req["model"]}
 	if v, ok := req["max_tokens"]; ok {
 		out["max_tokens"] = v
@@ -131,7 +144,7 @@ func anthropicToOpenAI(req map[string]any) (map[string]any, string) {
 			continue
 		}
 		role, _ := m["role"].(string)
-		converted, convErr := contentBlocksToOpenAI(role, m["content"])
+		converted, convErr := contentBlocksToOpenAI(role, m["content"], acceptsImages)
 		if convErr != "" {
 			return nil, convErr
 		}
@@ -229,7 +242,13 @@ func firstNonEmptyStr(vals ...string) string {
 // OpenAI tool wire carries. Text blocks are joined with newlines; a block of
 // any other type is DESCRIBED in place rather than dropped, so the model can
 // tell "the tool returned an image" from "the tool returned nothing".
-func toolResultText(content any) string {
+//
+// carryImages says the image itself is being sent alongside this text (see
+// toolResultImageParts), in which case an image block contributes NOTHING here:
+// describing a picture the request also attaches would tell the model about a
+// screenshot it can already see, and the client leg — which sends the image —
+// writes no such notice (2026-09-27 audit, round 38, B-F5).
+func toolResultText(content any, carryImages bool) string {
 	switch c := content.(type) {
 	case nil:
 		return ""
@@ -238,11 +257,17 @@ func toolResultText(content any) string {
 	case []any:
 		parts := make([]string, 0, len(c))
 		for _, cb := range c {
-			bm, ok := cb.(map[string]any)
-			if ok && bm["type"] == "text" {
-				if s, ok := bm["text"].(string); ok {
-					parts = append(parts, s)
-					continue
+			if bm, ok := cb.(map[string]any); ok {
+				switch bm["type"] {
+				case "text":
+					if s, ok := bm["text"].(string); ok {
+						parts = append(parts, s)
+						continue
+					}
+				case "image":
+					if carryImages {
+						continue
+					}
 				}
 			}
 			parts = append(parts, describeBlock(cb))
@@ -251,6 +276,47 @@ func toolResultText(content any) string {
 	default:
 		return describeBlock(c)
 	}
+}
+
+// toolResultImageParts renders the image blocks of a tool_result's content as
+// the OpenAI multimodal parts the model can see: a base64 source as a data URL,
+// a url source as itself. Refusing to send them, which this gateway did, made
+// the same body two different prompts: the client leg attaches the screenshot a
+// tool returned and this one replaced it with a one-line notice, and the prompt
+// meter already charged the payload as an image — so the session was billed for
+// a picture the model never received (2026-09-27 audit, round 38, B-F5).
+func toolResultImageParts(content any) []any {
+	blocks, _ := content.([]any)
+	parts := make([]any, 0, len(blocks))
+	for _, cb := range blocks {
+		bm, ok := cb.(map[string]any)
+		if !ok || bm["type"] != "image" {
+			continue
+		}
+		src, _ := bm["source"].(map[string]any)
+		if src == nil {
+			continue
+		}
+		switch st, _ := src["type"].(string); st {
+		case "url":
+			if u, _ := src["url"].(string); u != "" {
+				parts = append(parts, map[string]any{
+					"type": "image_url", "image_url": map[string]any{"url": u}})
+			}
+		case "base64", "":
+			data, _ := src["data"].(string)
+			if data == "" {
+				continue
+			}
+			media, _ := src["media_type"].(string)
+			parts = append(parts, map[string]any{
+				"type": "image_url",
+				"image_url": map[string]any{
+					"url": "data:" + media + ";base64," + data,
+				}})
+		}
+	}
+	return parts
 }
 
 // searchResultText flattens a search_result's content — the passages a search
@@ -335,6 +401,31 @@ func describeBlock(raw any) string {
 			size = len(d)
 		}
 		return fmt.Sprintf("[document tool result omitted: %s, %d bytes of base64]", media, size)
+	case "search_result":
+		// A passage list nested inside a tool result (or inside another
+		// passage list): title, origin and passages, rendered through the same
+		// flattener the message-level case uses. Without this arm the block
+		// fell to the JSON fallback below and took a screenshot's base64 into
+		// the prompt with it, while the client leg describes the identical
+		// block (2026-09-27 audit, round 38, A-F4).
+		var label []string
+		if title, _ := bm["title"].(string); title != "" {
+			label = append(label, title)
+		}
+		switch src := bm["source"].(type) {
+		case string:
+			if src != "" {
+				label = append(label, src)
+			}
+		case map[string]any:
+			if u, _ := src["url"].(string); u != "" {
+				label = append(label, u)
+			}
+		}
+		if body := searchResultText(bm["content"]); body != "" {
+			label = append(label, body)
+		}
+		return strings.Join(label, "\n")
 	}
 	if b, err := json.Marshal(bm); err == nil {
 		return string(b)
@@ -404,7 +495,7 @@ func webSearchErrorText(code any) string {
 // anthropicToOpenAI's own error string so the client gets a 400 naming the
 // block instead of an answer to a silently altered prompt (2026-09-27 audit,
 // round 33, B-F2).
-func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) {
+func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[string]any, string) {
 	if s, ok := content.(string); ok {
 		return []map[string]any{{"role": role, "content": s}}, ""
 	}
@@ -518,11 +609,25 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 			// before that case existed and every turn after it — the blocks
 			// are in the client's history from the moment it is answered
 			// (2026-09-27 audit, round 35, B-F1/A-F4).
-			content := toolResultText(bm["content"])
+			carryImages := acceptsImages && t == "tool_result"
+			content := toolResultText(bm["content"], carryImages)
 			if t == "web_search_tool_result" {
 				content = webSearchResultText(bm["content"])
 			}
 			msg := map[string]any{"role": "tool", "content": content}
+			if carryImages {
+				if parts := toolResultImageParts(bm["content"]); len(parts) > 0 {
+					// The OpenAI wire takes multimodal content on a tool message
+					// the same way it does on a user message; the client leg
+					// already sends this shape.
+					arr := make([]any, 0, len(parts)+1)
+					if content != "" {
+						arr = append(arr, map[string]any{"type": "text", "text": content})
+					}
+					arr = append(arr, parts...)
+					msg["content"] = arr
+				}
+			}
 			if id, ok := bm["tool_use_id"].(string); ok && id != "" {
 				msg["tool_call_id"] = id
 			}
@@ -626,8 +731,8 @@ type anthropicBridge struct {
 	textOpen bool
 	blockIdx int
 	// toolBlocks maps the key toolKey derives for an upstream tool call to the
-	// anthropic block index it is being written into.
-	toolBlocks map[string]int
+	// block it is being written into.
+	toolBlocks map[string]*toolBlock
 	// lastToolKey is the key of the last tool call a delta named, so an
 	// upstream that sends the index-less fragments this wire permits (an
 	// arguments-only continuation) keeps writing into the block it opened.
@@ -638,6 +743,27 @@ type anthropicBridge struct {
 	// synthSeq mints keys for calls whose upstream states neither an index nor
 	// an id, so two such calls cannot share a block.
 	synthSeq int
+}
+
+// toolBlock is one tool call being translated into an Anthropic content block.
+// Its content_block_start is emitted LATE — at the first fragment that names the
+// call or carries arguments — because the start is the only event that can carry
+// a name: an upstream that states an id in one fragment and the name in the next
+// opened the block on the id, and the name that followed had nowhere to go, so
+// the client was handed {"id":"call_1","name":""} and could neither name nor
+// execute the call while stop_reason said tool_use (2026-09-27 audit, round 38,
+// B-F2). The block index is reserved at first sight, so the blocks still appear
+// in upstream order.
+type toolBlock struct {
+	index int
+	id    string
+	name  string
+	// started is whether content_block_start has been emitted for this block.
+	started bool
+	// args is every argument fragment the upstream has stated so far, kept so
+	// toolKey can tell a repeat of the current call's name from the next call's
+	// (see startsANewToolCall's rule, mirrored from the client leg).
+	args strings.Builder
 }
 
 type bridgeSSE struct {
@@ -654,10 +780,19 @@ type bridgeSSE struct {
 	outTok    int
 	finished  bool
 	startSent bool
+	// upstreamErr is the sentence from an error frame the upstream sent INSIDE
+	// the stream. It is the truth about the turn: a stream that states a
+	// failure and then ends is not a turn that finished, whatever the missing
+	// finish_reason would otherwise be read as (round 38, B-F6).
+	upstreamErr string
+	// nonSSE holds the stream's non-"data:" lines, which is all of a whole
+	// completion document sent in answer to a stream request (see
+	// adoptWholeStream).
+	nonSSE bytes.Buffer
 }
 
 func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthropicBridge {
-	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[string]int{}}
+	return &anthropicBridge{ResponseWriter: w, stream: stream, model: model, toolBlocks: map[string]*toolBlock{}}
 }
 
 // WriteHeader records the upstream's status; it does not commit one to the
@@ -767,6 +902,13 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 		return 0, ""
 	}
 	if b.stream {
+		if b.sse.upstreamErr != "" {
+			// The upstream reported a failure inside the stream. Whether or not
+			// events were already sent, the client and the ledger must read the
+			// turn as failed: the stream path answers it with an SSE error event
+			// (finishStream), the not-yet-started one with the status below.
+			return http.StatusBadGateway, b.sse.upstreamErr
+		}
 		if b.sse.startSent {
 			return 0, ""
 		}
@@ -817,10 +959,27 @@ func (b *anthropicBridge) finalize() {
 		writeAnthropicErr(b.ResponseWriter, b.errStatus, "api_error", redactCredentialURLs(strings.TrimSpace(b.errBody.String())))
 		return
 	}
+	if b.stream {
+		// A stream request the upstream answered with ONE completion document
+		// instead of frames (or no frames at all) is ADOPTED as the turn, on
+		// the same reading the client leg's adoptNonSSECompletion makes: the
+		// answer exists, and reporting "upstream returned an empty stream" over
+		// it discarded a turn the upstream had produced and billed (2026-09-27
+		// audit, round 38, B-F4).
+		b.adoptWholeStream()
+	}
 	if status, msg := b.noAnswer(); status != 0 {
-		log.Printf("oaica-gateway: /v1/messages upstream 200 answered %d: %s", status, msg)
-		writeAnthropicErr(b.ResponseWriter, status, "api_error", msg)
-		return
+		// A stream that has already sent events cannot be given a status: the
+		// client is reading SSE, and an error document appended to the event
+		// stream is not an answer it can parse. finishStream emits the failure
+		// as an `error` event instead — the shape the Anthropic wire uses
+		// mid-stream. Nothing has been committed before the first event, so
+		// there the status is still ours to choose.
+		if !(b.stream && b.sse.startSent) {
+			log.Printf("oaica-gateway: /v1/messages upstream 200 answered %d: %s", status, msg)
+			writeAnthropicErr(b.ResponseWriter, status, "api_error", msg)
+			return
+		}
 	}
 	if b.stream {
 		b.finishStream()
@@ -925,6 +1084,14 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 		line := strings.TrimSpace(string(raw[:i]))
 		b.sse.tail.Next(i + 1)
 		if !strings.HasPrefix(line, "data:") {
+			// Kept, not discarded: an upstream that answers a stream request
+			// with a whole completion document sends no "data:" lines at all,
+			// and the adoption below needs the bytes (2026-09-27 audit, round
+			// 38, B-F4). Bounded, and only ever read when nothing was streamed.
+			if b.sse.nonSSE.Len() < 1<<20 {
+				b.sse.nonSSE.WriteString(line)
+				b.sse.nonSSE.WriteByte('\n')
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -993,8 +1160,23 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
+			// A mid-stream failure: an upstream that reports it inside the
+			// stream rather than as a status. The chunk fields above are all
+			// zero for such a frame — it parsed cleanly, contributed nothing,
+			// and the client was sent stop_reason end_turn for a turn that
+			// FAILED, with the ledger recording 200 (2026-09-27 audit, round
+			// 38, B-F6).
+			Error *struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+				Code    any    `json:"code"`
+			} `json:"error"`
 		}
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			b.sse.upstreamErr = upstreamErrorSentence(payload, chunk.Error.Message)
 			continue
 		}
 		if chunk.Usage != nil {
@@ -1015,11 +1197,19 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			if chunk.Usage.CompletionTokens > 0 {
 				b.sse.outTok = chunk.Usage.CompletionTokens
 			}
-			if c := (usage{
-				PromptTokens:         chunk.Usage.PromptTokens,
+			// The hit is read against the MERGED prompt size, not the chunk's
+			// own: cachedTokens clamps a hit above the prompt it belongs to,
+			// and a usage chunk that states the hit while omitting
+			// prompt_tokens (0 here) clamped it to 0 and threw the hit away —
+			// the client's message_delta reported cache_read_input_tokens=0
+			// for a stream whose ledger row recorded 900, so the two records of
+			// the same turn disagreed (2026-09-27 audit, round 38, B-F1).
+			u := usage{
+				PromptTokens:         b.sse.inTok,
 				PromptCacheHitTokens: chunk.Usage.PromptCacheHitTokens,
 				PromptTokensDetails:  chunk.Usage.PromptTokensDetails,
-			}).cachedTokens(); c != 0 {
+			}
+			if c := u.cachedTokens(); c != 0 {
 				b.sse.cacheTok = c
 			}
 		}
@@ -1045,6 +1235,11 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 
 func (b *anthropicBridge) textDelta(s string) {
 	if !b.textOpen {
+		// Any tool block whose start was still held is opened first: the text
+		// block takes the NEXT index, and a start emitted after a
+		// higher-indexed block's start (or after its stop) is an order a client
+		// reassembling by index is entitled to reject.
+		b.startPendingToolBlocks(b.blockIdx)
 		b.textOpen = true
 		b.emit("content_block_start", map[string]any{
 			"type": "content_block_start", "index": b.blockIdx,
@@ -1094,39 +1289,108 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name string) string {
 		b.lastToolKey = "!" + id
 		return b.lastToolKey
 	}
-	if (name != "" && name != b.lastToolName) || b.lastToolKey == "" {
-		b.synthSeq++
-		b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
-		if name != "" {
-			b.lastToolName = name
+	if b.lastToolKey != "" {
+		// The current block's accumulated arguments decide whether this
+		// nameless, id-less fragment continues that call or begins the next:
+		// a fragment that repeats the current call's name while its arguments
+		// are already a COMPLETE JSON object is the next call, which is the
+		// rule the client leg's startsANewToolCall applies to the same wire —
+		// without it two index-less calls to the SAME tool shared one block and
+		// the second call's arguments were concatenated onto the first's, so
+		// the client received one call whose partial_json held two objects
+		// (2026-09-27 audit, round 38, B-F3).
+		if name != "" && b.lastToolName != "" {
+			cur := b.toolBlocks[b.lastToolKey]
+			if name != b.lastToolName || (cur != nil && json.Valid([]byte(strings.TrimSpace(cur.args.String())))) {
+				b.synthSeq++
+				b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+				b.lastToolName = name
+				return b.lastToolKey
+			}
 		}
+		return b.lastToolKey
+	}
+	b.synthSeq++
+	b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+	if name != "" {
+		b.lastToolName = name
 	}
 	return b.lastToolKey
 }
 
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	key := b.toolKey(upIdx, id, name)
-	block, ok := b.toolBlocks[key]
+	tb, ok := b.toolBlocks[key]
 	if !ok {
 		if b.textOpen {
 			b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.blockIdx})
 			b.blockIdx++
 			b.textOpen = false
 		}
-		block = b.blockIdx
+		tb = &toolBlock{index: b.blockIdx}
 		b.blockIdx++
-		b.toolBlocks[key] = block
-		b.emit("content_block_start", map[string]any{
-			"type": "content_block_start", "index": block,
-			"content_block": map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}},
-		})
+		b.toolBlocks[key] = tb
+	}
+	if id != "" && tb.id == "" {
+		tb.id = id
+	}
+	if name != "" && tb.name == "" {
+		tb.name = name
+	}
+	// The start is held until the call can be NAMED, or until there is an
+	// argument to write (a delta cannot precede the block it belongs to). A
+	// fragment that states only an id is not enough to open the block: the
+	// name it will carry later is the one event this stream has no way to
+	// deliver afterwards.
+	if !tb.started && (tb.name != "" || args != "") {
+		b.startPendingToolBlocks(tb.index)
+		b.startToolBlock(tb)
 	}
 	if args != "" {
+		tb.args.WriteString(args)
 		b.emit("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": block,
+			"type": "content_block_delta", "index": tb.index,
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
 		})
 	}
+}
+
+// startPendingToolBlocks opens every held tool block whose index is below the
+// one about to be used, in index order — so a held start can never be emitted
+// after a later block's events.
+func (b *anthropicBridge) startPendingToolBlocks(before int) {
+	for _, tb := range b.toolBlocksByIndex() {
+		if tb.index >= before {
+			return
+		}
+		b.startToolBlock(tb)
+	}
+}
+
+// startToolBlock emits the content_block_start for one tool call, once.
+func (b *anthropicBridge) startToolBlock(tb *toolBlock) {
+	if tb.started {
+		return
+	}
+	tb.started = true
+	b.emit("content_block_start", map[string]any{
+		"type": "content_block_start", "index": tb.index,
+		"content_block": map[string]any{"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]any{}},
+	})
+}
+
+// toolBlocksByIndex returns every tool call's block in ANTHROPIC INDEX order.
+// finishStream used to iterate the map, so the closing content_block_stop events
+// arrived in Go's randomized map order — an order that changes run to run and
+// that a client reassembling blocks by index is entitled to reject
+// (2026-09-27 audit, round 38, B-F7).
+func (b *anthropicBridge) toolBlocksByIndex() []*toolBlock {
+	out := make([]*toolBlock, 0, len(b.toolBlocks))
+	for _, tb := range b.toolBlocks {
+		out = append(out, tb)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].index < out[j].index })
+	return out
 }
 
 // promptSplit returns the uncached and cached parts of the prompt as the
@@ -1162,8 +1426,23 @@ func (b *anthropicBridge) finishStream() {
 	if b.textOpen {
 		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.blockIdx})
 	}
-	for _, block := range b.toolBlocks {
-		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": block})
+	for _, tb := range b.toolBlocksByIndex() {
+		// A block whose start was still held (the upstream never named it and
+		// never sent an argument) is opened here so its stop refers to a block
+		// the client has seen.
+		b.startToolBlock(tb)
+		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": tb.index})
+	}
+	if b.sse.upstreamErr != "" {
+		// The upstream failed inside the stream. The turn ends with the error,
+		// not with a fabricated stop_reason: the events already sent cannot be
+		// un-sent, so the failure is delivered in the shape the Anthropic wire
+		// defines for it, and the ledger row records 502 (noAnswer).
+		b.emit("error", map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": b.sse.upstreamErr},
+		})
+		return
 	}
 	// input_tokens excludes what the upstream served from its prefix cache,
 	// which is reported separately: the two partition prompt_tokens and sum to
@@ -1180,6 +1459,78 @@ func (b *anthropicBridge) finishStream() {
 		},
 	})
 	b.emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+// upstreamErrorSentence renders an error object the upstream sent as a stream
+// frame into the sentence the client and the ledger are told. The message field
+// is the explanation when it is there; the raw frame is the fallback, so a
+// failure that arrives with an unfamiliar shape is still described rather than
+// reduced to "the stream ended".
+func upstreamErrorSentence(payload, message string) string {
+	if strings.TrimSpace(message) != "" {
+		return strings.TrimSpace(message)
+	}
+	trimmed := strings.TrimSpace(payload)
+	if len(trimmed) > 512 {
+		trimmed = trimmed[:512] + "…"
+	}
+	return "upstream error frame: " + redactCredentialURLs(trimmed)
+}
+
+// adoptWholeStream translates a whole OpenAI completion that answered a STREAM
+// request into the event sequence the client is waiting for. It is this leg's
+// counterpart of the client proxy's adoptNonSSECompletion, and it exists for
+// the same reason: an upstream (or a shim in front of one) that ignores
+// stream:true answers with one application/json document, the frame reader
+// finds no "data:" lines, and the turn was refused with "upstream returned an
+// empty stream" and 502 — an answer the upstream had produced and billed was
+// discarded and the ledger recorded the discard (2026-09-27 audit, round 38,
+// B-F4). Returns true when the buffered body was adopted.
+func (b *anthropicBridge) adoptWholeStream() bool {
+	if !b.stream || b.sse.startSent || (b.sse.nonSSE.Len() == 0 && b.sse.tail.Len() == 0) {
+		return false
+	}
+	// Both buffers: a one-line document with no trailing newline is still in
+	// tail, because the frame reader only ever completes a LINE.
+	body := strings.TrimSpace(b.sse.nonSSE.String() + b.sse.tail.String())
+	if body == "" {
+		return false
+	}
+	var resp openAICompletion
+	if json.Unmarshal([]byte(body), &resp) != nil || len(resp.Choices) == 0 {
+		return false
+	}
+	b.sse.startSent = true
+	b.emit("message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": respID(resp.ID), "type": "message", "role": "assistant",
+			"model": b.model, "content": []any{},
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+	choice := resp.Choices[0]
+	if choice.Message.Content != nil && *choice.Message.Content != "" {
+		b.textDelta(*choice.Message.Content)
+	}
+	if r := firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent); r != "" {
+		b.textDelta(r)
+	}
+	for i, tc := range choice.Message.ToolCalls {
+		idx := i
+		b.toolDelta(&idx, tc.ID, firstNonEmptyStr(tc.Function.Name, tc.Name),
+			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+	}
+	if choice.FinishReason != "" {
+		b.sse.stopMsg = choice.FinishReason
+	}
+	u := resp.Usage.nonNegative()
+	if u.PromptTokens > 0 {
+		b.sse.inTok = u.PromptTokens
+	}
+	b.sse.outTok = u.CompletionTokens
+	b.sse.cacheTok = u.cachedTokens()
+	return true
 }
 
 func (b *anthropicBridge) emit(event string, data any) {

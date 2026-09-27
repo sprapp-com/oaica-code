@@ -281,6 +281,49 @@ func (u *openAIUsage) statedPromptTokens() bool {
 	return u != nil && u.PromptTokens > 0
 }
 
+// mergeUsage folds a later chunk's usage object into the accumulated one FIELD
+// BY FIELD. SSE usage is not cumulative: a build may narrate the running counts
+// per chunk and state only what it has just measured, so assigning each chunk
+// whole kept whichever chunk arrived LAST — and a closing usage-only chunk that
+// states the cache hit while omitting prompt_tokens zeroed the prompt it is
+// clamped against, so cachedTokens() returned 0 and the client was told
+// cache_read_input_tokens=0 for a turn the gateway's ledger recorded 900: the
+// two records of the same request disagreed, and a session's cache-efficiency
+// read-out showed a hit as a miss (2026-09-27 audit, round 38, B-F1). Only a
+// positive count is a statement; silence keeps what an earlier chunk stated.
+// The gateway's usage.merge is the same function on the server side.
+func mergeUsage(acc, next *openAIUsage) *openAIUsage {
+	if next == nil {
+		return acc
+	}
+	if acc == nil {
+		clone := *next
+		if next.PromptTokensDetails != nil {
+			d := *next.PromptTokensDetails
+			clone.PromptTokensDetails = &d
+		}
+		return &clone
+	}
+	if next.PromptTokens > 0 {
+		acc.PromptTokens = next.PromptTokens
+	}
+	if next.CompletionTokens > 0 {
+		acc.CompletionTokens = next.CompletionTokens
+	}
+	if next.PromptCacheHitTokens > 0 {
+		acc.PromptCacheHitTokens = next.PromptCacheHitTokens
+	}
+	if next.PromptTokensDetails != nil {
+		if acc.PromptTokensDetails == nil {
+			d := *next.PromptTokensDetails
+			acc.PromptTokensDetails = &d
+		} else if next.PromptTokensDetails.CachedTokens > 0 {
+			acc.PromptTokensDetails.CachedTokens = next.PromptTokensDetails.CachedTokens
+		}
+	}
+	return acc
+}
+
 func (u *openAIUsage) statedCompletionTokens() bool {
 	return u != nil && u.CompletionTokens > 0
 }
@@ -504,6 +547,12 @@ func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 // (api.ImageData carries raw bytes with no type). Defaults to jpeg — vLLM's
 // Qwen3.5 vision preprocessor accepts the common web formats.
 func imageDataURL(img api.ImageData) string {
+	// A source of type "url" is carried as its own URL text (see
+	// anthropic.IsImageURL): the wire takes it as it stands, and encoding it as
+	// base64 would send the upstream a picture of a string.
+	if anthropic.IsImageURL(img) {
+		return string(img)
+	}
 	mime := "image/jpeg"
 	switch {
 	case len(img) >= 8 && img[0] == 0x89 && img[1] == 'P' && img[2] == 'N' && img[3] == 'G':
@@ -2459,7 +2508,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// on the reported usage -- never saw its context grow, never
 			// compacted, and ran straight into the 262k wall (real .46
 			// session at 253,958 tokens, 2026-08-30 16:13 UTC).
-			finalUsage = chunk.Usage
+			finalUsage = mergeUsage(finalUsage, chunk.Usage)
 			if onUsage != nil && chunk.Usage.PromptTokens > 0 {
 				onUsage(chunk.Usage.PromptTokens)
 			}
