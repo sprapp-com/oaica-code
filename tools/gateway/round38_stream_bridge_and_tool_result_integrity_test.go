@@ -35,6 +35,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -265,20 +266,88 @@ func TestANestedToolResultImageReachesAModelThatSees(t *testing.T) {
 }
 
 // TestClosingToolBlocksFollowIndexOrder is B-F7: the closing events must come
-// out in index order.
+// out in index order, and — round 39's half of the same contract — each block's
+// events must bracket its own deltas, never a neighbouring block's.
 func TestClosingToolBlocksFollowIndexOrder(t *testing.T) {
-	b := newAnthropicBridge(httptest.NewRecorder(), true, "m")
-	for i := 9; i >= 0; i-- {
-		b.toolBlocks["?"+string(rune('a'+i))] = &toolBlock{index: i, started: true}
-	}
-	for run := 0; run < 20; run++ {
-		prev := -1
-		for _, tb := range b.toolBlocksByIndex() {
-			if tb.index <= prev {
-				t.Fatalf("the closing content_block_stop events are not in index order: %d after %d (run %d)\nfinishStream iterated a Go map, whose order changes run to run", tb.index, prev, run)
-			}
-			prev = tb.index
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		frame := func(s string) {
+			io.WriteString(w, "data: "+s+"\n\n")
+			f.Flush()
 		}
+		frame(`{"choices":[{"delta":{"content":"Reading the file."}}]}`)
+		frame(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"Read","arguments":"{\"path\":\"a.txt\"}"}}]}}]}`)
+		frame(`{"choices":[{"delta":{"content":"Now the directory."}}]}`)
+		frame(`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"Bash","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`)
+		frame(`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`)
+		io.WriteString(w, "data: [DONE]\n\n")
+		f.Flush()
+	}))
+	defer upstream.Close()
+
+	srv := round38Gateway(t, upstream, nil)
+	stream := round36Stream(t, srv, `{"model":"kat-awq","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"go"}]}`)
+
+	// Every content_block_start opens a block, its stop closes it, and nothing
+	// else may arrive in between: the Anthropic wire is a sequence of bracketed
+	// blocks, and a delta or a start for another block inside one is an order a
+	// client reassembling the message is entitled to reject.
+	open := -1
+	stopped := map[int]bool{}
+	var order []int
+	lines := strings.Split(stream, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "event: ") {
+			continue
+		}
+		ev := strings.TrimSpace(strings.TrimPrefix(line, "event: "))
+		// The event's own data line is the next line that starts with "data: ",
+		// so an event name that appears more than once cannot pick up an earlier
+		// payload.
+		payload := ""
+		for j := i + 1; j < len(lines); j++ {
+			if strings.HasPrefix(lines[j], "data: ") {
+				payload = lines[j]
+				break
+			}
+		}
+		idx := -1
+		if k := strings.Index(payload, `"index":`); k >= 0 {
+			fmt.Sscanf(payload[k:], `"index":%d`, &idx)
+		}
+		switch ev {
+		case "content_block_start":
+			if open != -1 {
+				t.Fatalf("block %d opened while block %d was still open:\n%s", idx, open, stream)
+			}
+			open = idx
+			order = append(order, idx)
+		case "content_block_delta":
+			if open != idx {
+				t.Fatalf("a delta for block %d arrived with block %d open:\n%s", idx, open, stream)
+			}
+		case "content_block_stop":
+			if open != idx {
+				t.Fatalf("block %d stopped while block %d was open:\n%s", idx, open, stream)
+			}
+			stopped[idx] = true
+			open = -1
+		}
+	}
+	if open != -1 {
+		t.Fatalf("the stream ended with block %d still open:\n%s", open, stream)
+	}
+	prev := -1
+	for _, idx := range order {
+		if idx <= prev {
+			t.Errorf("the blocks were opened out of index order: %d after %d\nfinishStream iterated a Go map, whose order changes run to run", idx, prev)
+		}
+		prev = idx
+	}
+	if !stopped[0] || !stopped[1] {
+		t.Errorf("a tool block was never closed: %v\n%s", stopped, stream)
 	}
 }
 

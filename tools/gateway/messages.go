@@ -44,12 +44,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -109,6 +109,13 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	model, _ := req["model"].(string)
 	bridge := newAnthropicBridge(w, stream, model)
+	// The prompt size this request really carries, in the unit the rest of the
+	// gateway measures prompts in: the serialized body with each inline image's
+	// base64 replaced by its allowance. It is what the client is told when the
+	// upstream states no usage at all, rather than the 0 that left a session's
+	// context meter still and its auto-compaction unfired (2026-09-27 audit,
+	// round 39, C-F3).
+	bridge.promptEstimate = promptPayloadBytes(len(nb), openai) / 4
 	g.completionHandler(bridge, r)
 	bridge.finalize()
 }
@@ -260,8 +267,14 @@ func toolResultText(content any, carryImages bool) string {
 			if bm, ok := cb.(map[string]any); ok {
 				switch bm["type"] {
 				case "text":
+					// An empty text block is no text: joined as an empty part it
+					// put a blank line in front of the real content, where the
+					// client leg's copy skips it (2026-09-27 audit, round 39,
+					// A-F6).
 					if s, ok := bm["text"].(string); ok {
-						parts = append(parts, s)
+						if s != "" {
+							parts = append(parts, s)
+						}
 						continue
 					}
 				case "image":
@@ -285,9 +298,17 @@ func toolResultText(content any, carryImages bool) string {
 // tool returned and this one replaced it with a one-line notice, and the prompt
 // meter already charged the payload as an image — so the session was billed for
 // a picture the model never received (2026-09-27 audit, round 38, B-F5).
-func toolResultImageParts(content any) []any {
+//
+// The second return is a notice for every image block that produced NO part —
+// a source with an empty url, a source type this wire cannot express, a base64
+// source with no data. The caller writes them into the tool message's text, so
+// an image the model cannot be shown is STATED rather than erased: dropped in
+// silence, the message was byte-identical to "the tool returned nothing" and the
+// model answered as if the tool had said nothing (2026-09-27 audit, round 39,
+// C-F2).
+func toolResultImageParts(content any) (parts []any, notices []string) {
 	blocks, _ := content.([]any)
-	parts := make([]any, 0, len(blocks))
+	parts = make([]any, 0, len(blocks))
 	for _, cb := range blocks {
 		bm, ok := cb.(map[string]any)
 		if !ok || bm["type"] != "image" {
@@ -295,28 +316,93 @@ func toolResultImageParts(content any) []any {
 		}
 		src, _ := bm["source"].(map[string]any)
 		if src == nil {
+			notices = append(notices, describeBlock(cb))
 			continue
 		}
 		switch st, _ := src["type"].(string); st {
 		case "url":
-			if u, _ := src["url"].(string); u != "" {
-				parts = append(parts, map[string]any{
-					"type": "image_url", "image_url": map[string]any{"url": u}})
+			u, _ := src["url"].(string)
+			if u == "" {
+				notices = append(notices, describeBlock(cb))
+				continue
 			}
+			parts = append(parts, map[string]any{
+				"type": "image_url", "image_url": map[string]any{"url": u}})
 		case "base64", "":
 			data, _ := src["data"].(string)
 			if data == "" {
+				notices = append(notices, describeBlock(cb))
 				continue
 			}
 			media, _ := src["media_type"].(string)
 			parts = append(parts, map[string]any{
 				"type": "image_url",
 				"image_url": map[string]any{
-					"url": "data:" + media + ";base64," + data,
+					"url": "data:" + inlineImageMediaType(media, data) + ";base64," + data,
 				}})
+		default:
+			notices = append(notices, describeBlock(cb))
 		}
 	}
-	return parts
+	return parts, notices
+}
+
+// inlineImageMediaType is the MIME type a data URL is written with: the type the
+// image's own magic bytes name when they name one, and the type the client
+// stated otherwise (jpeg when it stated none). Taking the client's word for it
+// sent the upstream an image/png data URL holding JPEG bytes, which is a picture
+// the backend decode fails on — the client leg sniffs the same bytes for the
+// same reason (2026-09-27 audit, round 39, C-F11). The stated type is preferred
+// over the sibling's blanket jpeg only where the bytes are of a format this
+// sniffer does not know: there the client's own label is the better guess, and
+// the sibling's default would call it a JPEG.
+func inlineImageMediaType(media, data string) string {
+	n := len(data)
+	if n > 32 {
+		n = 32
+	}
+	n -= n % 4 // a base64 quantum, so the head decodes
+	var head []byte
+	if n > 0 {
+		if b, err := base64.StdEncoding.DecodeString(data[:n]); err == nil {
+			head = b
+		}
+	}
+	switch {
+	case len(head) >= 8 && head[0] == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G':
+		return "image/png"
+	case len(head) >= 3 && head[0] == 'G' && head[1] == 'I' && head[2] == 'F':
+		return "image/gif"
+	case len(head) >= 12 && string(head[0:4]) == "RIFF" && string(head[8:12]) == "WEBP":
+		return "image/webp"
+	case len(head) >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF:
+		return "image/jpeg"
+	}
+	if media != "" {
+		return media
+	}
+	return "image/jpeg"
+}
+
+// searchResultOrigin reads a search_result's source — where the passage came
+// from — as the sibling converter does: a bare string, or an object whose
+// `ref` and then `url` carry it. Reading only `url` dropped the origin of a
+// source that stated it as `ref`, so the same body reached the model with and
+// without its provenance depending on which leg served it (2026-09-27 audit,
+// round 39, C-F8).
+func searchResultOrigin(src any) string {
+	switch s := src.(type) {
+	case string:
+		return s
+	case map[string]any:
+		if ref, _ := s["ref"].(string); ref != "" {
+			return ref
+		}
+		if u, _ := s["url"].(string); u != "" {
+			return u
+		}
+	}
+	return ""
 }
 
 // searchResultText flattens a search_result's content — the passages a search
@@ -327,6 +413,11 @@ func toolResultImageParts(content any) []any {
 // (2026-09-27 audit, round 37, A-F1/A-F3).
 func searchResultText(content any) string {
 	switch c := content.(type) {
+	case nil:
+		// A result with no passages has no text. Described, it put the literal
+		// `null` in the prompt as though the search had returned it (2026-09-27
+		// audit, round 39, C-F7).
+		return ""
 	case string:
 		return c
 	case []any:
@@ -334,8 +425,15 @@ func searchResultText(content any) string {
 		for _, cb := range c {
 			bm, ok := cb.(map[string]any)
 			if ok && bm["type"] == "text" {
-				if s, ok := bm["text"].(string); ok && s != "" {
-					parts = append(parts, s)
+				// An empty passage is no passage: it fell through to the
+				// describer and put `{"text":"","type":"text"}` in the prompt as
+				// though the search had returned it, which the sibling converter
+				// has skipped since round 38 (2026-09-27 audit, round 39,
+				// C-F7/A-F6).
+				if s, ok := bm["text"].(string); ok {
+					if s != "" {
+						parts = append(parts, s)
+					}
 					continue
 				}
 			}
@@ -412,15 +510,8 @@ func describeBlock(raw any) string {
 		if title, _ := bm["title"].(string); title != "" {
 			label = append(label, title)
 		}
-		switch src := bm["source"].(type) {
-		case string:
-			if src != "" {
-				label = append(label, src)
-			}
-		case map[string]any:
-			if u, _ := src["url"].(string); u != "" {
-				label = append(label, u)
-			}
+		if origin := searchResultOrigin(bm["source"]); origin != "" {
+			label = append(label, origin)
 		}
 		if body := searchResultText(bm["content"]); body != "" {
 			label = append(label, body)
@@ -568,7 +659,7 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 				}
 				parts = append(parts, map[string]any{
 					"type":      "image_url",
-					"image_url": map[string]any{"url": "data:" + media + ";base64," + data},
+					"image_url": map[string]any{"url": "data:" + inlineImageMediaType(media, data) + ";base64," + data},
 				})
 			default:
 				return nil, fmt.Sprintf("image source.type %q cannot be represented on the OpenAI wire", st)
@@ -614,20 +705,38 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			if t == "web_search_tool_result" {
 				content = webSearchResultText(bm["content"])
 			}
-			msg := map[string]any{"role": "tool", "content": content}
+			var dropped []string
 			if carryImages {
-				if parts := toolResultImageParts(bm["content"]); len(parts) > 0 {
-					// The OpenAI wire takes multimodal content on a tool message
-					// the same way it does on a user message; the client leg
-					// already sends this shape.
+				// The images this model can be shown, and a sentence for each one
+				// it cannot: an image that yields no part is stated in the text
+				// (below), not erased (2026-09-27 audit, round 39, C-F2).
+				var parts []any
+				parts, dropped = toolResultImageParts(bm["content"])
+				if len(parts) > 0 {
+					if content == "" && len(dropped) > 0 {
+						content = strings.Join(dropped, "\n")
+						dropped = nil
+					}
 					arr := make([]any, 0, len(parts)+1)
 					if content != "" {
 						arr = append(arr, map[string]any{"type": "text", "text": content})
 					}
 					arr = append(arr, parts...)
-					msg["content"] = arr
+					msg := map[string]any{"role": "tool", "content": arr}
+					if id, ok := bm["tool_use_id"].(string); ok && id != "" {
+						msg["tool_call_id"] = id
+					}
+					out = append(out, msg)
+					continue
 				}
 			}
+			if len(dropped) > 0 {
+				if content != "" {
+					content += "\n"
+				}
+				content += strings.Join(dropped, "\n")
+			}
+			msg := map[string]any{"role": "tool", "content": content}
 			if id, ok := bm["tool_use_id"].(string); ok && id != "" {
 				msg["tool_call_id"] = id
 			}
@@ -675,15 +784,8 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			if title, _ := bm["title"].(string); title != "" {
 				label = append(label, title)
 			}
-			switch src := bm["source"].(type) {
-			case string:
-				if src != "" {
-					label = append(label, src)
-				}
-			case map[string]any:
-				if u, _ := src["url"].(string); u != "" {
-					label = append(label, u)
-				}
+			if origin := searchResultOrigin(bm["source"]); origin != "" {
+				label = append(label, origin)
 			}
 			content := searchResultText(bm["content"])
 			if content != "" {
@@ -727,12 +829,42 @@ type anthropicBridge struct {
 	errBody     bytes.Buffer
 
 	// stream state
-	sse      bridgeSSE
-	textOpen bool
-	blockIdx int
+	sse bridgeSSE
+	// promptEstimate is the prompt size in tokens this gateway can work out for
+	// itself from the request it just serialized. The upstream states the real
+	// prompt with its usage, and that is what is reported whenever it does; but
+	// an upstream that states NO usage at all left the client's message_delta
+	// with input_tokens:0 — a session whose context meter never moved, so
+	// auto-compaction never fired and the session walked into the context wall.
+	// The client leg has always reported its estimate in that case
+	// (cmd/launch/anthropic_openai_proxy.go, "!statedPrompt && estInputTokens >
+	// 0"); this is the server-side half of the same rule (2026-09-27 audit,
+	// round 39, C-F3).
+	promptEstimate int
+	// cur is the block whose content_block_start has been emitted and whose
+	// content_block_stop has not. The Anthropic wire is strictly sequential — a
+	// block's events bracket its deltas, and no block's events may arrive inside
+	// another's — so nothing opens until this one has closed (2026-09-27 audit,
+	// round 39, B-F7).
+	cur *openBlock
+	// nextIdx is the index the next block to open takes. Indices are assigned in
+	// START order rather than reserved when a tool call is first seen: a call
+	// whose name arrives late is held, and a text block that arrives in between
+	// must take the lower index, or the held block's start would be emitted after
+	// a higher-indexed block's (2026-09-27 audit, round 39, B-F2).
+	nextIdx int
+	// heldText is narration that arrived while a tool call's arguments were still
+	// an unfinished JSON object. Closing that block to open a text block would
+	// make the rest of its arguments undeliverable — half a call's JSON, the
+	// shape round 37's B-F1 closed — so the text waits until the call is closed
+	// and is then delivered as its own block.
+	heldText strings.Builder
 	// toolBlocks maps the key toolKey derives for an upstream tool call to the
 	// block it is being written into.
 	toolBlocks map[string]*toolBlock
+	// toolOrder is every tool block in the order it was first seen, so the sweep
+	// at end of stream is not a walk over a Go map (round 38's B-F7).
+	toolOrder []*toolBlock
 	// lastToolKey is the key of the last tool call a delta named, so an
 	// upstream that sends the index-less fragments this wire permits (an
 	// arguments-only continuation) keeps writing into the block it opened.
@@ -746,24 +878,49 @@ type anthropicBridge struct {
 }
 
 // toolBlock is one tool call being translated into an Anthropic content block.
-// Its content_block_start is emitted LATE — at the first fragment that names the
-// call or carries arguments — because the start is the only event that can carry
-// a name: an upstream that states an id in one fragment and the name in the next
-// opened the block on the id, and the name that followed had nowhere to go, so
-// the client was handed {"id":"call_1","name":""} and could neither name nor
-// execute the call while stop_reason said tool_use (2026-09-27 audit, round 38,
-// B-F2). The block index is reserved at first sight, so the blocks still appear
-// in upstream order.
+// Its content_block_start is emitted LATE — at the first fragment that NAMES the
+// call — because the start is the only event that can carry a name: an upstream
+// that states an id in one fragment and the name in the next opened the block on
+// the id, and the name that followed had nowhere to go, so the client was handed
+// {"id":"call_1","name":""} and could neither name nor execute the call while
+// stop_reason said tool_use (2026-09-27 audit, round 38, B-F2). Arguments that
+// arrive before the name are held in the block and sent as one delta once the
+// block opens.
+//
+// A block with no name is never opened at all. An upstream that never names a
+// call and never finishes one still produces arguments (a fragment with no
+// index, no id and no name), and opening the block for those argued the client
+// into a tool_use it could not execute — the round-39 auditor reached that shape
+// through a bare arguments fragment and through a held block swept at end of
+// stream (2026-09-27 audit, round 39, B-F8).
 type toolBlock struct {
+	// index is the block's index on the wire, assigned when it opens; -1 until
+	// then, because a block that opens later takes a later index (see nextIdx).
 	index int
+	key   string
 	id    string
 	name  string
 	// started is whether content_block_start has been emitted for this block.
 	started bool
+	// closed is whether its content_block_stop has been emitted. A closed block
+	// cannot be reopened: a fragment of its arguments that arrives afterwards can
+	// no longer be delivered (see toolDelta).
+	closed bool
 	// args is every argument fragment the upstream has stated so far, kept so
 	// toolKey can tell a repeat of the current call's name from the next call's
 	// (see startsANewToolCall's rule, mirrored from the client leg).
 	args strings.Builder
+	// emitted counts how much of args has been sent as input_json_delta. It
+	// trails args.Len() while the block is held, so the fragments that arrived
+	// before the name are delivered — in one delta — the moment the block opens.
+	emitted int
+}
+
+// openBlock is the block currently open on the wire: index, and the tool call it
+// belongs to (nil for a text block).
+type openBlock struct {
+	index int
+	tool  *toolBlock
 }
 
 type bridgeSSE struct {
@@ -775,10 +932,24 @@ type bridgeSSE struct {
 	// it: the closing message_delta reports inTok-cacheTok as input_tokens and
 	// cacheTok as cache_read_input_tokens, because Anthropic's input_tokens is
 	// the UNCACHED prompt (2026-09-27 audit, round 23).
-	inTok     int
-	cacheTok  int
-	outTok    int
-	finished  bool
+	inTok    int
+	cacheTok int
+	outTok   int
+	// statedPrompt and statedCompletion are whether the upstream STATED each
+	// count, which is not the same as stating a non-zero one: a fully-cached turn
+	// reports prompt_tokens>0 with all of it cached, and its uncached count is
+	// legitimately 0. When a field was never stated the client is told this
+	// gateway's own estimate instead of a hard 0 — a session that really did grow
+	// then looks flat, and Claude Code sizes auto-compaction on that number
+	// (2026-09-27 audit, round 39, C-F3).
+	statedPrompt     bool
+	statedCompletion bool
+	// outBytes counts the answer's bytes as they are relayed (text and tool
+	// argument fragments), the unit the client leg divides for the same fallback
+	// (streamedText/4 + 1).
+	outBytes int
+	finished bool
+	// startSent is whether message_start has been emitted.
 	startSent bool
 	// upstreamErr is the sentence from an error frame the upstream sent INSIDE
 	// the stream. It is the truth about the turn: a stream that states a
@@ -912,6 +1083,16 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 		if b.sse.startSent {
 			return 0, ""
 		}
+		if _, ok := b.bufferedCompletion(); ok {
+			// No data: line was ever sent, but the body is a whole completion:
+			// finalize adopts it as the turn, so the client reads an answer and
+			// the row must not call it a failure. LedgerStatus asks this
+			// predicate BEFORE finalize runs — the row is written first — so
+			// without this the ledger recorded 502 with zero tokens for a turn
+			// the client was served and the upstream billed (2026-09-27 audit,
+			// round 39, B-F3).
+			return 0, ""
+		}
 		// The upstream ended without a single event. finishStream's own contract
 		// ("the client must always get a well-formed end") cannot be met by an
 		// empty body, and a client reading the stream waits for message_stop —
@@ -941,6 +1122,30 @@ func (b *anthropicBridge) LedgerStatus(upstream int) int {
 		return status
 	}
 	return upstream
+}
+
+// EstimatedUsage reports the counts this bridge measured for itself, for a turn
+// whose upstream stated no usage at all. The recorder reads the upstream's own
+// bytes, so it has nothing to record for such a turn and its row read
+// prompt=0/completion=0/cost=0 — the one record kept of a turn that was served
+// and billed, saying it carried nothing (2026-09-27 audit, round 39, C-F3). The
+// same numbers go out in the client's message_delta, so the row and the client
+// cannot disagree. It reports false when the upstream stated anything, and the
+// recorder's own reading then stands.
+func (b *anthropicBridge) EstimatedUsage() (usage, bool) {
+	if b.sse.statedPrompt || b.sse.statedCompletion {
+		return usage{}, false
+	}
+	u := usage{PromptTokens: b.promptEstimate, CompletionTokens: b.sse.outTok}
+	if !b.sse.statedCompletion {
+		if est := b.outputEstimate(); est > 0 {
+			u.CompletionTokens = est
+		}
+	}
+	if u.PromptTokens <= 0 && u.CompletionTokens <= 0 {
+		return usage{}, false
+	}
+	return u, true
 }
 
 // finalize runs after completionHandler returns: emits the translated body
@@ -1042,6 +1247,24 @@ func (b *anthropicBridge) finalize() {
 	u := resp.Usage.nonNegative()
 	cached := u.cachedTokens()
 	in, out := u.PromptTokens-cached, u.CompletionTokens
+	// The answer's size, in the unit the stream path counts it in, so the
+	// fallback below is one rule for both paths (2026-09-27 audit, round 39,
+	// C-F3).
+	b.sse.outBytes = len(content)
+	if out <= 0 {
+		out = b.outputEstimate()
+	}
+	if u.PromptTokens <= 0 {
+		// Nothing stated about the prompt. Reporting 0 told the client its
+		// context had not grown, and Claude Code sizes auto-compaction on this
+		// field — the estimate below is what this gateway can work out for
+		// itself, which is what the client leg reports in the same case
+		// (2026-09-27 audit, round 39, C-F3).
+		in = b.promptEstimate - cached
+		if in < 0 {
+			in = 0
+		}
+	}
 	b.ResponseWriter.Header().Set("Content-Type", "application/json")
 	b.commit()
 	json.NewEncoder(b.ResponseWriter).Encode(map[string]any{
@@ -1111,42 +1334,9 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 		}
 		var chunk struct {
 			Choices []struct {
-				Delta struct {
-					Content   *string `json:"content"`
-					Reasoning *string `json:"reasoning"`
-					// See the non-stream shape: the same field under
-					// DeepSeek's/vLLM's spelling.
-					ReasoningContent *string `json:"reasoning_content"`
-					ToolCalls        []struct {
-						// A pointer, because the index is optional on this wire
-						// and a zero default filed every call of a stream into
-						// block 0 — the second call's id, name and arguments
-						// were folded into the first call's (2026-09-27 audit,
-						// round 36, B-F2). The sibling client leg made its own
-						// index a pointer for the same upstreams (round 15).
-						Index *int   `json:"index"`
-						ID    string `json:"id"`
-						Type  string `json:"type"`
-						// The identity is NESTED under `function` on this wire,
-						// which is how the same file's non-stream struct and
-						// the client leg's proxy both read it. Read at the top
-						// level, every streamed tool call reached the client as
-						// {"name":"","input":{}} with stop_reason tool_use and
-						// no input_json_delta: the model's chosen tool and its
-						// arguments dropped and the turn answered as a success,
-						// so Claude Code — which always streams — could neither
-						// name nor execute the call (2026-09-27 audit, round
-						// 36, B-F1). The flat spelling is still read: an
-						// upstream that writes it is not refused for it.
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
+				Delta        oaDelta  `json:"delta"`
+				Message      *oaDelta `json:"message"`
+				FinishReason *string  `json:"finish_reason"`
 			} `json:"choices"`
 			Usage *struct {
 				PromptTokens     int `json:"prompt_tokens"`
@@ -1160,23 +1350,20 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
-			// A mid-stream failure: an upstream that reports it inside the
-			// stream rather than as a status. The chunk fields above are all
-			// zero for such a frame — it parsed cleanly, contributed nothing,
-			// and the client was sent stop_reason end_turn for a turn that
-			// FAILED, with the ledger recording 200 (2026-09-27 audit, round
-			// 38, B-F6).
-			Error *struct {
-				Message string `json:"message"`
-				Type    string `json:"type"`
-				Code    any    `json:"code"`
-			} `json:"error"`
+			// Raw, because a failure stated inside the stream is not always an
+			// object: an upstream may send {"error":"upstream ran out of KV
+			// cache"} as a bare string, and modelling only the object made the
+			// whole frame fail to parse — so it was discarded, the client read a
+			// turn that ended normally with stop_reason end_turn, and the ledger
+			// recorded 200 for a request the upstream failed (2026-09-27 audit,
+			// round 39, B-F6).
+			Error json.RawMessage `json:"error"`
 		}
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
 			continue
 		}
-		if chunk.Error != nil {
-			b.sse.upstreamErr = upstreamErrorSentence(payload, chunk.Error.Message)
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			b.sse.upstreamErr = upstreamErrorSentence(payload, errorFrameMessage(chunk.Error))
 			continue
 		}
 		if chunk.Usage != nil {
@@ -1193,38 +1380,43 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			// the ledger row into a credit.
 			if chunk.Usage.PromptTokens > 0 {
 				b.sse.inTok = chunk.Usage.PromptTokens
+				b.sse.statedPrompt = true
 			}
 			if chunk.Usage.CompletionTokens > 0 {
 				b.sse.outTok = chunk.Usage.CompletionTokens
+				b.sse.statedCompletion = true
 			}
-			// The hit is read against the MERGED prompt size, not the chunk's
-			// own: cachedTokens clamps a hit above the prompt it belongs to,
-			// and a usage chunk that states the hit while omitting
-			// prompt_tokens (0 here) clamped it to 0 and threw the hit away —
-			// the client's message_delta reported cache_read_input_tokens=0
-			// for a stream whose ledger row recorded 900, so the two records of
-			// the same turn disagreed (2026-09-27 audit, round 38, B-F1).
-			u := usage{
-				PromptTokens:         b.sse.inTok,
-				PromptCacheHitTokens: chunk.Usage.PromptCacheHitTokens,
-				PromptTokensDetails:  chunk.Usage.PromptTokensDetails,
+			// The hit is REMEMBERED as stated and clamped only when it is
+			// reported (promptSplit), against the prompt that is known by then.
+			// Clamping it here measured it against the prompt known at this
+			// instant — which is zero on a stream that states the hit BEFORE the
+			// prompt size, so a real hit was thrown away and the client was told
+			// cache_read_input_tokens=0 for a turn the ledger row for the same
+			// request recorded 900 (2026-09-27 audit, round 39, B-F4/C-F4).
+			hit := 0
+			if chunk.Usage.PromptTokensDetails != nil {
+				hit = chunk.Usage.PromptTokensDetails.CachedTokens
 			}
-			if c := u.cachedTokens(); c != 0 {
-				b.sse.cacheTok = c
+			if hit <= 0 {
+				hit = chunk.Usage.PromptCacheHitTokens
+			}
+			if hit > 0 {
+				b.sse.cacheTok = hit
 			}
 		}
 		for _, ch := range chunk.Choices {
-			if r := firstNonEmpty(ch.Delta.Reasoning, ch.Delta.ReasoningContent); r != "" {
-				b.textDelta(r)
+			// A whole completion inside a frame carries the same fields as a
+			// delta, under `message`. Relay it when it is the FIRST thing the
+			// stream has said: an upstream emulating streaming around a
+			// non-streaming backend answers this way, and its answer (or its
+			// tool calls) was discarded — the client got a 200 with empty content
+			// and the ledger booked the discard (2026-09-27 audit, round 39,
+			// B-F1). A `message` arriving after content has begun is not the
+			// turn, and only its finish_reason is read.
+			if ch.Message != nil && b.nothingRelayed() {
+				b.relayDelta(*ch.Message)
 			}
-			if ch.Delta.Content != nil && *ch.Delta.Content != "" {
-				b.textDelta(*ch.Delta.Content)
-			}
-			for _, tc := range ch.Delta.ToolCalls {
-				b.toolDelta(tc.Index, tc.ID,
-					firstNonEmptyStr(tc.Function.Name, tc.Name),
-					firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
-			}
+			b.relayDelta(ch.Delta)
 			if ch.FinishReason != nil && *ch.FinishReason != "" {
 				b.sse.stopMsg = *ch.FinishReason
 			}
@@ -1234,20 +1426,76 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 }
 
 func (b *anthropicBridge) textDelta(s string) {
-	if !b.textOpen {
-		// Any tool block whose start was still held is opened first: the text
-		// block takes the NEXT index, and a start emitted after a
-		// higher-indexed block's start (or after its stop) is an order a client
-		// reassembling by index is entitled to reject.
-		b.startPendingToolBlocks(b.blockIdx)
-		b.textOpen = true
-		b.emit("content_block_start", map[string]any{
-			"type": "content_block_start", "index": b.blockIdx,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
+	if b.cur != nil && b.cur.tool != nil {
+		// A tool call is open. Narration arriving between calls means that call's
+		// arguments are as complete as the upstream will make them, so the block
+		// is closed and the text block takes the next index. If its arguments are
+		// still an unfinished JSON object the call is NOT over and the text is
+		// held instead: closing the block would make the rest of the arguments
+		// undeliverable, and the client would be handed a call whose partial_json
+		// stops mid-object — the shape round 37's B-F1 closed.
+		if !json.Valid([]byte(strings.TrimSpace(b.cur.tool.args.String()))) {
+			b.heldText.WriteString(s)
+			return
+		}
+		b.closeOpen()
+	}
+	if b.cur == nil {
+		b.openText()
 	}
 	b.emit("content_block_delta", map[string]any{
-		"type": "content_block_delta", "index": b.blockIdx,
+		"type": "content_block_delta", "index": b.cur.index,
+		"delta": map[string]any{"type": "text_delta", "text": s},
+	})
+}
+
+// openText opens a text block at the next index. The caller has closed whatever
+// was open.
+func (b *anthropicBridge) openText() {
+	idx := b.takeIdx()
+	b.emit("content_block_start", map[string]any{
+		"type": "content_block_start", "index": idx,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+	b.cur = &openBlock{index: idx}
+}
+
+// takeIdx hands out the next wire index. Indices are handed out in the order
+// blocks OPEN, which is the order their events go out, so the client always
+// reads a block's start before that block's deltas and never reads a start
+// inside another block.
+func (b *anthropicBridge) takeIdx() int {
+	idx := b.nextIdx
+	b.nextIdx++
+	return idx
+}
+
+// closeOpen ends the open block, if any. A tool block that closes is marked so:
+// an argument fragment that arrives afterwards belongs to a call the client has
+// already been told is finished, and the wire has no way to reopen it.
+func (b *anthropicBridge) closeOpen() {
+	if b.cur == nil {
+		return
+	}
+	if b.cur.tool != nil {
+		b.cur.tool.closed = true
+	}
+	b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.cur.index})
+	b.cur = nil
+}
+
+// flushHeldText delivers narration that was held behind a tool call whose
+// arguments had not finished. The caller has closed the tool block; the text
+// block that follows takes the next index.
+func (b *anthropicBridge) flushHeldText() {
+	if b.heldText.Len() == 0 {
+		return
+	}
+	s := b.heldText.String()
+	b.heldText.Reset()
+	b.openText()
+	b.emit("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": b.cur.index,
 		"delta": map[string]any{"type": "text_delta", "text": s},
 	})
 }
@@ -1274,7 +1522,7 @@ func (b *anthropicBridge) textDelta(s string) {
 // a stream that states neither an index nor an id shared one block, the second
 // name discarded and its arguments concatenated onto the first's input
 // (2026-09-27 audit, round 37, B-F2).
-func (b *anthropicBridge) toolKey(upIdx *int, id, name string) string {
+func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	if upIdx != nil {
 		if name != "" {
 			b.lastToolName = name
@@ -1299,9 +1547,25 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name string) string {
 		// the second call's arguments were concatenated onto the first's, so
 		// the client received one call whose partial_json held two objects
 		// (2026-09-27 audit, round 38, B-F3).
+		//
+		// A bare repeat — the fragment names the call again and states no
+		// arguments, over a call that has accumulated none — is the second of
+		// two argument-less calls, and it too begins the next call: an empty
+		// argument string is a COMPLETE argument list for a call that takes
+		// none, and reading it as a continuation delivers one tool_use where the
+		// model asked for two (2026-09-27 audit, round 39, B-F9). The cost of
+		// that reading, an upstream that restates the name in a chunk of its
+		// own before sending the arguments, is a call with no arguments — the
+		// other reading's cost is a call the client never hears about, and only
+		// one of the two can be reported to the model at all.
 		if name != "" && b.lastToolName != "" {
 			cur := b.toolBlocks[b.lastToolKey]
-			if name != b.lastToolName || (cur != nil && json.Valid([]byte(strings.TrimSpace(cur.args.String())))) {
+			acc := ""
+			if cur != nil {
+				acc = strings.TrimSpace(cur.args.String())
+			}
+			if name != b.lastToolName || (acc != "" && json.Valid([]byte(acc))) ||
+				(cur != nil && acc == "" && strings.TrimSpace(args) == "") {
 				b.synthSeq++
 				b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
 				b.lastToolName = name
@@ -1319,17 +1583,12 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name string) string {
 }
 
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
-	key := b.toolKey(upIdx, id, name)
+	key := b.toolKey(upIdx, id, name, args)
 	tb, ok := b.toolBlocks[key]
 	if !ok {
-		if b.textOpen {
-			b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.blockIdx})
-			b.blockIdx++
-			b.textOpen = false
-		}
-		tb = &toolBlock{index: b.blockIdx}
-		b.blockIdx++
+		tb = &toolBlock{key: key, index: -1}
 		b.toolBlocks[key] = tb
+		b.toolOrder = append(b.toolOrder, tb)
 	}
 	if id != "" && tb.id == "" {
 		tb.id = id
@@ -1337,60 +1596,71 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	if name != "" && tb.name == "" {
 		tb.name = name
 	}
-	// The start is held until the call can be NAMED, or until there is an
-	// argument to write (a delta cannot precede the block it belongs to). A
-	// fragment that states only an id is not enough to open the block: the
-	// name it will carry later is the one event this stream has no way to
-	// deliver afterwards.
-	if !tb.started && (tb.name != "" || args != "") {
-		b.startPendingToolBlocks(tb.index)
-		b.startToolBlock(tb)
-	}
 	if args != "" {
 		tb.args.WriteString(args)
+	}
+	if tb.closed {
+		// The client has already been told this call is finished, and the wire
+		// has no way to reopen a block: these arguments cannot be delivered. They
+		// stay in the builder, so the block still holds everything the call
+		// stated, and the divergence is a fragment the upstream sent across
+		// another block's events — an interleaving the OpenAI wire permits and
+		// Anthropic's does not (2026-09-27 audit, round 39, B-F7).
+		log.Printf("oaica-gateway: tool call %q sent arguments after its block closed (%d bytes undelivered)", tb.name, len(args))
+		return
+	}
+	if !tb.started {
+		if tb.name == "" {
+			// Nothing can open the block yet: content_block_start is the only
+			// event that carries the name, and a start that goes out without one
+			// can never be corrected. A fragment that states an id, or arguments,
+			// is held (2026-09-27 audit, round 38, B-F2 / round 39, B-F8).
+			return
+		}
+		b.closeOpen()
+		b.flushHeldText()
+		b.closeOpen() // the held text took a block of its own; the call follows it
+		b.startToolBlock(tb)
+	}
+	if tb.emitted < tb.args.Len() {
+		// Everything stated but not yet sent: the fragments that arrived while the
+		// block was held are delivered now, as one delta, so no argument is lost
+		// to the delay in the name.
+		pending := tb.args.String()[tb.emitted:]
+		tb.emitted = tb.args.Len()
 		b.emit("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": tb.index,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": pending},
 		})
 	}
 }
 
-// startPendingToolBlocks opens every held tool block whose index is below the
-// one about to be used, in index order — so a held start can never be emitted
-// after a later block's events.
-func (b *anthropicBridge) startPendingToolBlocks(before int) {
-	for _, tb := range b.toolBlocksByIndex() {
-		if tb.index >= before {
-			return
-		}
-		b.startToolBlock(tb)
-	}
-}
-
-// startToolBlock emits the content_block_start for one tool call, once.
+// startToolBlock emits the content_block_start for one tool call, once. The
+// caller has closed whatever was open.
 func (b *anthropicBridge) startToolBlock(tb *toolBlock) {
 	if tb.started {
 		return
 	}
 	tb.started = true
+	tb.index = b.takeIdx()
 	b.emit("content_block_start", map[string]any{
 		"type": "content_block_start", "index": tb.index,
 		"content_block": map[string]any{"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]any{}},
 	})
+	b.cur = &openBlock{index: tb.index, tool: tb}
 }
 
-// toolBlocksByIndex returns every tool call's block in ANTHROPIC INDEX order.
-// finishStream used to iterate the map, so the closing content_block_stop events
-// arrived in Go's randomized map order — an order that changes run to run and
-// that a client reassembling blocks by index is entitled to reject
-// (2026-09-27 audit, round 38, B-F7).
-func (b *anthropicBridge) toolBlocksByIndex() []*toolBlock {
-	out := make([]*toolBlock, 0, len(b.toolBlocks))
-	for _, tb := range b.toolBlocks {
-		out = append(out, tb)
+// openToolBlocks reports whether any tool call was ever opened for the client.
+// A finish_reason of tool_calls over zero tool blocks claims the model asked for
+// a tool it never named (2026-09-27 audit, round 39, B-F8).
+func (b *anthropicBridge) openToolBlocks() int {
+	n := 0
+	for _, tb := range b.toolOrder {
+		if tb.started {
+			n++
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].index < out[j].index })
-	return out
+	return n
 }
 
 // promptSplit returns the uncached and cached parts of the prompt as the
@@ -1406,14 +1676,25 @@ func (b *anthropicBridge) promptSplit() (fresh, cached int) {
 	if cached < 0 {
 		cached = 0
 	}
-	if cached > b.sse.inTok {
-		cached = b.sse.inTok
+	prompt := b.sse.inTok
+	if prompt <= 0 {
+		// The upstream never stated the prompt size. The hit it DID state is still
+		// what it served from its prefix cache, and it is reported against the
+		// prompt this gateway can work out for itself, not against a prompt of
+		// zero: clamping it there told the client cache_read_input_tokens=0 for a
+		// turn whose ledger row recorded the same hit, which is the round-38
+		// disagreement surviving a different chunk order (2026-09-27 audit,
+		// round 39, B-F4/C-F4). With no estimate either, the hit is all that is
+		// known of the prompt and it is reported as it stands.
+		prompt = b.promptEstimate
+		if prompt <= 0 {
+			prompt = cached
+		}
 	}
-	if cached < 0 {
-		// The prompt itself was stated negative; nothing of it is cached.
-		cached = 0
+	if cached > prompt {
+		cached = prompt
 	}
-	return b.sse.inTok - cached, cached
+	return prompt - cached, cached
 }
 
 // finishStream closes any open block and emits message_delta/message_stop.
@@ -1423,15 +1704,26 @@ func (b *anthropicBridge) finishStream() {
 	if !b.sse.startSent {
 		return // upstream produced no events at all
 	}
-	if b.textOpen {
-		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": b.blockIdx})
-	}
-	for _, tb := range b.toolBlocksByIndex() {
-		// A block whose start was still held (the upstream never named it and
-		// never sent an argument) is opened here so its stop refers to a block
-		// the client has seen.
-		b.startToolBlock(tb)
-		b.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": tb.index})
+	b.closeOpen()
+	b.flushHeldText()
+	b.closeOpen()
+	// A call the upstream never named is not a call the client can make: its
+	// content_block_start could only go out with an empty name (the event that
+	// carries the name has no second chance), so the block is never opened and
+	// whatever arguments arrived are delivered as TEXT — the model's raw output,
+	// which is at least readable — rather than as a tool_use Claude Code would
+	// report as pending and could never run (2026-09-27 audit, round 39, B-F8).
+	for _, tb := range b.toolOrder {
+		if tb.started || tb.args.Len() == 0 {
+			continue
+		}
+		log.Printf("oaica-gateway: a tool call the upstream never named (%d bytes of arguments) is relayed as text", tb.args.Len())
+		b.openText()
+		b.emit("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": b.cur.index,
+			"delta": map[string]any{"type": "text_delta", "text": tb.args.String()},
+		})
+		b.closeOpen()
 	}
 	if b.sse.upstreamErr != "" {
 		// The upstream failed inside the stream. The turn ends with the error,
@@ -1449,13 +1741,33 @@ func (b *anthropicBridge) finishStream() {
 	// it, so a client that adds them sees the real prompt and one that bills
 	// input_tokens bills only the uncached part (2026-09-27 audit, round 23).
 	fresh, cachedTok := b.promptSplit()
+	outTok := b.sse.outTok
+	if !b.sse.statedCompletion {
+		// Nothing stated about the answer's size, so the client is told this
+		// gateway's own count of what it relayed rather than a hard 0 — a turn
+		// whose output_tokens reads 0 looks like a turn that said nothing
+		// (2026-09-27 audit, round 39, C-F3).
+		if est := b.outputEstimate(); est > 0 {
+			outTok = est
+		}
+	}
+	stop := stopReasonOpenAIToAnthropic(b.sse.stopMsg)
+	if stop == "tool_use" && b.openToolBlocks() == 0 {
+		// The upstream said it stopped to call a tool, and no call reached the
+		// client (every one of them was unnamed, or there was none at all).
+		// Reporting tool_use there told Claude Code to wait for a call it will
+		// never receive, on a turn that is over (2026-09-27 audit, round 39,
+		// B-F8).
+		log.Printf("oaica-gateway: upstream stopped with tool_calls but named no call; reporting end_turn")
+		stop = "end_turn"
+	}
 	b.emit("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": stopReasonOpenAIToAnthropic(b.sse.stopMsg), "stop_sequence": nil},
+		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
 		"usage": map[string]any{
 			"input_tokens":            fresh,
 			"cache_read_input_tokens": cachedTok,
-			"output_tokens":           b.sse.outTok,
+			"output_tokens":           outTok,
 		},
 	})
 	b.emit("message_stop", map[string]any{"type": "message_stop"})
@@ -1468,7 +1780,13 @@ func (b *anthropicBridge) finishStream() {
 // reduced to "the stream ended".
 func upstreamErrorSentence(payload, message string) string {
 	if strings.TrimSpace(message) != "" {
-		return strings.TrimSpace(message)
+		// Redacted like every other error this gateway relays: the upstream's
+		// own text can name the URL it failed to reach WITH its credentials in
+		// it (an upstream that echoes back the request it rejected), and the
+		// non-stream path redacts that same text (finalize → redactCredentialURLs).
+		// The mid-stream path was the one place a credential reached the client
+		// unredacted (2026-09-27 audit, round 39, B-F5).
+		return redactCredentialURLs(strings.TrimSpace(message))
 	}
 	trimmed := strings.TrimSpace(payload)
 	if len(trimmed) > 512 {
@@ -1487,17 +1805,11 @@ func upstreamErrorSentence(payload, message string) string {
 // discarded and the ledger recorded the discard (2026-09-27 audit, round 38,
 // B-F4). Returns true when the buffered body was adopted.
 func (b *anthropicBridge) adoptWholeStream() bool {
-	if !b.stream || b.sse.startSent || (b.sse.nonSSE.Len() == 0 && b.sse.tail.Len() == 0) {
+	if !b.stream || b.sse.startSent {
 		return false
 	}
-	// Both buffers: a one-line document with no trailing newline is still in
-	// tail, because the frame reader only ever completes a LINE.
-	body := strings.TrimSpace(b.sse.nonSSE.String() + b.sse.tail.String())
-	if body == "" {
-		return false
-	}
-	var resp openAICompletion
-	if json.Unmarshal([]byte(body), &resp) != nil || len(resp.Choices) == 0 {
+	resp, ok := b.bufferedCompletion()
+	if !ok {
 		return false
 	}
 	b.sse.startSent = true
@@ -1527,10 +1839,123 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	u := resp.Usage.nonNegative()
 	if u.PromptTokens > 0 {
 		b.sse.inTok = u.PromptTokens
+		b.sse.statedPrompt = true
 	}
-	b.sse.outTok = u.CompletionTokens
+	if u.CompletionTokens > 0 {
+		b.sse.outTok = u.CompletionTokens
+		b.sse.statedCompletion = true
+	}
 	b.sse.cacheTok = u.cachedTokens()
 	return true
+}
+
+// bufferedCompletion reports whether the bytes this stream has buffered are a
+// whole OpenAI completion, and returns it. The body is the union of both
+// buffers: a one-line document with no trailing newline is still in tail,
+// because the frame reader only ever completes a LINE. One parser for the two
+// callers — adoption, and the status the ledger is told before adoption runs —
+// so the two can never disagree about whether the turn has an answer
+// (2026-09-27 audit, round 39, B-F3).
+func (b *anthropicBridge) bufferedCompletion() (openAICompletion, bool) {
+	var resp openAICompletion
+	if b.sse.nonSSE.Len() == 0 && b.sse.tail.Len() == 0 {
+		return resp, false
+	}
+	body := strings.TrimSpace(b.sse.nonSSE.String() + b.sse.tail.String())
+	if body == "" {
+		return resp, false
+	}
+	if json.Unmarshal([]byte(body), &resp) != nil || len(resp.Choices) == 0 {
+		return resp, false
+	}
+	return resp, true
+}
+
+// oaDelta is one assistant turn's fields as the OpenAI wire states them, in
+// either of its two shapes: a streamed `delta` and the `message` of a whole
+// completion carry the same content, so the two are read by one struct and
+// relayed by one function (2026-09-27 audit, round 39, B-F1).
+type oaDelta struct {
+	Content   *string `json:"content"`
+	Reasoning *string `json:"reasoning"`
+	// See the non-stream shape: the same field under DeepSeek's/vLLM's spelling.
+	ReasoningContent *string      `json:"reasoning_content"`
+	ToolCalls        []oaToolCall `json:"tool_calls"`
+}
+
+// oaToolCall is one tool call on the OpenAI wire. The index is a POINTER
+// because it is optional here and a zero default filed every call of a stream
+// into block 0 — the second call's id, name and arguments were folded into the
+// first call's (2026-09-27 audit, round 36, B-F2). The identity is also read
+// NESTED under `function`, which is the spelling this wire uses, with the flat
+// one kept as a fallback: read at the top level only, every streamed tool call
+// reached the client as {"name":"","input":{}} with stop_reason tool_use and no
+// input_json_delta (round 36, B-F1).
+type oaToolCall struct {
+	Index    *int   `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// relayDelta writes one turn's content into the bridge: reasoning, then text,
+// then its tool calls. Both wire shapes go through it.
+func (b *anthropicBridge) relayDelta(d oaDelta) {
+	if r := firstNonEmpty(d.Reasoning, d.ReasoningContent); r != "" {
+		b.sse.outBytes += len(r)
+		b.textDelta(r)
+	}
+	if d.Content != nil && *d.Content != "" {
+		b.sse.outBytes += len(*d.Content)
+		b.textDelta(*d.Content)
+	}
+	for _, tc := range d.ToolCalls {
+		b.sse.outBytes += len(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+		b.toolDelta(tc.Index, tc.ID,
+			firstNonEmptyStr(tc.Function.Name, tc.Name),
+			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments))
+	}
+}
+
+// outputEstimate is the answer's size in tokens when the upstream stated no
+// completion count: the bytes relayed divided by four, the same unit the client
+// leg reports for the same case (streamedText/4 + 1, with the +1 there for a
+// non-empty one-byte answer).
+func (b *anthropicBridge) outputEstimate() int {
+	if b.sse.outBytes <= 0 {
+		return 0
+	}
+	return b.sse.outBytes/4 + 1
+}
+
+// nothingRelayed reports whether the stream has said nothing yet — no block
+// opened and no text held — which is the condition for adopting a whole
+// completion that arrives inside a frame as the turn itself.
+func (b *anthropicBridge) nothingRelayed() bool {
+	return b.nextIdx == 0 && len(b.toolOrder) == 0 && b.heldText.Len() == 0
+}
+
+// errorFrameMessage reads the explanation out of a mid-stream error frame,
+// which the wire states either as an object with a message or as a bare string.
+// It returns "" when the frame states neither, and the caller then falls back to
+// the raw frame (upstreamErrorSentence).
+func errorFrameMessage(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var obj struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return strings.TrimSpace(obj.Message)
+	}
+	return ""
 }
 
 func (b *anthropicBridge) emit(event string, data any) {

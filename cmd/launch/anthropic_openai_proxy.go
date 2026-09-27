@@ -248,14 +248,25 @@ func (u *openAIUsage) cachedTokens() int {
 	if c < 0 {
 		return 0
 	}
+	if u.PromptTokens <= 0 {
+		// The prompt was never stated (or was stated as a negative, which is
+		// no statement either), so there is no measurement to clamp against —
+		// and returning 0 here threw a stated hit away. "0" is silence, not a
+		// measurement (see statedPromptTokens): an upstream that narrates the
+		// hit while never stating the prompt size made the client believe the
+		// whole prompt was fresh input, while the gateway's ledger for the
+		// same turn recorded the hit — the round-38 B-F1 disagreement, one
+		// chunk ordering away from the case that was fixed (2026-09-27 audit,
+		// round 39, A-F4).
+		//
+		// No consumer can turn this into a negative input_tokens: each one
+		// either fills the unknown prompt with its own estimate and clamps the
+		// hit against that (UsageFromMetrics, and the non-stream leg's call
+		// site), or patches the hit onto a delta whose prompt it only touches
+		// when the upstream stated one (the streaming tail).
+		return c
+	}
 	if c > u.PromptTokens {
-		// The clamp target is itself unvalidated: a malformed upstream that
-		// states a NEGATIVE prompt_tokens made `0 > -5` true and returned -5,
-		// a cache-read count nobody stated, contradicting this function's own
-		// contract (2026-09-26 audit, fifteenth round).
-		if u.PromptTokens < 0 {
-			return 0
-		}
 		return u.PromptTokens
 	}
 	return c
@@ -388,7 +399,15 @@ type openAIStreamChunk struct {
 // whole — a name repeated on every argument fragment of the same call (which
 // several upstreams do) is not a new call, because the arguments accumulated
 // so far are not yet valid JSON (2026-09-26 audit, fifteenth round).
-func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName string) bool {
+//
+// The one exception is a bare repeat: the delta names the call again and
+// states no arguments over a call that has accumulated none. An empty argument
+// string is a COMPLETE argument list for a call that takes no arguments, so
+// two argument-less calls in one index-less stream are two calls — reading the
+// second as a continuation delivered one tool_use where the model asked for
+// two (2026-09-27 audit, round 39, B-F9). The gateway leg's toolKey applies the
+// same rule to the same wire.
+func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName, deltaArgs string) bool {
 	if accID == "" && accName == "" {
 		return false
 	}
@@ -399,7 +418,10 @@ func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName string) bool
 		return false
 	}
 	raw := strings.TrimSpace(accArgs)
-	return raw != "" && json.Valid([]byte(raw))
+	if raw != "" && json.Valid([]byte(raw)) {
+		return true
+	}
+	return raw == "" && strings.TrimSpace(deltaArgs) == ""
 }
 
 // mapToolChoice converts an Anthropic ToolChoice to an OpenAI tool_choice value.
@@ -2495,7 +2517,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// with all the calls' arguments concatenated into
 					// {"_raw": ...} (2026-09-26 audit, fifteenth round).
 					if acc, exists := toolAccums[syntheticToolSlot]; exists &&
-						startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name) {
+						startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name, tc.Function.Arguments) {
 						syntheticToolSlot++
 					}
 					slot = syntheticToolSlot

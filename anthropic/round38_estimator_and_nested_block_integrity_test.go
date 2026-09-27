@@ -59,8 +59,6 @@ func TestANestedBodyIsEstimatedInOnePass(t *testing.T) {
 func TestEveryBlockTheConverterCarriesIsCharged(t *testing.T) {
 	payload := strings.Repeat("QUJD", 100_000) // 400 KB
 	cases := map[string]ContentBlock{
-		"image": {Type: "image", Source: &ImageSource{
-			Type: "base64", MediaType: "image/png", Data: payload}},
 		"server_tool_use": {Type: "server_tool_use", ID: "srv_1", Name: "web_search",
 			Input: makeArgs("query", payload)},
 		"web_search_tool_result": {Type: "web_search_tool_result", ToolUseID: "srv_1",
@@ -75,6 +73,26 @@ func TestEveryBlockTheConverterCarriesIsCharged(t *testing.T) {
 			t.Errorf("a turn carrying %s of ~%d bytes of content is estimated at %d tokens: the estimate is what middleware/anthropic.go seeds the stream converter's input_tokens with when the upstream states no usage, so the session's context meter never grows and auto-compaction never fires while the prompt walks into the upstream's real limit",
 				name, len(payload), got)
 		}
+	}
+
+	// An image is the exception, and deliberately so (round 39, A-F3): it is
+	// charged the inline allowance rather than its base64 length, which is what
+	// the product's other two prompt-size measures do — cmd/launch's
+	// prompt_payload_bytes and tools/gateway's imagePartByteAllowance, both
+	// 4096 bytes an image. Charging the base64 here made one measure disagree
+	// with the two it is meant to agree with: this is a 400 KB image, and the
+	// estimate must not move with it.
+	imageAt := func(data string) int {
+		return EstimateInputTokens(MessagesRequest{Model: "m", MaxTokens: 64,
+			Messages: []MessageParam{{Role: "user", Content: []ContentBlock{
+				{Type: "image", Source: &ImageSource{Type: "base64", MediaType: "image/png", Data: data}}}}}})
+	}
+	big, small := imageAt(payload), imageAt("QUJD")
+	if big != small {
+		t.Errorf("a %d-byte image is estimated at %d tokens and a 4-byte one at %d: an image is charged the inline allowance, not its base64 length, as in the other two measures", len(payload), big, small)
+	}
+	if big < 1000 {
+		t.Errorf("a turn carrying an image is estimated at %d tokens, want the 4096-byte allowance to be charged", big)
 	}
 }
 

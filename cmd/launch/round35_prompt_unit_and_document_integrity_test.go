@@ -142,23 +142,24 @@ func TestABinaryDocumentIsRefusedOnBothLegs(t *testing.T) {
 	}
 }
 
-// TestAnEmptyConversationIsNotSentAsNull: a turn whose every block the
-// conversion does not forward converts to no messages, and json.Marshal writes
+// TestAnEmptyConversationIsNotSentAsNull: a turn that carries no block the
+// conversion forwards at all converts to no messages, and json.Marshal writes
 // that as `"messages":null` — a malformed body the upstream answers with a 400
 // worded for an OpenAI client, matched by no recovery path this proxy knows.
+//
+// The body is an EMPTY content list, and since round 39 that is the only shape
+// that still reaches the guard: an unknown block TYPE is now refused by name
+// (C-F5) instead of counted and dropped, so the all-unrepresentable turn this
+// test used to send no longer converts to no messages — it converts to nothing
+// at all, with the type named. An empty content list is what is left of that
+// class, and it is reachable from a client that has nothing to say yet. The
+// supersession is pinned by TestAnUnknownBlockTypeIsRefusedByName below.
+// (2026-09-27 audit, round 37, A-F5 had already re-pointed this test off a
+// search_result, which round 36 taught the converter to forward.)
 func TestAnEmptyConversationIsNotSentAsNull(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 
-	body := round34MessagesBody(t, "user", []map[string]any{
-		{"type": "some_future_block", "text": "unrepresentable"},
-		// A second block the converter does not forward. This used to be a
-		// search_result, which the round-36 converter gained a case for: its
-		// title now reaches the prompt, so the turn was no longer the
-		// all-unrepresentable one this test is named for and both of its
-		// assertions passed for a reason unrelated to the guard (2026-09-27
-		// audit, round 37, A-F5).
-		{"type": "another_future_block", "text": "also unrepresentable"},
-	}, 4096)
+	body := round34MessagesBody(t, "user", []map[string]any{}, 4096)
 
 	var anthReq anthropic.MessagesRequest
 	if err := json.Unmarshal(body, &anthReq); err != nil {
@@ -177,6 +178,34 @@ func TestAnEmptyConversationIsNotSentAsNull(t *testing.T) {
 	}
 	if !bytes.Contains(wire, []byte(`"messages":[{`)) {
 		t.Errorf("the converted body has no user turn in it (the conversation really is empty of representable content, so an empty turn is the honest request): %s", wire)
+	}
+}
+
+// TestAnUnknownBlockTypeIsRefusedByName is the round-39 supersession of the
+// body this file's guard test used to send. An unknown block type was counted
+// and dropped here, which made the turn an empty one — answered 200 with the
+// block missing from the prompt and nothing said to the client. The gateway
+// leg refuses the same body in words, so one request was a 400 on one leg and
+// an answer to an altered prompt on the other (2026-09-27 audit, round 39,
+// C-F5). The refusal must name the type: without the name a client cannot tell
+// "you dropped my block" from a bug.
+func TestAnUnknownBlockTypeIsRefusedByName(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+
+	body := round34MessagesBody(t, "user", []map[string]any{
+		{"type": "some_future_block", "text": "unrepresentable"},
+	}, 4096)
+
+	var anthReq anthropic.MessagesRequest
+	if err := json.Unmarshal(body, &anthReq); err != nil {
+		t.Fatal(err)
+	}
+	_, err := anthropic.FromMessagesRequest(anthReq)
+	if err == nil {
+		t.Fatal("a block type the converter cannot represent must fail the turn: answered 200, the block is missing from the prompt and the client is never told")
+	}
+	if !strings.Contains(err.Error(), "some_future_block") {
+		t.Errorf("the refusal does not name the type it refused: %v", err)
 	}
 }
 

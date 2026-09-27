@@ -1708,9 +1708,20 @@ func TestEstimateTokens_WithThinking(t *testing.T) {
 
 	tokens := estimateTokens(req)
 
-	// Thinking content should be counted
-	if tokens < 10 {
-		t.Errorf("expected at least 10 tokens with thinking content, got %d", tokens)
+	// Thinking content is charged NOTHING (round 39, C-F13): the reasoning a
+	// client echoes back is not prompt text on any wire this fork speaks — it
+	// is never projected onto an OpenAI message and no chat template renders
+	// it — so the estimate must be identical to the same body without the
+	// block. Charging it billed the context meter for text the model is not
+	// asked about.
+	without := CountTokensRequest{Model: req.Model, Messages: []MessageParam{
+		{Role: "user", Content: textContent("Hello")},
+		{Role: "assistant", Content: []ContentBlock{
+			{Type: "text", Text: strPtrT("Here is my response.")},
+		}},
+	}}
+	if want := estimateTokens(without); tokens != want {
+		t.Errorf("estimate with a thinking block = %d, want %d (the same body without it): thinking is not prompt text", tokens, want)
 	}
 }
 

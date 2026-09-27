@@ -552,7 +552,6 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	documentBinaryBlocks := 0
 	searchResultBlocks := 0
 	searchResultTextBlocks := 0
-	unknownBlocks := 0
 
 	for _, block := range msg.Content {
 		switch block.Type {
@@ -755,7 +754,15 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 			}
 
 		default:
-			unknownBlocks++
+			// A block of a type this converter does not name used to be
+			// COUNTED and dropped: the turn was answered 200 with the block
+			// missing from the prompt and nothing said to the client about it
+			// (an image-only or unknown-only message left an empty user turn).
+			// The gateway leg refuses the same body in words, so the same
+			// request was a 400 on one leg and an answer to an altered prompt
+			// on the other (2026-09-27 audit, round 39, C-F5). Naming the type
+			// is what lets a client tell "you dropped my block" from a bug.
+			return nil, fmt.Errorf("content block type %q cannot be represented on the OpenAI wire", block.Type)
 		}
 	}
 
@@ -794,7 +801,6 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		"document_binary_dropped", documentBinaryBlocks,
 		"search_result", searchResultBlocks,
 		"search_result_text", searchResultTextBlocks,
-		"unknown", unknownBlocks,
 		"messages", TraceAPIMessages(messages),
 	)
 
@@ -1366,12 +1372,44 @@ func shortToolCallID(key string) string {
 // data URL — refusing the block instead was a divergence from the gateway leg,
 // which forwards the same source, so one body was answered with a 400 here and
 // with a request the model could see there (2026-09-27 audit, round 38, A-F3).
-// The prefixes cannot collide with decoded image bytes: every format this
-// converter meets starts with a magic number (PNG's 0x89, JPEG's 0xFF, GIF's
-// 'G', RIFF's "RIFF"), never with an ASCII scheme.
+//
+// The test is what a URL IS — a scheme (or a protocol-relative "//"), on the
+// trimmed string — not the three lowercase prefixes it started as. Matching
+// only "http://"/"https://"/"data:" re-encoded a url source the client wrote
+// as "HTTPS://…" or "ftp://…" into a JPEG of the address text, so the model
+// was asked about a picture of a URL and the backend was never sent the image
+// the client pointed at (2026-09-27 audit, round 39, A-F1/C-F9). Every format
+// this converter accepts starts with a magic number (PNG's 0x89, JPEG's 0xFF,
+// GIF's 'G', RIFF's "RIFF"), none of which spells a scheme — and the base64
+// arm of resolveImageSource refuses a payload that decodes to one, so a byte
+// string can only reach here as bytes.
 func IsImageURL(img api.ImageData) bool {
-	s := string(img)
-	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "data:")
+	return isURLText(string(img))
+}
+
+// isURLText reports whether s reads as a URL: "//" (protocol-relative),
+// "data:" case-insensitively, or an alpha scheme followed by "://".
+func isURLText(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "//") {
+		return true
+	}
+	if len(s) >= 5 && strings.EqualFold(s[:5], "data:") {
+		return true
+	}
+	i := strings.Index(s, "://")
+	if i <= 0 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := s[j]
+		alpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		tail := (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
+		if !alpha && !(j > 0 && tail) {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveImageSource(source *ImageSource) (api.ImageData, error) {
@@ -1381,7 +1419,10 @@ func resolveImageSource(source *ImageSource) (api.ImageData, error) {
 			return nil, errors.New(`invalid image source type: url, with no url`)
 		}
 		return api.ImageData(source.URL), nil
-	case "base64":
+	case "base64", "":
+		// "" is the source a client spells as media_type+data with no type.
+		// Refusing it 400'd a body the gateway leg has always read (2026-09-27
+		// audit, round 39, C-F10).
 		if source.Data == "" {
 			// An empty payload decodes to zero bytes with no error, and the
 			// blank image was carried into the request as a part the upstream
@@ -1393,6 +1434,15 @@ func resolveImageSource(source *ImageSource) (api.ImageData, error) {
 		decoded, err := base64.StdEncoding.DecodeString(source.Data)
 		if err != nil {
 			return nil, fmt.Errorf("invalid base64 image data: %w", err)
+		}
+		if isURLText(string(decoded)) {
+			// A source that says "base64" and decodes to a URL is not an image.
+			// Byte-sniffing sent it on as a URL the client never named — the
+			// picture was dropped and the backend was told to fetch an address
+			// out of the payload (2026-09-27 audit, round 39, A-F1, direction
+			// 1). The gateway leg refuses the same payload, so the two legs
+			// answer one body one way.
+			return nil, errors.New("invalid image source: base64 data decodes to a URL, not image bytes")
 		}
 		return decoded, nil
 	default:
@@ -1607,7 +1657,13 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 		for _, cb := range c {
 			cbMap, ok := cb.(map[string]any)
 			if !ok {
-				continue
+				// A non-object element is not a content block: it was skipped
+				// here and json.Marshal'd into the prompt by the gateway leg,
+				// so the same body reached the model as two different prompts
+				// ("after" vs "1\n\"x\"\nafter"). One rule at both depths on
+				// both legs: refuse it, and name what was refused (2026-09-27
+				// audit, round 39, C-F6).
+				return "", nil, errors.New("tool_result content holds an element that is not a JSON object")
 			}
 
 			switch cbMap["type"] {
@@ -1658,6 +1714,16 @@ func convertToolResultContent(content any) (string, []api.ImageData, error) {
 				}
 				if rawData, ok := rawSource["data"].(string); ok {
 					source.Data = rawData
+				}
+				// The url is copied for the same reason the three fields above
+				// are: this arm hand-builds the source, and a field it does not
+				// copy is a field resolveImageSource cannot see. A nested url
+				// source was therefore refused with "url, with no url" — a body
+				// the gateway leg forwards to the model — so the same screenshot
+				// reached the model or was lost depending on which leg served
+				// the turn (2026-09-27 audit, round 39, C-F1/A-F2).
+				if rawURL, ok := rawSource["url"].(string); ok {
+					source.URL = rawURL
 				}
 
 				img, err := resolveImageSource(&source)
@@ -1797,15 +1863,12 @@ func countContentItem(item any) int {
 	if s, ok := m["text"].(string); ok {
 		total += len(s)
 	}
-	if s, ok := m["thinking"].(string); ok {
-		total += len(s)
-	}
 	switch t, _ := m["type"].(string); t {
 	case "tool_use", "tool_result":
-		// The block's own JSON, exactly as the typed arm charges it.
-		if data, err := json.Marshal(m); err == nil {
-			total += len(data)
-		}
+		// The block's own JSON, exactly as the typed arm charges it — with the
+		// inline binary held to the image allowance, so a nested payload the
+		// converter DESCRIBES is not billed as its transport encoding.
+		total += clampedJSONBytes(m)
 	case "document":
 		if src, ok := m["source"].(map[string]any); ok {
 			data, _ := src["data"].(string)
@@ -1813,7 +1876,7 @@ func countContentItem(item any) int {
 			total += len(data) + len(ref)
 		}
 	case "image":
-		total += imageSourceBytes(m["source"])
+		total += imageBlockBytes(m["source"])
 	case "search_result":
 		if title, ok := m["title"].(string); ok {
 			total += len(title)
@@ -1834,7 +1897,9 @@ func countContentItem(item any) int {
 
 // imageSourceBytes is the content a block's `source` carries, in either
 // spelling: a base64 payload, a bare-string reference (a search_result's URL),
-// or the url field of the object form.
+// or the url field of the object form. It charges a REFERENCE — the search
+// result's origin, which the converter writes into the prompt as text — not an
+// image's payload, which imageBlockBytes charges.
 func imageSourceBytes(source any) int {
 	switch s := source.(type) {
 	case string:
@@ -1848,19 +1913,105 @@ func imageSourceBytes(source any) int {
 	return 0
 }
 
+// inlineImageByteAllowance is the bytes one inline image is charged, the unit
+// cmd/launch/prompt_payload_bytes.go (inlineImageByteAllowance) and
+// tools/gateway/main.go (imagePartByteAllowance) already use. The product has
+// three prompt-size measures and this one charged an image its whole base64 —
+// 133 335 tokens for a 400 KB PNG where the client leg's own unit charged
+// 4 210 bytes for the same body. That is 127×, and it is the wrong direction:
+// the estimate seeds the client-visible input_tokens on /v1/messages, so an
+// image-bearing turn reported a prompt far larger than the model was sent and
+// the session compacted early (2026-09-27 audit, round 39, A-F3).
+const inlineImageByteAllowance = 4096
+
+// imageBlockBytes charges one image block: the allowance when the source
+// carries anything to show, nothing when it carries nothing. The converter
+// sends a url source as a reference rather than bytes, and the allowance
+// replaces the URL too — matching prompt_payload_bytes.go, which charges the
+// same 4 096 bytes for a url-sourced image (2026-09-27 audit, round 39, A-F3).
+func imageBlockBytes(source any) int {
+	switch s := source.(type) {
+	case string:
+		if s == "" {
+			return 0
+		}
+	case map[string]any:
+		data, _ := s["data"].(string)
+		url, _ := s["url"].(string)
+		ref, _ := s["ref"].(string)
+		if data == "" && url == "" && ref == "" {
+			return 0
+		}
+	default:
+		return 0
+	}
+	return inlineImageByteAllowance
+}
+
+// clampedJSONBytes is len(json.Marshal(v)) with every inline binary payload in
+// it held to the image allowance. The converter DESCRIBES a nested payload
+// rather than pasting it (a 400 KB image nested in a tool_result is carried as
+// a 74-byte notice), so serializing the enclosing block pasted the base64 back
+// in and billed a 74-byte prompt as 100 051 tokens. The clamp is the same
+// distinction the converter draws, in bytes (2026-09-27 audit, round 39, A-F3).
+func clampedJSONBytes(v any) int {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(data) - binaryOverflow(v)
+}
+
+// binaryOverflow is the length by which serializing v overstates the prompt:
+// the base64 beyond the allowance, for every image or non-text document source
+// anywhere inside it. A text document's data is left alone — the converter
+// pastes that into the prompt, so it is charged in full.
+func binaryOverflow(v any) int {
+	switch t := v.(type) {
+	case map[string]any:
+		total := 0
+		if typ, _ := t["type"].(string); typ == "image" || typ == "document" {
+			if src, ok := t["source"].(map[string]any); ok {
+				if st, _ := src["type"].(string); st != "text" {
+					if d, ok := src["data"].(string); ok && len(d) > inlineImageByteAllowance {
+						total += len(d) - inlineImageByteAllowance
+					}
+				}
+			}
+		}
+		for _, x := range t {
+			total += binaryOverflow(x)
+		}
+		return total
+	case []any:
+		total := 0
+		for _, x := range t {
+			total += binaryOverflow(x)
+		}
+		return total
+	}
+	return 0
+}
+
 func countContentBlock(block ContentBlock) int {
 	total := 0
 	if block.Text != nil {
 		total += len(*block.Text)
 	}
-	if block.Thinking != nil {
-		total += len(*block.Thinking)
-	}
+	// A thinking block is charged NOTHING, and a redacted one never was. The
+	// reasoning a client echoes back in its history is not prompt text on any
+	// wire this fork speaks (api.Message.Thinking is never projected onto an
+	// OpenAI message, and is not rendered by a chat template), so charging it
+	// billed the context meter for text the model is not asked about: a 700 KB
+	// thinking blob — with a 400 KB redacted one beside it — took the estimate
+	// from 5 502 tokens to 180 502 while the converted prompt was byte-for-byte
+	// the same 22 084 bytes. The estimate seeds the client-visible input_tokens
+	// when the upstream states nothing, so the session's meter and its
+	// auto-compaction read a prompt 32× its real size (2026-09-27 audit, round
+	// 39, C-F13).
 	switch block.Type {
 	case "tool_use", "tool_result":
-		if data, err := json.Marshal(block); err == nil {
-			total += len(data)
-		}
+		total += clampedJSONBytes(block)
 	case "document":
 		// A text source's data is written into the prompt by the converter and
 		// was charged nothing here, so a turn whose newest message was a large
@@ -1884,14 +2035,16 @@ func countContentBlock(block ContentBlock) int {
 			total += len(block.Source.Ref) + len(block.Source.URL)
 		}
 	case "image":
-		// The payload of an image the converter CARRIES (as request bytes, not
-		// as prompt text) is content the session pays for: it seeds the
-		// estimate, and an estimate of 1 token for a 400 KB screenshot left the
-		// context meter still and auto-compaction unfired while the prompt
-		// walked into the upstream's real limit. The decoded path charged the
-		// same omission (2026-09-27 audit, round 38, A-F2).
+		// An image the converter carries is content the session pays for, and
+		// the estimate charges it the same way the product's other two
+		// prompt-size measures do: the inline allowance, not the base64. See
+		// imageBlockBytes (2026-09-27 audit, round 39, A-F3).
 		if block.Source != nil {
-			total += len(block.Source.Data) + len(block.Source.URL) + len(block.Source.Ref)
+			total += imageBlockBytes(map[string]any{
+				"data": block.Source.Data,
+				"url":  block.Source.URL,
+				"ref":  block.Source.Ref,
+			})
 		}
 	case "server_tool_use", "web_search_tool_result":
 		// The same omission, two types over: a server tool call and its
