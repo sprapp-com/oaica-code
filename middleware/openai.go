@@ -106,6 +106,10 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
 				u := openai.ToUsage(chatResponse)
 				c.Usage = &u
+				// The OpenAI clients that read timings want them beside the usage
+				// trailer; safeDiv guards the divisions a zero-duration run would make
+				// NaN (upstream 16b4376ae).
+				c.Timings = openai.ToTimings(chatResponse.Metrics)
 				c.Choices = []openai.ChunkChoice{}
 				d, err := json.Marshal(c)
 				if err != nil {
@@ -175,6 +179,7 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 			if w.streamOptions != nil && w.streamOptions.IncludeUsage {
 				u := openai.ToUsageGenerate(generateResponse)
 				c.Usage = &u
+				c.Timings = openai.ToTimings(generateResponse.Metrics)
 				c.Choices = []openai.CompleteChunkChoice{}
 				d, err := json.Marshal(c)
 				if err != nil {
