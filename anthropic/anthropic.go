@@ -2460,6 +2460,9 @@ func conversationBytes(messages []MessageParam, system any) int {
 		system bool
 		text   string // the text the converter writes, for a system entry
 		bytes  int    // the charge for this entry as it stands
+		// toolResults counts the blocks of this turn that become their OWN
+		// role-"tool" messages (see the rewrite's charge below).
+		toolResults int
 	}
 	entries := make([]entry, 0, len(messages)+1)
 	if text, present := topLevelSystemText(system); present {
@@ -2502,13 +2505,21 @@ func conversationBytes(messages []MessageParam, system any) int {
 			// message only when it is text-only and its text is blank: a
 			// whitespace-only one is dropped (and is not content), while one
 			// carrying an image or a call is kept whatever its text says.
-			if (ownRuns > 0 || resultsStated > 0) && (strings.TrimSpace(text) != "" || !textOnly) {
+			//
+			// A stated tool result is content on its own terms: the hoist never
+			// sees it as a system message at all, because the converter wrote it
+			// as a role-"tool" message the prompt carries whatever this turn's
+			// text says. It is asked of the whole turn and not of the text
+			// below, so the question does not depend on the block being text
+			// (2026-09-28 audit, round 61, F61-L1-2).
+			if resultsStated > 0 || (ownRuns > 0 && (strings.TrimSpace(text) != "" || !textOnly)) {
 				carriesContent = true
 			}
 			entries = append(entries, entry{
-				system: true,
-				text:   text,
-				bytes:  role + countAnyContent(msg.Content),
+				system:      true,
+				text:        text,
+				bytes:       role + countAnyContent(msg.Content),
+				toolResults: toolResults,
 			})
 			continue
 		}
@@ -2566,6 +2577,23 @@ func conversationBytes(messages []MessageParam, system any) int {
 	for _, e := range entries {
 		if !e.system {
 			total += e.bytes
+			continue
+		}
+		// A system turn the converter writes a SEPARATE message for: each of its
+		// tool results becomes a role-"tool" message that the hoist keeps beside
+		// the merged system string, and the merge carries the turn's text alone.
+		// Charging the whole entry in the joined branch would bill its text
+		// twice, and charging nothing — which is what the joined branch did —
+		// dropped the result from the prompt the client was billed for: the
+		// 62-byte prompt of a system turn holding one result cost 13 tokens with
+		// a blank system message beside it and 13 without, but a result-only turn
+		// was billed nothing at all for the message it becomes (2026-09-28 audit,
+		// round 61, F61-L1-2; round 60 had already taught the same arm to count a
+		// stated result as content so the fallback is not taken).
+		if e.toolResults > 0 {
+			if extra := e.bytes - len(e.text); extra > 0 {
+				total += extra
+			}
 		}
 	}
 	joined, sysTexts := 0, 0
@@ -2644,20 +2672,61 @@ func topLevelSystemText(system any) (string, bool) {
 // audit, round 60, F60-L1-1).
 func systemContentIsTextOnly(content []ContentBlock) bool {
 	for _, block := range content {
-		if blockWritesText(block) || blockWritesNothing(block) {
-			continue
+		if blockKeepsSystemMessage(block) {
+			return false
 		}
-		return false
 	}
 	return true
 }
 
+// blockKeepsSystemMessage reports whether the converter writes this block INTO
+// the converted message as something the hoist's merge would lose — an image, a
+// tool call, or replayed reasoning. Those three are the three fields of
+// api.Message that systemMessageIsTextOnly reads (Images, ToolCalls, Thinking),
+// and they are the answer to the merge question because merging concatenates
+// the message's TEXT alone.
+//
+// Every other block says nothing about it, and asking the client's block TYPES
+// instead (round 58's blockWritesText/blockWritesNothing pair) made the answer
+// wrong in two directions at once:
+//
+//   - a block that writes NOTHING into the run is not a reason to refuse the
+//     merge. A text block with no `text` key (the converter writes no run for
+//     it — convertMessage's text arm writes `block.Text != nil`), a redacted
+//     thinking block, an empty thinking block and an empty search_result all
+//     leave the converted message exactly as blank as a `""` text block does,
+//     and the hoist DELETES that message either way. Refusing the merge sent the
+//     charge to the as-is branch, where the blank message beside it survived and
+//     was billed: `{"type":"text"}` in a system turn cost 25004 tokens against
+//     the 1 token the same converted 32-byte prompt cost spelled with `"text":""`
+//     (2026-09-28 audit, round 61, F61-L1-1 — the same overcharge round 60 fixed
+//     for a document, one block type over).
+//   - a block the converter writes as a SEPARATE message is not a reason to
+//     refuse it either. A tool_result and a web_search_tool_result become their
+//     own role-"tool" messages (convertMessage sets cur = nil), which the hoist
+//     keeps beside the merged system string and never merges into it; the
+//     converted system message is left with no images, calls or reasoning, so it
+//     IS text-only. Read as "not text", a system turn holding one refused the
+//     merge and charged 25014 against the 13 its own 62-byte prompt costs
+//     (2026-09-28 audit, round 61, F61-L1-2).
+func blockKeepsSystemMessage(block ContentBlock) bool {
+	switch block.Type {
+	case "image", "tool_use", "server_tool_use":
+		return true
+	case "thinking":
+		// The converter joins this block's text into the run only when the
+		// pointer is set; an empty one writes nothing.
+		return block.Thinking != nil && *block.Thinking != ""
+	}
+	return false
+}
+
 // blockWritesText reports whether convertMessage writes this block into the
 // run's TEXT — the three arms that do: a text block, a document with an inline
-// text source, and a search_result carrying a passage. They are what leaves a
-// converted system message text-only (see systemContentIsTextOnly); every other
-// block it writes either carries an image, a call or reasoning, or writes
-// nothing at all (blockWritesNothing).
+// text source, and a search_result carrying a passage. It is the reader
+// joinedMessageText walks, and the text it names is what the system hoist's
+// merge carries; whether a system message is text-only is not this question and
+// is asked by blockKeepsSystemMessage.
 //
 // A block whose source makes the converter REFUSE the whole request — a base64
 // document — answers false here, which is of no consequence: nothing is sent
@@ -2677,36 +2746,6 @@ func blockWritesText(block ContentBlock) bool {
 			}
 		}
 		return searchResultPromptText(block.Title, ref, block.Content) != ""
-	}
-	return false
-}
-
-// blockWritesNothing reports whether convertMessage writes no part of a run for
-// this block — the blocks whose presence in a message says nothing about what
-// that message carries, and so cannot be why a system message is not text-only
-// (see systemContentIsTextOnly).
-func blockWritesNothing(block ContentBlock) bool {
-	switch block.Type {
-	case "redacted_thinking":
-		// Dropped whole: api.Message.Thinking is not emitted on any wire this
-		// fork speaks and the payload is opaque.
-		return true
-	case "thinking":
-		// The converter joins this block's text into the run only when the
-		// pointer is set, and drops a run whose thinking is empty.
-		return block.Thinking == nil || *block.Thinking == ""
-	case "search_result":
-		// The arm writes its built passage only when there is one: a block with
-		// no title, no source and no passage leaves the run untouched, exactly
-		// as the two above do (2026-09-28 audit, round 59, F59-L1-2).
-		ref := ""
-		if block.Source != nil {
-			ref = block.Source.Ref
-			if ref == "" {
-				ref = block.Source.URL
-			}
-		}
-		return searchResultPromptText(block.Title, ref, block.Content) == ""
 	}
 	return false
 }
@@ -3266,8 +3305,11 @@ func countContentItemIn(item any, ctx chargeContext) int {
 	case "tool_result":
 		// Not clampedJSONBytes: the converter does not paste this block, it
 		// CONVERTS its content (convertToolResultContent), and the charge
-		// follows that reader (see toolResultBytes).
-		total += toolResultBytes(m)
+		// follows that reader (see toolResultBytes) — for the fields the
+		// converter reads and no others, which is the same frame the typed arm
+		// charges (toolResultFrame).
+		id, _ := m["tool_use_id"].(string)
+		total += toolResultBytes(toolResultFrame(blockType, id), m["content"])
 	case "document":
 		// What the converter WRITES for this block, which is not what the
 		// block carries: a nested document reaches the prompt as its text, or
@@ -3292,7 +3334,22 @@ func countContentItemIn(item any, ctx chargeContext) int {
 		// against a five-byte notice and the session's meter read a prompt the
 		// model was never sent (2026-09-27 audit, round 42, C42-1).
 		total += countItemsIn(m["content"], chargeSearchResult)
-		total += imageSourceBytes(m["source"])
+		// The reference the converter writes, and ONLY it: searchResultText
+		// names the source's ref (or its url) in the passage it builds, so a
+		// `data` payload on a search result's source is not prompt bytes —
+		// imageSourceBytes counted it and billed a 40000-byte blob the typed
+		// arm charges nothing for, one spelling of one block apart (2026-09-28
+		// audit, round 61, F61-L1-3).
+		switch src := m["source"].(type) {
+		case string:
+			total += len(src)
+		case map[string]any:
+			ref, _ := src["ref"].(string)
+			if ref == "" {
+				ref, _ = src["url"].(string)
+			}
+			total += len(ref)
+		}
 	case "server_tool_use":
 		// Charged exactly as the tool_use arm above, because the converter
 		// writes the two the same way: this block's JSON IS the tool call, and
@@ -3304,18 +3361,18 @@ func countContentItemIn(item any, ctx chargeContext) int {
 		// reduction to the converter's own fields as its twin (round 55).
 		total += callBlockBytes(decodedCallBlock(m))
 	case "web_search_tool_result":
-		// This arm is the DECODED-JSON reader, so the block here is a nested
-		// one — inside a tool result or a passage list, where the converter
-		// falls through to describeToolResultBlock's JSON fallback, which is
-		// what the arms above charge for it. The message-level spelling is the
-		// typed arm's business, and it is charged the formatted hits rather
-		// than this JSON (2026-09-27 audit, round 41, A41-3). It is no longer
-		// said to be the `system` path: system content is charged by
-		// systemBytes for exactly the text blocks the converter reads
-		// (2026-09-27 audit, round 42, A42-4).
-		if data, err := json.Marshal(m); err == nil {
-			total += len(data)
-		}
+		// The HITS, exactly as the typed arm charges its twin: the converter
+		// writes one line per hit and nothing else, so serializing the block
+		// pasted its encrypted_content into the charge instead — a few hundred
+		// kilobytes of opaque blob billed against a wire holding a title, a URL
+		// and a newline, on an estimate that seeds the client-visible
+		// input_tokens (2026-09-27 audit, round 41, A41-3; the decoded arm was
+		// the last spelling still doing it, round 61, F61-L1-3).
+		//
+		// A NESTED one — inside a tool result or a passage list — never reaches
+		// this arm: those carriers return above, through the readers that
+		// describe what the converter writes for them.
+		total += len(formatWebSearchToolResultContent(m["content"]))
 	}
 	return total
 }
@@ -3391,18 +3448,30 @@ func countItemsIn(content any, ctx chargeContext) int {
 // base64 of a file the model is told about in seventy bytes, and the same shape
 // at 4 bytes measured 148 against a 156-byte wire, i.e. the charge tracked the
 // payload rather than the notice (2026-09-27 audit, round 42, A42-2/A42-6).
-func toolResultBytes(block map[string]any) int {
-	frame := make(map[string]any, len(block))
-	for k, v := range block {
-		if k != "content" {
-			frame[k] = v
-		}
-	}
+func toolResultBytes(frame map[string]any, content any) int {
 	total := 0
 	if data, err := json.Marshal(frame); err == nil {
 		total += len(data) - jsonEscapeOverhead(data)
 	}
-	return total + toolResultContentBytes(block["content"])
+	return total + toolResultContentBytes(content)
+}
+
+// toolResultFrame is the part of a tool_result the converter writes beside its
+// content: the block's type, and the id only when the body stated one. The
+// message the block becomes writes its tool_call_id with omitempty, so an
+// id-less result adds no key to the prompt — and charging a fabricated
+// `"tool_use_id":""` billed bytes the model was never sent (2026-09-28 audit,
+// round 61, F61-L1-4). Every OTHER key the body carries is not prompt bytes
+// either: convertMessage reads the type, the id and the content of a
+// tool_result and writes nothing else, so a stray key beside them — which the
+// decoded walk used to marshal straight into the charge — must not be billed
+// (round 61, F61-L1-3).
+func toolResultFrame(blockType, toolUseID string) map[string]any {
+	frame := map[string]any{"type": blockType}
+	if toolUseID != "" {
+		frame["tool_use_id"] = toolUseID
+	}
+	return frame
 }
 
 // toolResultContentBytes charges one tool_result's `content` field the way
@@ -3796,11 +3865,7 @@ func countContentBlock(block ContentBlock) int {
 		// nested attachment's base64 against a wire that holds a notice for it,
 		// and billed a nested image nothing at all where the converter carries
 		// it (2026-09-27 audit, round 42, A42-2/C42-1).
-		total += toolResultBytes(map[string]any{
-			"type":        block.Type,
-			"tool_use_id": block.ToolUseID,
-			"content":     block.Content,
-		})
+		total += toolResultBytes(toolResultFrame(block.Type, block.ToolUseID), block.Content)
 	case "document":
 		// A text source's data is written into the prompt by the converter and
 		// was charged nothing here, so a turn whose newest message was a large

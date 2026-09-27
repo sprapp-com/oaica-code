@@ -3057,7 +3057,7 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		}
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
 			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
-				((id != "" || name != "") && secondFinishedObject(tb.args.String(), args))) {
+				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
 			// begins the next one. Two things can say so, and only these two: a
 			// stated id this block does not hold (round 43's B43-3, the shape
@@ -3087,16 +3087,21 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// the slot already carries is asked first and stays a repeat
 			// (round 56's F1/F2).
 			//
-			// The third clause is the same split one field over, and it is NOT
-			// splitFromCurrent's complete-object reading (see the note above): a
-			// fragment that states the slot's own id or name beside a COMPLETE
-			// argument object that differs from the one the block holds is the
-			// next call the vendor stated this index for — the vendor that reuses
-			// one id for the turn's calls as well as one index. Appended, the
-			// client accumulated `{"a":1}{"b":2}` under a stop_reason of
-			// tool_use and the model's second call did not exist on this arm at
-			// all, while the same body's document arm and the client leg both
-			// answer two calls (2026-09-28 audit, round 60, F60-L3-1).
+			// The third clause is the arguments' own answer, and it is NOT
+			// splitFromCurrent's reading (see the note above): a fragment that
+			// states the slot's own id or name beside bytes the block's
+			// arguments cannot take is the next call the vendor stated this
+			// index for — the vendor that reuses one id for the turn's calls as
+			// well as one index. Appended, the client accumulated
+			// `{"a":1}{"b":2}` under a stop_reason of tool_use and the model's
+			// second call did not exist on this arm at all, while the same
+			// body's document arm and the client leg both answer two calls
+			// (2026-09-28 audit, round 60, F60-L3-1). The bytes need not be a
+			// whole object themselves: the ordinary chunked second call arrives
+			// as `{"b":` then `2}`, and the gate that required both texts to be
+			// whole objects missed it — appended to the first call's finished
+			// object, the first piece read as more of it (2026-09-28 audit,
+			// round 61, F61-L3-1 and F61-L3-2).
 			b.synthSeq++
 			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
 			if name != "" {
@@ -3322,20 +3327,35 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 //
 // No block accumulated under the key yet is not a split — there is nothing to
 // continue — and neither is a fragment that names nothing.
-// secondFinishedObject reports whether an argument-only fragment carries a
-// call's own COMPLETE argument list beside the one a block already holds.
-// Neither is more of the other: two finished objects do not concatenate into
-// JSON. It is the client leg's twoFinishedObjects, and the whole-list arm of
-// every path that holds one reads the same body as two calls.
+// callArgsExtend reports whether a fragment's argument bytes can still be more
+// of the call whose arguments have accumulated as blockArgs. An object in
+// progress takes more of itself; a COMPLETE object takes nothing (two of them
+// never concatenate into JSON, and neither does an object onto a finished one);
+// a freeform line — the model's whole command, delivered once (round 51's G1) —
+// takes more of the same line and not the beginning of an object.
 //
-// Both sides must be OBJECTS: argsAreFinished counts freeform text as finished
-// too, because freeform is delivered once, whole — so a later fragment is still
-// more of the SAME line, and the wire round 51's G1 pins exactly that: one call
-// whose input is the model's whole command. Splitting it would be a call the
-// client cannot run, out of bytes the model wrote as one.
-func secondFinishedObject(blockArgs, args string) bool {
-	return finishedObjectArgs(blockArgs) && finishedObjectArgs(args) &&
-		canonicalCallArgs(blockArgs) != canonicalCallArgs(args)
+// It replaces the complete-object gate that asked whether BOTH texts were whole
+// objects, which answered the ordinary chunked wire wrongly: a call's SECOND
+// object arrives in pieces (`{"b":` then `2}`), so the pieces were appended to
+// the first call's finished one and the client accumulated `{"a":1}{"b":2}` for
+// a call it could not run while the model's second call did not exist on this
+// arm (2026-09-28 audit, round 61, F61-L3-1). Freeform continuations stay in
+// their call because more of a line IS extendable (round 60's gate keeps that
+// wire one call), and the same predicate is the client leg's canExtend, so one
+// wire cannot be answered two ways.
+func callArgsExtend(blockArgs, args string) bool {
+	a := strings.TrimSpace(blockArgs)
+	d := strings.TrimSpace(args)
+	if d == "" || a == "" {
+		return true
+	}
+	if finishedObjectArgs(a) {
+		return false
+	}
+	if strings.HasPrefix(a, "{") {
+		return !finishedObjectArgs(d)
+	}
+	return !strings.HasPrefix(d, "{")
 }
 
 func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
@@ -3720,6 +3740,20 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		tb.name = name
 	}
 	if args != "" {
+		if !callArgsExtend(tb.args.String(), args) {
+			// Bytes this call's arguments cannot take: a whole object after a
+			// finished one or after a freeform line, or a whole object onto an
+			// object the model was still writing. No block of this bridge can
+			// carry them as arguments — the client would accumulate
+			// `{"b":{"c":3}2}` or `{"_raw":"echo hi{\"c\":3}"}` for a call the
+			// model never made — and the client leg drops the same bytes from
+			// the same wire, so one document cannot be answered two ways
+			// (2026-09-28 audit, round 61, F61-L3-2's sibling). Logged, because
+			// the upstream sent them: an interleaving this wire permits and the
+			// arguments do not (round 39's B-F7 for the closed-block case).
+			log.Printf("oaica-gateway: tool call %q sent %d argument bytes its arguments cannot continue", tb.name, len(args))
+			return
+		}
 		tb.args.WriteString(args)
 	}
 	if tb.id == "" {

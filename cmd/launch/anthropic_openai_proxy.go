@@ -2629,6 +2629,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// continues that call rather than the first one (2026-09-28 audit, round
 	// 59, F59-L2-1).
 	indexSlot := map[int]int{}
+	// indexChain is every slot one stated index has named, in the order the
+	// stream named them — the turn's calls as the vendor that writes ONE index
+	// for all of them introduced them. An argument fragment that states no id
+	// and no name is matched to the oldest of those calls that has not yet
+	// received its arguments, while the newest has received none of its own
+	// (2026-09-28 audit, round 61, F61-L2-2).
+	indexChain := map[int][]int{}
+	// seenIndex records the indices the stream has stated. A fresh index is the
+	// wire's own statement that a call begins there (2026-09-28 audit, round 61,
+	// F61-L2-3).
+	seenIndex := map[int]bool{}
 
 	// argsFinished reports whether an argument text is a call's own finished
 	// argument list: a complete JSON object — the one spelling the wire has for
@@ -2678,6 +2689,34 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		return string(b)
 	}
 
+	// canExtend reports whether a fragment's argument bytes can still be more of
+	// the call whose arguments have accumulated as accArgs — the one question
+	// that decides whether appending them is a continuation or damage. An object
+	// in progress takes more of itself; a COMPLETE object takes nothing (two of
+	// them never concatenate into JSON, and neither does an object onto a
+	// finished one); a freeform line — the model's whole command, delivered once
+	// (round 51's G1) — takes more of the same line and not the beginning of an
+	// object. Appending bytes that cannot be more of a call handed clients
+	// `{"b":{"c":3}2}` and `{"_raw":"echo hi{\"c\":3}"}` for calls the model
+	// never made, and the same bodies' whole-list arms answer them with the
+	// calls the model did make (2026-09-28 audit, round 61, F61-L2-4, F61-L2-5).
+	canExtend := func(accArgs, delta string) bool {
+		a := strings.TrimSpace(accArgs)
+		d := strings.TrimSpace(delta)
+		if d == "" || a == "" {
+			return true
+		}
+		if finishedObjectArgs(a) {
+			return false
+		}
+		if strings.HasPrefix(a, "{") {
+			// An object the model is still writing: only more of that object —
+			// a fragment that is itself a whole object cannot be part of one.
+			return !finishedObjectArgs(d)
+		}
+		return !strings.HasPrefix(d, "{")
+	}
+
 	// restatesAccumulatedCall reports whether one tool-call delta is the call the
 	// accumulator already holds, restated — the same name (or none), the same
 	// finished arguments, canonically equal — rather than more of it. Two
@@ -2713,35 +2752,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			canonicalArgs(accArgs) == canonicalArgs(args)
 	}
 
-	// twoFinishedObjects reports whether a fragment states a call's own COMPLETE
-	// argument list beside the one the accumulator already holds. Neither is more
-	// of the other: two finished objects do not concatenate into JSON, so a
-	// fragment that names its call and carries a second one is the next call the
-	// vendor stated the same index for — the shape round 36's B-F2 is about, one
-	// field over, and the one the whole-list arm reads as two entries. Appended,
-	// the client accumulated `{"p":"a.go"}{"p":"b.go"}` for a Read it was asked
-	// to run (2026-09-28 audit, round 60, F60-L2-1).
-	//
-	// Both sides must be OBJECTS: argsFinished counts freeform text as finished
-	// too, because freeform is delivered once, whole — so a later fragment is
-	// still more of the SAME line, and the wire the gateway leg pins as one call
-	// whose input is the model's whole command (round 51's G1) would be split
-	// here into a second call carrying half a command.
-	twoFinishedObjects := func(accArgs, deltaArgs string) bool {
-		return finishedObjectArgs(accArgs) && finishedObjectArgs(deltaArgs) &&
-			canonicalArgs(accArgs) != canonicalArgs(deltaArgs)
-	}
-
 	// openSlotStating reports the slot of the accumulator a fragment's stated id
 	// or name belongs to, when that call's arguments are still open — the call a
 	// continuation is more of, whatever index the fragment carries. The id is
-	// asked first and exactly; the name is asked only when exactly ONE open call
-	// carries it, because two calls of one tool at one index (round 60's
-	// F60-L2-1) are two calls by the vendor's own statement and a name alone
-	// cannot choose between them. A call whose arguments are already finished is
-	// never returned: more of a finished list is not a thing the wire has, and
-	// the branches below are the ones that decide what such a fragment is.
-	openSlotStating := func(id, name string) (int, bool) {
+	// asked first and exactly (an id this stream has seen names the call it
+	// introduced, wherever the vendor filed it); the name is asked only when
+	// exactly ONE open call carries it, because two calls of one tool at one
+	// index (round 60's F60-L2-1) are two calls by the vendor's own statement
+	// and a name alone cannot choose between them. A call whose arguments are
+	// already finished is never returned: more of a finished list is not a thing
+	// the wire has, and the branches below are the ones that decide what such a
+	// fragment is.
+	//
+	// The NAME is asked only of an index this stream has already stated (the
+	// caller passes indexSeen). A fresh index is this leg's own signal for a new
+	// call — nextFreeToolSlot is kept above every index the stream has stated for
+	// exactly that reason — so a name-bearing fragment that states one is a call
+	// of its own, not a continuation of a same-named call open elsewhere. Routed
+	// by the name, its arguments were concatenated onto that call's open
+	// arguments and the call it introduced did not exist, while the whole-list
+	// arm reads the same body as three calls (2026-09-28 audit, round 61,
+	// F61-L2-3). An id is still asked at any index: ids name calls, not slots.
+	openSlotStating := func(id, name string, indexSeen bool) (int, bool) {
 		if id != "" {
 			byID, found := -1, false
 			for s, a := range toolAccums {
@@ -2756,7 +2788,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				return byID, true
 			}
 		}
-		if name != "" {
+		if name != "" && indexSeen {
 			byName, count := -1, 0
 			for s, a := range toolAccums {
 				if a.name != name || argsFinished(a.args.String()) {
@@ -3147,6 +3179,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				indexed := tc.Index != nil
 				if indexed {
 					slot = *tc.Index
+					indexSeen := seenIndex[slot]
+					seenIndex[slot] = true
 					if cur, ok := indexSlot[slot]; ok {
 						// The index names the SLOT; the call that slot holds is
 						// what a fragment stating the index continues. A vendor
@@ -3175,15 +3209,40 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// ordinary wire — where the stated id restates the call the
 					// index names — is untouched, and round 56's F1 restatement,
 					// whose call is finished, keeps its own slot.
-					if stated, ok := openSlotStating(tc.ID, tc.Function.Name); ok {
+					if stated, ok := openSlotStating(tc.ID, tc.Function.Name, indexSeen); ok {
 						slot = stated
+					}
+					// A fragment that states NO id and no name is an argument
+					// continuation, and the vendor that writes one index for
+					// every call of the turn introduces its calls in one delta
+					// and then streams their arguments one fragment each, in the
+					// order the calls were introduced: the index names the
+					// NEWEST call, so the first call's arguments landed in the
+					// second call's block and the client ran a Read whose input
+					// was Bash's `{"cmd":"ls"}` — a well-formed call with another
+					// call's input, which signals nothing — while the second
+					// call's own arguments were dropped and the whole-list arm of
+					// this leg answered the same body with both calls' own
+					// (2026-09-28 audit, round 61, F61-L2-2). Matched here, while
+					// the newest call has received none of its own: a fragment
+					// arriving after that one has started belongs to it.
+					if tc.ID == "" && tc.Function.Name == "" {
+						if acc, exists := toolAccums[slot]; exists && strings.TrimSpace(acc.args.String()) == "" {
+							for _, s := range indexChain[*tc.Index] {
+								if a, ok := toolAccums[s]; ok && s != slot && !argsFinished(a.args.String()) {
+									slot = s
+									break
+								}
+							}
+						}
 					}
 					if acc, exists := toolAccums[slot]; exists &&
 						!restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) &&
 						((tc.ID != "" && acc.id != "" && tc.ID != acc.id) ||
 							(tc.Function.Name != "" && acc.name != "" && tc.Function.Name != acc.name) ||
 							((tc.ID != "" || tc.Function.Name != "") &&
-								twoFinishedObjects(acc.args.String(), tc.Function.Arguments))) {
+								strings.TrimSpace(tc.Function.Arguments) != "" &&
+								!canExtend(acc.args.String(), tc.Function.Arguments))) {
 						// A call the upstream stated this slot for a SECOND time
 						// begins the next one: a stated id this slot does not
 						// hold (round 43's B43-3) or a name it does not carry
@@ -3198,6 +3257,22 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// both arms that hold a whole list — this leg's adoption
 						// and the gateway's document arm — already keep the two
 						// calls apart (2026-09-28 audit, round 58, F58-L3-2).
+						//
+						// The third clause is the arguments' own answer, and it
+						// is what reaches the ordinary chunked wire: a call's
+						// SECOND object arrives in pieces (`{"b":` then `2}`), so
+						// requiring the fragment itself to be a complete object
+						// missed it and the pieces were appended to the first
+						// call's finished one — the client accumulated
+						// `{"a":1}{"b":2}` for a Bash it was asked to run, and
+						// the model's second call did not exist on this arm
+						// (2026-09-28 audit, round 61, F61-L2-1). canExtend is
+						// the whole test: bytes a finished list cannot take are
+						// not more of that call, whether they are a whole object
+						// or its first piece. Round 56's restatement — the same
+						// call listed again — is asked before this and stays one
+						// call, and freeform continuations stay in theirs because
+						// more of a line IS extendable.
 						//
 						// The call the slot already carries, restated, is asked
 						// first and stays that call: round 56's F1 lists it again
@@ -3218,26 +3293,32 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// of tool_use (2026-09-28 audit, round 59, F59-L2-1).
 						indexSlot[*tc.Index] = slot
 					} else if acc, exists := toolAccums[slot]; exists &&
-						tc.ID == "" && tc.Function.Name == "" && finishedObjectArgs(acc.args.String()) {
+						tc.ID == "" && tc.Function.Name == "" &&
+						argsFinished(acc.args.String()) &&
+						!canExtend(acc.args.String(), tc.Function.Arguments) {
 						// An argument-only fragment whose slot already holds a
 						// FINISHED argument list is not more of that call: two
 						// finished objects do not concatenate into JSON, and the
 						// whole-list arm would read them as two calls. It is the
 						// call this stream last wrote to, when that one is still
-						// open — the wire whose continuations state an index the
-						// vendor did not update. A call whose arguments are still
-						// open is left where the index put it, which is the
-						// ordinary interleaved-parallel order (2026-09-28 audit,
-						// round 59, F59-L2-1).
+						// open AND can take these bytes — the wire whose
+						// continuations state an index the vendor did not update.
+						// A call whose arguments are still open is left where the
+						// index put it, which is the ordinary interleaved-parallel
+						// order (2026-09-28 audit, round 59, F59-L2-1).
 						//
-						// Only an OBJECT counts as a finished list here:
-						// argsFinished calls freeform finished because freeform
-						// arrives whole the moment it arrives, and a later
-						// fragment of the same line is still more of that one
-						// call (round 60's gate; the gateway leg's own
-						// finishedObjectArgs keeps the same wire one call).
+						// argsFinished counts a freeform line as finished too, and
+						// canExtend is what keeps its continuations whole: more of
+						// the same line is still that call (round 60's gate), while
+						// the beginning of an object after it is not (2026-09-28
+						// audit, round 61, F61-L2-5). A fragment that is itself a
+						// whole object can only start a call, so it is never
+						// handed to one already holding a partial object: the two
+						// do not concatenate into JSON, and the call left open
+						// beside the finished slot kept the model's own arguments
+						// whole only from the fragment after it (F61-L2-4).
 						if last, ok := toolAccums[lastToolSlot]; lastToolSlot >= 0 && lastToolSlot != slot && ok &&
-							!argsFinished(last.args.String()) {
+							!argsFinished(last.args.String()) && canExtend(last.args.String(), tc.Function.Arguments) {
 							slot = lastToolSlot
 						} else {
 							// Nowhere left to put it: the slot's own call is
@@ -3283,6 +3364,19 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					} else {
 						slot = nextFreeToolSlot
 						nextFreeToolSlot++
+					}
+				}
+				if indexed {
+					c := indexChain[*tc.Index]
+					known := false
+					for _, s := range c {
+						if s == slot {
+							known = true
+							break
+						}
+					}
+					if !known {
+						indexChain[*tc.Index] = append(c, slot)
 					}
 				}
 				lastToolSlot = slot
