@@ -431,6 +431,21 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		messages = append(messages, converted...)
 	}
 
+	if len(messages) == 0 {
+		// Every message converted to nothing — an empty content array, or an
+		// assistant turn holding only a redacted thinking block, which Claude
+		// Code replays. The conversation marshals as "messages":null, and the
+		// server answers that body with a synthetic 200 (server/routes.go: no
+		// messages, no generation) while the client is told a successful turn
+		// and charged the middleware's estimate for a prompt no model ever read.
+		// The other two legs both keep a turn here — the client proxy
+		// substitutes {"role":"user"}, the gateway substitutes an empty message
+		// of the last role — so one body was answered two ways, and this leg's
+		// was the one that answered without calling the model at all
+		// (2026-09-27 audit, round 43, C43-1).
+		messages = []api.Message{{Role: "user"}}
+	}
+
 	messages = normalizeSystemFirst(messages)
 
 	options := make(map[string]any)
@@ -553,6 +568,15 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 // A system message carrying anything but text (an image, a call, a tool-result
 // id, thinking) cannot be merged into that one string without dropping what it
 // carries, so a conversation holding one is returned exactly as it arrived.
+//
+// That check is over the WHOLE conversation, which is why the scan below has no
+// early exit. It used to stop at the first system message that arrived after a
+// non-system one — the rewrite was already decided by then — so a conversation
+// whose later system message carried an image never reached the guard: the
+// scan ended first, and the rewrite merged both messages into one bare string
+// and dropped the image on the floor. The estimate still charged it its 4096
+// bytes, so the client was billed for an image the model never saw
+// (2026-09-27 audit, round 43, A43-1).
 func normalizeSystemFirst(messages []api.Message) []api.Message {
 	ordered := true
 	blank := false
@@ -564,7 +588,6 @@ func normalizeSystemFirst(messages []api.Message) []api.Message {
 			}
 			if seenNonSystem {
 				ordered = false
-				break
 			}
 			if strings.TrimSpace(m.Content) == "" {
 				blank = true

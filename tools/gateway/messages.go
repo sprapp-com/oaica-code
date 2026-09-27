@@ -354,6 +354,12 @@ func anthropicToOpenAI(req map[string]any, acceptsImages bool) (map[string]any, 
 // tool-result id, any key but role and content — cannot be merged into that one
 // string without dropping what it carries, so a conversation holding one is
 // returned exactly as it arrived.
+//
+// That check is over the WHOLE conversation, so the scan below has no early
+// exit: stopping at the first system message that arrived after a non-system
+// one — the rewrite was already decided by then — left a later carrier
+// unguarded, and the rewrite merged it into a bare string and dropped what it
+// carried (2026-09-27 audit, round 43, A43-1).
 func normalizeSystemFirst(msgs []map[string]any) []map[string]any {
 	ordered := true
 	blank := false
@@ -365,7 +371,6 @@ func normalizeSystemFirst(msgs []map[string]any) []map[string]any {
 			}
 			if seenNonSystem {
 				ordered = false
-				break
 			}
 			if s, _ := m["content"].(string); strings.TrimSpace(s) == "" {
 				blank = true
@@ -992,8 +997,24 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 		}
 		switch t, _ := bm["type"].(string); t {
 		case "text":
-			txt, _ := bm["text"].(string)
-			parts = append(parts, map[string]any{"type": "text", "text": txt})
+			// The field is a string on this wire, and the sibling legs decode it
+			// into one — anthropic.ContentBlock.Text is a *string, so the same
+			// body is a 400 there. Reading it with a comma-ok and ignoring the
+			// miss wrote an empty string into the prompt instead: the model was
+			// asked about a turn whose text the client had sent and this gateway
+			// had dropped, the client read a 200, and one body got two answers
+			// depending on which leg served it (2026-09-27 audit, round 43,
+			// B43-2). Absent or null is not the same thing — that is a text block
+			// with no text, which the sibling legs keep as an empty block.
+			if raw, present := bm["text"]; present && raw != nil {
+				txt, isStr := raw.(string)
+				if !isStr {
+					return nil, "message content text is not a string"
+				}
+				parts = append(parts, map[string]any{"type": "text", "text": txt})
+				break
+			}
+			parts = append(parts, map[string]any{"type": "text", "text": ""})
 		case "image":
 			// The source's TYPE decides what the OpenAI wire can carry, and
 			// reading only media_type/data read an Anthropic url source as two
@@ -1077,7 +1098,20 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 					}
 				}
 			}
-			args, _ := json.Marshal(bm["input"])
+			// An input the block does not state at all is a call made with no
+			// arguments, and the canonical encoding of that on this wire is an
+			// empty object: re-marshalling the missing key wrote the literal
+			// string "null" into the arguments, and leg 1's own decoder (a
+			// nil-map ToolCallFunctionArguments that marshals to {}) and the
+			// client leg both say {} for the same body — an upstream tool parser
+			// doing json.loads got None from one leg and {} from the other two
+			// (2026-09-27 audit, round 43, C43-2). An input stated AS null is a
+			// different body and stays null on all three.
+			in := bm["input"]
+			if _, present := bm["input"]; !present {
+				in = map[string]any{}
+			}
+			args, _ := json.Marshal(in)
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   id,
 				"type": "function",
@@ -1533,7 +1567,7 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 			}
 			return 0, ""
 		}
-		if _, ok := b.bufferedCompletion(); ok {
+		if doc, ok := b.bufferedCompletion(); ok && documentSaysSomething(doc) {
 			// No data: line was ever sent, but the body is a whole completion:
 			// finalize adopts it as the turn, so the client reads an answer and
 			// the row must not call it a failure. LedgerStatus asks this
@@ -1543,12 +1577,21 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 			// round 39, B-F3).
 			return 0, ""
 		}
-		// The upstream ended without a single event. finishStream's own contract
-		// ("the client must always get a well-formed end") cannot be met by an
-		// empty body, and a client reading the stream waits for message_stop —
-		// so answer the way the non-stream path answers an empty completion: 502,
-		// which tells the client to retry instead of waiting (round 24). Nothing
-		// has been committed yet, so the status is still ours to choose.
+		// The upstream ended without a single event, or with a whole completion
+		// that says nothing — no text, no reasoning, no call. finishStream's own
+		// contract ("the client must always get a well-formed end") cannot be met
+		// by an empty turn, and a client reading the stream waits for
+		// message_stop — so answer the way the non-stream path answers an empty
+		// completion: 502, which tells the client to retry instead of waiting
+		// (round 24). Nothing has been committed yet, so the status is still
+		// ours to choose.
+		//
+		// Asking only whether the body PARSED, as this arm used to, made the two
+		// readers of one turn disagree: the row was written before finalize from
+		// this arm and read 200, while the client — after adoption had set
+		// startSent and the turn was found to hold nothing — was told the turn
+		// failed by round 42's empty-stream arm (2026-09-27 audit, round 43,
+		// B43-1).
 		return http.StatusBadGateway, "upstream returned an empty stream"
 	}
 	var resp openAICompletion
@@ -1808,7 +1851,7 @@ func (b *anthropicBridge) finalize() {
 		"role":          "assistant",
 		"model":         b.model,
 		"content":       respBlocks,
-		"stop_reason":   stopReasonOpenAIToAnthropic(resp.Choices[0].FinishReason),
+		"stop_reason":   stopReason(resp.Choices[0].FinishReason, len(msg.ToolCalls)),
 		"stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":            in,
@@ -2068,46 +2111,33 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		return b.lastToolKey
 	}
 	if id != "" {
+		key := "!" + id
+		// The id names the call, but a repeated id is not proof this fragment
+		// continues it: an upstream that reuses one id for the turn's second call
+		// is the same wire the id-less path below splits on, and returning on the
+		// id alone answered it two ways — the block merged, the second name
+		// dropped, and its arguments concatenated onto the first's partial_json
+		// (2026-09-27 audit, round 43, B43-3). An id no block carries yet is a
+		// new call outright, which is why this asks only about a key already
+		// accumulated.
+		if b.toolBlocks[key] != nil && b.splitFromCurrent(key, name, args) {
+			b.synthSeq++
+			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+			b.lastToolName = name
+			return b.lastToolKey
+		}
 		if name != "" {
 			b.lastToolName = name
 		}
-		b.lastToolKey = "!" + id
+		b.lastToolKey = key
 		return b.lastToolKey
 	}
 	if b.lastToolKey != "" {
-		// The current block's accumulated arguments decide whether this
-		// nameless, id-less fragment continues that call or begins the next:
-		// a fragment that repeats the current call's name while its arguments
-		// are already a COMPLETE JSON object is the next call, which is the
-		// rule the client leg's startsANewToolCall applies to the same wire —
-		// without it two index-less calls to the SAME tool shared one block and
-		// the second call's arguments were concatenated onto the first's, so
-		// the client received one call whose partial_json held two objects
-		// (2026-09-27 audit, round 38, B-F3).
-		//
-		// A bare repeat — the fragment names the call again and states no
-		// arguments, over a call that has accumulated none — is the second of
-		// two argument-less calls, and it too begins the next call: an empty
-		// argument string is a COMPLETE argument list for a call that takes
-		// none, and reading it as a continuation delivers one tool_use where the
-		// model asked for two (2026-09-27 audit, round 39, B-F9). The cost of
-		// that reading, an upstream that restates the name in a chunk of its
-		// own before sending the arguments, is a call with no arguments — the
-		// other reading's cost is a call the client never hears about, and only
-		// one of the two can be reported to the model at all.
-		if name != "" && b.lastToolName != "" {
-			cur := b.toolBlocks[b.lastToolKey]
-			acc := ""
-			if cur != nil {
-				acc = strings.TrimSpace(cur.args.String())
-			}
-			if name != b.lastToolName || (acc != "" && json.Valid([]byte(acc))) ||
-				(cur != nil && acc == "" && strings.TrimSpace(args) == "") {
-				b.synthSeq++
-				b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
-				b.lastToolName = name
-				return b.lastToolKey
-			}
+		if b.splitFromCurrent(b.lastToolKey, name, args) {
+			b.synthSeq++
+			b.lastToolKey = "?" + strconv.Itoa(b.synthSeq)
+			b.lastToolName = name
+			return b.lastToolKey
 		}
 		return b.lastToolKey
 	}
@@ -2117,6 +2147,42 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		b.lastToolName = name
 	}
 	return b.lastToolKey
+}
+
+// splitFromCurrent reports whether a fragment begins the NEXT tool call rather
+// than continuing the block accumulated under key. It is the client leg's
+// startsANewToolCall in the terms this bridge keeps state in, and both of
+// toolKey's keyless arms ask it, so one wire cannot be answered two ways.
+//
+// A fragment that repeats the current call's name while its arguments are
+// already a COMPLETE JSON object is the next call (2026-09-27 audit, round 38,
+// B-F3). A bare repeat — the fragment names the call again and states no
+// arguments over a call that has accumulated none — is the second of two
+// argument-less calls, and it too begins the next call: an empty argument
+// string is a COMPLETE argument list for a call that takes none, and reading it
+// as a continuation delivers one tool_use where the model asked for two
+// (2026-09-27 audit, round 39, B-F9). The cost of that reading, an upstream
+// that restates the name in a chunk of its own before sending the arguments, is
+// a call with no arguments — the other reading's cost is a call the client
+// never hears about, and only one of the two can be reported to the model at
+// all. A DIFFERENT name is always the next call: an argument continuation
+// carries arguments alone, and folding two names into one block hands the
+// client a call it cannot execute under the name it received (round 40, A40-8).
+//
+// No block accumulated under the key yet is not a split — there is nothing to
+// continue — and neither is a fragment that names nothing.
+func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
+	if name == "" || b.lastToolName == "" {
+		return false
+	}
+	cur := b.toolBlocks[key]
+	if cur == nil {
+		return false
+	}
+	acc := strings.TrimSpace(cur.args.String())
+	return name != b.lastToolName ||
+		(acc != "" && json.Valid([]byte(acc))) ||
+		(acc == "" && strings.TrimSpace(args) == "")
 }
 
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
@@ -2327,16 +2393,14 @@ func (b *anthropicBridge) finishStream() {
 			outTok = est
 		}
 	}
-	stop := stopReasonOpenAIToAnthropic(b.sse.stopMsg)
-	if stop == "tool_use" && b.openToolBlocks() == 0 {
-		// The upstream said it stopped to call a tool, and no call reached the
-		// client (every one of them was unnamed, or there was none at all).
-		// Reporting tool_use there told Claude Code to wait for a call it will
-		// never receive, on a turn that is over (2026-09-27 audit, round 39,
-		// B-F8).
-		log.Printf("oaica-gateway: upstream stopped with tool_calls but named no call; reporting end_turn")
-		stop = "end_turn"
-	}
+	// The blocks this stream actually opened decide, exactly as they do on the
+	// non-stream path and on leg 1: a call reached the client means tool_use,
+	// whatever the upstream's finish_reason said, and no call means not
+	// tool_use — an upstream stopping to call a tool whose fragments were all
+	// unnamed said nothing the client can act on, and reporting tool_use there
+	// told Claude Code to wait for a call it will never receive, on a turn that
+	// is over (2026-09-27 audit, round 39, B-F8; round 43, C43-3 and C43-4).
+	stop := stopReason(b.sse.stopMsg, b.openToolBlocks())
 	b.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
@@ -2385,7 +2449,12 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		return false
 	}
 	resp, ok := b.bufferedCompletion()
-	if !ok {
+	if !ok || !documentSaysSomething(resp) {
+		// A whole completion that says nothing — no text, no reasoning, no call
+		// — is not an answer to adopt. Adopting it opened a message_start for a
+		// turn the bridge then declared empty, so the client read a start and an
+		// error for a body that was never an answer, and the ledger row written
+		// before this ran read 200 for it (2026-09-27 audit, round 43, B43-1).
 		return false
 	}
 	b.sse.startSent = true
@@ -2550,6 +2619,32 @@ func documentRelayedBytes(msg oaDelta) int {
 	return bytes
 }
 
+// documentSaysSomething reports whether a whole completion holds anything an
+// adopted turn would relay: text, reasoning, or a call. It is nothingRelayed's
+// question asked of a document the bridge is still holding rather than of the
+// stream, and the two callers that ask it — the ledger's status before finalize
+// and adoptWholeStream itself — must ask it together, or the row and the client
+// read one turn two ways (2026-09-27 audit, round 43, B43-1).
+//
+// A call counts even with no arguments: adoptWholeStream opens its block either
+// way, so a document carrying one is a turn the client can use. That is why this
+// is not documentRelayedBytes > 0 — that measures the BYTES an adopted turn
+// relays, and a call whose arguments are empty relays none while still naming
+// itself.
+func documentSaysSomething(doc openAICompletion) bool {
+	if len(doc.Choices) == 0 {
+		return false
+	}
+	m := doc.Choices[0].Message
+	if m.Content != nil && *m.Content != "" {
+		return true
+	}
+	if firstNonEmpty(m.Reasoning, m.ReasoningContent) != "" {
+		return true
+	}
+	return len(m.ToolCalls) > 0
+}
+
 // documentOutputEstimate is outputEstimate's arm for a document the bridge is
 // still holding: the same number finalize() will put in the client's
 // output_tokens for it, worked out from the document's own text rather than
@@ -2599,19 +2694,30 @@ func (b *anthropicBridge) emit(event string, data any) {
 	b.Flush()
 }
 
-// stopReason maps OpenAI finish_reason to Anthropic stop_reason.
-func stopReasonOpenAIToAnthropic(fr string) string {
-	switch fr {
-	case "tool_calls", "function_call":
+// stopReason maps an OpenAI finish_reason to an Anthropic stop_reason, in the
+// terms the turn's own blocks decide — leg 1's mapStopReason, which is the rule
+// the local leg answers with and which the client-side proxy mirrors.
+//
+// A turn that carries a call is tool_use whatever the upstream said, including
+// "length": the call is in the body the client just read, so it can execute it,
+// and the two legs Claude Code talks to say tool_use for exactly this body
+// (2026-09-27 audit, round 43, C43-4). A turn carrying none is NOT tool_use even
+// when the upstream stopped to call one: "tool_use" promises the client a
+// tool_use content block, and an agent that reads it waits for a call that is
+// not in the message — the stalled turn the stream path has guarded against
+// since round 39 (B-F8), and which this arm answered anyway on the non-stream
+// path (2026-09-27 audit, round 43, C43-3).
+func stopReason(finishReason string, toolBlocks int) string {
+	if toolBlocks > 0 {
 		return "tool_use"
+	}
+	switch finishReason {
 	case "length":
 		return "max_tokens"
-	case "stop":
-		return "end_turn"
 	default:
-		if fr == "" {
-			return "end_turn"
-		}
+		// "tool_calls", "function_call", "stop", "" and anything unknown: the
+		// turn ended. "stop_sequence" is never produced — nothing in this pipe
+		// records the sequence that matched.
 		return "end_turn"
 	}
 }

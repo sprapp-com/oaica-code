@@ -563,6 +563,12 @@ func chatRequestToOpenAI(chatReq *api.ChatRequest, anthropicReq anthropic.Messag
 // anthropic.FromMessagesRequest and the gateway's /v1/messages bridge), and the
 // reason all three return a conversation holding one exactly as it arrived
 // (2026-09-27 audit, round 42, C42-5).
+//
+// That check is over the WHOLE conversation, so the scan below has no early
+// exit: stopping at the first system message that arrived after a non-system
+// one — the rewrite was already decided by then — left a later image-carrying
+// system message unguarded, and the rewrite merged it into a bare string and
+// dropped the image (2026-09-27 audit, round 43, A43-1).
 func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 	// Leave an already-ordered conversation byte-for-byte alone. The rewrite
 	// below is only needed for a system message that arrives AFTER a non-system
@@ -581,7 +587,6 @@ func normalizeSystemFirst(msgs []openAIMessage) []openAIMessage {
 			}
 			if seenNonSystem {
 				ordered = false
-				break
 			}
 			if strings.TrimSpace(m.Content) == "" {
 				blank = true
