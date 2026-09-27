@@ -1549,13 +1549,29 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			}
 		}
 		if allText {
-			texts := make([]string, 0, len(parts))
+			// The blank line goes in front of a block only when the run already
+			// carries bytes, which is the sibling converter's own rule — it
+			// writes the separator behind a `text.Len() > 0` test (anthropic.go,
+			// the "text" arm of convertMessage), so a run that opens with an
+			// empty block takes no separator while the block after a stated one
+			// does. Joining every part unconditionally wrote a blank line that
+			// no sibling leg writes: a body whose first block was an empty text
+			// block reached the backend as "\n\naa" here and "aa" on the local
+			// leg, and a body of empty text blocks alone as "\n\n" — prompt
+			// bytes the client never sent, charged to the estimate and to the
+			// model's context (2026-09-28 audit, round 54, B1).
+			var run strings.Builder
 			for _, p := range parts {
-				if t, ok := p["text"].(string); ok {
-					texts = append(texts, t)
+				t, ok := p["text"].(string)
+				if !ok {
+					continue
 				}
+				if run.Len() > 0 {
+					run.WriteString("\n\n")
+				}
+				run.WriteString(t)
 			}
-			putContent(strings.Join(texts, "\n\n"))
+			putContent(run.String())
 			parts = nil
 			return
 		}
@@ -1583,17 +1599,24 @@ func contentBlocksToOpenAI(role string, content any, acceptsImages bool) ([]map[
 			// asked about a turn whose text the client had sent and this gateway
 			// had dropped, the client read a 200, and one body got two answers
 			// depending on which leg served it (2026-09-27 audit, round 43,
-			// B43-2). Absent or null is not the same thing — that is a text block
-			// with no text, which the sibling legs keep as an empty block.
+			// B43-2). An absent or null text is a text block that STATES nothing,
+			// and the sibling converter writes nothing for it at all: its text
+			// arm is gated on `block.Text != nil`, so such a block contributes
+			// no bytes AND no separator — a body of ["aa", {"type":"text"}]
+			// reached the model as "aa" there and "aa\n\n" here, and a body of
+			// nothing but such blocks as no message at all there and "\n\n"
+			// here, bytes the client never sent (2026-09-28 audit, round 54,
+			// B1). The block is skipped rather than kept as an empty part for
+			// exactly that reason; a client that meant a stated empty text
+			// sends `"text": ""`, which is kept below, as the local leg keeps
+			// it.
 			if raw, present := bm["text"]; present && raw != nil {
 				txt, isStr := raw.(string)
 				if !isStr {
 					return nil, "message content text is not a string"
 				}
 				parts = append(parts, map[string]any{"type": "text", "text": txt})
-				break
 			}
-			parts = append(parts, map[string]any{"type": "text", "text": ""})
 		case "image":
 			// The source's TYPE decides what the OpenAI wire can carry, and
 			// reading only media_type/data read an Anthropic url source as two

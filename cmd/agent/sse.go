@@ -19,11 +19,56 @@ import (
 type anthropicSSEAccumulator struct {
 	blocks map[int]*anthropicBlockAccum
 	done   bool
-	// usage is the token count the upstream STATED for this turn, accumulated
-	// across the frames that carry it (message_start's input_tokens,
-	// message_delta's output_tokens) and delivered on the message_stop delta —
-	// the only delta the engine stores as the turn's last one.
-	usage api.Metrics
+	// The token counts the upstream STATED for this turn, per field, delivered
+	// on the message_stop delta — the only delta the engine stores as the
+	// turn's last one (agent/session.go, *latest = response).
+	//
+	// Both frames that carry a usage are read, and the LATER statement wins,
+	// because the two legs that serve this shim put the real numbers in
+	// different frames: the metered gateway states zeros in message_start and
+	// the prompt, the cache split and the output count in message_delta
+	// (tools/gateway/messages.go, finishStream), while the local leg's
+	// message_start carries an estimate (middleware/anthropic.go,
+	// ensureStreamMessageStart) and its message_delta the observed usage. Only
+	// a POSITIVE count is a statement — the gateway's own rule — so a frame
+	// that is silent about a field, or states a zero because it has nothing to
+	// say about it, does not overwrite what the other frame stated
+	// (2026-09-28 audit, round 54: reading message_start alone kept 0 on the
+	// gateway leg and an estimate elsewhere, so the "prompt_eval" trigger this
+	// was meant to revive stayed dead, and cache_read_input_tokens was dropped
+	// whenever the delta stated it).
+	startInput, startCache, startOutput int
+	input, cache, output               int
+}
+
+// usage is the api.Metrics the turn's stated counts add up to, in this
+// product's convention: PromptEvalCount is the WHOLE prompt and
+// PromptEvalCachedCount the part of it served from cache (anthropic.Usage's
+// own reading — input_tokens excludes what cache_read_input_tokens counts, and
+// a client's context arithmetic is their sum; anthropic.UsageFromMetrics
+// converts back the same way). A field no frame stated stays unset, so a turn
+// whose upstream said nothing about its prompt reports nothing rather than a
+// zero.
+func (a *anthropicSSEAccumulator) usage() api.Metrics {
+	in, cacheTok, outTok := a.input, a.cache, a.output
+	if in == 0 {
+		in = a.startInput
+	}
+	if cacheTok == 0 {
+		cacheTok = a.startCache
+	}
+	if outTok == 0 {
+		outTok = a.startOutput
+	}
+	metrics := api.Metrics{EvalCount: outTok}
+	if in > 0 || cacheTok > 0 {
+		metrics.PromptEvalCount = in + cacheTok
+	}
+	if cacheTok > 0 {
+		cached := cacheTok
+		metrics.PromptEvalCachedCount = &cached
+	}
+	return metrics
 }
 
 type anthropicBlockAccum struct {
@@ -44,32 +89,37 @@ func newAnthropicSSEAccumulator() *anthropicSSEAccumulator {
 func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []api.ChatResponse, done bool, err error) {
 	switch eventType {
 	case "message_start":
-		// The prompt the upstream counted, dropped on the floor until round 53:
-		// the engine stores only the LAST delta of a turn (agent/session.go,
-		// *latest = response), and the frames that state a usage are the first
-		// and the second-to-last, so nothing the engine kept ever carried one.
-		// shouldCompact reads that number for its "prompt_eval" trigger
-		// (agent/compactor.go), so the trigger was dead on this leg and every
-		// session compacted on the character estimate instead — the local
-		// model's own count of the prompt was available and never reached it
-		// (2026-09-27 audit, round 53).
+		// A seed, not the count: see the accumulator's field comment. Kept so a
+		// leg that states its usage only here is still read.
 		var ev anthropic.MessageStartEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, false, fmt.Errorf("parse message_start: %w", err)
 		}
-		a.usage.PromptEvalCount = ev.Message.Usage.InputTokens
+		a.startInput = ev.Message.Usage.InputTokens
 		if cached := ev.Message.Usage.CacheReadInputTokens; cached != nil {
-			a.usage.PromptEvalCachedCount = cached
+			a.startCache = *cached
 		}
+		a.startOutput = ev.Message.Usage.OutputTokens
 		return nil, false, nil
 	case "ping":
 		return nil, false, nil
 	case "message_delta":
+		// The frame the turn is CLOSED with, and the one both legs put the real
+		// numbers in. Only positive counts are statements, so a leg that is
+		// silent about a field here does not erase what message_start stated.
 		var ev anthropic.MessageDeltaEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, false, fmt.Errorf("parse message_delta: %w", err)
 		}
-		a.usage.EvalCount = ev.Usage.OutputTokens
+		if ev.Usage.InputTokens > 0 {
+			a.input = ev.Usage.InputTokens
+		}
+		if cached := ev.Usage.CacheReadInputTokens; cached != nil && *cached > 0 {
+			a.cache = *cached
+		}
+		if ev.Usage.OutputTokens > 0 {
+			a.output = ev.Usage.OutputTokens
+		}
 		return nil, false, nil
 	case "content_block_start":
 		var ev anthropic.ContentBlockStartEvent
@@ -158,7 +208,7 @@ func (a *anthropicSSEAccumulator) Feed(eventType string, data []byte) (deltas []
 		// keeps for the turn (its Message is empty, so the engine's delta
 		// handler stores it as *latest), and a turn whose count is only stated
 		// is a turn whose meter and compaction read a guess instead.
-		return []api.ChatResponse{{Done: true, Metrics: a.usage}}, true, nil
+		return []api.ChatResponse{{Done: true, Metrics: a.usage()}}, true, nil
 	case "error":
 		var ev anthropic.StreamErrorEvent
 		if err := json.Unmarshal(data, &ev); err != nil {

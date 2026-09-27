@@ -73,13 +73,24 @@ func TestANamelessCallIsNotAToolUseOnEitherPath(t *testing.T) {
 		defer up.Close()
 		proxy := startCalibProxy(t, up.URL, "sess-r45-unnamed-ns")
 		body, status := postMessagesRaw(t, proxy, false)
-		// A document whose only call was never named says nothing, so the turn
-		// is refused (A45-5) rather than relayed as a finished one.
-		if status != http.StatusBadGateway {
-			t.Fatalf("status=%d, want 502:\n%s", status, body)
+		// Round 45 read this document as one that "says nothing" and refused it
+		// 502 under A45-5. Round 54 overturns that reading: the arguments are
+		// the model's output, the byte-identical STREAM of this same document
+		// answers 200 with them relayed as text (this leg's flushToolCalls and
+		// both arms of the metered gateway do exactly that, and the gateway's
+		// documentSaysSomething counts a nameless call WITH arguments as
+		// something), so a 502 here made the verdict depend on which shape the
+		// upstream sent. A45-5's real subject — a completion with no content and
+		// no calls at all — is still refused, and is pinned by
+		// TestACompletionThatSaysNothingIsRefused below.
+		if status != http.StatusOK {
+			t.Fatalf("a document whose only payload is a nameless call WITH arguments was answered %d, want 200:\n%s", status, body)
 		}
 		if strings.Contains(body, `"stop_reason":"tool_use"`) {
 			t.Errorf("the turn reports tool_use for a call the client cannot run: %s", body)
+		}
+		if !strings.Contains(body, `\"q\":1`) && !strings.Contains(body, `{"q":1}`) {
+			t.Errorf("the arguments the upstream wrote did not reach the client as text: %s", body)
 		}
 	})
 

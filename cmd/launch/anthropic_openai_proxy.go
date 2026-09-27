@@ -477,7 +477,16 @@ func mapToolChoice(tc *anthropic.ToolChoice) any {
 	if tc == nil {
 		return nil
 	}
-	switch tc.Type {
+	// The type is normalized before it is read, exactly as both sibling legs
+	// normalize theirs (the converter's own dropTools test reads
+	// EqualFold(TrimSpace(type), "none") at anthropic.go:589, and the metered
+	// gateway lowercases and trims before its switch). Matching the bare
+	// literals sent `{"type":"Any"}` and `{"type":"Tool","name":"read_file"}`
+	// down the default arm, so the same body forced a tool call on the gateway
+	// leg and left the model free here — and the converter's own case-insensitive
+	// reading of "none" already proved the two legs disagree about the spelling
+	// (2026-09-28 audit, round 54).
+	switch strings.ToLower(strings.TrimSpace(tc.Type)) {
 	case "auto":
 		return "auto"
 	case "any":
@@ -2435,6 +2444,42 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// nowhere for that, it is answered with the stop_reason the upstream
 	// stated.
 	choice := oaiResp.Choices[0]
+	// A call the upstream never named: content_block_start is the only event
+	// that carries a name, so there is no block to open for it and it is not a
+	// call the client can make. Its arguments are still the model's output and
+	// they were billed, so they are relayed as TEXT — which is what BOTH arms of
+	// the gateway do (messages.go: the non-stream arm appends a text block per
+	// unnamed fragment, the stream arm opens a text block for it) and what this
+	// leg's own streaming path does (flushToolCalls). This path alone dropped
+	// them, and a whole completion whose ONLY payload was such a fragment was
+	// refused 502 as an "empty completion" while the byte-identical stream
+	// answered it 200 with the arguments as prose: the verdict depended on which
+	// shape the upstream sent, not on what it said (2026-09-28 audit, round 54).
+	//
+	// Dropped from the parsed list as they are harvested: the estimate below
+	// counts the arguments once, as the stream path counts them once
+	// (streamedText += unnamedText.Len(), plus the NAMED calls only).
+	{
+		var unnamed strings.Builder
+		named := chatResp.Message.ToolCalls[:0:0]
+		for _, tc := range choice.Message.ToolCalls {
+			if strings.TrimSpace(tc.Function.Name) != "" {
+				continue
+			}
+			if s := strings.TrimSpace(tc.Function.Arguments); s != "" {
+				unnamed.WriteString(s)
+			}
+		}
+		if unnamed.Len() > 0 {
+			chatResp.Message.Content += unnamed.String()
+		}
+		for _, tc := range chatResp.Message.ToolCalls {
+			if strings.TrimSpace(tc.Function.Name) != "" {
+				named = append(named, tc)
+			}
+		}
+		chatResp.Message.ToolCalls = named
+	}
 	namedCall := false
 	for _, tc := range choice.Message.ToolCalls {
 		if strings.TrimSpace(tc.Function.Name) != "" {
@@ -2449,7 +2494,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// streaming path answers too), on a body whose text the upstream did write
 	// (2026-09-27 audit, round 44's rule; reintroduced here in round 45 and
 	// caught in round 46, A46-2).
-	if choice.Message.Content == "" &&
+	if chatResp.Message.Content == "" &&
 		firstNonEmpty(choice.Message.Reasoning, choice.Message.ReasoningContent) == "" &&
 		!namedCall {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream returned an empty completion")
@@ -4076,6 +4121,25 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	// split is the one this proxy already makes everywhere: failures are ours
 	// to sanitize, an answer is not.
 	if resp.StatusCode >= 300 {
+		// A 401/403 here is OUR credential failing, not the client's: this leg
+		// injected its own key into the request the client never authenticated
+		// with. The translated path re-emits that refusal as a 502 for exactly
+		// that reason (writeUpstreamError: "they mean OUR key for that remote is
+		// wrong, and handing Claude Code an authentication_error would send it
+		// into its own login flow"), and this branch relayed the vendor's raw
+		// authentication_error instead — so the same body against the same
+		// refusing upstream took the client into its login flow on one wire and
+		// told it the proxy was broken on the other. The status fed to route
+		// health stays the upstream's own, so a credential refusal is classified
+		// exactly as the translated path classifies it (a 4xx is the leg
+		// answering; nothing is recorded for it) rather than as a dead backend
+		// (2026-09-28 audit, round 54).
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			text := strings.TrimSpace(string(httpbody.ReadCappedOrEmpty(resp.Body, httpbody.DiagnosticMax, "the upstream error body")))
+			resp.Body.Close()
+			writeUpstreamError(w, resp, text, headerValue)
+			return resp.StatusCode, false
+		}
 		relayUpstreamResponse(w, resp, headerValue)
 		// relayed is false: a body the health feed only reads for a sub-300
 		// status, and this is not one (see feedPassthroughRouteHealth's switch:

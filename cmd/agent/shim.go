@@ -257,7 +257,7 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 				return err
 			}
 			if done {
-				if err := fn(api.ChatResponse{Done: true, Metrics: acc.usage}); err != nil {
+				if err := fn(api.ChatResponse{Done: true, Metrics: acc.usage()}); err != nil {
 					return err
 				}
 			}

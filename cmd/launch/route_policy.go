@@ -810,10 +810,21 @@ func (t proxyRouteTable) startRouteHealthPoll(ctx context.Context, pollInterval 
 	probe := func() {
 		for _, leg := range legs {
 			u := leg.BaseURL
+			// A row that declares models_path serves its list THERE, not at the
+			// sibling of its base — the same rule doctor, the context-window
+			// probe and both models branches resolve through. Probing <base>/models
+			// against such a row asked an endpoint the vendor does not serve, read
+			// the 404 as a leg failure, and opened the breaker on a leg answering
+			// completions fine: selectRoute then retired it from fallback and
+			// oversize selection (2026-09-28 audit, round 54).
+			probeURL := strings.TrimRight(u, "/") + "/models"
+			if leg.ModelsURL != "" {
+				probeURL = leg.ModelsURL
+			}
 			// ctx-bound request: shutdown cancels an in-flight probe instead
 			// of letting shutdown lag behind it (up to the 5s client timeout
 			// per URL under the old channel-only signal).
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(u, "/")+"/models", nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 			if err != nil {
 				continue
 			}

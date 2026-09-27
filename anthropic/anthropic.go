@@ -2440,33 +2440,131 @@ func countAnyContent(content any) int {
 // front of it is written with it — so it is counted here too, exactly as the
 // converter writes it.
 func messageJoinSeparatorBytes(content any) int {
-	separators, run := 0, 0
-	text := func(blockType, blockText string) {
+	separators, run := 0, false
+	// write is the converter's join, run by run: the separator in front of a
+	// block is written when the run ALREADY holds text, and the block is what
+	// makes the run hold text from then on. The two tests are not the same one:
+	// a text block that states the empty string writes no bytes of its own yet
+	// still takes the separator behind a run that has some — the converter
+	// writes "\n\n" first and the empty text after it — so ["aaaa", "", "bbbb"]
+	// is written 12 bytes by the converter and was charged 10 here (round 53's
+	// own test, empty_between, caught this in round 54's rewrite). A block whose
+	// text is not stated writes nothing at all and never reaches this function.
+	write := func(written int) {
+		if run {
+			separators += 2
+		}
+		run = run || written > 0
+	}
+	// A document with a TEXT source and a search_result are the other two arms
+	// that write into the same run (convertMessage), and they write more than
+	// the bytes the content chargers bill them: the blank line they take when
+	// the run already holds text, the newline the document arm adds when its
+	// data does not end in one, and the newlines the search_result arm writes
+	// after a title and a reference. Left out, a prompt whose newest blocks
+	// were attachments was charged a few bytes short each — and this estimate
+	// seeds the client-visible input_tokens whenever the upstream states no
+	// usage, so the session's meter and its auto-compaction read a prompt
+	// smaller than the one that was sent (2026-09-28 audit, round 54; the same
+	// omission the text arm had in round 53).
+	//
+	// documentChunk is the text the converter writes for a document whose
+	// source is inline text: the data, plus the trailing newline it adds when
+	// the data does not end in one.
+	documentChunk := func(sourceType, data string) int {
+		if sourceType != "text" {
+			return 0
+		}
+		if !strings.HasSuffix(data, "\n") {
+			return len(data) + 1
+		}
+		return len(data)
+	}
+	// searchResultChunk is the string the converter builds for a passage: the
+	// title, the reference and the passage text, each of the first two followed
+	// by a newline, and a trailing newline when the result does not end in one.
+	// The reference is written Ref first, then URL, exactly as the arm reads
+	// them.
+	searchResultChunk := func(title, ref, passage string) int {
+		var sb strings.Builder
+		if title != "" {
+			sb.WriteString(title)
+			sb.WriteString("\n")
+		}
+		if ref != "" {
+			sb.WriteString(ref)
+			sb.WriteString("\n")
+		}
+		sb.WriteString(passage)
+		if sb.Len() == 0 {
+			return 0
+		}
+		if !strings.HasSuffix(sb.String(), "\n") {
+			return sb.Len() + 1
+		}
+		return sb.Len()
+	}
+	// The bytes already billed by countContentBlock/countContentItemIn for each
+	// of those two arms, so the extra this walk charges is exactly what the
+	// converter writes AROUND them.
+	join := func(blockType string, chunk, billed int) {
 		switch blockType {
 		case "tool_result", "web_search_tool_result":
-			run = 0
-		case "text":
-			if run > 0 {
+			// The converter sets cur = nil for both: the next own block opens a
+			// run of its own and takes no separator.
+			run = false
+		default:
+			if chunk <= 0 {
+				return
+			}
+			if run {
 				separators += 2
 			}
-			run += len(blockText)
+			separators += chunk - billed
+			run = true
 		}
 	}
 
 	switch c := content.(type) {
 	case []ContentBlock:
 		for i := range c {
-			// A text block with no text pointer writes nothing at all — the
-			// converter's case guards on block.Text != nil — so it is not a
-			// block this walk may charge a separator for.
-			if c[i].Type == "text" && c[i].Text == nil {
-				continue
+			b := c[i]
+			switch b.Type {
+			case "text":
+				// A text block with no text pointer writes nothing at all — the
+				// converter's case guards on block.Text != nil — so it is not a
+				// block this walk may charge a separator for.
+				if b.Text == nil {
+					continue
+				}
+				write(len(*b.Text))
+			case "document":
+				if b.Source == nil {
+					continue
+				}
+				chunk := documentChunk(b.Source.Type, b.Source.Data)
+				billed := 0
+				if b.Source.Type == "text" {
+					billed = len(b.Source.Data)
+				}
+				join(b.Type, chunk, billed)
+			case "search_result":
+				ref := ""
+				if b.Source != nil {
+					ref = b.Source.Ref
+					if ref == "" {
+						ref = b.Source.URL
+					}
+				}
+				chunk := searchResultChunk(b.Title, ref, searchResultText(b.Content))
+				billed := len(b.Title) + countItemsIn(b.Content, chargeSearchResult)
+				if b.Source != nil {
+					billed += len(b.Source.Ref) + len(b.Source.URL)
+				}
+				join(b.Type, chunk, billed)
+			default:
+				join(b.Type, 0, 0)
 			}
-			var s string
-			if c[i].Text != nil {
-				s = *c[i].Text
-			}
-			text(c[i].Type, s)
 		}
 	case []any:
 		for _, item := range c {
@@ -2475,14 +2573,59 @@ func messageJoinSeparatorBytes(content any) int {
 				continue
 			}
 			blockType, _ := m["type"].(string)
-			if blockType == "text" && m["text"] == nil {
-				// The same block the typed arm above skips: null and absent
-				// both decode to no text pointer, and the converter writes
-				// nothing for either.
-				continue
+			switch blockType {
+			case "text":
+				if m["text"] == nil {
+					// The same block the typed arm above skips: null and absent
+					// both decode to no text pointer, and the converter writes
+					// nothing for either.
+					continue
+				}
+				blockText, _ := m["text"].(string)
+				write(len(blockText))
+			case "document":
+				sourceType, data := "", ""
+				switch src := m["source"].(type) {
+				case map[string]any:
+					sourceType, _ = src["type"].(string)
+					data, _ = src["data"].(string)
+				}
+				chunk := documentChunk(sourceType, data)
+				billed := 0
+				if sourceType == "text" {
+					billed = len(data)
+				}
+				join(blockType, chunk, billed)
+			case "search_result":
+				title, _ := m["title"].(string)
+				ref := ""
+				switch src := m["source"].(type) {
+				case map[string]any:
+					ref, _ = src["ref"].(string)
+					if ref == "" {
+						ref, _ = src["url"].(string)
+					}
+				case string:
+					// The documented bare-string spelling of a search_result's
+					// source, which UnmarshalJSON reads as Ref.
+					ref = src
+				}
+				chunk := searchResultChunk(title, ref, searchResultText(m["content"]))
+				billed := len(title) + countItemsIn(m["content"], chargeSearchResult)
+				if src, ok := m["source"].(map[string]any); ok {
+					if r, _ := src["ref"].(string); r != "" {
+						billed += len(r)
+					}
+					if u, _ := src["url"].(string); u != "" {
+						billed += len(u)
+					}
+				} else if ref != "" {
+					billed += len(ref)
+				}
+				join(blockType, chunk, billed)
+			default:
+				join(blockType, 0, 0)
 			}
-			blockText, _ := m["text"].(string)
-			text(blockType, blockText)
 		}
 	}
 	return separators
@@ -2574,10 +2717,16 @@ func countContentItemIn(item any, ctx chargeContext) int {
 		return searchResultItemBytes(m)
 	}
 	total := 0
-	if s, ok := m["text"].(string); ok {
-		total += len(s)
+	blockType, _ := m["type"].(string)
+	if blockType == "text" {
+		// The same gate as the typed arm above: the converter writes a text
+		// block's text and nothing else's, so a "text" key on a block of
+		// another type is not prompt content this walk may charge.
+		if s, ok := m["text"].(string); ok {
+			total += len(s)
+		}
 	}
-	switch t, _ := m["type"].(string); t {
+	switch blockType {
 	case "tool_use":
 		// The block's own JSON, exactly as the typed arm charges it — with the
 		// inline binary held to the image allowance, so a nested payload the
@@ -2996,7 +3145,14 @@ func binaryOverflow(v any) int {
 
 func countContentBlock(block ContentBlock) int {
 	total := 0
-	if block.Text != nil {
+	if block.Type == "text" && block.Text != nil {
+		// Only a text block's text is written by the converter: a "text" key on
+		// a block of any other type is not a field of that block's shape, and
+		// convertMessage never reads it. Charged for every type, a body like
+		// [{"type":"image","text":"<40 KB>"}] took the estimate from ~1 025
+		// tokens to ~11 025 against a prompt of 1 025 bytes, and the estimate is
+		// what seeds the client-visible input_tokens whenever the upstream
+		// states no usage (2026-09-28 audit, round 54).
 		total += len(*block.Text)
 	}
 	// A thinking block is charged NOTHING, and a redacted one never was. A
