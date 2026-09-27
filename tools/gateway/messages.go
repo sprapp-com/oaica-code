@@ -389,9 +389,45 @@ func contentBlocksToOpenAI(role string, content any) ([]map[string]any, string) 
 				msg["tool_call_id"] = id
 			}
 			out = append(out, msg)
-		case "thinking":
-			// Dropped: the OpenAI wire has no thinking-block representation,
-			// and replaying prior reasoning is not required for coherence.
+		case "thinking", "redacted_thinking":
+			// Dropped DELIBERATELY, not silently: the OpenAI wire has no
+			// reasoning block, so there is nothing to translate and nothing the
+			// answer depends on. A redacted payload is opaque ciphertext by the
+			// provider's own contract — it cannot be read, replayed or
+			// modified. Claude Code with extended thinking echoes both back on
+			// every following turn, so refusing them (which the default case
+			// below does to any type it does not name) 400s a session that was
+			// answered before that case existed. The sibling client-side
+			// converter drops the same two (cmd/launch's block switch).
+		case "document":
+			// A file the client attached. The OpenAI wire has no document
+			// block, but one whose source is TEXT carries its content inline,
+			// and the sibling converter (cmd/launch's) writes that text into
+			// the prompt — refusing it here would answer a turn this product
+			// serves on its other leg. A binary source (a PDF) has no
+			// representation and is refused in words rather than dropped.
+			src, _ := bm["source"].(map[string]any)
+			if src == nil {
+				return nil, "document block without a source"
+			}
+			if st, _ := src["type"].(string); st != "text" {
+				return nil, fmt.Sprintf("document source.type %q cannot be represented on the OpenAI wire", st)
+			}
+			data, _ := src["data"].(string)
+			if data == "" {
+				return nil, `document block with source.type "text" and no data`
+			}
+			parts = append(parts, map[string]any{"type": "text", "text": data})
+		default:
+			// A block this bridge cannot represent is REFUSED in words, never
+			// dropped: the switch had no default and no "document" case, so an
+			// Anthropic document block (a PDF the client attached) fell
+			// through silently, the model was asked about a document it never
+			// received, and the client got a 200 for the answer — the same
+			// silent-lie class the image case above refuses, and the attached
+			// payload was never charged to the prompt either (2026-09-27
+			// audit, round 34, B-F2).
+			return nil, fmt.Sprintf("content block type %q cannot be represented on the OpenAI wire", t)
 		}
 	}
 	flushText()
@@ -457,6 +493,12 @@ func (b *anthropicBridge) WriteHeader(code int) {
 	}
 	b.wroteHeader = true
 	b.status = code
+	// The upstream's Content-Length describes the UPSTREAM's body, and every
+	// path out of this bridge answers with a different one (see commit's doc).
+	// Dropped here, at the one point every response passes through, so the
+	// translated body is framed by the server instead of truncated to a
+	// length that was never ours.
+	b.ResponseWriter.Header().Del("Content-Length")
 	if code >= 400 {
 		// Error body arrives as OpenAI JSON; buffer and translate in
 		// finalize() so the client sees the Anthropic error shape.
@@ -467,11 +509,25 @@ func (b *anthropicBridge) WriteHeader(code int) {
 
 // commit writes the success status exactly once. Callers must have set any
 // Content-Type they want first: WriteHeader flushes the header block.
+//
+// Content-Length is DELETED here and never re-declared by hand: the reverse
+// proxy copies the upstream's own Content-Length onto this response, and this
+// bridge answers with a TRANSLATED body — a different length, sometimes a
+// different shape entirely. net/http enforces a declared Content-Length on
+// handler writes, so the client read a truncated body or none at all and
+// `unexpected EOF`, on every non-stream /v1/messages turn and every
+// /v1/messages error — including the "prompt is too long" wording Claude Code
+// pattern-matches to its compaction recovery path, which without it retries
+// the identical doomed request (2026-09-27 audit, round 34, B-F1). Without a
+// declared length the server frames the body itself (chunked or computed),
+// which is what every translating proxy must do. httptest.NewRecorder does not
+// enforce a declared length, which is why the suite could not see this.
 func (b *anthropicBridge) commit() {
 	if b.committed {
 		return
 	}
 	b.committed = true
+	b.ResponseWriter.Header().Del("Content-Length")
 	if b.stream {
 		b.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 	}
@@ -636,8 +692,13 @@ func (b *anthropicBridge) finalize() {
 	// proxy has split the same body this way since 2026-09-26 (see
 	// anthropic_openai_proxy.go, and anthropic/anthropic.go for the contract);
 	// this side never emitted the field at all (2026-09-27 audit, round 23).
-	cached := resp.Usage.cachedTokens()
-	in, out := resp.Usage.PromptTokens-cached, resp.Usage.CompletionTokens
+	// nonNegative, like the stream path and the ledger row: an upstream that
+	// states a negative prompt_tokens said nothing about the prompt, and the
+	// raw subtraction handed the client input_tokens=-400 for the same turn
+	// the ledger records as 0 (2026-09-27 audit, round 34, B-F3).
+	u := resp.Usage.nonNegative()
+	cached := u.cachedTokens()
+	in, out := u.PromptTokens-cached, u.CompletionTokens
 	b.ResponseWriter.Header().Set("Content-Type", "application/json")
 	b.commit()
 	json.NewEncoder(b.ResponseWriter).Encode(map[string]any{

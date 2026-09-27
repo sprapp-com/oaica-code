@@ -718,11 +718,47 @@ func (q *Qwen) CurrentModel() string {
 	// it — anything else is a foreign config and keeps its own name.
 	baseURL := qwenManagedBaseURL(cfg)
 	if baseURL != "" && strings.TrimRight(baseURL, "/") != strings.TrimRight(qwenBaseURL(), "/") {
+		remote, ok := qwenConfiguredRemoteForBase(baseURL)
+		if !ok {
+			return name
+		}
+		if !qwenConfigHoldsLiveRemoteKey(cfg, remote) {
+			return ""
+		}
 		if picker := qwenRemotePickerName(baseURL, name); picker != "" {
 			return picker
 		}
 	}
 	return name
+}
+
+// qwenConfigHoldsLiveRemoteKey reports whether env.OLLAMA_API_KEY is the value
+// applyQwenOllamaKey would leave for this remote — the read-back its writer
+// never had.
+//
+// The writer stores the remote's token there, and nothing else supplies it:
+// Qwen's managed launch passes the environment through untouched, so a store
+// holding a key the remote has since replaced still read as "current", the
+// launch skipped applyQwenOllamaConfig, and Qwen started against the remote
+// with the revoked bearer — a silent 401 on every request. The same class
+// round 32 fixed for droid and round 33 for OMP and Hermes; Qwen's reader was
+// the one left (2026-09-27 audit, round 34, A-F3).
+//
+// A remote that resolves to no token at all is not this failure: there the
+// writer deliberately leaves a stored value alone for a loopback endpoint (and
+// blanks it for another host, round 19/20/21), so the key is not a field it
+// writes either way.
+func qwenConfigHoldsLiveRemoteKey(cfg map[string]any, remote userRemote) bool {
+	live := strings.TrimSpace(remote.key())
+	if live == "" {
+		return true
+	}
+	envCfg, _ := cfg["env"].(map[string]any)
+	if envCfg == nil {
+		return false
+	}
+	stored, _ := envCfg[qwenOllamaEnvKey].(string)
+	return strings.TrimSpace(stored) == live
 }
 
 func (q *Qwen) Onboard() error {

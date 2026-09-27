@@ -1843,13 +1843,22 @@ func estimateMessageTokens(req map[string]any) int {
 // calibMaxRatio). Charged in the same byte unit as the messages, by length --
 // no image and no inline payload can ride a tool schema.
 func messagesBytes(req map[string]any) int {
+	// The two prompt spellings are alternatives, so the LARGER of the two is
+	// the bound: testing req["messages"] by presence let a body carrying an
+	// empty messages array beside a real legacy prompt measure as 0 tokens and
+	// walk past both guards — the same payload the prompt-only shape is
+	// refused for (2026-09-27 audit, round 34, B-F5; round 33 covered the
+	// shape where "messages" is absent, not where it is empty). Charging the
+	// max can only over-charge a body that carries both, which no real client
+	// sends, and never under-charges a prefill the upstream will do.
 	total := 0
 	if msgs, ok := req["messages"]; ok {
 		if b, err := json.Marshal(msgs); err == nil {
 			total = promptPayloadBytes(len(b), msgs)
 		}
-	} else if p, ok := req["prompt"]; ok {
-		if b, err := json.Marshal(p); err == nil {
+	}
+	if p, ok := req["prompt"]; ok {
+		if b, err := json.Marshal(p); err == nil && len(b) > total {
 			total = len(b)
 		}
 	}
@@ -2178,9 +2187,16 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			// exactly the requests that ask for more than the window can hold
 			// (2026-09-27 audit, round 31). Same two cases as the maxTokens
 			// read further down, which was fixed the same way.
+			// Compared as float64, never through int(): int(1e19) wraps
+			// negative, so the comparison was false and an absurd budget was
+			// forwarded verbatim on the one path where this clamp is the only
+			// guard — a model that publishes no max_completion_tokens, because
+			// the output-budget clamp above runs only when one is published
+			// (2026-09-27 audit, round 34, B-F4). Same conversion the
+			// output-budget clamp lost in round 32, and the same wrap.
 			switch v := req[k].(type) {
 			case float64:
-				if int(v) > fitBudget {
+				if v > float64(fitBudget) {
 					req[k] = fitBudget
 				}
 			case int:
