@@ -3637,6 +3637,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// the frame it adopted or a delta later (2026-09-28 audit,
 					// round 68, F68-L2-1).
 					if !indexed || adoptedCallAt[slot] != nil {
+						// The id this fragment states belongs to the TURN even
+						// though nothing of it can be delivered, so it is
+						// reserved before the drop — the same rule the flush
+						// follows for the entries IT drops (round 70). This
+						// one needs saying here because it never reaches the
+						// flush at all: no accumulator is created for it, so
+						// it was invisible to droppedStatedIDs, and a later
+						// id-less call's mint landed on the id the wire had
+						// already stated for this entry — the same turn
+						// reaching the client under a different id depending
+						// on whether the upstream wrote its first call inside
+						// the frame this leg adopted or as a delta
+						// (2026-09-28 audit, round 71, F71-L2-1).
+						conv.ReserveToolCallIDs(tc.ID)
 						continue
 					}
 				}
