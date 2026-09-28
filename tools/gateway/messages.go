@@ -5271,7 +5271,26 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 					continue
 				}
 			}
-			b.statedIDOwner[tc.ID] = toolCallIdentity(name, args)
+			// The record is written only where none is held, which is what the
+			// non-stream list does (finalize: the assignment sits in the else of
+			// "this id is already held by a different call", so a second,
+			// different call under a stated id re-mints without taking the id's
+			// record with it). Writing it unconditionally here let a middle entry
+			// that re-mints — the ordinary "same id, another call" reading both
+			// other legs share (round 45's A45-3) — overwrite the record of the
+			// call the FIRST entry stated. A later byte-for-byte repeat of that
+			// first entry then no longer matched the record, and the clause above
+			// could not answer it either (the first block is mid-object, so
+			// blockCarrying refuses it), so the repeat opened a THIRD block under
+			// a minted id: one upstream body reached the client as 3 tool_use
+			// blocks when the request streamed and 2 when it did not (2026-09-28
+			// audit, round 85, R85-L3-1). Measured: 4096 triples over a 16-entry
+			// pool gave 8 such divergences, all of this shape, and all of them
+			// gone with this clause; the two-entry case never diverges, being
+			// answered by the round-84 byte clause above.
+			if _, held := b.statedIDOwner[tc.ID]; !held {
+				b.statedIDOwner[tc.ID] = toolCallIdentity(name, args)
+			}
 		}
 		idx := i
 		b.toolDelta(&idx, tc.ID, name, args)
