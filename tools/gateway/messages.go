@@ -3662,7 +3662,29 @@ func callArgsExtend(blockArgs, args string) bool {
 }
 
 func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
-	if name == "" || b.lastToolName == "" {
+	if name == "" {
+		// A fragment the upstream never named is not a call on any arm of this
+		// leg: its arguments are relayed as TEXT, and a call written from it
+		// would carry a name the model never wrote. It is never a call this one
+		// splits away from either.
+		return false
+	}
+	if b.lastToolName == "" {
+		// Nothing in this turn has named a call yet. A fragment that DOES name
+		// one and lands on a block that has not started is therefore not
+		// continuing it: it begins its own call. The block it landed on is the
+		// parked nameless fragment — whose bytes were being written into the
+		// block of the call that followed, so the model's raw output stopped
+		// being relayed as text and became that call's input, under a minted id
+		// hashed from arguments the model never wrote: `[{nameless,"zzz"},{id-
+		// less,Read,"{}"}]` reached the client as `Read {"_raw":"zzz"}` on this
+		// arm where both document arms of this same bridge answer `Read {}` with
+		// `zzz` as prose, and with a stated id on the nameless fragment the
+		// delivered call took an id the upstream had stated for something every
+		// arm agrees is not a call (2026-09-28 audit, round 75, F75-L3-1).
+		if cur := b.toolBlocks[key]; cur != nil && !cur.started {
+			return true
+		}
 		return false
 	}
 	cur := b.toolBlocks[key]
