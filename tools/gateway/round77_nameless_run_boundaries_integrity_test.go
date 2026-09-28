@@ -161,3 +161,32 @@ func TestARunEndsWhereACallIsNamed(t *testing.T) {
 			gotFrame, want, frame)
 	}
 }
+
+// TestANamelessRunInterleavedAcrossSlotsIsOneBlock is the same run rule read
+// across slots: the upstream stated one run's bytes at two different indices,
+// the way a vendor interleaves two streams, and the wire's order — not the
+// order the slots were first seen — is what the client reads. The document arms
+// write one text block per contiguous run of nameless entries in LIST order, so
+// the frame arm groups by the run, not by the slot the router filed a fragment
+// under. A bridge that appends each fragment to its slot's own block answers
+// two blocks here and puts the second slot's bytes first.
+func TestANamelessRunInterleavedAcrossSlotsIsOneBlock(t *testing.T) {
+	entries := []string{
+		`{"index":0,"type":"function","function":{"arguments":"{\"a\":"}}`,
+		`{"index":1,"type":"function","function":{"arguments":"{\"z\":9}"}}`,
+		`{"index":0,"type":"function","function":{"arguments":"{\"a\":1}"}}`,
+	}
+	doc, plain, frame := r76ThreeArms(t, entries)
+	want := `<text "{\"a\":{\"z\":9}{\"a\":1}">`
+	gotDoc, gotPlain, gotFrame := r76BlockOrder(t, doc), r76BlockOrder(t, plain), r76BlockOrder(t, frame)
+	if gotDoc != want {
+		t.Errorf("the adopted arm answered %s, want %s (2026-09-28 audit, round 77, F77-L3-2)", gotDoc, want)
+	}
+	if gotPlain != want {
+		t.Errorf("the non-stream arm answered %s, want %s (2026-09-28 audit, round 77, F77-L3-2)", gotPlain, want)
+	}
+	if gotFrame != want {
+		t.Errorf("the fragment arm answered %s, want %s — a nameless entry's bytes are the model's prose whatever index the wire stated them at, and one run of prose is one text block in the order the wire wrote it (2026-09-28 audit, round 77, F77-L3-2)\n%s",
+			gotFrame, want, frame)
+	}
+}

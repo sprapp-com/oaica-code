@@ -3170,10 +3170,7 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		return key
 	}
 	cur := b.toolBlocks[key]
-	if cur == nil || callArgsExtend(cur.args.String(), args) {
-		return key
-	}
-	if !namesItself(cur) && b.namelessRunKey == key {
+	if cur == nil || !namesItself(cur) || callArgsExtend(cur.args.String(), args) {
 		return key
 	}
 	b.synthSeq++
@@ -4170,6 +4167,26 @@ func rawFallbackArgs(s string) string {
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	key := b.toolKey(upIdx, id, name, args)
 	tb, ok := b.toolBlocks[key]
+	if strings.TrimSpace(name) == "" && strings.TrimSpace(args) != "" {
+		// An entry the upstream never named, on a block that is not a call:
+		// its bytes are the model's prose, and prose is ONE run, in the order
+		// the wire wrote it — the whole-list arms concatenate every nameless
+		// entry's arguments in list order, so a run the wire interleaved across
+		// two slots is still one text block holding those bytes in that order.
+		// The fragment joins the run currently open wherever the router filed
+		// it; when a call has closed that run it starts one of its own, and it
+		// never reopens the run's block the wire has already left behind.
+		if rb, rok := b.toolBlocks[b.namelessRunKey]; rok && rb != nil && !namesItself(rb) {
+			tb, key, ok = rb, rb.key, true
+		} else if ok && !namesItself(tb) {
+			// The router filed this fragment on a nameless block that is not
+			// the open run: the run it belonged to ended when a call was named
+			// after it (2026-09-28 audit, round 77, F77-L3-1).
+			b.synthSeq++
+			key = "?" + strconv.Itoa(b.synthSeq)
+			tb, ok = nil, false
+		}
+	}
 	if !ok {
 		tb = &toolBlock{key: key, index: -1}
 		b.toolBlocks[key] = tb
