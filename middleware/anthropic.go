@@ -562,12 +562,15 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 					"loop", loop,
 					"error", err,
 				)
+				// The narration of this turn is already in serverContent: the
+				// append above it is what put it there, so it is cloned alone
+				// (2026-09-29 audit, round 87, F87-L1-1).
 				return anthropic.MessagesResponse{}, &webSearchLoopError{
 					code:    "api_error",
 					query:   query,
 					usage:   usage,
 					err:     err,
-					content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
+					content: slices.Clone(serverContent),
 				}
 			}
 			assistantMsg.Content = content
@@ -587,12 +590,16 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 				"query", query,
 				"error", err,
 			)
+			// The narration of the turn that asked for this search is already in
+			// serverContent (appended before the search blocks above), so the
+			// failure carries what the turn has already been given and not a
+			// second copy of its prose (2026-09-29 audit, round 87, F87-L1-1).
 			return anthropic.MessagesResponse{}, &webSearchLoopError{
 				code:    "api_error",
 				query:   query,
 				usage:   usage,
 				err:     err,
-				content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
+				content: slices.Clone(serverContent),
 			}
 		}
 		logutil.TraceContext(ctx, "anthropic middleware: followup response",
