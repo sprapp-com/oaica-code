@@ -3139,6 +3139,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// the two are told apart below so that each gets the sentence its buffered
 	// twin gives it (2026-09-29 audit, round 90, F90-L2-3).
 	choiceslessFrame := false
+	// wholeCompletionFrameSeen records whether any frame this stream read PARSED
+	// as a whole completion — a choice carrying `message` — the streamed
+	// spelling of the document the buffered arm decodes and refuses with
+	// "upstream returned an empty completion" when the message says nothing.
+	// A stream of such frames that relays nothing ended the same way that
+	// document does, and is named the same way below (2026-09-29 audit, round
+	// 93, F93-L2-1b).
+	wholeCompletionFrameSeen := false
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -3749,7 +3757,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// the stream already holds is still left alone — and the two branches
 		// are mutually exclusive on `started` as it stood when the frame
 		// arrived, so a frame is never both adopted and folded.
-		if (started || len(toolAccums) > 0) && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, heldCall) {
+		// A frame that IS a whole completion is read by its MESSAGE and nothing
+		// else, which is the reading the unframed arm of this leg makes: the
+		// whole-body path decodes the document's message and never looks at a
+		// `delta` field. The two branches below ARE that reading for a frame —
+		// the fold builds a delta FROM the message, the adoption relays the
+		// message itself — and the only other thing such a frame carries is the
+		// finish_reason its choice states. Its own `delta` is not this arm's to
+		// relay: a frame carrying a `message` and a `delta` that neither branch
+		// takes (a message stating nothing, with the turn in the delta) fell
+		// through to the delta reader and answered 200 with that delta's prose,
+		// while the byte-identical document, the same body with no `data:`
+		// prefix, and the same request asking not to stream were all refused 502
+		// (2026-09-29 audit, round 93, F93-L2-1a).
+		wholeCompletionFrame := frameCarriesWholeCompletion(payload)
+		if wholeCompletionFrame {
+			wholeCompletionFrameSeen = true
+		}
+		frameReadAsDelta := false
+
+		if (started || len(toolAccums) > 0) && wholeCompletionFrame && frameAddsToTheTurn(payload, heldCall) {
 			var doc openAIChatResponse
 			if err := json.Unmarshal([]byte(payload), &doc); err == nil && len(doc.Choices) > 0 && len(chunk.Choices) > 0 {
 				m := doc.Choices[0].Message
@@ -3787,9 +3814,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					})
 				}
 			}
+			// The fold built this frame's delta out of its message, so the
+			// reader below is reading what the fold wrote.
+			frameReadAsDelta = true
 		}
 
-		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, heldCall) {
+		if !started && len(toolAccums) == 0 && wholeCompletionFrame && frameAddsToTheTurn(payload, heldCall) {
 			if adopted, refused := adoptWholeCompletion(payload); adopted {
 				// The turn's whole completion has been relayed, and the stream
 				// goes on: the upstream stated the message and then kept
@@ -3857,6 +3887,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// message, and that still does not happen.
 				continue
 			}
+		}
+
+		// What is left of a whole-completion frame the branches above did not
+		// take is the finish_reason its choice states — a stream-level fact that
+		// must still end the turn — and nothing else. Blanking the delta rather
+		// than skipping the frame keeps that scan reachable, and the frame's
+		// `delta` reaches the client exactly as often as the unframed arm's does
+		// (2026-09-29 audit, round 93, F93-L2-1a).
+		if wholeCompletionFrame && !frameReadAsDelta {
+			chunk.Choices[0].Delta = openAIStreamDelta{}
 		}
 
 		for ci, choice := range chunk.Choices {
@@ -4632,6 +4672,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// them PARSED as a chunk carrying no choice at all, which is
 					// the streamed spelling of the body the buffered arm reads
 					// and refuses with this same sentence.
+					msg = "upstream returned an empty completion"
+				} else if !started && wholeCompletionFrameSeen {
+					// Same rule for the other spelling of an empty body: a frame
+					// that PARSED as a whole completion and stated nothing is the
+					// streamed spelling of the document the buffered arm decodes,
+					// finds empty, and refuses with this sentence — and the
+					// `[DONE]` that followed it does not change what the upstream
+					// said, so the sentence must not change either. Measured
+					// 2026-09-29 (round 93, F93-L2-1b): a frame
+					// `{"message":{"role":"assistant"}}` with `[DONE]` behind it
+					// was answered "upstream stream ended before the response was
+					// complete" while the byte-identical document, buffered,
+					// whole-bodied and unframed, all answered "upstream returned
+					// an empty completion".
 					msg = "upstream returned an empty completion"
 				}
 			}
