@@ -1973,6 +1973,11 @@ type anthropicBridge struct {
 	// upstream that sends the index-less fragments this wire permits (an
 	// arguments-only continuation) keeps writing into the block it opened.
 	lastToolKey string
+	// namelessRunKey is the key of the nameless block currently taking bytes:
+	// the run of entries the upstream never named that the wire has not yet
+	// interrupted with a call. A block that names itself clears it, so the next
+	// nameless fragment stands in a run of its own (see toolKey, F77-L3-1).
+	namelessRunKey string
 	// lastToolName is the name that opened that block, so a later fragment
 	// naming a DIFFERENT tool is understood to be introducing one.
 	lastToolName string
@@ -3146,12 +3151,19 @@ func (b *anthropicBridge) flushHeldText() {
 // The test is the WRITE's own (callArgsExtend), so a nameless fragment whose
 // bytes ARE more of what the block holds — the continuation a vendor splits
 // across a nameless prefix, and the second half of one contiguous nameless run
-// — keeps going into that block, exactly as it did before this round. What
-// splits off is a fragment the block's bytes CANNOT take, and that is the same
-// rule whether the block is a call (its arguments are finished, so these are
-// not its arguments) or a nameless run's own text (the wire put a call, or a
-// non-concatenable fragment, between the two halves — the document arms write
-// one text block per CONTIGUOUS run, so the later half is a run of its own).
+// — keeps going into that block, exactly as it did before this round.
+//
+// The predicate is the CALL's, though, and it is asked only of a block that IS
+// a call. A nameless block is prose: its bytes are one run of the model's
+// output, and a run takes any bytes — two whole objects the wire sent as two
+// nameless entries are one text block on both document arms, and the frame arm
+// split them into two and answered one body two ways. The argument list a call
+// cannot extend is a fact about arguments, and applying it to a nameless block
+// also reordered a run's own bytes: the fragment that split off opened a block
+// relayed last, so the bytes AFTER it went back into the run's first block and
+// the client read the model's prose out of order (2026-09-28 audit, round 77,
+// F77-L3-1 and F77-L3-2). What splits off is a fragment a CALL's bytes cannot
+// take — its arguments are finished, so these are not its arguments.
 func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	key := b.routeToolKey(upIdx, id, name, args)
 	if strings.TrimSpace(name) != "" || strings.TrimSpace(args) == "" {
@@ -3159,6 +3171,9 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	}
 	cur := b.toolBlocks[key]
 	if cur == nil || callArgsExtend(cur.args.String(), args) {
+		return key
+	}
+	if !namesItself(cur) && b.namelessRunKey == key {
 		return key
 	}
 	b.synthSeq++
@@ -4198,8 +4213,14 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	if name != "" && tb.name == "" {
 		tb.name = name
 	}
+	if namesItself(tb) {
+		// The wire named a call here, so the run the nameless entries before it
+		// stood in ends at this block: the next nameless fragment is a run of
+		// its own (the document arms write one text block per CONTIGUOUS run).
+		b.namelessRunKey = ""
+	}
 	if args != "" {
-		if !callArgsExtend(tb.args.String(), args) {
+		if namesItself(tb) && !callArgsExtend(tb.args.String(), args) {
 			// Bytes this call's arguments cannot take: a whole object after a
 			// finished one or after a freeform line, or a whole object onto an
 			// object the model was still writing. No block of this bridge can
@@ -4214,6 +4235,9 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			return
 		}
 		tb.args.WriteString(args)
+		if !namesItself(tb) {
+			b.namelessRunKey = tb.key
+		}
 	}
 	if tb.id == "" {
 		// The id is decided after the fragment's name and arguments are in, so
