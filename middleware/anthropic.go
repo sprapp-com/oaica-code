@@ -195,13 +195,24 @@ func (w *AnthropicWriter) Write(data []byte) (int, error) {
 // WebSearchAnthropicWriter intercepts responses containing web_search tool calls,
 // executes the search, re-invokes the model with results, and assembles the
 // Anthropic-format response (server_tool_use + web_search_tool_result + text).
+// webSearchLoopWindow is the budget the web_search loop's own work runs under.
+// It is a variable so a test can hold the two arms to one window in milliseconds
+// rather than living through five minutes; production never writes it.
+var webSearchLoopWindow = 5 * time.Minute
+
 type WebSearchAnthropicWriter struct {
 	BaseWriter
 	newLoopContext func() (context.Context, context.CancelFunc)
-	inner          *AnthropicWriter
-	req            anthropic.MessagesRequest // original Anthropic request
-	chatReq        *api.ChatRequest          // converted Ollama request (for followup calls)
-	stream         bool
+	// loopWaitContext bounds the wait for the turn's own tail (F83-L1-1). It is
+	// the CLIENT's context and not the loop's window: the tail is the turn's
+	// work, not the loop's, and a window that covered it decided the turn's
+	// verdict on the streaming arm alone (2026-09-29 audit, round 89,
+	// F89-L1-1).
+	loopWaitContext context.Context
+	inner           *AnthropicWriter
+	req             anthropic.MessagesRequest // original Anthropic request
+	chatReq         *api.ChatRequest          // converted Ollama request (for followup calls)
+	stream          bool
 
 	estimatedInputTokens int
 
@@ -575,6 +586,17 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 			}
 			assistantMsg.Content = content
 			assistantMsg.Thinking = thinking
+			// The loop's window starts where the loop's OWN work does, which on
+			// this arm is after the wait above: the search call and the tail are
+			// work the whole-document arm either does inside its window or never
+			// does, and a tail longer than the window would otherwise spend this
+			// arm's whole budget before its follow-up was ever sent. Re-minted,
+			// the rest of the loop gets the window its sibling arm's loop got,
+			// and the two arms answer one body the same way (2026-09-29 audit,
+			// round 89, F89-L1-1).
+			mintedCtx, mintedCancel := w.startLoopContext()
+			defer mintedCancel()
+			ctx = mintedCtx
 		}
 		toolResultMsg := api.Message{
 			Role:       "tool",
@@ -721,11 +743,22 @@ func (w *WebSearchAnthropicWriter) finishTurnNarration() {
 // ends its turn, must not leave the worker waiting on a turn that will never
 // finish.
 func (w *WebSearchAnthropicWriter) waitForTurnNarration(ctx context.Context) (string, string, error) {
+	// The CLIENT's context, not the loop's window: what is being waited for is
+	// the turn's own tail, which the whole-document arm of the same body has
+	// already been handed whole. Bounded by the loop's window instead, a first
+	// turn whose tail outlived it failed the streaming client with a fabricated
+	// api_error search pair and no answer, while the buffered client was
+	// answered the follow-up for the same bytes (2026-09-29 audit, round 89,
+	// F89-L1-1).
+	waitCtx := ctx
+	if w.loopWaitContext != nil {
+		waitCtx = w.loopWaitContext
+	}
 	select {
 	case <-w.turnNarrationDone:
 		return w.turnContent.String(), w.turnThinking.String(), nil
-	case <-ctx.Done():
-		return "", "", ctx.Err()
+	case <-waitCtx.Done():
+		return "", "", waitCtx.Err()
 	}
 }
 
@@ -811,7 +844,7 @@ func (w *WebSearchAnthropicWriter) startLoopContext() (context.Context, context.
 	if w.newLoopContext != nil {
 		return w.newLoopContext()
 	}
-	return context.WithTimeout(context.Background(), 5*time.Minute)
+	return context.WithTimeout(context.Background(), webSearchLoopWindow)
 }
 
 func (w *WebSearchAnthropicWriter) combineServerAndFinalContent(serverContent []anthropic.ContentBlock, finalResponse api.ChatResponse, usage anthropic.Usage) anthropic.MessagesResponse {
@@ -1695,8 +1728,9 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 			c.Writer = &WebSearchAnthropicWriter{
 				BaseWriter: BaseWriter{ResponseWriter: c.Writer},
 				newLoopContext: func() (context.Context, context.CancelFunc) {
-					return context.WithTimeout(requestCtx, 5*time.Minute)
+					return context.WithTimeout(requestCtx, webSearchLoopWindow)
 				},
+				loopWaitContext:      requestCtx,
 				inner:                innerWriter,
 				req:                  req,
 				chatReq:              chatReq,
