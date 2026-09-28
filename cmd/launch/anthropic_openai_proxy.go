@@ -3635,6 +3635,24 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							namedBy(acc, *tc.Index)) &&
 						((tc.ID != "" && acc.id != "" && tc.ID != acc.id) ||
 							(tc.Function.Name != "" && acc.name != "" && tc.Function.Name != acc.name) ||
+							// A slot holding a fragment the upstream never NAMED
+							// is not a call at all — at flush its arguments reach
+							// the client as TEXT and no block is written for it
+							// (relayUnnamedCallArguments). A fragment that DOES
+							// name a call therefore does not continue it: written
+							// into that accumulator the call took the unnamed
+							// fragment's arguments as its own and the model's own
+							// arguments for it were dropped —
+							// `[{index 0, name "", args {"a":1}},{index 0, id c1,
+							// name Bash}]` reached the client as `Bash {"a":1}`
+							// where this leg's whole-list arm answers that same
+							// body with `Bash {}` and `{"a":1}` as prose, which is
+							// what every other leg answers too (2026-09-28 audit,
+							// round 76, F76-L2-1). The un-indexed spelling of this
+							// wire is the same rule round 75 gave
+							// startsANewToolCall; this is the spelling vendors
+							// actually write, and only that one was closed.
+							(strings.TrimSpace(acc.name) == "" && tc.Function.Name != "") ||
 							(adoptedCallAt[slot] == nil &&
 								(tc.ID != "" || tc.Function.Name != "") &&
 								strings.TrimSpace(tc.Function.Arguments) != "" &&
@@ -3732,15 +3750,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// Nowhere left to put it: the slot's own call is
 							// finished and so is the one the stream last wrote
 							// to. Two finished objects do not concatenate into
-							// JSON, and every other arm DROPS this fragment —
-							// this leg's whole-list adoption answers the same
-							// body with the call alone, and the gateway leg
-							// refuses the bytes after a closed block. Appending
-							// it here handed the client a call whose input is
-							// `{"b":2}{"c":3}`, which no tool can parse, under a
-							// stop_reason of tool_use (2026-09-28 audit, round
-							// 60, F60-X-1 and F60-X-2).
-							continue
+							// JSON, so appending it here handed the client a call
+							// whose input is `{"b":2}{"c":3}`, which no tool can
+							// parse, under a stop_reason of tool_use (2026-09-28
+							// audit, round 60, F60-X-1 and F60-X-2). Dropping it
+							// WHOLE is a different matter: it is a fragment the
+							// upstream billed and the client never saw, and it
+							// carries no
+							// name and no id — the branch above requires it — so
+							// this leg's own whole-list arm relays its arguments
+							// as TEXT, as the adoption arm does, and round 54's
+							// rule is that a nameless call's arguments reach the
+							// client on BOTH of this leg's paths. It gets an
+							// accumulator of its own, which is what makes the
+							// flush relay it as text: `[{index 0, id c1, name
+							// Bash, args {"a":1}},{index 0, name "", args
+							// {"b":2}}]` answered the call alone here and the
+							// call plus the text `{"b":2}` as one list
+							// (2026-09-28 audit, round 76, F76-L2-2).
+							slot = nextFreeToolSlot
+							nextFreeToolSlot++
 						}
 					}
 				} else {
@@ -3764,7 +3793,25 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// slot that was not the call's (2026-09-28 audit, round 58,
 					// F58-L3-1).
 					if acc, exists := toolAccums[lastToolSlot]; lastToolSlot >= 0 && exists &&
-						startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name, tc.Function.Arguments) {
+						(startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name, tc.Function.Arguments) ||
+							// An argument-only fragment whose bytes are not more
+							// of the call it would join — the call's own
+							// arguments are finished on the wire and these
+							// cannot extend them — is a fragment of its own, not
+							// a continuation: appended it made the call's input
+							// `{"p":1}{"a":1}`, which no tool can parse, under a
+							// stop_reason of tool_use, where this leg's
+							// whole-list arm answers the same body with the call
+							// and the fragment's bytes as TEXT. The indexed path
+							// above has asked canExtend of exactly this case
+							// since round 61; this path joined whatever arrived
+							// at the last slot. The fragment is nameless by the
+							// same token (it states no id and no name), so the
+							// accumulator it gets relays its bytes as text
+							// (2026-09-28 audit, round 76, F76-L2-3).
+							(tc.ID == "" && tc.Function.Name == "" &&
+								argsFinished(acc.args.String()) &&
+								!canExtend(acc.args.String(), tc.Function.Arguments))) {
 						slot = nextFreeToolSlot
 						nextFreeToolSlot++
 					} else if lastToolSlot >= 0 {
