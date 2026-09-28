@@ -372,10 +372,49 @@ func userRemotesPath() string {
 // pay-per-token API), relabeling, or fixing an endpoint is an overlay change —
 // never a change here. A user-defined remote of the same name in remotes.json
 // still wins (see loadUserRemotes).
+// firstSetEnv returns the first variable in env that is actually SET, or "".
+//
+// models.dev orders a provider's env[] by popularity upstream, not by what a
+// given user holds, so env[0] is the wrong answer for everyone who holds a
+// later one — opencode reads it the same way (provider.env.map((item) =>
+// envs[item]).find(Boolean)). It is the fallback for a catalog row that
+// declares no api_key_env of its own: our overlay's spec is more specific, so
+// it is asked first.
+func firstSetEnv(env []string) string {
+	for _, name := range env {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if os.Getenv(name) != "" {
+			return name
+		}
+	}
+	return ""
+}
+
 func builtinRemotes() []userRemote {
 	var out []userRemote
-	for _, p := range providerCatalogAsUserRemotes() {
+	for _, e := range providerCatalog() {
+		// An SDK-signed provider cannot work through a plain base URL, and a
+		// row with no endpoint at all cannot be launched: both would offer the
+		// user a provider that cannot succeed, however well credentialed they
+		// are. The catalog keeps such rows (their credentials are real, and
+		// models.dev states some endpoints per model), so the gate is here.
+		if e.Hidden || strings.TrimSpace(e.BaseURL) == "" {
+			continue
+		}
+		p := userRemoteFromCatalogEntry(e)
 		if remoteKeyEnvSet(p) {
+			out = append(out, p)
+			continue
+		}
+		// The row's own env[]: a catalog row that declares no api_key_env is
+		// still usable when the user holds one of the variables upstream lists
+		// for it. The variable that IS set becomes the row's spec, because it
+		// is the one key() will read.
+		if set := firstSetEnv(e.Env); set != "" {
+			p.APIKeyEnv = set
 			out = append(out, p)
 			continue
 		}

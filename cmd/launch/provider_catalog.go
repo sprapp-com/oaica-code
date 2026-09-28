@@ -276,24 +276,32 @@ func mergeDeclaredModelLimits(kept, incoming map[string]providerCatalogModelLimi
 // providerCatalogAsUserRemotes converts the merged catalog to userRemote
 // values for builtinRemotes() to gate by env-var presence exactly like
 // every other builtin.
+// userRemoteFromCatalogEntry converts one catalog row to the remote oaica
+// routes through. The env[] list is NOT copied: a row with no api_key_env is
+// gated by firstSetEnv at the call site, which then records the variable that
+// is actually set (builtinRemotes).
+func userRemoteFromCatalogEntry(e providerCatalogEntry) userRemote {
+	return userRemote{
+		Name:       e.Name,
+		BaseURL:    e.BaseURL,
+		Version:    e.Version,
+		ModelsPath: e.ModelsPath,
+		Wire:       e.Wire,
+		ToolFormat: e.ToolFormat,
+		APIKeyEnv:  e.APIKeyEnv,
+		AuthVia:    e.AuthVia,
+		// Marks the row as the catalog's, which is what lets
+		// remoteLaunchModels apply the vendor's declared model list to it
+		// and to nothing else (see CatalogOrigin).
+		CatalogOrigin: true,
+	}
+}
+
 func providerCatalogAsUserRemotes() []userRemote {
 	entries := providerCatalog()
 	out := make([]userRemote, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, userRemote{
-			Name:       e.Name,
-			BaseURL:    e.BaseURL,
-			Version:    e.Version,
-			ModelsPath: e.ModelsPath,
-			Wire:       e.Wire,
-			ToolFormat: e.ToolFormat,
-			APIKeyEnv:  e.APIKeyEnv,
-			AuthVia:    e.AuthVia,
-			// Marks the row as the catalog's, which is what lets
-			// remoteLaunchModels apply the vendor's declared model list to it
-			// and to nothing else (see CatalogOrigin).
-			CatalogOrigin: true,
-		})
+		out = append(out, userRemoteFromCatalogEntry(e))
 	}
 	return out
 }

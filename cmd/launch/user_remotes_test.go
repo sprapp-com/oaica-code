@@ -67,10 +67,17 @@ func clearAllCatalogKeys(t *testing.T) {
 	// hermeticTestEnv points OAICA_AUTH_FILE at a nonexistent path, so this
 	// loop only has to handle the env half.
 	for _, p := range providerCatalog() {
-		if p.APIKeyEnv == "" {
-			continue // a catalog row with no credential (e.g. a reference-only entry) is never a builtin
+		if p.APIKeyEnv != "" {
+			t.Setenv(p.APIKeyEnv, "")
 		}
-		t.Setenv(p.APIKeyEnv, "")
+		// And the row's upstream env[] names, which gate a row that declares
+		// no api_key_env of its own — otherwise a developer's own shell decides
+		// whether such a row is offered (firstSetEnv).
+		for _, name := range p.Env {
+			if name = strings.TrimSpace(name); name != "" {
+				t.Setenv(name, "")
+			}
+		}
 	}
 }
 
@@ -303,5 +310,97 @@ func TestRemoteLaunchModels_UserRowDoesNotInheritCatalogDeclaredModels(t *testin
 		t.Errorf("the picker offers %d model id(s) this remote never advertised (%v), because the catalog's "+
 			"declared list for the NAME %q is applied to the user's own row; a launch would POST %q to %s",
 			len(foreign), foreign, r.Name, foreign[0], r.BaseURL)
+	}
+}
+
+// A catalog row's env[] is ordered by popularity upstream, not by what a given
+// user holds: taking env[0] hides this provider from anyone with the second
+// variable set, which is what the fixture's zai-coding-plan would do to a
+// Z_AI_API_KEY holder (2026-09-26 models.dev plan, task 5).
+func TestBuiltinRemotes_MultiEnvFirstSetWins(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	clearAllCatalogKeys(t)
+	writeModelsDevCache(t, modelsDevFixture)
+	t.Setenv("Z_AI_API_KEY", "k") // the SECOND variable in zai-coding-plan's env[]
+
+	r := findBuiltinRemote(t, builtinRemotes(), "zai-coding-plan")
+	if r == nil {
+		t.Fatal("zai-coding-plan must be offered when its second env var is set")
+	}
+	if r.APIKeyEnv != "Z_AI_API_KEY" {
+		t.Fatalf("gated on %q, want the variable that is actually set", r.APIKeyEnv)
+	}
+}
+
+// The other half: a row whose credential is not held must not be offered at
+// all — it would launch a request with no bearer.
+func TestBuiltinRemotes_NoEnvSetMeansNotOffered(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	clearAllCatalogKeys(t)
+	writeModelsDevCache(t, modelsDevFixture)
+
+	remotes := builtinRemotes()
+	for _, name := range []string{"zai-coding-plan", "groq"} {
+		if r := findBuiltinRemote(t, remotes, name); r != nil {
+			t.Fatalf("%s offered with no credential set: %+v", name, *r)
+		}
+	}
+	t.Setenv("GROQ_API_KEY", "k")
+	if r := findBuiltinRemote(t, builtinRemotes(), "groq"); r == nil {
+		t.Fatal("groq must be offered once GROQ_API_KEY is set")
+	} else if r.APIKeyEnv != "GROQ_API_KEY" {
+		t.Fatalf("groq gated on %q, want GROQ_API_KEY", r.APIKeyEnv)
+	}
+}
+
+// A row the overlay marks hidden cannot work through a plain base URL (the
+// SDK-signed group: Bedrock, Vertex, Azure). Offering it offers the user a
+// provider that cannot succeed, however well credentialed they are.
+func TestBuiltinRemotes_HiddenProviderNotOffered(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	clearAllCatalogKeys(t)
+	writeModelsDevCache(t, modelsDevFixture)
+	writeOverlayCache(t, `{"providers":[{"name":"sdk-signed-vendor","base_url":"https://sdk.example/v1","env":["SDK_SIGNED_KEY"],"hidden":true}]}`)
+
+	t.Setenv("SDK_SIGNED_KEY", "k")
+	if r := findBuiltinRemote(t, builtinRemotes(), "sdk-signed-vendor"); r != nil {
+		t.Fatalf("hidden provider offered: %+v", *r)
+	}
+	// The flag is not a blanket drop: the same row without it IS offered.
+	writeOverlayCache(t, `{"providers":[{"name":"sdk-signed-vendor","base_url":"https://sdk.example/v1","env":["SDK_SIGNED_KEY"]}]}`)
+	if r := findBuiltinRemote(t, builtinRemotes(), "sdk-signed-vendor"); r == nil {
+		t.Fatal("the same row without hidden must be offered when its credential is set")
+	}
+}
+
+// A row with no endpoint cannot be launched at all, whatever credentials the
+// user holds: models.dev states some vendors' endpoints per model or not at
+// all, and the catalog keeps those rows rather than dropping them.
+func TestBuiltinRemotes_NoEndpointNotOffered(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	clearAllCatalogKeys(t)
+	writeModelsDevCache(t, modelsDevFixture)
+	writeOverlayCache(t, `{"providers":[{"name":"endpointless","api_key_env":"ENDPOINTLESS_KEY","env":["ENDPOINTLESS_KEY"]}]}`)
+	t.Setenv("ENDPOINTLESS_KEY", "k")
+
+	if r := findBuiltinRemote(t, builtinRemotes(), "endpointless"); r != nil {
+		t.Fatalf("a row with no base URL was offered: %+v", *r)
+	}
+}
+
+// A user's own remotes.json row of the same name wins outright: its URL and
+// its key, not just its URL.
+func TestBuiltinRemotes_UserRemoteBeatsCatalogIncludingItsKey(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	clearAllCatalogKeys(t)
+	writeModelsDevCache(t, modelsDevFixture)
+	writeRemotes(t, `{"remotes":[{"name":"groq","base_url":"http://my-groq-proxy:8080/v1","api_key":"mine"}]}`)
+
+	if r := findBuiltinRemote(t, builtinRemotes(), "groq"); r != nil {
+		t.Fatalf("builtin groq must be shadowed by the user's row, got %+v", *r)
+	}
+	got, ok := findUserRemoteByName("groq")
+	if !ok || got.BaseURL != "http://my-groq-proxy:8080/v1" || got.APIKey != "mine" {
+		t.Fatalf("user's groq = %+v, %v", got, ok)
 	}
 }
