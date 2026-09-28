@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -183,6 +184,13 @@ type webSearchLoopError struct {
 	query string
 	usage anthropic.Usage
 	err   error
+	// content is everything the client has already been given for this turn
+	// before the failure: every completed iteration's narration and search
+	// blocks, then the narration of the turn whose search just failed. The
+	// error terminal is a terminal like its two siblings, and the streaming arm
+	// has already streamed all of this — a failed search must not reach the two
+	// arms as two different answers (2026-09-28 audit, round 71, F71-L1-2).
+	content []anthropic.ContentBlock
 }
 
 func (e *webSearchLoopError) Error() string {
@@ -232,9 +240,19 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 
 	if !hasWebSearch {
 		if w.stream {
-			if !chatResponse.Done && len(chatResponse.Message.ToolCalls) > 0 {
-				// A call the model asked for, in a turn that may still turn out
-				// to be a search turn. Held, not written: see the field.
+			// A call the model asked for, in a turn that may still turn out to
+			// be a search turn. Held, not written: see the field.
+			//
+			// The hold lasts as long as the doubt does — until a chunk carries
+			// a web_search call (the loop takes the turn over), or until the
+			// turn ends (the calls are the client's after all). A chunk in
+			// between carries no tool call and says nothing either way: a model
+			// that calls Bash, writes a line of prose and only then searches
+			// produces exactly that, and releasing on the prose handed the
+			// client a tool_use the whole-document arm of the same turn drops
+			// (2026-09-28 audit, round 71, F71-L1-1). Held chunks are written
+			// out in the order they arrived.
+			if !chatResponse.Done && (len(chatResponse.Message.ToolCalls) > 0 || len(w.pendingCallChunks) > 0) {
 				w.pendingCallChunks = append(w.pendingCallChunks, chatResponse)
 				return len(data), nil
 			}
@@ -281,7 +299,7 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	)
 	response, loopErr := w.runWebSearchLoop(loopCtx, chatResponse, webSearchCall, initialUsage)
 	if loopErr != nil {
-		return len(data), w.sendError(loopErr.code, loopErr.query, loopErr.usage)
+		return len(data), w.sendError(loopErr.code, loopErr.query, loopErr.usage, loopErr.content)
 	}
 
 	if err := w.writeTerminalResponse(response); err != nil {
@@ -319,9 +337,10 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 		)
 		if query == "" {
 			return anthropic.MessagesResponse{}, &webSearchLoopError{
-				code:  "invalid_request",
-				query: "",
-				usage: usage,
+				code:    "invalid_request",
+				query:   "",
+				usage:   usage,
+				content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
 			}
 		}
 
@@ -334,10 +353,11 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 				"error", err,
 			)
 			return anthropic.MessagesResponse{}, &webSearchLoopError{
-				code:  "unavailable",
-				query: query,
-				usage: usage,
-				err:   err,
+				code:    "unavailable",
+				query:   query,
+				usage:   usage,
+				err:     err,
+				content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
 			}
 		}
 		logutil.TraceContext(ctx, "anthropic middleware: web_search results",
@@ -381,10 +401,11 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 				"error", err,
 			)
 			return anthropic.MessagesResponse{}, &webSearchLoopError{
-				code:  "api_error",
-				query: query,
-				usage: usage,
-				err:   err,
+				code:    "api_error",
+				query:   query,
+				usage:   usage,
+				err:     err,
+				content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
 			}
 		}
 		logutil.TraceContext(ctx, "anthropic middleware: followup response",
@@ -483,7 +504,9 @@ func (w *WebSearchAnthropicWriter) startLoopWorker(initialResponse api.ChatRespo
 
 func (w *WebSearchAnthropicWriter) writeLoopResult() error {
 	if w.loopResultCh == nil {
-		return w.sendError("api_error", "", w.currentObservedUsage())
+		// No worker ever started, so nothing of this turn has been written and
+		// nothing is carried: there is no other arm to disagree with.
+		return w.sendError("api_error", "", w.currentObservedUsage(), nil)
 	}
 
 	result := <-w.loopResultCh
@@ -498,7 +521,14 @@ func (w *WebSearchAnthropicWriter) writeLoopResult() error {
 		)
 		usage := result.loopErr.usage
 		w.applyObservedUsageDeltaToUsage(&usage)
-		return w.sendError(result.loopErr.code, result.loopErr.query, usage)
+		// The late narration (chunks this arm discarded after the takeover)
+		// belongs to the same reading the siblings give: the whole-document
+		// arm's merged message carries the model's whole prose, and the
+		// streaming arm has already written the part of it that arrived before
+		// the search call.
+		errResp := w.webSearchErrorResponse(result.loopErr.code, result.loopErr.query, usage, result.loopErr.content)
+		w.mergeLateNarration(&errResp)
+		return w.writeTerminalResponse(errResp)
 	}
 	logutil.Trace("anthropic middleware: loop worker done", "resp", anthropic.TraceMessagesResponse(result.response))
 
@@ -1050,38 +1080,38 @@ func (w *WebSearchAnthropicWriter) streamResponse(response anthropic.MessagesRes
 	return w.writeTerminalResponse(response)
 }
 
-func (w *WebSearchAnthropicWriter) webSearchErrorResponse(errorCode, query string, usage anthropic.Usage) anthropic.MessagesResponse {
+func (w *WebSearchAnthropicWriter) webSearchErrorResponse(errorCode, query string, usage anthropic.Usage, carried []anthropic.ContentBlock) anthropic.MessagesResponse {
 	toolUseID := serverToolUseID(w.inner.id)
 
-	return anthropic.MessagesResponse{
-		ID:    w.inner.id,
-		Type:  "message",
-		Role:  "assistant",
-		Model: w.req.Model,
-		Content: []anthropic.ContentBlock{
-			{
-				Type:  "server_tool_use",
-				ID:    toolUseID,
-				Name:  "web_search",
-				Input: queryArgs(query),
-			},
-			{
-				Type:      "web_search_tool_result",
-				ToolUseID: toolUseID,
-				Content: anthropic.WebSearchToolResultError{
-					Type:      "web_search_tool_result_error",
-					ErrorCode: errorCode,
-				},
-			},
+	content := append(slices.Clone(carried), anthropic.ContentBlock{
+		Type:  "server_tool_use",
+		ID:    toolUseID,
+		Name:  "web_search",
+		Input: queryArgs(query),
+	}, anthropic.ContentBlock{
+		Type:      "web_search_tool_result",
+		ToolUseID: toolUseID,
+		Content: anthropic.WebSearchToolResultError{
+			Type:      "web_search_tool_result_error",
+			ErrorCode: errorCode,
 		},
+	})
+
+	return anthropic.MessagesResponse{
+		ID:         w.inner.id,
+		Type:       "message",
+		Role:       "assistant",
+		Model:      w.req.Model,
+		Content:    content,
 		StopReason: "end_turn",
 		Usage:      usage,
 	}
 }
 
-// sendError sends a web search error response.
-func (w *WebSearchAnthropicWriter) sendError(errorCode, query string, usage anthropic.Usage) error {
-	response := w.webSearchErrorResponse(errorCode, query, usage)
+// sendError sends a web search error response. carried is what the turn has
+// already been given (see webSearchLoopError.content).
+func (w *WebSearchAnthropicWriter) sendError(errorCode, query string, usage anthropic.Usage, carried []anthropic.ContentBlock) error {
+	response := w.webSearchErrorResponse(errorCode, query, usage, carried)
 	logutil.Trace("anthropic middleware: web_search error", "code", errorCode, "query", query, "usage", usage)
 	return w.writeTerminalResponse(response)
 }

@@ -1380,7 +1380,7 @@ func TestWebSearchSendError_NonStreaming(t *testing.T) {
 	}
 
 	errorUsage := anthropic.Usage{InputTokens: 7, OutputTokens: 2}
-	if err := wsWriter.sendError("unavailable", "test query", errorUsage); err != nil {
+	if err := wsWriter.sendError("unavailable", "test query", errorUsage, nil); err != nil {
 		t.Fatalf("sendError error: %v", err)
 	}
 
@@ -1466,7 +1466,7 @@ func TestWebSearchSendError_Streaming(t *testing.T) {
 	}
 
 	errorUsage := anthropic.Usage{InputTokens: 9, OutputTokens: 4}
-	if err := wsWriter.sendError("invalid_request", "bad query", errorUsage); err != nil {
+	if err := wsWriter.sendError("invalid_request", "bad query", errorUsage, nil); err != nil {
 		t.Fatalf("sendError error: %v", err)
 	}
 
@@ -1543,7 +1543,7 @@ func TestWebSearchSendError_EmptyQuery(t *testing.T) {
 		req:        anthropic.MessagesRequest{Model: "test-model"},
 	}
 
-	if err := wsWriter.sendError("invalid_request", "", anthropic.Usage{}); err != nil {
+	if err := wsWriter.sendError("invalid_request", "", anthropic.Usage{}, nil); err != nil {
 		t.Fatalf("sendError error: %v", err)
 	}
 
@@ -2959,11 +2959,20 @@ func TestWebSearchFollowupNon200ReturnsApiError(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
 	}
-	if len(result.Content) != 2 {
-		t.Fatalf("expected 2 blocks in error response, got %d", len(result.Content))
+	// The error terminal reports the whole turn, like its two siblings: the
+	// search that DID run (its server_tool_use + web_search_tool_result) comes
+	// first, then the block for the search whose follow-up failed. This pin
+	// asserted 2 before round 71 — it encoded the error terminal dropping the
+	// turn's earlier blocks, which is the F71-L1-2 class of divergence
+	// (2026-09-28 audit, round 71).
+	if len(result.Content) != 4 {
+		t.Fatalf("expected 4 blocks in error response (the completed search, then the failed one), got %d", len(result.Content))
+	}
+	if result.Content[0].Type != "server_tool_use" || result.Content[2].Type != "server_tool_use" {
+		t.Fatalf("expected the completed search first and the failed one last, got %v, %v", result.Content[0].Type, result.Content[2].Type)
 	}
 
-	contentJSON, _ := json.Marshal(result.Content[1].Content)
+	contentJSON, _ := json.Marshal(result.Content[3].Content)
 	var errContent anthropic.WebSearchToolResultError
 	if err := json.Unmarshal(contentJSON, &errContent); err != nil {
 		t.Fatalf("failed to parse error content: %v", err)
