@@ -3757,7 +3757,59 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							(acc.name != "" &&
 								tc.Function.Name == acc.name &&
 								strings.TrimSpace(acc.args.String()) == "" &&
-								strings.TrimSpace(tc.Function.Arguments) != "")) {
+								strings.TrimSpace(tc.Function.Arguments) != "") ||
+							// The mirror of that clause, and the arm that was
+							// still folding these shapes: a fragment that names
+							// the slot's call again stating NO arguments, over a
+							// call that HOLDS no whole arguments for it to be a
+							// re-listing of. A call's own name says nothing about
+							// whether it has had its bytes yet, and a call whose
+							// arguments are complete is the shape round 56 pinned
+							// as a RE-LISTING of that call — the vendor stating
+							// one call again with its id and its name on chunks of
+							// their own — so it is left to that reading, and the
+							// difference between it and this leg's whole-list arm
+							// (which answers that document's two entries as two
+							// calls) is recorded rather than decided here
+							// (2026-09-28 audit, round 81, L2-1). Two shapes a
+							// re-listing cannot be, and both were folded:
+							//
+							//   * a slot still MID-OBJECT — `[{index 0,id c1,name
+							//     Bash,arguments {"a":`},{index 0,id c1,name
+							//     Bash}]` is two calls on this leg's whole-list
+							//     arm, and folding them lost the second one
+							//     outright: the truncated call is dropped at the
+							//     flush (its bytes never became an object) and the
+							//     argument-less call the wire names reached no
+							//     client at all (2026-09-28 audit, round 81,
+							//     L2-5);
+							//   * a slot holding an EMPTY argument list, stated
+							//     again by a fragment that does NOT claim it by id.
+							//     An empty argument list is a COMPLETE one, so the
+							//     call is whole and these bytes begin the next
+							//     call — which is what the gateway leg's document
+							//     arm answers for the two entries and what this
+							//     leg's whole-list arm answers for the spelling
+							//     that states no id: `[{index 0,id c1,name
+							//     Bash},{index 0,name Bash}]` reached the client
+							//     as ONE call where both of those answer two
+							//     (2026-09-28 audit, round 80, F80-L3-1; round
+							//     81, L2-4). The same repeat WITH the id stays one
+							//     call, which is round 69's restatement rule and
+							//     what the whole-list arm answers for it.
+							//
+							// The fragment must name the slot's own call, so an
+							// argument-only continuation (which names nothing) is
+							// untouched, and so is the same clause above read the
+							// other way round, where the arguments are on the
+							// fragment instead.
+							(acc.name != "" &&
+								tc.Function.Name == acc.name &&
+								strings.TrimSpace(tc.Function.Arguments) == "" &&
+								((strings.TrimSpace(acc.args.String()) != "" &&
+									!argsFinished(acc.args.String())) ||
+									(strings.TrimSpace(acc.args.String()) == "" &&
+										acc.id != "" && tc.ID == "")))) {
 						// A call the upstream stated this slot for a SECOND time
 						// begins the next one: a stated id this slot does not
 						// hold (round 43's B43-3) or a name it does not carry
@@ -3960,9 +4012,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// a slot the adoption never wrote is a call of the model's
 					// own, which the gateway leg opens a block for, and dropping
 					// it lost a tool the upstream had asked for (2026-09-27
-					// audit, round 49, A-F2). A fragment carrying no index is
-					// dropped either way: it cannot be told from a continuation
-					// of the calls the adoption wrote.
+					// audit, round 49, A-F2).
 					//
 					// Asked of the slot this fragment RESOLVED to, not of the
 					// index it stated: a fragment naming a different call at an
@@ -3974,7 +4024,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// depending on whether the upstream stated the second inside
 					// the frame it adopted or a delta later (2026-09-28 audit,
 					// round 68, F68-L2-1).
-					if !indexed || adoptedCallAt[slot] != nil {
+					// Asked of the slot this fragment RESOLVED to and of nothing
+					// else. The arm this gate used to keep for an index-less
+					// fragment — every one of them dropped, on the reading that
+					// it cannot be told from a continuation of the calls the
+					// adoption wrote — is not what the resolution above decides:
+					// a fragment that NAMES a call the accumulator does not hold
+					// is routed to a slot of its own (startsANewToolCall), and
+					// `adoptedCallAt` says nothing about that slot. Dropped
+					// anyway, `[<whole completion: Bash {"a":1}>]` followed by
+					// `[{id c2, name Read, arguments {"f":2}}]` with no index
+					// reached the client as ONE call where the same two calls
+					// spelled as deltas with no adoption frame answer two, and
+					// where this leg's whole-list arm answers two
+					// (2026-09-28 audit, round 81, L2-2). A continuation of an
+					// adopted call still resolves to the adopted call's own slot
+					// and is still dropped: that is the reading this gate keeps.
+					if adoptedCallAt[slot] != nil {
 						// The id this fragment states belongs to the TURN even
 						// though nothing of it can be delivered, so it is
 						// reserved before the drop — the same rule the flush
@@ -4419,9 +4485,49 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 		// delta stream would have given them, since the accumulator keys those
 		// by the same sequence.
 		slot := 0
+		wroteCall := false
+		// The turn's verdict, read the way the conversion below reads it: a
+		// call the converter DROPS is not a call this adoption wrote, and no
+		// slot of its own is spoken for. On a turn the upstream ended at the
+		// token limit, argument JSON that never parsed is a fragment the model
+		// was still writing (parseOpenAIToolCalls, and the same rule on the
+		// flush path), so no block reaches the client for it — and a delta that
+		// goes on to FINISH that call then found its slot claimed, was dropped
+		// as a continuation of a block that does not exist, and the whole turn
+		// reached the client as nothing under stop_reason max_tokens where the
+		// same document's other arm answers the call
+		// (2026-09-28 audit, round 81, L2-3). The slot is still consumed, so
+		// the calls beside it keep the numbering an index-less delta stream
+		// would have given them.
+		truncated := false
+		for _, c := range oaiResp.Choices {
+			if c.FinishReason != "" {
+				truncated = c.FinishReason == "length"
+			}
+		}
 		for _, tc := range m.ToolCalls {
 			if strings.TrimSpace(tc.Function.Name) == "" {
 				continue
+			}
+			// A call the upstream NAMED says something even when the arguments
+			// never became an object: the non-streaming path refuses the same
+			// document on the same reading ("a call that IS named says something
+			// even when its arguments were cut off", above), and the gateway
+			// leg's documentSaysSomething with it. Asked of the name alone, so a
+			// turn's only payload being a call this path cannot deliver is still
+			// an answer — refused instead, the framed spelling of the document
+			// reached the client as 502 while the unframed one was answered with
+			// the turn's own stop_reason (2026-09-28 audit, round 81, L2-3).
+			wroteCall = true
+			if truncated {
+				raw := strings.TrimSpace(tc.Function.Arguments)
+				if raw == "" {
+					raw = "{}"
+				}
+				if err := json.Unmarshal([]byte(raw), &api.ToolCallFunctionArguments{}); err != nil {
+					slot++
+					continue
+				}
 			}
 			acc := &toolAccum{id: tc.ID, name: tc.Function.Name, slot: slot}
 			if tc.Function.Arguments != "" {
@@ -4430,7 +4536,7 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			wroteSlots[slot] = acc
 			slot++
 		}
-		wroteCalls = len(wroteSlots) > 0
+		wroteCalls = wroteCall
 		// A call the upstream never named is not a call — but its arguments are
 		// the model's output, this leg relays them as text on both of its arms,
 		// and the gateway's own says-something predicate counts them for that
