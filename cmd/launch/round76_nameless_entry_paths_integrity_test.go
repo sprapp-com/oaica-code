@@ -27,6 +27,19 @@ package launch
 //
 // Every row below is one body spelled both ways, answered by this leg's own two
 // arms; the assertion is that they agree, byte for byte, block for block.
+//
+// The last row is round 75's recorded Q1, and this round closes it. That record
+// left the arguments split across a nameless prefix and the named suffix joined
+// into a working `{"a":1}` here while the whole-list arm, both gateway arms and
+// the local server's document arm answered the prefix as text and the call as
+// `{"_raw":"1}"}`. The record's reason for leaving it was that closing it moves
+// this leg toward the answer the other four arms give, which was the unrunnable
+// one — but one body reaching four arms one way and a fifth another is the
+// defect the whole doctrine is about, and the reading the other four take is the
+// one this leg's own list arm takes for the SAME bytes. F76-L2-1's rule — a
+// nameless accumulator is never the call a later fragment names — closes it as
+// a side effect, and both arms now answer the prefix as text and the call as
+// `{"_raw":"1}"}`, which is what the local server's document arm answers.
 
 // Recorded, not fixed (same round): the same body with the named call's own
 // arguments arriving as a further nameless entry at that index —
@@ -103,6 +116,13 @@ func TestANamelessEntryIsAnsweredAlikeOnBothArms(t *testing.T) {
 			[]string{
 				`{"index":1,"id":"c2","type":"function","function":{"name":"Read","arguments":"{\"p\":1}"}}`,
 				`{"type":"function","function":{"name":"","arguments":"{\"a\":1}"}}`,
+			},
+		},
+		{
+			"arguments SPLIT across a nameless entry and the named call that follows",
+			[]string{
+				`{"index":0,"type":"function","function":{"name":"","arguments":"{\"a\":"}}`,
+				`{"index":0,"id":"c1","type":"function","function":{"name":"Bash","arguments":"1}"}}`,
 			},
 		},
 		{

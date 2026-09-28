@@ -31,18 +31,15 @@ package launch
 //     as one call with its own arguments plus the nameless entry's object as
 //     text. A nameless accumulator is never the call a later fragment names.
 //
-// Recorded, not fixed (same round): the same wire with the arguments SPLIT
-// across the two entries — the nameless prefix `{"a":` then the named entry
-// carrying `1}` — still joins here and answers one call whose input is
-// `{"a":1}`, where the list arm, both gateway arms and the local server's
-// document arm answer the prefix as text and the named call as
-// `{"_raw":"1}"}`. The joined answer is the working call and the others are
-// not, so closing it moves this leg TOWARD an unrunnable answer; the direction
-// is a decision about the header-late fragment wire (a fragment that states no
-// name continued by one that does), not one line. Round 73's F73-L3-2 — a
-// restatement folds only onto a twin the upstream named an id for — is the rule
-// the other four arms read this wire by, and applying it to this leg's indexed
-// routing path is what closing it would take.
+// Recorded OPEN here and CLOSED in round 76: the same wire with the arguments
+// SPLIT across the two entries — the nameless prefix `{"a":` then the named
+// entry carrying `1}` — joined here into one call whose input was `{"a":1}`,
+// where the list arm, both gateway arms and the local server's document arm
+// answered the prefix as text and the named call as `{"_raw":"1}"}`. Round 76's
+// F76-L2-1 (a nameless accumulator is never the call a later fragment names) is
+// the rule the other four arms read that wire by, applied to the indexed
+// routing path; both arms of this leg now answer it the way the other four do,
+// and round76_nameless_entry_paths_integrity_test.go carries the row.
 
 import (
 	"encoding/json"
