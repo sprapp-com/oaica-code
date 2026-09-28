@@ -101,12 +101,25 @@ func TestABareRepeatOfTheNameBeginsTheNextCall(t *testing.T) {
 			want:      false,
 		},
 		{
+			// REVERSED by round 78 (F78-L3-2). This row held that a delta
+			// naming the call again WITH arguments over a call that had
+			// accumulated none continues it, which is the conservative reading
+			// B-F9 chose for the bare repeat only. The reading could not
+			// survive its own sibling: `[{name:"Bash"},{name:"Bash"}]` splits
+			// here (the row above), so adding arguments to the second entry
+			// made the SAME prefix answer one call instead of two — while this
+			// leg's own whole-list arm, and both document arms and the frame arm
+			// of the gateway leg, all answer two, because an empty argument list
+			// is a COMPLETE argument list for a call that takes none. The
+			// reading measured against the streaming twin before it changed:
+			// the whole-list arm answers two calls for this body (2026-09-28
+			// audit, round 78, F78-L3-2).
 			name:      "arguments arriving after a name-only fragment",
 			accID:     "c1",
 			accName:   "Bash",
 			deltaName: "Bash",
 			deltaAr:   `{"cmd":"ls"}`,
-			want:      false,
+			want:      true,
 		},
 		{
 			name:    "a different id is the next call",

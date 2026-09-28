@@ -55,8 +55,9 @@ func TestAnAdoptedTextTurnKeepsTheCallsThatFollow(t *testing.T) {
 
 // TestAnAdoptedCallTurnDropsItsOwnTail is the other half of A-F2/C-F2: the
 // adoption wrote a call itself, so the client holds its block already and a
-// fragment continuing it cannot be delivered — accumulating it would flush a
-// second call under an id the client can answer once.
+// nameless fragment after it cannot be delivered as a second call under an id
+// the client can answer once. It is relayed as the prose it is — see the
+// REVERSED note on the last check below (2026-09-28 audit, round 78, F78-L2-1).
 func TestAnAdoptedCallTurnDropsItsOwnTail(t *testing.T) {
 	up := streamUpstream(t,
 		"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_X\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"a\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"+
@@ -75,8 +76,20 @@ func TestAnAdoptedCallTurnDropsItsOwnTail(t *testing.T) {
 	if !strings.Contains(body, `{\"a\":1}`) {
 		t.Errorf("the adopted call's arguments never reached the client:\n%s", body)
 	}
-	if strings.Contains(body, `{\"b\":2}`) {
-		t.Errorf("the fragment continuing the adopted call was relayed as a call of its own:\n%s", body)
+	// REVERSED by round 78 (F78-L2-1). This row held that the fragment's bytes
+	// must not reach the client at all, read as "the fragment continues the
+	// adopted call". The fragment states no name, so it is not a call on any arm
+	// of this leg: content_block_start is the only event that carries a name, and
+	// an entry the upstream never named has none to carry. What the row was
+	// really pinning — that the fragment does not open a SECOND tool block under
+	// the adopted id — is still checked above (one block, and it is call_X's).
+	// The bytes themselves are the model's output and reach the client as text,
+	// which is what the whole-list arm answers for the same body: measured
+	// 2026-09-28, both arms answer the call `{"a":1}` and the prose `{"b":2}`
+	// beside it. Dropping the text here made the turn's answer depend on whether
+	// the body arrived as frames or as a document.
+	if !strings.Contains(body, `{\"b\":2}`) {
+		t.Errorf("the nameless fragment's bytes never reached the client — they are the model's prose and are relayed as text (2026-09-28 audit, round 78, F78-L2-1):\n%s", body)
 	}
 }
 

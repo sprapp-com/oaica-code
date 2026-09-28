@@ -507,11 +507,21 @@ func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName, deltaArgs s
 	if deltaName != accName {
 		return true
 	}
+	// The accumulated arguments being a COMPLETE argument list ends the call, and
+	// an EMPTY list is complete: a call that takes no arguments has all of them
+	// the moment it is named. Round 39's B-F9 said so for the bare repeat and
+	// stopped there, so a delta naming the same call WITH arguments over a
+	// call that had accumulated none was read as its continuation:
+	// `[{name:"Read"},{name:"Read",arguments:"{\"a\":1}"}]` reached a streaming
+	// client as ONE tool_use where this leg's own whole-list arm and both arms of
+	// the gateway deliver two — the first call, which the client runs, did not
+	// exist on this arm. The conservative direction B-F9 protects is unchanged:
+	// a partial object is not a complete one, so a name repeated over an
+	// accumulator holding `{"a":` still continues that call, which is what keeps
+	// an upstream that restates the name on every argument fragment of one call
+	// from being read as many (2026-09-28 audit, round 78, F78-L3-2).
 	raw := strings.TrimSpace(accArgs)
-	if raw != "" && json.Valid([]byte(raw)) {
-		return true
-	}
-	return raw == "" && strings.TrimSpace(deltaArgs) == ""
+	return raw == "" || json.Valid([]byte(raw))
 }
 
 // mapToolChoice converts an Anthropic ToolChoice to an OpenAI tool_choice value.
@@ -3747,7 +3757,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// of tool_use (2026-09-28 audit, round 59, F59-L2-1).
 						indexSlot[*tc.Index] = slot
 					} else if acc := slotCall(slot); acc != nil &&
-						tc.ID == "" && tc.Function.Name == "" &&
+						strings.TrimSpace(tc.Function.Name) == "" &&
 						argsFinished(acc.args.String()) &&
 						!canExtend(acc.args.String(), tc.Function.Arguments) {
 						// An argument-only fragment whose slot already holds a
@@ -3783,19 +3793,36 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// parse, under a stop_reason of tool_use (2026-09-28
 							// audit, round 60, F60-X-1 and F60-X-2). Dropping it
 							// WHOLE is a different matter: it is a fragment the
-							// upstream billed and the client never saw, and it
-							// carries no
-							// name and no id — the branch above requires it — so
-							// this leg's own whole-list arm relays its arguments
-							// as TEXT, as the adoption arm does, and round 54's
-							// rule is that a nameless call's arguments reach the
-							// client on BOTH of this leg's paths. It gets an
-							// accumulator of its own, which is what makes the
-							// flush relay it as text: `[{index 0, id c1, name
+							// upstream billed and the client never saw, and the
+							// branch above requires only that it NAMES nothing —
+							// an entry that carries the call's own id and repeats
+							// its finished arguments is still not a call on this
+							// leg, and neither the id nor the bytes make it one.
+							// This leg's own whole-list arm relays the entry's
+							// arguments as TEXT, as the adoption arm does, and
+							// round 54's rule is that a nameless call's arguments
+							// reach the client on BOTH of this leg's paths. It
+							// gets an accumulator of its own, which is what makes
+							// the flush relay it as text: `[{index 0, id c1, name
 							// Bash, args {"a":1}},{index 0, name "", args
 							// {"b":2}}]` answered the call alone here and the
 							// call plus the text `{"b":2}` as one list
 							// (2026-09-28 audit, round 76, F76-L2-2).
+							//
+							// Requiring an EMPTY ID as well, as this branch did,
+							// let such an entry through whenever the wire
+							// restated the call's id: the entry's bytes were
+							// appended to the call it was not more of, and
+							// `[{id c1, name Bash, args {"a":1}},{id c1, args
+							// {"a":1}}]` handed a streaming client
+							// `{"_raw":"{\"a\":1}{\"a\":1}"}` — a call no tool
+							// can run, under a stop_reason of tool_use — where
+							// both document arms answer the call and the prose
+							// beside it. A truncated turn made it worse: the
+							// joined bytes no longer parse, so the flush's
+							// truncation gate dropped the CALL as well and the
+							// client was told max_tokens with nothing at all
+							// (2026-09-28 audit, round 78, F78-L2-1, F78-L2-2).
 							slot = nextFreeToolSlot
 							nextFreeToolSlot++
 						}
