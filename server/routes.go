@@ -2222,7 +2222,21 @@ func writeRelayedStatusError(c *gin.Context, apiError api.StatusError) {
 	if msg == "" {
 		msg = apiError.Error()
 	}
-	c.JSON(apiError.StatusCode, gin.H{"error": msg})
+	if !c.Writer.Written() {
+		c.JSON(apiError.StatusCode, gin.H{"error": msg})
+		return
+	}
+	// The relay's own framing is already on the wire, so the status can only be
+	// stated in the frame — which is exactly what the runner lane does for the
+	// same mid-stream failure (routes.go:2286-2289), and the middleware's
+	// Anthropic writer READS that field to choose the error type the client is
+	// handed. Encoded without it, one mid-stream refusal reached the client as
+	// `not_found_error` with HTTP 404 when it did not stream and as `api_error`
+	// with HTTP 200 when it did (2026-09-29 audit, round 94, F94-L1-1).
+	frame := gin.H{"error": msg, "status": apiError.StatusCode}
+	if err := json.NewEncoder(c.Writer).Encode(frame); err != nil {
+		slog.Error("writeRelayedStatusError failed to encode json error", "error", err)
+	}
 }
 
 func streamResponse(c *gin.Context, ch chan any) {

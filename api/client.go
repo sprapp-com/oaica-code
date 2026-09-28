@@ -220,7 +220,17 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	scanner.Buffer(scanBuf, maxBufferSize)
 	for scanner.Scan() {
 		var errorResponse struct {
-			Error     string `json:"error,omitempty"`
+			Error string `json:"error,omitempty"`
+			// Status is the HTTP status a MID-STREAM error frame states: the
+			// producer that writes such a frame names the status its own clients
+			// are answered (server/routes.go:2288 keeps it for exactly that
+			// reason). Dropping it here left the relay lane with a bare
+			// errors.New and no typed error at all, so `errors.As(err,
+			// &api.StatusError)` never matched and the already-written fallback
+			// wrote a frame with no status field — one mid-stream failure reached
+			// the client as `not_found_error` when it did not stream and as
+			// `api_error` when it did (2026-09-29 audit, round 94, F94-L1-1).
+			Status    int    `json:"status,omitempty"`
 			SigninURL string `json:"signin_url,omitempty"`
 		}
 
@@ -251,6 +261,18 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 		}
 
 		if errorResponse.Error != "" {
+			// A refusal the stream stated mid-flight, with the status its own
+			// clients are answered. A frame that names no status, or names one
+			// that is not a refusal, stays a plain error: fabricating a status
+			// out of some other field would type the failure for every arm from
+			// a field that was never about the failure.
+			if errorResponse.Status >= http.StatusBadRequest && errorResponse.Status <= 599 {
+				return StatusError{
+					StatusCode:   errorResponse.Status,
+					Status:       http.StatusText(errorResponse.Status),
+					ErrorMessage: errorResponse.Error,
+				}
+			}
 			return errors.New(errorResponse.Error)
 		}
 
