@@ -663,36 +663,66 @@ func (h *meterHub) subscriberListHandler(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]any{"subscribers": out})
 }
 
-// planLimit is one tier's rolling-window token caps, matching the plans
-// proposed in docs/PRICING.md ("Real throttle (5hr / weekly)" column).
-// These are the load-bearing limits: the monthly headline number in that
-// doc is marketing, this is what actually protects the fleet from one
-// subscriber consuming more than a shared 2-GPU box can serve.
+// planLimit is one tier's rolling-window caps, in REQUESTS, matching the
+// tiers in docs/PRICING.md ("Our matching tiers" table — the column that
+// doc calls the 5h window and the weekly cap). These are the load-bearing
+// limits: the monthly token headline in that doc is marketing, this is
+// what actually protects the fleet from one subscriber consuming more
+// than a shared 2-GPU box can serve.
+//
+// Requests, not tokens, deliberately (2026-09-28): request count is what
+// the comparable subscription products sell and what a coding agent
+// actually consumes our GPU with — a prefill-heavy agent turn is ~120K
+// tokens and the per-request marginal cost is what the pricing math in
+// docs/PRICING.md is built on, while token sums let one subscriber's cheap
+// long-context reads burn a cap an expensive-but-few-request user never
+// touches. usage.request_id is the primary key, so one API call is exactly
+// one row: COUNT(*) over the window IS the request count, with no
+// double-count from a gateway retrying a report (INSERT OR IGNORE).
 type planLimit struct {
-	Window5h int64
-	Window7d int64
+	Requests5h int64
+	Requests7d int64
 }
 
 // planLimits is deliberately a Go map, not a DB table: these are business
 // decisions that change with a pricing doc edit + deploy, not per-tenant
 // data. Empty/unknown plan = no cap (subscriberUsageHandler reports usage
 // with caps omitted rather than guessing a limit that was never set).
+//
+// Slugs are the tier names lowercased; "pro+" is the one that is not a
+// bare identifier, so it only ever reaches here as a stored string (the
+// subscribers.plan column is free-form and written by the operator or the
+// billing webhook, never derived from this map).
+//
+// Renamed 2026-09-28 from starter/pro/team — those were the token-cap slugs
+// of a superseded rate card (docs/PRICING.md's single-price-per-size
+// proposal) and no subscriber has ever been provisioned against them: the
+// Stripe receiver is still pre-launch (docs/PRODUCTION_READINESS.md).
 var planLimits = map[string]planLimit{
-	"starter": {Window5h: 8_000_000, Window7d: 40_000_000},
-	"pro":     {Window5h: 25_000_000, Window7d: 130_000_000},
-	"team":    {Window5h: 60_000_000, Window7d: 320_000_000},
+	"free": {Requests5h: 40, Requests7d: 500},
+	"lite": {Requests5h: 400, Requests7d: 7_500},
+	"pro":  {Requests5h: 900, Requests7d: 14_500},
+	"pro+": {Requests5h: 1_300, Requests7d: 21_000},
+	"max":  {Requests5h: 1_700, Requests7d: 27_500},
 }
 
+// usageWindow is one rolling window's reading. Tokens is reported without
+// a cap: it is the billing/audit quantity (usage rows are what /usage and
+// /usage/summary bill from) and the number a human needs to see to know
+// whether a cap that counts requests is being gamed by outsized ones. Cap
+// and Over are the request cap and whether it is exceeded.
 type usageWindow struct {
-	Tokens int64 `json:"tokens"`
-	Cap    int64 `json:"cap,omitempty"`
-	Over   bool  `json:"over"`
+	Tokens   int64 `json:"tokens"`
+	Requests int64 `json:"requests"`
+	Cap      int64 `json:"cap,omitempty"`
+	Over     bool  `json:"over"`
 }
 
 // subscriberUsageHandler is the per-subscriber rolling-window instrument:
-// how many tokens has this key actually used in the trailing 5 hours and
-// trailing 7 days, against its plan's cap — the read side of the
-// throttling docs/PRICING.md's tiers depend on. Nothing in the request
+// how many requests (and, for the audit trail, how many tokens) this key
+// has actually used in the trailing 5 hours and trailing 7 days, against
+// its plan's request cap — the read side of the throttling
+// docs/PRICING.md's tiers depend on. Nothing in the request
 // path enforces this yet (see gateway's entitlementCache for the
 // active/canceled/suspended enforcement point this could extend); this
 // endpoint is the visibility a human or a future enforcement check needs
@@ -721,37 +751,37 @@ func (h *meterHub) subscriberUsageHandler(w http.ResponseWriter, r *http.Request
 	// explicit reset (see subscriberResetHandler) — a reset only ever
 	// shrinks what counts, it can't extend a window back further than the
 	// window itself already reaches.
-	sum := func(since time.Time) (int64, error) {
+	sum := func(since time.Time) (int64, int64, error) {
 		cutoff := since
 		if resetAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, resetAt); err == nil && t.After(cutoff) {
 				cutoff = t
 			}
 		}
-		var tokens sql.NullInt64
+		var tokens, requests sql.NullInt64
 		err := h.db.QueryRow(
-			`SELECT SUM(prompt_tokens + completion_tokens) FROM usage WHERE key_label = ? AND ts >= ?`,
+			`SELECT SUM(prompt_tokens + completion_tokens), COUNT(*) FROM usage WHERE key_label = ? AND ts >= ?`,
 			key, cutoff.Format(time.RFC3339Nano),
-		).Scan(&tokens)
-		return tokens.Int64, err
+		).Scan(&tokens, &requests)
+		return tokens.Int64, requests.Int64, err
 	}
 
-	tok5h, err := sum(now.Add(-5 * time.Hour))
+	tok5h, req5h, err := sum(now.Add(-5 * time.Hour))
 	if err != nil {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
-	tok7d, err := sum(now.Add(-7 * 24 * time.Hour))
+	tok7d, req7d, err := sum(now.Add(-7 * 24 * time.Hour))
 	if err != nil {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
 
-	w5h := usageWindow{Tokens: tok5h}
-	w7d := usageWindow{Tokens: tok7d}
+	w5h := usageWindow{Tokens: tok5h, Requests: req5h}
+	w7d := usageWindow{Tokens: tok7d, Requests: req7d}
 	if limit, ok := planLimits[plan]; ok {
-		w5h.Cap, w5h.Over = limit.Window5h, tok5h > limit.Window5h
-		w7d.Cap, w7d.Over = limit.Window7d, tok7d > limit.Window7d
+		w5h.Cap, w5h.Over = limit.Requests5h, req5h > limit.Requests5h
+		w7d.Cap, w7d.Over = limit.Requests7d, req7d > limit.Requests7d
 	}
 
 	w.Header().Set("Content-Type", "application/json")

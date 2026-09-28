@@ -426,12 +426,26 @@ plans separately at higher per-minute caps — we should do the same
 before launch: meter and price unattended/scripted usage differently
 from interactive sessions, not lump them into the same cap.
 
-**Status:** proposal only. Before deploying: (1) add automation-tier
-metering (see risk above), (2) verify the gateway can enforce
-request-count caps, not just token-count caps — `checkWindowCap` (in
-`tools/gateway/main.go`, reading its caps data from `tools/meterhub`)
-only handles tokens (see the single-GPU section above), so this needs
-new plumbing, not just a rate-card change.
+**Status:** the request-count caps are ENFORCED as of 2026-09-28.
+`tools/meterhub`'s `planLimits` now carries this table's 5h/weekly
+request numbers (slug per row: `free`, `lite`, `pro`, `pro+`, `max`),
+`/subscribers/usage` counts requests per rolling window
+(`usage.request_id` is the primary key, so one call is one row and a
+gateway retrying a report cannot double-count) and flags `over`, and
+`checkWindowCap` in `tools/gateway/main.go` refuses the request with
+429 before it reaches a backend. The window's token total is still
+reported beside the request count — it is the billing quantity and what
+tells a human whether a request cap is being gamed by outsized requests
+— but it gates nothing. Still outstanding before launch: (1)
+automation-tier metering (see the risk above — a scripted workload that
+runs near-continuously defeats a flat request cap, which is why
+Openference prices those separately and we should too), and (2) the
+slugs are a rename of `starter`/`pro`/`team` from the superseded
+token-cap proposal; no subscriber was ever provisioned against those
+(the Stripe receiver is still pre-launch, see
+`docs/PRODUCTION_READINESS.md`), but any operator-provisioned row
+carrying one of the old spellings now resolves to no plan and therefore
+NO cap — re-provision those rows with a slug from the table above.
 
 ## "Unlimited" tier, rate-limited by concurrency, not tokens/requests —
 ## alternative proposal (2026-09-07)

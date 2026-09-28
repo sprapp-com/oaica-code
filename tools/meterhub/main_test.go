@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -601,28 +602,114 @@ func TestSubscriberUsage_SumsWithinWindow(t *testing.T) {
 	if got := w7d["tokens"].(float64); got != 3_500_000 {
 		t.Errorf("window_7d tokens = %v, want 3500000 (r1+r2, not r3)", got)
 	}
+	// The window is the same cutoff for the request count, which is what a
+	// plan cap is checked against.
+	if got := w5h["requests"].(float64); got != 1 {
+		t.Errorf("window_5h requests = %v, want 1 (only r1 is within 5h)", got)
+	}
+	if got := w7d["requests"].(float64); got != 2 {
+		t.Errorf("window_7d requests = %v, want 2 (r1+r2, not r3)", got)
+	}
 }
 
-func TestSubscriberUsage_AppliesPlanCapAndFlagsOver(t *testing.T) {
-	hub, token := testHub(t)
-	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "bob", Status: "active", Plan: "starter"})
+// rqIngest posts n usage records one minute apart, all inside the 5h
+// window, so the request COUNT is what a cap sees.
+func rqIngest(t *testing.T, hub *meterHub, token, key string, n int) {
+	t.Helper()
 	now := time.Now().UTC()
-	// starter cap is 8_000_000 in the 5h window -- push it over.
-	postIngest(t, hub, token, usageRecord{
-		RequestID: "r1", TS: now.Add(-1 * time.Hour).Format(time.RFC3339Nano),
-		Region: "a100b", KeyLabel: "bob", Model: "m", PromptTokens: 9_000_000, CompletionTokens: 0,
-	})
+	for i := 0; i < n; i++ {
+		postIngest(t, hub, token, usageRecord{
+			RequestID: fmt.Sprintf("%s-r%d", key, i),
+			TS:        now.Add(-time.Duration(i+1) * time.Minute).Format(time.RFC3339Nano),
+			Region:    "a100b", KeyLabel: key, Model: "m",
+			PromptTokens: 1_000, CompletionTokens: 500,
+		})
+	}
+}
+
+func TestSubscriberUsage_AppliesRequestCapAndFlagsOver(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "bob", Status: "active", Plan: "free"})
+	// The free tier's 5h cap is 40 requests. 40 exactly is AT the cap.
+	rqIngest(t, hub, token, "bob", 40)
 
 	out := getSubscriberUsage(t, hub, token, "bob")
-	if out["plan"] != "starter" {
-		t.Errorf("plan = %v, want starter", out["plan"])
+	if out["plan"] != "free" {
+		t.Errorf("plan = %v, want free", out["plan"])
 	}
 	w5h := out["window_5h"].(map[string]any)
-	if got := w5h["cap"].(float64); got != 8_000_000 {
-		t.Errorf("window_5h cap = %v, want 8000000", got)
+	if got := w5h["cap"].(float64); got != 40 {
+		t.Errorf("window_5h cap = %v, want 40", got)
+	}
+	if got := w5h["requests"].(float64); got != 40 {
+		t.Errorf("window_5h requests = %v, want 40", got)
+	}
+	if over, _ := w5h["over"].(bool); over {
+		t.Error("window_5h.over = true at exactly the cap; the cap is an allowance, not a limit to stop short of")
+	}
+
+	// One more request is over.
+	rqIngest(t, hub, token, "bob", 41)
+	out = getSubscriberUsage(t, hub, token, "bob")
+	w5h = out["window_5h"].(map[string]any)
+	if got := w5h["requests"].(float64); got != 41 {
+		t.Fatalf("window_5h requests = %v, want 41 (rqIngest reuses ids, so this must not double-count)", got)
 	}
 	if over, _ := w5h["over"].(bool); !over {
-		t.Error("window_5h.over = false, want true (9M used against 8M cap)")
+		t.Error("window_5h.over = false, want true (41 requests against a 40-request cap)")
+	}
+}
+
+// TestSubscriberUsage_ReportsTokensWithoutGatingOnThem pins the semantic
+// the request cap rests on: the window's token total is REPORTED (it is
+// the billing/audit quantity, and a human checking the cap needs to see
+// whether request-shaped enforcement is being gamed by outsized requests)
+// but never produces `over` — a subscriber whose few requests happen to be
+// huge is over their token budget, not over their request cap.
+func TestSubscriberUsage_ReportsTokensWithoutGatingOnThem(t *testing.T) {
+	hub, token := testHub(t)
+	postSubscriberSet(t, hub, token, subscriberStatus{KeyLabel: "huge", Status: "active", Plan: "free"})
+	now := time.Now().UTC()
+	postIngest(t, hub, token, usageRecord{
+		RequestID: "huge-r0", TS: now.Add(-1 * time.Hour).Format(time.RFC3339Nano),
+		Region: "a100b", KeyLabel: "huge", Model: "m", PromptTokens: 200_000_000, CompletionTokens: 0,
+	})
+
+	w5h := getSubscriberUsage(t, hub, token, "huge")["window_5h"].(map[string]any)
+	if got := w5h["tokens"].(float64); got != 200_000_000 {
+		t.Errorf("window_5h tokens = %v, want 200000000", got)
+	}
+	if got := w5h["requests"].(float64); got != 1 {
+		t.Errorf("window_5h requests = %v, want 1", got)
+	}
+	if over, _ := w5h["over"].(bool); over {
+		t.Error("window_5h.over = true for one 200M-token request against a 40-REQUEST cap: the cap counts requests, and the token total is reported beside it, not compared against it")
+	}
+}
+
+// TestEveryPlanTierCarriesTheRateCardsNumbers pins the whole rate card.
+// These numbers are a business decision duplicated in docs/PRICING.md, so
+// a failure here means one of the two was edited without the other.
+func TestEveryPlanTierCarriesTheRateCardsNumbers(t *testing.T) {
+	want := map[string][2]int64{
+		"free": {40, 500},
+		"lite": {400, 7_500},
+		"pro":  {900, 14_500},
+		"pro+": {1_300, 21_000},
+		"max":  {1_700, 27_500},
+	}
+	if len(planLimits) != len(want) {
+		t.Errorf("planLimits has %d tiers, docs/PRICING.md sells %d: %v", len(planLimits), len(want), planLimits)
+	}
+	for slug, w := range want {
+		got, ok := planLimits[slug]
+		if !ok {
+			t.Errorf("plan %q is sold in docs/PRICING.md and unknown here: a subscriber on it gets NO cap", slug)
+			continue
+		}
+		if got.Requests5h != w[0] || got.Requests7d != w[1] {
+			t.Errorf("plan %q = %d/5h, %d/7d; docs/PRICING.md sells %d/5h, %d/7d", slug, got.Requests5h, got.Requests7d, w[0], w[1])
+		}
 	}
 }
 
@@ -691,6 +778,15 @@ func TestReset_ZeroesWindowUsageWithoutTouchingCumulativeTotals(t *testing.T) {
 	}
 	if got := after["window_7d"].(map[string]any)["tokens"].(float64); got != 0 {
 		t.Errorf("post-reset window_7d tokens = %v, want 0", got)
+	}
+	// The request count carries the cap now, so a reset that failed to zero
+	// IT would leave a subscriber over their cap with nothing left in the
+	// window to point at.
+	if got := after["window_5h"].(map[string]any)["requests"].(float64); got != 0 {
+		t.Errorf("post-reset window_5h requests = %v, want 0", got)
+	}
+	if got := after["window_7d"].(map[string]any)["requests"].(float64); got != 0 {
+		t.Errorf("post-reset window_7d requests = %v, want 0", got)
 	}
 
 	// The billing/audit trail must be untouched by a window reset.
