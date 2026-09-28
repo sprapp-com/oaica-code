@@ -417,35 +417,44 @@ func (u *openAIUsage) statedCompletionTokens() bool {
 	return u != nil && u.CompletionTokens > 0
 }
 
+// openAIStreamToolDelta is one tool-call entry of a delta frame. It is a named
+// type, not an anonymous struct, because a whole completion that arrives after
+// the stream has written to the client is read back as the delta it is worth
+// (see the fold in the read loop): the same entry then has to be written into
+// the chunk the loop is about to read.
+type openAIStreamToolDelta struct {
+	// Index is a POINTER because its zero value is meaningful here: an
+	// upstream that omits the field (several do) sent no index at all, and
+	// reading that as 0 merged every tool call in the stream into one
+	// accumulator (2026-09-26 audit, fifteenth round).
+	Index    *int               `json:"index"`
+	ID       string             `json:"id,omitempty"`
+	Type     string             `json:"type,omitempty"`
+	Function openAIToolFunction `json:"function,omitempty"`
+}
+
+// openAIStreamDelta is the delta of one streamed choice.
+type openAIStreamDelta struct {
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// Reasoning: see the identical field on openAIChatResponse's Message struct
+	// above for why this alias exists.
+	Reasoning string                  `json:"reasoning,omitempty"`
+	ToolCalls []openAIStreamToolDelta `json:"tool_calls,omitempty"`
+}
+
+// openAIStreamChoice is one choice of a streamed chunk.
+type openAIStreamChoice struct {
+	Index        int               `json:"index"`
+	Delta        openAIStreamDelta `json:"delta"`
+	FinishReason string            `json:"finish_reason,omitempty"`
+}
+
 // openAIStreamChunk is one SSE data: payload from a streaming response.
 type openAIStreamChunk struct {
-	Choices []struct {
-		Index int `json:"index"`
-		Delta struct {
-			Role             string `json:"role,omitempty"`
-			Content          string `json:"content,omitempty"`
-			ReasoningContent string `json:"reasoning_content,omitempty"`
-			// Reasoning: see the identical field on openAIChatResponse's
-			// Message struct above for why this alias exists.
-			Reasoning string `json:"reasoning,omitempty"`
-			ToolCalls []struct {
-				// Index is a POINTER because its zero value is meaningful
-				// here: an upstream that omits the field (several do) sent no
-				// index at all, and reading that as 0 merged every tool call
-				// in the stream into one accumulator (2026-09-26 audit,
-				// fifteenth round).
-				Index    *int   `json:"index"`
-				ID       string `json:"id,omitempty"`
-				Type     string `json:"type,omitempty"`
-				Function struct {
-					Name      string `json:"name,omitempty"`
-					Arguments string `json:"arguments,omitempty"`
-				} `json:"function,omitempty"`
-			} `json:"tool_calls,omitempty"`
-		} `json:"delta"`
-		FinishReason string `json:"finish_reason,omitempty"`
-	} `json:"choices"`
-	Usage *openAIUsage `json:"usage,omitempty"`
+	Choices []openAIStreamChoice `json:"choices"`
+	Usage   *openAIUsage         `json:"usage,omitempty"`
 }
 
 // startsANewToolCall reports whether an index-less tool-call delta begins the
@@ -3517,7 +3526,47 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// an answer was dropped whole (round 83, F83-L2-1). So the FRAME is
 		// asked: it is adopted when it carries something of its own, and left
 		// alone when it only restates what the stream already holds.
-		if !started && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
+		// A whole completion that arrives AFTER the stream has already written
+		// to the client is still the model's answer, and it used to be read for
+		// its usage line and nothing else. The reader below models only `delta`,
+		// so this frame's content, its tool calls and the stop reason its choice
+		// states were dropped on the floor, and the client was given a turn that
+		// ended at the delta before it: `[text delta "hi"][frame(content + call
+		// c2)][finish][DONE]` reached the client as `text` and end_turn, where
+		// the same frame with no delta before it, and the same turn written as
+		// deltas, both carry the call (2026-09-28 audit, round 85, R85-L2-1).
+		//
+		// The `!started` gate below exists so that a mid-stream whole message is
+		// not ADOPTED as the turn: it must not replace what the client already
+		// holds, and it must not end the stream (rounds 46, 56, 83). Neither
+		// reason applies to reading it as what it is worth as a DELTA — the turn
+		// still ends where the wire ends it, and everything the frame carried
+		// reaches the client in this arm's own order, through the rules any
+		// other delta of the same content goes through. The frame is asked the
+		// same question the adoption gate asks, so one that only restates what
+		// the stream already holds is still left alone — and the two branches
+		// are mutually exclusive on `started` as it stood when the frame
+		// arrived, so a frame is never both adopted and folded.
+		if (started || len(toolAccums) > 0) && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
+			var doc openAIChatResponse
+			if err := json.Unmarshal([]byte(payload), &doc); err == nil && len(doc.Choices) > 0 && len(chunk.Choices) > 0 {
+				m := doc.Choices[0].Message
+				d := &chunk.Choices[0].Delta
+				d.Content = m.Content
+				d.ReasoningContent = m.ReasoningContent
+				d.Reasoning = m.Reasoning
+				for _, tc := range m.ToolCalls {
+					d.ToolCalls = append(d.ToolCalls, openAIStreamToolDelta{
+						Index:    tc.Index,
+						ID:       tc.ID,
+						Type:     tc.Type,
+						Function: tc.Function,
+					})
+				}
+			}
+		}
+
+		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
 			if adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
@@ -4487,6 +4536,19 @@ func frameAddsToTheTurn(payload string, accums map[int]*toolAccum) bool {
 	// name for name and argument bytes for argument bytes, which is the
 	// comparison the restatement folds elsewhere on this leg make.
 	held := func(name, args string) bool {
+		// An entry the upstream never NAMED is not a call on this leg at all —
+		// its bytes are prose the model wrote, and they are relayed as text
+		// (see relayUnnamedCallArguments) — so it cannot be a call the stream
+		// already holds either, however exactly its bytes match one the stream
+		// relayed. Matching it did hold the frame back, and the second of the
+		// model's two statements was dropped: `[nameless fragment {"a":1}]
+		// [frame with the same nameless entry]` reached the client with those
+		// bytes ONCE where the same two statements in the other frame order,
+		// and as one list, both reach it twice (2026-09-28 audit, round 85,
+		// R85-L2-4).
+		if strings.TrimSpace(name) == "" {
+			return false
+		}
 		for _, a := range accums {
 			if a.name == name && a.args.String() == args {
 				return true
@@ -4723,7 +4785,19 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			*finishReason = c.FinishReason
 		}
 	}
-	*finalUsage = oaiResp.Usage
+	// MERGED, not replaced. A whole completion is read here for its answer, and
+	// its usage line is the ordinary case's only statement of the prompt size —
+	// but a frame that states NO usage is just as ordinary (several vendors put
+	// the usage in a chunk of its own, and this frame then arrives without
+	// one), and overwriting threw away what the stream had already stated: the
+	// same upstream usage reached the client as input_tokens 4242 when the
+	// stream stated it before the frame and as the character estimate when the
+	// same statement came in a chunk before a frame that carried no usage of
+	// its own (2026-09-28 audit, round 85, R85-L2-2). mergeUsage is what the
+	// chunk arm already uses — it ignores an absent statement and lets a later
+	// non-zero one win — so both arms now answer the same number for the same
+	// body.
+	*finalUsage = mergeUsage(*finalUsage, oaiResp.Usage)
 	return true, false, wroteCalls, wroteSlots
 }
 
