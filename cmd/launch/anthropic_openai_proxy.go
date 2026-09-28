@@ -3503,15 +3503,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// adopted as a whole completion with an EMPTY message, the rest of the
 		// stream was discarded, and the client got 200 with no answer and a
 		// healthy leg (2026-09-26 audit, sixteenth round).
-		// Not `len(toolAccums) == 0`: a fragment with neither a name nor
-		// arguments relays nothing when it is flushed, so letting it close this
-		// gate discarded the whole completion that followed — the client got
-		// 200, an empty message and output_tokens for an answer the upstream had
-		// already written, while the identical frame without the fragment relays
-		// that answer (and the gateway leg relays it too, its own nothingRelayed
+		// What the stream has relayed is NOT the question, and neither is
+		// `len(toolAccums) == 0`: a fragment with neither a name nor arguments
+		// relays nothing when it is flushed, so letting it close this gate
+		// discarded the whole completion that followed — the client got 200, an
+		// empty message and output_tokens for an answer the upstream had already
+		// written, while the identical frame without the fragment relays that
+		// answer (and the gateway leg relays it too, its own nothingRelayed
 		// asking the same question of the same fragment) (2026-09-28 audit,
-		// round 56, F2).
-		if !started && !relaysSomething(toolAccums) && frameCarriesWholeCompletion(payload) {
+		// round 56, F2). A fragment that relays SOMETHING closed the same gate
+		// and cost the same answer — the accumulated arguments are text, so the
+		// stream was marked as having said something and a later frame that IS
+		// an answer was dropped whole (round 83, F83-L2-1). So the FRAME is
+		// asked: it is adopted when it carries something of its own, and left
+		// alone when it only restates what the stream already holds.
+		if !started && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
 			if adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
@@ -3614,6 +3620,35 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				continue
 			}
 			d := choice.Delta
+
+			// A call the wire has already finished stands before the prose that
+			// followed it: a vendor feeds its calls in the order it wrote them,
+			// so a text (or reasoning) delta arriving now means the wire has
+			// moved past the arguments every call so far was receiving. Reading
+			// the same turn as ONE document says the same thing — the adopted
+			// whole completion is written in its own order, calls before the
+			// prose — while this arm kept the calls until the turn's end and
+			// wrote the prose as it arrived, so one body reached the client as
+			// text,tool_use streamed and tool_use,text whole (2026-09-28 audit,
+			// round 83, F83-L2-2).
+			//
+			// Only calls with nothing left to receive are flushed. A call still
+			// mid-object stays where the wire left it: emitting it now would
+			// hand the client an argument string the model had not finished as
+			// its input (rounds 16, 17), which is worse than the order — and a
+			// fragment that has named nothing is not a call this leg may name.
+			if d.Content != "" || reasoningOf(d.ReasoningContent, d.Reasoning) != "" {
+				settled := len(toolAccums) > 0
+				for _, a := range toolAccums {
+					if strings.TrimSpace(a.name) == "" || !finishedObjectArgs(a.args.String()) {
+						settled = false
+						break
+					}
+				}
+				if settled {
+					flushToolCalls(false)
+				}
+			}
 
 			// Reasoning content → thinking delta. It counts toward the output
 			// estimate below like the answer does: it was relayed to the client
@@ -4420,6 +4455,58 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	}
 	emit(events)
 	return true
+}
+
+// frameAddsToTheTurn reports whether a whole-completion frame says anything the
+// stream does not already hold: prose, reasoning, or a call whose name and
+// argument bytes the accumulators have not already grown.
+//
+// It is the question the adoption gate asks INSTEAD of "has this stream relayed
+// anything yet", which could not be answered by the stream alone. A stream that
+// had accumulated a fragment the upstream never named — its arguments are the
+// model's output, relayed as text, so counting them marked the turn as said —
+// closed the gate for the rest of the stream, and the whole completion that
+// followed was discarded: a frame that IS an answer, with the model's prose in
+// it, reached the client as nothing while the same two frames in the other
+// order relayed both, and while the byte-identical document did too. Which
+// frame the vendor put its message in decided the client's answer
+// (2026-09-28 audit, round 83, F83-L2-1). The frame is asked now, and it is
+// adopted when it carries something of its own; a frame that only restates the
+// calls the stream already holds is still not adopted, which is what that
+// clause was there for (round 56, F2; round 47, C-F3).
+func frameAddsToTheTurn(payload string, accums map[int]*toolAccum) bool {
+	var resp openAIChatResponse
+	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
+		return false
+	}
+	if len(resp.Choices) == 0 {
+		return false
+	}
+	m := resp.Choices[0].Message
+	if m.Content != "" || m.ReasoningContent != "" || m.Reasoning != "" {
+		return true
+	}
+	// A named call counts when the stream does not already hold it, whole:
+	// name for name and argument bytes for argument bytes, which is the
+	// comparison the restatement folds elsewhere on this leg make.
+	held := func(name, args string) bool {
+		for _, a := range accums {
+			if a.name == name && a.args.String() == args {
+				return true
+			}
+		}
+		return false
+	}
+	for _, tc := range m.ToolCalls {
+		name, args := tc.Function.Name, tc.Function.Arguments
+		if strings.TrimSpace(name) == "" && strings.TrimSpace(args) == "" {
+			continue
+		}
+		if !held(name, args) {
+			return true
+		}
+	}
+	return false
 }
 
 // frameCarriesWholeCompletion reports whether an SSE payload is a whole
