@@ -230,8 +230,17 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 			// wrote a frame with no status field — one mid-stream failure reached
 			// the client as `not_found_error` when it did not stream and as
 			// `api_error` when it did (2026-09-29 audit, round 94, F94-L1-1).
-			Status    int    `json:"status,omitempty"`
-			SigninURL string `json:"signin_url,omitempty"`
+			//
+			// It is read as RAW JSON, not as an int: the same key carries the
+			// PROGRESS line's status, which is a string (`{"status":"success"}`,
+			// `{"status":"pulling manifest"}`), so a typed int here makes every
+			// line of a pull or a generate-with-progress fail to decode. Measured
+			// with one: `oaica launch`'s auto-pull answered
+			// `failed to pull missing-model: {"status":"success"}` and no local
+			// model could be pulled at all. See statedRefusalStatus for the
+			// reading a frame that names one has to earn.
+			Status    json.RawMessage `json:"status,omitempty"`
+			SigninURL string          `json:"signin_url,omitempty"`
 		}
 
 		bts := scanner.Bytes()
@@ -266,10 +275,10 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 			// that is not a refusal, stays a plain error: fabricating a status
 			// out of some other field would type the failure for every arm from
 			// a field that was never about the failure.
-			if errorResponse.Status >= http.StatusBadRequest && errorResponse.Status <= 599 {
+			if status, ok := statedRefusalStatus(errorResponse.Status); ok {
 				return StatusError{
-					StatusCode:   errorResponse.Status,
-					Status:       http.StatusText(errorResponse.Status),
+					StatusCode:   status,
+					Status:       http.StatusText(status),
 					ErrorMessage: errorResponse.Error,
 				}
 			}
@@ -305,6 +314,29 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	}
 
 	return nil
+}
+
+// statedRefusalStatus reads the status a mid-stream error frame states, when the
+// frame states one that is a refusal. The same `status` key carries a progress
+// line's own status — a string, `"success"` or `"pulling manifest"` — so a frame
+// whose status is anything but a JSON number in the refusal range states no
+// refusal, and its error (if it has one) stays a plain error. Reading the key
+// as an int rejected every progress line before this could be asked
+// (2026-09-29 audit, round 94).
+func statedRefusalStatus(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+
+	var status int
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return 0, false
+	}
+	if status < http.StatusBadRequest || status > 599 {
+		return 0, false
+	}
+
+	return status, true
 }
 
 // GenerateResponseFunc is a function that [Client.Generate] invokes every time
