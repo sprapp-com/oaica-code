@@ -285,6 +285,27 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 			return errors.New(errorResponse.Error)
 		}
 
+		// A frame that states a refusal STATUS and no message is a refusal too.
+		// The runner lane pushes exactly that frame when its own failure carried
+		// no text — `gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}`
+		// with an empty ErrorMessage (server/routes.go:3254, :3382, whose source
+		// is `statusErrorMessage` in llm/llama_server.go) — so a peer answering a
+		// relayed turn with it stated a cause. Read only for its `error` field it
+		// fell through to the relay's chunk writer: every streaming client on all
+		// four surfaces was handed a junk empty chunk and then a synthesised 502
+		// "upstream stream ended before the response was complete" in place of the
+		// status the peer stated, where the same document pushed straight onto the
+		// runner lane's channel reaches the client with its own `{"error":"",
+		// "status":500}` (2026-09-29 audit, round 95, F95-L1-1). The status is
+		// read through the same guard as above, so a progress line's string
+		// `status` still states no refusal.
+		if status, ok := statedRefusalStatus(errorResponse.Status); ok {
+			return StatusError{
+				StatusCode: status,
+				Status:     http.StatusText(status),
+			}
+		}
+
 		if err := fn(bts); err != nil {
 			return err
 		}
