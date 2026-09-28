@@ -362,11 +362,16 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 		c.Header("Content-Type", contentType)
 
+		relayChunks, relayDone := 0, false
 		fn := func(resp api.GenerateResponse) error {
 			resp.Model = origModel
 			resp.RemoteModel = m.Config.RemoteModel
 			resp.RemoteHost = m.Config.RemoteHost
 
+			relayChunks++
+			if resp.Done {
+				relayDone = true
+			}
 			data, err := json.Marshal(resp)
 			if err != nil {
 				return err
@@ -381,6 +386,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 		client := api.NewClient(remoteURL, http.DefaultClient)
 		err = client.Generate(c, &req, fn)
+		if err == nil && !relayDone {
+			relayEndedWithoutAFinalResponse(c, relayChunks)
+			return
+		}
 		if err != nil {
 			var authError api.AuthorizationError
 			if errors.As(err, &authError) {
@@ -2134,6 +2143,40 @@ func waitForStream(c *gin.Context, ch chan any) {
 	c.JSON(http.StatusOK, latest)
 }
 
+// relayEndedWithoutAFinalResponse states the failure of a remote-host turn whose
+// stream ended with no final response. The two relay branches (`/api/generate`
+// and `/api/chat`, for a model whose config names another host) are the one path
+// on this leg that does not go through the arm machinery at all: their `fn`
+// writes each chunk straight to the writer, so neither the empty-stream refusal
+// nor the truncated-turn refusal below is reachable from them, and the reader
+// they read through — `api/client.go`'s `stream` — returns nil however the
+// remote's body ends. A remote that closed its stream mid-turn (a build that
+// predates this round's refusal in `llm/llama_server.go`, a remote restarted
+// between frames) was therefore relayed as a 200 that simply STOPS: no
+// terminal chunk, no error, nothing for the client to retry on, and a truncated
+// answer sold as the model's whole reply. The empty case was worse — 200 and an
+// empty body, where the runner path refuses the same event as 502.
+// (2026-09-29 audit, round 91, F91-L1-2.)
+func relayEndedWithoutAFinalResponse(c *gin.Context, chunks int) {
+	const truncated = "upstream stream ended before the response was complete"
+	sentence, status := truncated, http.StatusBadGateway
+	if chunks == 0 {
+		sentence = "upstream returned an empty stream"
+	}
+	if !c.Writer.Written() {
+		c.JSON(status, gin.H{"error": sentence})
+		return
+	}
+	// Already-written: the relay's own framing is an ndjson document, and the
+	// frame is the one the chat path writes for a mid-turn failure — the same
+	// shape the other arms of this server state the same cause in, status
+	// included, so a reading middleware names the client-facing type from it.
+	frame := gin.H{"error": sentence, "status": status}
+	if err := json.NewEncoder(c.Writer).Encode(frame); err != nil {
+		slog.Error("relayEndedWithoutAFinalResponse failed to encode json error", "error", err)
+	}
+}
+
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	// The first chunk is read before the loop because an Anthropic client's
@@ -2777,11 +2820,16 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 		c.Header("Content-Type", contentType)
 
+		relayChunks, relayDone := 0, false
 		fn := func(resp api.ChatResponse) error {
 			resp.Model = origModel
 			resp.RemoteModel = m.Config.RemoteModel
 			resp.RemoteHost = m.Config.RemoteHost
 
+			relayChunks++
+			if resp.Done {
+				relayDone = true
+			}
 			data, err := json.Marshal(resp)
 			if err != nil {
 				return err
@@ -2796,6 +2844,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 		client := api.NewClient(remoteURL, http.DefaultClient)
 		err = client.Chat(c, &req, fn)
+		if err == nil && !relayDone {
+			relayEndedWithoutAFinalResponse(c, relayChunks)
+			return
+		}
 		if err != nil {
 			var authError api.AuthorizationError
 			if errors.As(err, &authError) {

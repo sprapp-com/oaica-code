@@ -30,6 +30,13 @@ type ChatWriter struct {
 	streamOptions *openai.StreamOptions
 	id            string
 	toolCallSent  bool
+	// failed is set when an error frame ended this turn. Everything after it is
+	// nothing: the client has been told why the turn stopped, and a converter
+	// fed the frames that follow would write chunks for a turn that is over.
+	// The Anthropic writer has carried this since round 72 (`failed`,
+	// middleware/anthropic.go); this surface had no reading of the error frame
+	// at all until round 91 (2026-09-29 audit, F91-L1-1).
+	failed bool
 	BaseWriter
 }
 
@@ -37,6 +44,8 @@ type CompleteWriter struct {
 	stream        bool
 	streamOptions *openai.StreamOptions
 	id            string
+	// failed — see ChatWriter.failed (2026-09-29 audit, F91-L1-1).
+	failed bool
 	BaseWriter
 }
 
@@ -140,12 +149,62 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 }
 
 func (w *ChatWriter) Write(data []byte) (int, error) {
+	if w.failed {
+		return len(data), nil
+	}
+
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
 
+	if sentence, status, ok := upstreamErrorFrame(data); ok {
+		return w.failTurn(sentence, status)
+	}
+
 	return w.writeResponse(data)
+}
+
+// failOpenAITurn states a mid-stream failure to the client in this wire's own
+// shape: one `data:` chunk carrying the very envelope the buffered arm answers
+// with, and NO `[DONE]` — the sentinel says the turn finished, and this turn did
+// not. The buffered arm is unchanged and needs no help here: an unwritten writer
+// is answered by the chat lane's own refusal (server/routes.go, `c.JSON(status,
+// gin.H{"error": …})`), which reaches this writer with a non-200 status and goes
+// through `writeError` — measured 500 `{"error":{"message":"…","type":
+// "api_error"}}` on both `/v1/chat/completions` and `/v1/completions`. Without
+// this function the STREAMED arm of those two surfaces dropped the runner's
+// failure entirely: the frame the chat path writes into a 200 stream when the
+// generation dies partway (`server/routes.go:2149-2166`) has no `error` field of
+// its own as far as `api.ChatResponse` is concerned, so it unmarshalled to a zero
+// chunk and was relayed as an empty delta followed by nothing — 200, no sentence,
+// no `[DONE]`. The Anthropic writer has read that frame since round 86
+// (`upstreamErrorFrame` → `failTurn`), so one upstream body was answered with the
+// runner's own sentence on `/v1/messages` and with silence on
+// `/v1/chat/completions` (2026-09-29 audit, round 91, F91-L1-1).
+func failOpenAITurn(rw gin.ResponseWriter, stream bool, failed *bool, sentence string, status int) (int, error) {
+	if *failed {
+		return 0, nil
+	}
+	*failed = true
+	if stream {
+		rw.Header().Set("Content-Type", "text/event-stream")
+		d, err := json.Marshal(openai.NewError(status, sentence))
+		if err != nil {
+			return 0, err
+		}
+		if _, err := rw.Write([]byte(fmt.Sprintf("data: %s\n\n", d))); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	return 0, json.NewEncoder(rw).Encode(openai.NewError(status, sentence))
+}
+
+func (w *ChatWriter) failTurn(sentence string, status int) (int, error) {
+	return failOpenAITurn(w.ResponseWriter, w.stream, &w.failed, sentence, status)
 }
 
 func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
@@ -210,12 +269,24 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 }
 
 func (w *CompleteWriter) Write(data []byte) (int, error) {
+	if w.failed {
+		return len(data), nil
+	}
+
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
 		return w.writeError(data)
 	}
 
+	if sentence, status, ok := upstreamErrorFrame(data); ok {
+		return w.failTurn(sentence, status)
+	}
+
 	return w.writeResponse(data)
+}
+
+func (w *CompleteWriter) failTurn(sentence string, status int) (int, error) {
+	return failOpenAITurn(w.ResponseWriter, w.stream, &w.failed, sentence, status)
 }
 
 func (w *ListWriter) writeResponse(data []byte) (int, error) {
