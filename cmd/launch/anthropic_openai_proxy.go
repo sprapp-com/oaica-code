@@ -2908,19 +2908,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// its non-stream list encode it (the parsed object, or the `_raw` wrapper for
 	// text that is not one), so two spellings of one call — whitespace, key order
 	// — compare equal here as they do everywhere else in this file.
-	canonicalArgs := func(raw string) string {
-		s := strings.TrimSpace(raw)
-		var args api.ToolCallFunctionArguments
-		if err := json.Unmarshal([]byte(s), &args); err != nil {
-			args = api.NewToolCallFunctionArguments()
-			args.Set("_raw", s)
-		}
-		b, err := json.Marshal(args)
-		if err != nil {
-			return s
-		}
-		return string(b)
-	}
+	canonicalArgs := canonicalCallArgs
 
 	// canExtend reports whether a fragment's argument bytes can still be more of
 	// the call whose arguments have accumulated as accArgs — the one question
@@ -3556,6 +3544,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				d.ReasoningContent = m.ReasoningContent
 				d.Reasoning = m.Reasoning
 				for _, tc := range m.ToolCalls {
+					// Only the entries the stream does NOT already hold, which is
+					// the question the gate asks above — asked here too because
+					// the gate answers for the FRAME, not for each of its
+					// entries. A frame carrying prose of its own short-circuits
+					// the gate on that prose, so a call it merely restates was
+					// folded as a new delta alongside: the model's one call
+					// reached the client twice under two ids (`{"a": 1}` then
+					// `{"a":1}` in the frame is one restatement the byte
+					// comparison missed), and a freeform restatement had the two
+					// statements' bytes concatenated into a command the model
+					// never wrote. Both are F86-L2-1 (2026-09-28 audit, round 86).
+					if accumHoldsTheCall(toolAccums, tc.Function.Name, tc.Function.Arguments) {
+						continue
+					}
 					d.ToolCalls = append(d.ToolCalls, openAIStreamToolDelta{
 						Index:    tc.Index,
 						ID:       tc.ID,
@@ -4503,6 +4505,44 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	return true
 }
 
+// canonicalCallArgs re-encodes an argument text the way this leg's own mint and
+// its non-stream list encode it (the parsed object, or the `_raw` wrapper for
+// text that is not one), so two spellings of one call — whitespace, key order —
+// compare equal here as they do everywhere else in this file. It is the
+// comparison `restatesAccumulatedCall` folds on, and the one the accumulator
+// question below asks; text that is not a JSON object keeps its bytes exactly,
+// because the `_raw` wrapper holds them whole.
+func canonicalCallArgs(raw string) string {
+	s := strings.TrimSpace(raw)
+	var args api.ToolCallFunctionArguments
+	if err := json.Unmarshal([]byte(s), &args); err != nil {
+		args = api.NewToolCallFunctionArguments()
+		args.Set("_raw", s)
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return s
+	}
+	return string(b)
+}
+
+// accumHoldsTheCall reports whether the accumulators already hold this call:
+// named, and with argument bytes that canonicalise to the same ones. A nameless
+// entry is not a call on this leg at all — its bytes are prose the model wrote,
+// relayed as text — so it is never held, however exactly its bytes match
+// something the stream relayed (2026-09-28 audit, round 85, R85-L2-4).
+func accumHoldsTheCall(accums map[int]*toolAccum, name, args string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	for _, a := range accums {
+		if a.name == name && canonicalCallArgs(a.args.String()) == canonicalCallArgs(args) {
+			return true
+		}
+	}
+	return false
+}
+
 // frameAddsToTheTurn reports whether a whole-completion frame says anything the
 // stream does not already hold: prose, reasoning, or a call whose name and
 // argument bytes the accumulators have not already grown.
@@ -4534,27 +4574,14 @@ func frameAddsToTheTurn(payload string, accums map[int]*toolAccum) bool {
 	}
 	// A named call counts when the stream does not already hold it, whole:
 	// name for name and argument bytes for argument bytes, which is the
-	// comparison the restatement folds elsewhere on this leg make.
+	// comparison the restatement folds elsewhere on this leg make. It is asked
+	// CANONICALLY — `{"a": 1}` and `{"a":1}` are one call here as they are to
+	// `restatesAccumulatedCall` — because a frame restating a held call in the
+	// other spacing is the same restatement, and reading it as a new call is
+	// what the fold below would then relay twice (2026-09-28 audit, round 86,
+	// F86-L2-1).
 	held := func(name, args string) bool {
-		// An entry the upstream never NAMED is not a call on this leg at all —
-		// its bytes are prose the model wrote, and they are relayed as text
-		// (see relayUnnamedCallArguments) — so it cannot be a call the stream
-		// already holds either, however exactly its bytes match one the stream
-		// relayed. Matching it did hold the frame back, and the second of the
-		// model's two statements was dropped: `[nameless fragment {"a":1}]
-		// [frame with the same nameless entry]` reached the client with those
-		// bytes ONCE where the same two statements in the other frame order,
-		// and as one list, both reach it twice (2026-09-28 audit, round 85,
-		// R85-L2-4).
-		if strings.TrimSpace(name) == "" {
-			return false
-		}
-		for _, a := range accums {
-			if a.name == name && a.args.String() == args {
-				return true
-			}
-		}
-		return false
+		return accumHoldsTheCall(accums, name, args)
 	}
 	for _, tc := range m.ToolCalls {
 		name, args := tc.Function.Name, tc.Function.Arguments
