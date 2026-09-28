@@ -2179,7 +2179,24 @@ func streamResponse(c *gin.Context, ch chan any) {
 					c.Header("Content-Type", "application/json")
 					c.JSON(status, gin.H{"error": e})
 				} else {
-					if err := json.NewEncoder(c.Writer).Encode(gin.H{"error": e}); err != nil {
+					// The frame carries the status the producer stated, when it
+					// stated one, because the middleware's Anthropic writer reads
+					// that field to choose the error TYPE the client is handed
+					// (`upstreamErrorFrame` → `anthropic.NewError`). Encoded
+					// without it, the status defaulted to 500 on the already-
+					// written arm only, so one upstream body reached the client as
+					// `rate_limit_error` with HTTP 429 when it did not stream and
+					// as `api_error` with HTTP 200 when it did — the same
+					// mid-stream failure, typed two ways, and the retry the
+					// producer asked for never signalled (2026-09-28 audit, round
+					// 86, F86-L1-1). A frame that states no status is left alone:
+					// both arms default to 500, so they already agree, and the
+					// native `/api/chat` lane's line keeps its shape.
+					frame := gin.H{"error": e}
+					if _, stated := h["status"]; stated {
+						frame["status"] = status
+					}
+					if err := json.NewEncoder(c.Writer).Encode(frame); err != nil {
 						slog.Error("streamResponse failed to encode json error", "error", err)
 					}
 				}
