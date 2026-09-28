@@ -2955,7 +2955,32 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			}
 			b.stateCacheHit(details, chunk.Usage.PromptCacheHitTokens)
 		}
-		for _, ch := range chunk.Choices {
+		for ci, ch := range chunk.Choices {
+			if ci > 0 {
+				// One client request produced one message here, and every other
+				// spelling of the same body reads its FIRST choice: the
+				// one-list/whole-message arm takes `resp.Choices[0]`, the
+				// adoption path takes `resp.Choices[0]`, and the client leg
+				// skips a later entry positionally, reading only its
+				// finish_reason (round 67, F67-L2-1). Relaying every choice
+				// spliced the alternatives into one turn: a chunk stating "A" at
+				// index 0 and "B" at index 1 reached the client as "AB" here and
+				// as "A" as one list, from one body — text the model never wrote,
+				// in the client's conversation — and a call stated only by the
+				// second choice was handed over as an executable tool_use under
+				// a tool_use verdict the other spellings never reached
+				// (2026-09-28 audit, round 73, F73-L3-1).
+				//
+				// Positional, not `ch.Index == 0`: a vendor numbering its choices
+				// from 1 is still relayed the way the whole arm relays it. The
+				// finish_reason is the exception — it is read on every entry,
+				// because which choice carried it is not this arm's to decide.
+				if ch.FinishReason != nil && *ch.FinishReason != "" {
+					b.sse.stopMsg = *ch.FinishReason
+					b.sse.finished = true
+				}
+				continue
+			}
 			// A whole completion inside a frame carries the same fields as a
 			// delta, under `message`. Relay it when it is the FIRST thing the
 			// stream has said: an upstream emulating streaming around a
@@ -4982,15 +5007,18 @@ type oaStreamChunk struct {
 // ledger before the turn is written. This one answers for one frame mid-stream,
 // where a nameless call's arguments do reach the client.
 func frameRelaysSomething(chunk oaStreamChunk) bool {
-	for _, ch := range chunk.Choices {
-		if ch.Message != nil && deltaRelaysSomething(*ch.Message) {
-			return true
-		}
-		if deltaRelaysSomething(ch.Delta) {
-			return true
-		}
+	// The FIRST choice, positionally — the same reading the relay itself gives a
+	// chunk (see writeStream): a later entry is not part of the turn, so a frame
+	// whose only content sits in one commits nothing
+	// (2026-09-28 audit, round 73, F73-L3-1).
+	if len(chunk.Choices) == 0 {
+		return false
 	}
-	return false
+	ch := chunk.Choices[0]
+	if ch.Message != nil && deltaRelaysSomething(*ch.Message) {
+		return true
+	}
+	return deltaRelaysSomething(ch.Delta)
 }
 
 // deltaRelaysSomething is frameRelaysSomething's question for one delta, in the
