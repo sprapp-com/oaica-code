@@ -758,7 +758,11 @@ func derefFloat64(p *float64, def float64) float64 {
 // ToResponse converts an api.ChatResponse to a Responses API response.
 // The request is used to echo back request parameters in the response.
 func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse, request ResponsesRequest) ResponsesResponse {
-	var output []ResponsesOutputItem
+	// An empty array, not a nil one: `output` is an array on this wire, and the
+	// streamed arm's own `response.created`/`response.in_progress` events state
+	// it as `[]`, so a terminal `null` would contradict this response's own
+	// first two events (2026-09-29 audit, round 94, F94-L1-2).
+	output := []ResponsesOutputItem{}
 
 	// Add reasoning item if thinking is present
 	if chatResponse.Message.Thinking != "" {
@@ -776,8 +780,7 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 	}
 
 	// The text of a turn that also called a tool is part of the answer, not an
-	// alternative to it (2026-09-27 audit, round 18). A turn with no tool calls
-	// still gets its message item, as it always did. It is written BEFORE the
+	// alternative to it (2026-09-27 audit, round 18). It is written BEFORE the
 	// calls because that is the order the streaming arm's own output array is
 	// built in — its `buildFinalOutput` states reasoning, then the message, then
 	// the calls, whatever order the events arrived in — so writing the calls
@@ -788,7 +791,16 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 	// leg (native, OpenAI chat, Anthropic) and on this arm's own streamed
 	// sibling, which all say text-then-call (2026-09-29 audit, round 92,
 	// F92-L1-3).
-	if len(chatResponse.Message.ToolCalls) == 0 || chatResponse.Message.Content != "" {
+	//
+	// A turn that stated NO text gets no message item, on this arm or the
+	// streamed one: the item exists to hold the text, and one holding an empty
+	// string is an item no other arm states — the streamed arm's own output is
+	// built from the text deltas the client was sent, and the Anthropic surface,
+	// whose `content` is the same kind of array this `output` is, answers the
+	// same turn `"content": []`. Written unconditionally, this arm answered
+	// `[{"type":"message","content":[{"text":""}]}]` where its streamed sibling
+	// answered nothing at all (2026-09-29 audit, round 94, F94-L1-2).
+	if chatResponse.Message.Content != "" {
 		output = append(output, ResponsesOutputItem{
 			ID:     itemID,
 			Type:   "message",
@@ -1320,7 +1332,10 @@ func (c *ResponsesStreamConverter) processTextContent(content string) []Response
 }
 
 func (c *ResponsesStreamConverter) buildFinalOutput() []any {
-	var output []any
+	// An empty array, not a nil one — see ToResponse: the terminal object must
+	// not state `null` where this same response's own `response.created` events
+	// stated `[]` (2026-09-29 audit, round 94, F94-L1-2).
+	output := []any{}
 
 	// Add reasoning item if present
 	if c.reasoningStarted {
