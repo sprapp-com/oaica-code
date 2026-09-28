@@ -103,10 +103,16 @@ shipped, so it's reported in full:
   2` on a shared 8-GPU box with 7 other live tenants; user was asked and
   chose to skip rather than take that risk. Current fleet stays GPU0+GPU1.
 - `docs/BILLING_ENTITLEMENT.md` / `docs/MULTI_REGION_ROUTING.md`:
-  referenced in code comments as forward pointers, not yet written as
-  actual files — low priority, write on request.
+  written 2026-09-28 — the forward pointers from `tools/meterhub/main.go`
+  and `tools/gateway/main.go` now resolve to actual files describing the
+  admission path, its fail-open/fail-closed policy, and the routing
+  layers as they exist today. Still out of scope within them: Stripe
+  webhook signature verification, automation-tier metering.
 - Per-key rate limiting / quota enforcement beyond binary
-  active/blocked status — not asked for, not built.
+  active/blocked status — rolling-window REQUEST caps landed 2026-09-28
+  (`planLimits` in `tools/meterhub/main.go`, enforced by
+  `checkWindowCap`); a requests-per-MINUTE throttle for scripted
+  workloads is not built.
 
 ## Test status at time of writing
 
