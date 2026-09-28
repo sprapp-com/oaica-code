@@ -3182,6 +3182,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// adds to it the argument bytes of the calls it emits.
 	streamedText := 0
 
+	// relayedText and relayedThinking are the prose this turn has already handed
+	// to the client: the answer and the reasoning the deltas relayed, and the
+	// ones an adopted whole completion wrote. They answer, for text, the
+	// question heldCall answers for calls — has the turn already stated these
+	// bytes? — and the fold below relays only the part of a frame's prose the
+	// client does not hold: `[delta "hi"][frame "hi there"]` reached the client
+	// as "hihi there" while its deltas spelling — `[delta "hi"][delta " there"]`
+	// — answers "hi there", and a frame restating the relayed text whole added
+	// it a second time (2026-09-29 audit, round 92, F92-L2-3). The two sites
+	// that write them are the two sites whose text a later frame can restate:
+	// every delta, and the whole completion an adoption relays. A flush at the
+	// end of the turn relays text into a stream that has no frames left to read,
+	// so it is not recorded.
+	var relayedText, relayedThinking strings.Builder
+
 	// truncation is closed over rather than passed in: it is decided by the
 	// finish_reason the stream carried, and it changes what a fragment means.
 	flushToolCalls := func(truncated bool) {
@@ -3515,7 +3530,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// it here is what keeps every call after the adoption off the slots the
 	// adoption closed.
 	adoptWholeCompletion := func(payload string) (bool, bool) {
-		adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText)
+		adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText, &relayedText, &relayedThinking)
 		if !adopted {
 			return false, refused
 		}
@@ -3739,9 +3754,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			if err := json.Unmarshal([]byte(payload), &doc); err == nil && len(doc.Choices) > 0 && len(chunk.Choices) > 0 {
 				m := doc.Choices[0].Message
 				d := &chunk.Choices[0].Delta
-				d.Content = m.Content
-				d.ReasoningContent = m.ReasoningContent
-				d.Reasoning = m.Reasoning
+				// Only the part of the frame's prose the client does not hold: a
+				// whole completion states the WHOLE answer, so what the turn has
+				// already relayed is a prefix of it and the tail is the new text.
+				// Writing it whole re-stated the answer the deltas before it had
+				// already delivered — one body reached the client as "hihi" from
+				// its frame spelling and "hi" from every other spelling of it
+				// (2026-09-29 audit, round 92, F92-L2-3).
+				d.Content = relayedTail(relayedText.String(), m.Content)
+				d.ReasoningContent = ""
+				d.Reasoning = relayedTail(relayedThinking.String(), reasoningOf(m.ReasoningContent, m.Reasoning))
 				for _, tc := range m.ToolCalls {
 					// Only the entries the stream does NOT already hold, which is
 					// the question the gate asks above — asked here too because
@@ -3894,6 +3916,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// and the upstream bills it as output (2026-09-27 audit, round 17).
 			if reasoning := reasoningOf(d.ReasoningContent, d.Reasoning); reasoning != "" {
 				streamedText += len(reasoning)
+				relayedThinking.WriteString(reasoning)
 				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Thinking: reasoning}}
 				emit(conv.Process(cr))
 			}
@@ -3901,6 +3924,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// Text content delta.
 			if d.Content != "" {
 				streamedText += len(d.Content)
+				relayedText.WriteString(d.Content)
 				cr := api.ChatResponse{Model: upstreamModel, Message: api.Message{Content: d.Content}}
 				emit(conv.Process(cr))
 			}
@@ -4547,7 +4571,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// this from replacing a turn the client already holds; the refusal sentence
 	// below still belongs to the run that has not completed.
 	if !started && upstreamErr == "" {
-		if adopted, refused, _, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+		if adopted, refused, _, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText, &relayedText, &relayedThinking); adopted {
 			completed = true
 		} else if refused && !completed {
 			upstreamErr = "upstream returned an empty completion"
@@ -4787,6 +4811,19 @@ func accumHoldsTheCall(accums map[int]*toolAccum, id, name, args string) bool {
 	return false
 }
 
+// relayedTail is the part of a whole-completion frame's prose that the client
+// has not been given: the text beyond what the turn has already relayed, which
+// is a prefix of it. Text that is not a continuation of what the client holds
+// is relayed whole — the frame is stating something else, and truncating it to
+// nothing would lose output the model wrote (2026-09-29 audit, round 92,
+// F92-L2-3).
+func relayedTail(relayed, stated string) string {
+	if tail, ok := strings.CutPrefix(stated, relayed); ok {
+		return tail
+	}
+	return stated
+}
+
 // frameAddsToTheTurn reports whether a whole-completion frame says anything the
 // stream does not already hold: prose, reasoning, or a call whose name and
 // argument bytes the accumulators have not already grown.
@@ -4919,7 +4956,7 @@ func relayUnnamedCallArguments(msg *api.Message, upstreamCalls []openAIToolCall)
 // content on every retry (the upstream produced and billed a whole answer) and
 // marked the leg failed, so three such turns opened its breaker and moved the
 // session off a leg that was serving it (2026-09-26 audit, fourteenth round).
-func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool, wroteSlots map[int]*toolAccum) {
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int, relayedText, relayedThinking *strings.Builder) (adopted, refused, wroteCalls bool, wroteSlots map[int]*toolAccum) {
 	if strings.TrimSpace(raw) == "" {
 		return false, false, false, nil
 	}
@@ -5043,6 +5080,20 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// and non-streaming estimates (2026-09-27 audit, round 23).
 	*streamedText = len(chatResp.Message.Content) + len(chatResp.Message.Thinking) +
 		toolCallArgumentsSize(chatResp.Message.ToolCalls)
+	// The prose this adoption just put in front of the client, recorded as the
+	// turn's own output: a frame that arrives later and restates it is the same
+	// turn written again, and folding it added the answer to itself — the frame
+	// spelling of "M" reached the client as "MM" where every other spelling of
+	// it answers "M" (2026-09-29 audit, round 92, F92-L2-1/F92-L2-3). The
+	// argument bytes are not text the client holds: they reached it inside a
+	// tool_use block, and a frame stating them again is a call the heldCall
+	// comparison answers for.
+	if relayedText != nil {
+		relayedText.WriteString(chatResp.Message.Content)
+	}
+	if relayedThinking != nil {
+		relayedThinking.WriteString(chatResp.Message.Thinking)
+	}
 	// The LAST finish_reason any choice stated, which is what this leg's
 	// fragment arm reads off the same field: which of an upstream's choices
 	// carried the reason is not this leg's to decide, and reading Choices[0]
