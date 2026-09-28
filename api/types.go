@@ -219,6 +219,13 @@ type Message struct {
 	// lane on the Anthropic surface fills this in, because only that surface
 	// reads it: the OpenAI wire has one text field by definition (2026-09-28
 	// audit, round 75, F75-L1-1).
+	//
+	// The split is at every tool call, including the ones no block is written
+	// for — a fragment the upstream never named, or a restatement of a call
+	// already written. The boundary belongs to the BLOCK, so a reader joins the
+	// runs around such a call rather than starting a text block at them, which
+	// is what the streaming arm does by never closing its text block there
+	// (2026-09-28 audit, round 76, F76-L1-1).
 	ContentRuns []string `json:"content_runs,omitempty"`
 	ToolName    string   `json:"tool_name,omitempty"`
 	ToolCallID  string   `json:"tool_call_id,omitempty"`

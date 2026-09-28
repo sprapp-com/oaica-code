@@ -1367,19 +1367,41 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	if runsMode {
 		// The order the model wrote: run i is the text that arrived before
 		// ToolCalls[i], and the last run follows the final call.
+		//
+		// A call that writes NO block — a fragment the upstream never named, or
+		// a restatement of a call already written — does not split the text
+		// either: the run boundary belongs to the BLOCK, not to the entry. The
+		// streaming arm closes its text block only where it opens a tool_use
+		// one, so a nameless call between two runs left the prose in ONE block
+		// there and in two here, and the arm that wrote fewer blocks was the
+		// one that split the prose (2026-09-28 audit, round 76, F76-L1-1). The
+		// text of the runs around such a call is joined into the next block
+		// written, which is what "no boundary here" means on the other arm.
+		var pending strings.Builder
+		ci := 0
 		for i, run := range runs {
-			if run != "" {
-				content = append(content, ContentBlock{
-					Type: "text",
-					Text: ptr(run),
-				})
-			}
+			pending.WriteString(run)
 			if i < len(r.Message.ToolCalls) {
-				if block, ok := blockFor(r.Message.ToolCalls[i]); ok {
+				tc := r.Message.ToolCalls[ci]
+				ci++
+				if block, ok := blockFor(tc); ok {
+					if pending.Len() > 0 {
+						content = append(content, ContentBlock{
+							Type: "text",
+							Text: ptr(pending.String()),
+						})
+						pending.Reset()
+					}
 					toolBlocks++
 					content = append(content, block)
 				}
 			}
+		}
+		if pending.Len() > 0 {
+			content = append(content, ContentBlock{
+				Type: "text",
+				Text: ptr(pending.String()),
+			})
 		}
 	} else {
 		for _, tc := range r.Message.ToolCalls {
