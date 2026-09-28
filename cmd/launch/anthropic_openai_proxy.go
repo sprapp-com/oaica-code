@@ -3157,6 +3157,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// sentence about a frame that did state content — is a sentence about a
 	// thing that did not happen (2026-09-29 audit, round 96, F96-L2-1).
 	var unreadFramed string
+	// emptyDocumentFrame records that a frame this reader could not read as a
+	// chunk is one the document reader accepts as a body with no turn in it
+	// (F97-L2-2, below).
+	var emptyDocumentFrame bool
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -3697,6 +3701,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// buffered arm meets the same bytes as a document and names the
 				// decode detail; keep them so the tail below can name it too.
 				unreadFramed = payload
+			}
+			// These bytes are one this reader cannot read as a CHUNK and the
+			// document reader accepts: what it states as a document is a choice
+			// with no message, because this reader's `delta` is not a field that
+			// reader knows. That is the body the buffered arm reads and refuses
+			// as an empty completion, and the tail can work it out for no
+			// spelling of it — it asks whether the payload is UNREADABLE, and
+			// this one is not (2026-09-29 audit, round 97, F97-L2-2).
+			if strings.TrimSpace(payload) != "" && unreadFrameCause(payload) == "" {
+				emptyDocumentFrame = true
 			}
 			continue
 		}
@@ -4710,6 +4724,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// the streamed spelling of the body the buffered arm reads
 					// and refuses with this same sentence.
 					msg = "upstream returned an empty completion"
+				} else if !started && emptyDocumentFrame {
+					// A frame this reader could not read as a chunk, and the
+					// document reader reads as a choice stating no message: the
+					// same bytes as a document are refused by the buffered arm
+					// with this sentence, and a client that streamed them was
+					// told instead that the stream ended early — a cause that
+					// did not happen, since the upstream closed it (2026-09-29
+					// audit, round 97, F97-L2-2).
+					msg = "upstream returned an empty completion"
 				} else if !started && wholeCompletionFrameSeen {
 					// Same rule for the other spelling of an empty body: a frame
 					// that PARSED as a whole completion and stated nothing is the
@@ -5029,7 +5052,16 @@ func unreadCompletionFrame(payload string) (string, bool) {
 func frameCarriesWholeCompletion(payload string) bool {
 	var resp openAIChatResponse
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
-		return false
+		// A whole completion written in a spelling this decoder rejects is
+		// still a whole completion. The buffered arm meets the same bytes as a
+		// document and refuses to DECODE them; a frame that states a `message`
+		// this decoder cannot read is that document. Answered false, the frame
+		// was read as an ordinary delta frame and the `delta` beside the
+		// unreadable message was relayed — prose, or a tool call the client
+		// could RUN — for a body every other spelling of it refuses with the
+		// decode detail (2026-09-29 audit, round 97, F97-L2-1).
+		_, unreadable := unreadCompletionFrame(payload)
+		return unreadable
 	}
 	if len(resp.Choices) == 0 {
 		return false
