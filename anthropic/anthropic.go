@@ -1207,8 +1207,13 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 
 	// A buffered turn that still knows where its text arrived relative to its
 	// calls hands the boundaries over in ContentRuns, and then this arm writes
-	// the blocks in the order the model produced them — the same order its
-	// streaming twin writes, block for block. Without them the turn has ONE
+	// the text and tool_use blocks in the order the model produced them — the
+	// order its streaming twin writes for the same turn. Reasoning is the
+	// exception and stays first: api.ChatResponse carries one merged Thinking
+	// string with no boundaries of its own, so a turn whose reasoning arrived
+	// after its text is written here as [thinking, text, ...] where the
+	// streaming arm re-opens a reasoning block where it arrived. Reported and
+	// deliberately unchanged (F68-L1-1). Without the runs the turn has ONE
 	// text string, the runs are already joined, and the call can only be
 	// written after all of it: `text/call/text` reached a client that asked for
 	// no stream as `texttext` then the call, prose the model wrote after the
