@@ -3184,9 +3184,31 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// with `{"x":1}` relayed as prose on the document arm, from one
 			// upstream answer (2026-09-28 audit, round 67, F67-L3-1). A
 			// mid-object list or a finished one is unchanged by the swap.
+			//
+			// It is not only a call still being written that this route has to
+			// reach. A call the turn introduced and left argument-less is HELD
+			// (nothing can open a block whose arguments have not arrived), and
+			// the fragment that completes it — the same id, the same name, an
+			// argument list that is the empty one it already holds — is that
+			// call RESTATED, not a new one. Without the identity it opened a
+			// block of its own at the fragment's index, and the held block was
+			// then merged into that later one at the end of the turn: the same
+			// two calls reached the client in one order when the restatement
+			// stated the call's OWN index and in the other when it stated any
+			// other, and in the wrong one of the two the adopt arm — whose
+			// entries are handed their list position, so its restatement ALWAYS
+			// lands on a fresh index — answered every body of this shape. Both
+			// other legs keep the call where it was introduced (measured on the
+			// same body: the client leg answers [call_1 Read, call_781541ff
+			// Bash] under both spellings), because the call the model wrote
+			// first is the one the client's list must open first (round 63's
+			// F63-L3-1). The identity is the same one the mint and both legs key
+			// "the same call restated" by, so a second call that merely shares
+			// the id and the name does not fold here — its arguments differ
+			// (2026-09-28 audit, round 71, F71-L3-2).
 			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
 				(name == "" || carried.name == "" || name == carried.name) &&
-				argsAreMidObject(carried.args.String()) {
+				(argsAreMidObject(carried.args.String()) || restatesCarriedIdentity(carried, name, args)) {
 				b.noteIndexKey(*upIdx, carried.key)
 				b.lastToolKey = carried.key
 				return carried.key
@@ -3713,10 +3735,22 @@ func (b *anthropicBridge) idHeldByAnotherCall(id string) bool {
 // may not be handed to, most often the mint of an id-less call, whose string is
 // reproducible and therefore one an upstream can state for a call of its own
 // (round 46's G45-1).
+//
+// A holder keyed at the id itself is asked the same question as any other. The
+// key is a NAME for the block the upstream's stated id introduced, not a claim
+// about which call the id belongs to, and skipping it read the id's own key as
+// that claim: the turn's SECOND call, stated under an id the turn's first call
+// had already stated, split off on its name (below) and then found no holder —
+// so it took the id, and the block that had stated it first was minted instead.
+// One body reached the client as [minted Read, call_1 Bash] where both other
+// legs and this bridge's own whole-list arm answer [call_1 Read, minted Bash]:
+// which call wore the id the wire stated twice depended on whether the upstream
+// streamed the turn or wrote it as one list (2026-09-28 audit, round 71,
+// F71-L3-1).
 func (b *anthropicBridge) idHeldByASeparateCall(tb *toolBlock, id string) bool {
 	mine, settled := settledIdentity(tb)
 	for _, other := range b.toolOrder {
-		if other == tb || other.merged || other.key == "!"+id || other.id != id || !namesItself(other) {
+		if other == tb || other.merged || other.id != id || !namesItself(other) {
 			continue
 		}
 		if settled && other.statedID {
@@ -3763,6 +3797,17 @@ func (b *anthropicBridge) blockCarrying(id string, tb *toolBlock) *toolBlock {
 		return other
 	}
 	return nil
+}
+
+// restatesCarriedIdentity reports whether a fragment stating id, name and args
+// is the call the carried block already IS — the same name, and an argument
+// list the canonical encoding reads as the same one — rather than a second call
+// that merely shares the id and the name. The carried call's own arguments must
+// be far enough along for the comparison to mean anything (settledIdentity), so
+// a block still writing half an object is never read as restated.
+func restatesCarriedIdentity(carried *toolBlock, name, args string) bool {
+	mine, ok := settledIdentity(carried)
+	return ok && mine == toolCallIdentity(name, args)
 }
 
 // settledIdentity is what a call is, as far as the ids this bridge hands out are
