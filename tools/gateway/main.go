@@ -1801,7 +1801,12 @@ func (u *usageRecorder) Write(p []byte) (int, error) {
 		// cap the drain never ran again, so every later line was dropped too
 		// and a served 200 was metered as zero (2026-09-27 audit, round 31).
 		u.scanSSE(p)
-	} else if u.body.Len() < 4<<20 {
+	} else if u.body.Len() < docBufferLimit {
+		// docBufferLimit, not the 4 MiB this arm used to carry: the two arms are
+		// two spellings of one turn, and a 5 MiB completion document was metered
+		// with usage_seen=false when it arrived buffered and usage_seen=true when
+		// the same bytes arrived as frames — the meter trusted a different size
+		// on each arm (2026-09-29 audit, round 88, F88-L3-4).
 		u.body.Write(p)
 	}
 	return n, err
@@ -1899,6 +1904,20 @@ func (u *usageRecorder) finish() {
 	if d, ok := u.ResponseWriter.(interface{ DocumentServed() bool }); ok {
 		served = d.DocumentServed()
 	}
+	// The scanner above only consumes WHOLE lines, so a stream that ended without
+	// a final newline leaves its last line — a frame or a document — in tail,
+	// where `raw` would read it glued to the body: `{...document...}data: {...}`
+	// is not JSON, so a turn whose client WAS served the document was metered from
+	// the frame that preceded it: 9000/500 for a turn served as 7/3, and the row
+	// kept the number that was not the turn (2026-09-29 audit, round 88,
+	// F88-L3-1). Feeding the one pending line to the same scanner first lets it
+	// leave the tail the way it would have had the upstream ended its last line:
+	// a frame goes to the usage scan and stops gluing itself to the document.
+	// Only a frame needs the feed — a pending document line is read out of the
+	// tail by `raw` below exactly as it was before.
+	if pending := bytes.TrimSpace(u.tail.Bytes()); bytes.HasPrefix(pending, []byte("data:")) {
+		u.scanSSE([]byte("\n"))
+	}
 	raw := make([]byte, 0, u.body.Len()+u.tail.Len())
 	raw = append(raw, u.body.Bytes()...)
 	raw = append(raw, u.tail.Bytes()...)
@@ -1906,9 +1925,16 @@ func (u *usageRecorder) finish() {
 	// partial-line buffer — the loop above only consumes whole lines — so it is
 	// the tail, not the body, that holds the last (here: only) line.
 	var doc struct {
-		Usage *usage `json:"usage"`
+		Usage   *usage            `json:"usage"`
+		Choices []json.RawMessage `json:"choices"`
 	}
-	document := json.Unmarshal(raw, &doc) == nil && doc.Usage != nil
+	// A document IS a turn only if it carries one. An object with usage and no
+	// choices is what the bridge refuses — the client was answered 502 — so
+	// booking its usage charged a session for an answer it never received, and
+	// whether it was charged depended on which arm met the same bytes: the
+	// buffered arm read the usage of the refused turn, the streamed arm did not
+	// (2026-09-29 audit, round 88, F88-L3-3).
+	document := json.Unmarshal(raw, &doc) == nil && doc.Usage != nil && len(doc.Choices) > 0
 	if !served {
 		return
 	}
@@ -1921,7 +1947,15 @@ func (u *usageRecorder) finish() {
 		// were never reconciled and the row kept the one that was not the turn
 		// (2026-09-29 audit, round 87, F87-L3-2). The scan above still wins
 		// wherever no document was served (round 39, B-F3's other half).
-		u.usage = *doc.Usage
+		//
+		// Merged, not assigned (2026-09-29 audit, round 88, F88-L3-2): the
+		// document's word for the fields it states, and the frame's for the ones
+		// it does not. Assigning the whole struct erased a cache hit an earlier
+		// frame had stated — the frame's row booked 7/3 with cached=0 while its
+		// client was read the same frame's hit and answered 2/3 with cached=5, and
+		// the two readings of one turn disagreed exactly on whether the prompt
+		// paid the cached rate.
+		u.usage.merge(*doc.Usage)
 		u.seen = true
 		return
 	}

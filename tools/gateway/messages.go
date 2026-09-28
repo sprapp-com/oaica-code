@@ -2466,14 +2466,23 @@ func (b *anthropicBridge) DocumentServed() bool {
 	if !b.stream || b.sse.adoptedDoc {
 		return true
 	}
-	// startSent is the whole of the question that the buffer cannot answer for
-	// itself. finalize() feeds the one unterminated line left in the frame buffer
-	// (flushStreamTail) BEFORE it judges adoption, and that feed can set
-	// startSent — but only for a line that begins `data:`, and a body whose
-	// buffered bytes contain a `data:` line is not the buffered completion at
-	// all: bufferedCompletion concatenates the two buffers and parses them as one
-	// document, which such a body cannot be. So the pending line cannot change
-	// this answer, and no second term mirrors the feed.
+	// The last line of a stream that ended without a newline is still in the
+	// frame buffer, and finalize() feeds it to the frame reader before it judges
+	// adoption (flushStreamTail) — so asking this question BEFORE that feed
+	// answers it about a stream the bridge has not finished reading. A body whose
+	// last line is that unterminated frame was read here as "not a document":
+	// bufferedCompletion concatenated the document with the frame and parsed the
+	// two as one, which is not JSON, so documentSaysSomething saw nothing and
+	// `served` came back false for a turn whose client WAS served the document.
+	// The meter's early return for an unserved turn then booked the usage of the
+	// frame that preceded the document — 9000/500 for a turn the client read as
+	// the document's own 7/3 (2026-09-29 audit, round 88, F88-L3-1; measured:
+	// removing this feed puts G1 and G1d back to 9000/500). noAnswer reads the
+	// tail before it judges for the same reason, and the feed is idempotent.
+	b.flushStreamTail()
+	// A feed of a `data:` line — a frame — is the one case where the pending line
+	// could answer differently, and startSent is where it shows: a stream that
+	// relayed frames is not the buffered completion, which is what this says.
 	if b.sse.startSent {
 		return false
 	}
