@@ -226,16 +226,32 @@ type WebSearchAnthropicWriter struct {
 	// (server/routes.go) — so a turn that never searches streams its calls at
 	// the same boundary it always did (2026-09-28 audit, round 70, F70-L1-1).
 	pendingCallChunks []api.ChatResponse
-	// lateThinking and lateText are the narration of every chunk this arm
-	// discarded while the loop was in flight. The loop's terminal response is
+	// lateRuns is the narration of every chunk this arm discarded while the
+	// loop was in flight, in the order the chunks arrived and, within a chunk,
+	// in the order the converter writes them (reasoning, prose, then the bytes
+	// of an entry the upstream never named). The loop's terminal response is
 	// built by the worker from the ONE chunk that carried the search call, so
 	// the model's later prose would otherwise be lost here while the
 	// whole-document arm — which sees the merged message — carries it. Merged
 	// into the terminal's leading narration at write time, which is after
 	// every such chunk has arrived (the terminal is written on the done
 	// chunk) (2026-09-28 audit, round 70, F70-L1-2).
-	lateThinking string
-	lateText     string
+	//
+	// An ordered LIST rather than one bucket per kind: the whole-document arm
+	// of the same body keeps the order the runs arrived in, and folding this
+	// arm's into a fixed [thinking, text] pair put prose-then-reasoning on one
+	// wire and reasoning-then-prose on the other (2026-09-28 audit, round 82,
+	// F82-L1-2). The nameless entry's bytes are in it for the same reason they
+	// are in carriedNarrationBlocks: they are the model's output and no other
+	// arm drops them (round 82, F82-L1-4).
+	lateRuns []lateNarrationRun
+}
+
+// lateNarrationRun is one narration block absorbed while the loop was in
+// flight: the kind the converter would open for it, and its text.
+type lateNarrationRun struct {
+	kind string
+	text string
 }
 
 const maxWebSearchLoops = 3
@@ -726,11 +742,32 @@ func carriedNarrationBlocks(response api.ChatResponse) []anthropic.ContentBlock 
 			t := s
 			blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: &t})
 		}
+		// addThinking joins reasoning the same way, for the same reason: a run
+		// boundary is a block boundary only where the KIND changes. A call run
+		// this loop superseded writes no block here either — its entry is not a
+		// call the turn kept — so reasoning written either side of it is one
+		// thinking block on the streaming arm (the converter's `Process` opens
+		// one and keeps writing into it, and round 81's F81-L1-1 read the two
+		// arms of this bridge as one run per kind) and was two here, because
+		// this case appended unconditionally: one upstream body reached a
+		// buffered client as `<thinking T1><thinking T2>` and a streaming one as
+		// `<thinking T1T2>` (2026-09-28 audit, round 82, F82-L1-1).
+		addThinking := func(s string) {
+			if s == "" {
+				return
+			}
+			if n := len(blocks); n > 0 && blocks[n-1].Type == "thinking" && blocks[n-1].Thinking != nil {
+				joined := *blocks[n-1].Thinking + s
+				blocks[n-1].Thinking = &joined
+				return
+			}
+			t := s
+			blocks = append(blocks, anthropic.ContentBlock{Type: "thinking", Thinking: &t})
+		}
 		for _, run := range response.Message.OutputRuns {
 			switch run.Kind {
 			case "thinking":
-				thinking := run.Text
-				blocks = append(blocks, anthropic.ContentBlock{Type: "thinking", Thinking: &thinking})
+				addThinking(run.Text)
 			case "text":
 				addText(run.Text)
 			case "call":
@@ -758,6 +795,39 @@ func carriedNarrationBlocks(response api.ChatResponse) []anthropic.ContentBlock 
 	}
 	if response.Message.Content != "" {
 		text := response.Message.Content
+		blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: &text})
+	}
+	// An entry the upstream never NAMED is not a call: its bytes are the model's
+	// own output and reach the client as TEXT — the rule the runs path above
+	// writes, `releasePendingCallChunks` keeps, and the other two legs apply
+	// (round 77, F77-L1-1). A chunk that arrives without runs is the ordinary
+	// shape on this arm — the merge lane that builds OutputRuns is the buffered
+	// lane's — so the fallback dropped those bytes on every streamed takeover
+	// whose chunk carried one, while the buffered arm of the same body relayed
+	// them: measured, `[{index-less nameless {"k":"v"}}, {web_search}]` reached a
+	// buffered client with the entry's text and a streaming one without it
+	// (2026-09-28 audit, round 82, F82-L1-4).
+	//
+	// Last, because that is where the converter puts a call run: reasoning, then
+	// prose, then the calls a chunk carried.
+	for _, tc := range response.Message.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) != "" || tc.Function.Arguments.Len() == 0 {
+			continue
+		}
+		args, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			continue
+		}
+		s := string(args)
+		// Joined to the prose before it when there is one, exactly as the runs
+		// path's addText joins it: the model wrote one message, and a text block
+		// boundary is where the KIND changes.
+		if n := len(blocks); n > 0 && blocks[n-1].Type == "text" && blocks[n-1].Text != nil {
+			joined := *blocks[n-1].Text + s
+			blocks[n-1].Text = &joined
+			continue
+		}
+		text := s
 		blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: &text})
 	}
 	return blocks
@@ -869,8 +939,24 @@ func (w *WebSearchAnthropicWriter) callFollowUpChat(ctx context.Context, message
 // absorbLateNarration records the narration of a chunk this arm is about to
 // discard, so the loop's terminal can carry it (F70-L1-2).
 func (w *WebSearchAnthropicWriter) absorbLateNarration(chatResponse api.ChatResponse) {
-	w.lateThinking += chatResponse.Message.Thinking
-	w.lateText += chatResponse.Message.Content
+	if chatResponse.Message.Thinking != "" {
+		w.lateRuns = append(w.lateRuns, lateNarrationRun{kind: "thinking", text: chatResponse.Message.Thinking})
+	}
+	if chatResponse.Message.Content != "" {
+		w.lateRuns = append(w.lateRuns, lateNarrationRun{kind: "text", text: chatResponse.Message.Content})
+	}
+	// The chunk's own nameless entries, where the converter puts them: after
+	// the reasoning and the prose of the same chunk.
+	for _, tc := range chatResponse.Message.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) != "" || tc.Function.Arguments.Len() == 0 {
+			continue
+		}
+		args, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			continue
+		}
+		w.lateRuns = append(w.lateRuns, lateNarrationRun{kind: "text", text: string(args)})
+	}
 }
 
 // releasePendingCallChunks writes out the streaming chunks this arm held back
@@ -920,33 +1006,57 @@ func (w *WebSearchAnthropicWriter) releasePendingCallChunks(keepCalls bool) erro
 // streamed turn's block order the whole-document arm's, where the model's whole
 // prose is one merged message and its narration is emitted together.
 func (w *WebSearchAnthropicWriter) mergeLateNarration(response *anthropic.MessagesResponse) {
-	if w.lateThinking == "" && w.lateText == "" {
+	if len(w.lateRuns) == 0 {
 		return
 	}
 	lead := 0
 	for lead < len(response.Content) && (response.Content[lead].Type == "thinking" || response.Content[lead].Type == "text") {
 		lead++
 	}
-	thinking := ""
-	text := ""
+	// The terminal's own narration, then the absorbed runs, in that order and
+	// each in its own: adjacent runs of one KIND are one block, exactly as the
+	// runs path and the streaming converter write them.
+	combined := make([]anthropic.ContentBlock, 0, lead+len(w.lateRuns))
+	appendRun := func(kind, text string) {
+		if text == "" {
+			return
+		}
+		if n := len(combined); n > 0 && combined[n-1].Type == kind {
+			if kind == "thinking" && combined[n-1].Thinking != nil {
+				joined := *combined[n-1].Thinking + text
+				combined[n-1].Thinking = &joined
+				return
+			}
+			if kind == "text" && combined[n-1].Text != nil {
+				joined := *combined[n-1].Text + text
+				combined[n-1].Text = &joined
+				return
+			}
+		}
+		b := anthropic.ContentBlock{Type: kind}
+		if kind == "thinking" {
+			t := text
+			b.Thinking = &t
+		} else {
+			t := text
+			b.Text = &t
+		}
+		combined = append(combined, b)
+	}
 	for _, b := range response.Content[:lead] {
-		if b.Type == "thinking" && b.Thinking != nil {
-			thinking += *b.Thinking
-		}
-		if b.Type == "text" && b.Text != nil {
-			text += *b.Text
+		switch b.Type {
+		case "thinking":
+			if b.Thinking != nil {
+				appendRun("thinking", *b.Thinking)
+			}
+		case "text":
+			if b.Text != nil {
+				appendRun("text", *b.Text)
+			}
 		}
 	}
-	thinking += w.lateThinking
-	text += w.lateText
-	combined := make([]anthropic.ContentBlock, 0, 2)
-	if thinking != "" {
-		t := thinking
-		combined = append(combined, anthropic.ContentBlock{Type: "thinking", Thinking: &t})
-	}
-	if text != "" {
-		t := text
-		combined = append(combined, anthropic.ContentBlock{Type: "text", Text: &t})
+	for _, run := range w.lateRuns {
+		appendRun(run.kind, run.text)
 	}
 	response.Content = append(combined, response.Content[lead:]...)
 }
@@ -1184,6 +1294,21 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 // its own, which is where the streaming converter closes one too.
 func (w *WebSearchAnthropicWriter) writeStreamNarration(blocks []anthropic.ContentBlock) error {
 	for _, block := range blocks {
+		// A block of ANOTHER kind ends the open one where it stands. Left open,
+		// the stale index stayed the continuation target: on `[{text "P"}],
+		// [{think "T", text "Y", web_search}]` the wire carried `start 0 text`,
+		// `delta 0 "P"`, `start 1 thinking`, `delta 1 "T"`, `stop 1`,
+		// `delta 0 "Y"`, `stop 0` — an index-keyed client read block 0 as "PY",
+		// the model's later prose landed in the block BEFORE it, and the buffered
+		// arm answered the same body `<text P><thinking T><text Y>`
+		// (2026-09-28 audit, round 82, F82-L1-3). The same stale index framed
+		// the turn illegally on `[{text "P"}], [{web_search}], [{think "T"}]`,
+		// where `stop 1` went out before `stop 0`.
+		if w.streamHasOpenBlock && w.streamOpenBlockKind != block.Type {
+			if err := w.closeOpenStreamBlock(); err != nil {
+				return err
+			}
+		}
 		if w.streamHasOpenBlock && w.streamOpenBlockKind == block.Type {
 			delta := anthropic.Delta{Type: "text_delta"}
 			if block.Text != nil {
