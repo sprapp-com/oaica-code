@@ -3114,6 +3114,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// here while the whole-body arm read it fine (2026-09-29 audit, round 87,
 	// F87-L2-2).
 	var eventBuf strings.Builder
+	// choiceslessFrame records whether any frame this stream read PARSED as a
+	// chunk and carried no choice at all — the streamed spelling of the body
+	// the buffered arm reads as "upstream returned an empty completion". The
+	// cause is the upstream stating a frame with nothing in it, which is not
+	// the same cause as a stream that ended without ever stating anything, and
+	// the two are told apart below so that each gets the sentence its buffered
+	// twin gives it (2026-09-29 audit, round 90, F90-L2-3).
+	choiceslessFrame := false
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -3468,6 +3476,43 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		return acc.statedSlots[stated]
 	}
+	// adoptWholeCompletion adopts a whole completion as the TURN and books the
+	// slots it wrote: one implementation of that reading, used by the frame
+	// whose payload IS a whole completion and by the event whose payload only
+	// becomes one when its `data:` lines are joined. Both are the same bytes
+	// read the same way, and a second copy of this bookkeeping is how the two
+	// spellings come to disagree (2026-09-29 audit, round 90, F90-L2-1).
+	//
+	// The slots the adoption filled are SLOTS THIS STREAM HAS USED, and the
+	// stream's own counter has to know it. The counter is what a call split off
+	// a repeated index is given (see the split below), and the adoption numbers
+	// the slots it writes from zero without touching it — so with more than one
+	// call in the frame the split's fresh slot was often one the client had
+	// already been given a closed block for, and the fragment was dropped by the
+	// very gate the split exists to escape: a tool the model asked for never
+	// reached the client, while the same calls written wholly inside the frame,
+	// or wholly as deltas, arrived whole (2026-09-28 audit, round 72,
+	// F72-L2-1). The split is also the only writer of a fresh slot that can
+	// reach an adopted one — a stated index is the upstream's own answer and an
+	// index-less call that starts a new one is given this counter — so raising
+	// it here is what keeps every call after the adoption off the slots the
+	// adoption closed.
+	adoptWholeCompletion := func(payload string) (bool, bool) {
+		adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText)
+		if !adopted {
+			return false, refused
+		}
+		completed = true
+		adoptedWhole = true
+		adoptedCalls = wroteCalls
+		adoptedCallAt = wrote
+		for slot := range adoptedCallAt {
+			if slot >= nextFreeToolSlot {
+				nextFreeToolSlot = slot + 1
+			}
+		}
+		return true, false
+	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -3475,9 +3520,30 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// The blank line ends the event: what it held, joined, is the only
 			// reading of it that can recognise an object that spanned more than
 			// one line (2026-09-29 audit, round 87, F87-L2-2).
+			joined := eventBuf.String()
 			eventErr := eventErrorMessage(&eventBuf, secret)
 			if upstreamErr == "" && eventErr != "" {
 				upstreamErr = upstreamErrorPrefix + eventErr
+			}
+			// The joined reading is the event's TURN as well as its error. The
+			// SSE grammar joins an event's `data:` lines with newlines, so a
+			// JSON object — which may be pretty-printed across lines — is one
+			// event however many lines it was written on, and an upstream that
+			// wraps a long answer does exactly that. Reading the payload per
+			// LINE means no line of such an event is a completion, nothing is
+			// ever started or completed, and the turn the client is waiting for
+			// is handed to it as a 502 that says the stream "ended before the
+			// response was complete" — a cause that did not happen, since the
+			// whole completion is in the buffer being read. Measured 2026-09-29
+			// (round 90, F90-L2-1): one turn spread over three `data:` lines
+			// answered 502 where the same bytes on one line, and the same
+			// bytes as a bare body, answer 200 text="hi" blocks=text,tool_use
+			// usage{input 8, output 3}. The error arm was given this join in
+			// round 87; the turn arm is given it here, through the same
+			// adoption the frame uses.
+			if !completed && !started && len(toolAccums) == 0 &&
+				frameCarriesWholeCompletion(joined) && frameAddsToTheTurn(joined, heldCall) {
+				adoptWholeCompletion(joined)
 			}
 			continue
 		}
@@ -3563,6 +3629,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				upstreamErr = upstreamErrorPrefix + m
 				continue
 			}
+		}
+		if len(chunk.Choices) == 0 {
+			choiceslessFrame = true
 		}
 
 		// A whole completion can arrive INSIDE an SSE frame, not only as a
@@ -3654,8 +3723,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 
 		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, heldCall) {
-			if adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
-				completed = true
+			if adopted, refused := adoptWholeCompletion(payload); adopted {
 				// The turn's whole completion has been relayed, and the stream
 				// goes on: the upstream stated the message and then kept
 				// sending. Its TEXT is still text the model wrote, and both
@@ -3678,30 +3746,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// the turn's answer depend on whether the text arrived as a
 				// whole message or as deltas (2026-09-27 audit, round 48, A-F2
 				// and C-F2).
-				adoptedWhole = true
-				adoptedCalls = wroteCalls
-				adoptedCallAt = wrote
-				// The slots the adoption filled are SLOTS THIS STREAM HAS USED,
-				// and the stream's own counter has to know it. The counter is
-				// what a call split off a repeated index is given (see the split
-				// below), and the adoption numbers the slots it writes from zero
-				// without touching it — so with more than one call in the frame
-				// the split's fresh slot was often one the client had already
-				// been given a closed block for, and the fragment was dropped by
-				// the very gate the split exists to escape: a tool the model
-				// asked for never reached the client, while the same calls
-				// written wholly inside the frame, or wholly as deltas, arrived
-				// whole (2026-09-28 audit, round 72, F72-L2-1). The split is
-				// also the only writer of a fresh slot that can reach an adopted
-				// one — a stated index is the upstream's own answer and an
-				// index-less call that starts a new one is given this counter —
-				// so raising it here is what keeps every call after the adoption
-				// off the slots the adoption closed.
-				for slot := range adoptedCallAt {
-					if slot >= nextFreeToolSlot {
-						nextFreeToolSlot = slot + 1
-					}
-				}
+				//
+				// The frame's own payload has now been relayed WHOLE, and the
+				// loop must not read the same payload a second time as a delta.
+				// This frame is a whole completion by the gate above, and a
+				// choice that states its content in `message` AND in `delta` —
+				// an upstream mirroring its final message into the chunk
+				// without clearing the delta — was adopted for its message and
+				// then fell through to the delta loop below, so the model's one
+				// sentence reached the client twice with twice the output
+				// tokens: measured 2026-09-29 (round 90, F90-L2-2), one frame
+				// `{message:{content:"hi"},delta:{content:"hi"}}` answered
+				// text="hihi" usage{input 8, output 2} where its unframed
+				// twin, its message-only twin and its delta-only twin all
+				// answer text="hi" usage{input 8, output 1}. The whole-body
+				// arm reads the MESSAGE of a whole completion and nothing
+				// else, so the frame's delta is not this arm's to relay.
+				continue
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. It is
 				// dropped — the refusal happens before this adoption writes
@@ -4423,16 +4484,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 	}
 
-	if !completed {
-		// Nothing streamed and no error seen: the body may be a whole
-		// completion the upstream sent instead of frames. Adopt it as the turn
-		// rather than reporting a failure over an answer that exists.
-		if !started && upstreamErr == "" {
-			if adopted, refused, _, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
-				completed = true
-			} else if refused {
-				upstreamErr = "upstream returned an empty completion"
-			}
+	// Nothing streamed and no error seen: the body may be a whole completion the
+	// upstream sent instead of frames. Adopt it as the turn rather than
+	// reporting a failure over an answer that exists.
+	//
+	// Asked whenever nothing has been RELAYED, not only when no frame has
+	// announced a turn's end. `completed` is set by a framed chunk that states a
+	// finish_reason even when that chunk carried no content, and gating the
+	// fallback on it meant a wire that put its whole completion OUTSIDE the
+	// frames — an unprefixed document beside a framed finish chunk — reached the
+	// end with the answer sitting in nonSSE, unread, and the client was told
+	// "upstream returned an empty completion" while the same bytes with a
+	// `data: ` prefix answered 200 with the whole turn. Measured 2026-09-29
+	// (round 90, F90-L2-4): `[bare doc][framed finish]` 502 where `[framed
+	// doc][framed finish]` is 200 text="hi" blocks=text,tool_use, and
+	// `[framed finish][bare doc]` is 502 too. `!started` is the gate that keeps
+	// this from replacing a turn the client already holds; the refusal sentence
+	// below still belongs to the run that has not completed.
+	if !started && upstreamErr == "" {
+		if adopted, refused, _, _ := adoptNonSSECompletion(nonSSE.String(), conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			completed = true
+		} else if refused && !completed {
+			upstreamErr = "upstream returned an empty completion"
 		}
 	}
 
@@ -4469,6 +4542,29 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				msg = "upstream stream failed: " + redactErr(err).Error()
 			} else {
 				msg = "upstream stream ended before the response was complete"
+				// A body that was never frames, and that the tail could not
+				// adopt because it is not a JSON completion at all, is the same
+				// body the buffered arm declines to DECODE — and that arm names
+				// the cause ("decode upstream response: <detail>"). One cause,
+				// one sentence, whichever arm met it: measured 2026-09-29
+				// (round 90, F90-L2-3), the byte-identical 200 body "not json
+				// at all" answered 502 "decode upstream response: invalid
+				// character 'o' in literal null (expecting 'u')" buffered and
+				// 502 "upstream stream ended before the response was complete"
+				// when the client asked to stream, and the buffered arm's
+				// detail is the actionable half of that pair.
+				if !started && nonSSE.Len() > 0 {
+					var probe openAIChatResponse
+					if derr := json.Unmarshal([]byte(strings.TrimSpace(nonSSE.String())), &probe); derr != nil {
+						msg = "decode upstream response: " + redactErr(derr).Error()
+					}
+				} else if !started && choiceslessFrame {
+					// The frames the stream read said nothing: at least one of
+					// them PARSED as a chunk carrying no choice at all, which is
+					// the streamed spelling of the body the buffered arm reads
+					// and refuses with this same sentence.
+					msg = "upstream returned an empty completion"
+				}
 			}
 		}
 		if !started {
