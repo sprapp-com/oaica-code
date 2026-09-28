@@ -1831,6 +1831,28 @@ func (u *usageRecorder) WriteHeader(code int) {
 	u.ResponseWriter.WriteHeader(code)
 }
 
+// clientStatus is the status the CLIENT will read for this turn: the writer that
+// knows better than the upstream's own header may move it (the /v1/messages
+// bridge answers an untranslatable 200 with 502, see ledgerStatusWriter), and it
+// answers that question before the row is built, so every reader of this turn's
+// verdict must ask it here rather than read u.status raw.
+//
+// It exists because the two readers had drifted: the row asked (entry) and the
+// ground-truth guard below did not, so a turn the client was REFUSED — 502, row
+// booked with nothing — still counted as a success for the next request of the
+// session. Both halves of that were measured: /health reported a healthy
+// upstream from a refused turn's upstream-stated usage, and one refused turn
+// turned a later request of the same session from a 200 into a 400 "prompt is
+// too long", using the refused turn's own prompt ratio as this session's
+// calibration (2026-09-29 audit, round 92, F92-L3-1).
+func (u *usageRecorder) clientStatus() int {
+	status := u.status
+	if reporter, ok := u.ResponseWriter.(ledgerStatusWriter); ok {
+		status = reporter.LedgerStatus(status)
+	}
+	return status
+}
+
 func (u *usageRecorder) Write(p []byte) (int, error) {
 	n, err := u.ResponseWriter.Write(p)
 	if u.stream {
@@ -2735,8 +2757,12 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// Ground truth for the next request of this session: only a 200 whose
 	// usage was actually seen (rec.seen covers the stream's final usage-only
 	// chunk as well as a non-stream usage object) -- never an error, never a
-	// zero. See context_calibration.go for the incident.
-	if rec.status == http.StatusOK && rec.seen && rec.usage.PromptTokens > 0 {
+	// zero. See context_calibration.go for the incident. The status asked is
+	// the one the CLIENT was told, not the upstream's own: a turn the bridge
+	// refused stated the upstream's 200 and stated usage, and reading that as
+	// ground truth made a refused turn the session's calibration and its
+	// recent success (2026-09-29 audit, round 92, F92-L3-1).
+	if rec.clientStatus() == http.StatusOK && rec.seen && rec.usage.PromptTokens > 0 {
 		g.lastOKAt.Store(time.Now().Unix())
 		g.calibrator().record(calibKey, msgBytes, rec.usage.PromptTokens)
 	}
@@ -2768,11 +2794,10 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	// The status the CLIENT will read, when the writer knows better than the
 	// upstream's own header: the /v1/messages bridge answers an untranslatable
 	// 200 with 502 and that decision is made after this row is built (see
-	// ledgerStatusWriter).
-	status := rec.status
-	if reporter, ok := rec.ResponseWriter.(ledgerStatusWriter); ok {
-		status = reporter.LedgerStatus(status)
-	}
+	// ledgerStatusWriter). Resolved by the recorder itself so the row and the
+	// ground-truth guard above cannot drift apart again (2026-09-29 audit,
+	// round 92, F92-L3-1).
+	status := rec.clientStatus()
 	// A translating writer may know the counts when the upstream stated none:
 	// the recorder reads the UPSTREAM's bytes, and an upstream that sends no
 	// usage object at all leaves the row recording zero for a turn the client was
