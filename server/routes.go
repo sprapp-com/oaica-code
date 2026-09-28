@@ -2507,7 +2507,17 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		// them in: reasoning, then prose, then the calls it carries.
 		var outputRuns []api.OutputRun
 		appendOutputRun := func(kind, text string) {
-			if len(outputRuns) > 0 && outputRuns[len(outputRuns)-1].Kind == kind {
+			// A call run is never merged with the call run before it, whatever
+			// either says: ONE call run stands for ONE entry of ToolCalls, so the
+			// reader counting them can trust the list. "call" runs carry no text,
+			// so consecutive ones always looked identical and always merged — and
+			// two parallel calls in one chunk, or in adjacent chunks, is the shape
+			// agentic clients hit most. The list then did not account for the turn
+			// (one run, two calls), was thrown away by the producer's own check
+			// below, and the reader fell back to the merged fields: the arms
+			// disagreed again on exactly the shape round 79 was written to fix
+			// (2026-09-28 audit, round 80, F80-L1-2).
+			if kind != "call" && len(outputRuns) > 0 && outputRuns[len(outputRuns)-1].Kind == kind {
 				outputRuns[len(outputRuns)-1].Text += text
 				return
 			}

@@ -1426,6 +1426,29 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 				if run.Text == "" {
 					continue
 				}
+				// Reasoning joins the block before it when that block is
+				// reasoning. The streaming arm closes a thinking block only where
+				// it writes a block at all — prose, or a call it can name — so a
+				// run boundary that writes NO block (an entry the upstream never
+				// named, a restatement of a call already written) leaves reasoning
+				// either side of it in ONE block there. Appending here split one
+				// reasoning block into two on the document arm for a body the
+				// streaming arm answered as one, which is a regression round 79's
+				// ordered list introduced: before it, the merged fields gave the
+				// streaming arm's own answer (2026-09-28 audit, round 80,
+				// F80-L1-1). The join is the reasoning twin of addBlock's text
+				// join below, and it is what makes the trust question refuse the
+				// unproducible order — a list whose two adjacent thinking runs no
+				// chunk sequence can produce (2026-09-28 audit, round 80,
+				// F80-L1-3).
+				if n := len(content); n > 0 && content[n-1].Type == "thinking" {
+					joined := ""
+					if content[n-1].Thinking != nil {
+						joined = *content[n-1].Thinking
+					}
+					content[n-1].Thinking = ptr(joined + run.Text)
+					continue
+				}
 				content = append(content, ContentBlock{
 					Type:     "thinking",
 					Thinking: ptr(run.Text),
