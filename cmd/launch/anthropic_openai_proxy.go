@@ -2936,6 +2936,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// SLOT the fragment states that lets this arm tell two calls apart
 	// (2026-09-28 audit, round 62; the append site is NOT guarded by the document
 	// arm, which holds the same concatenation).
+	//
+	// That parity is against round 62's own twin DOCUMENT, whose one entry
+	// carries the bytes already joined. Where the same two fragments are spelled
+	// as two ENTRIES of a list — round 81's convention for the whole arm — the
+	// whole-list arm answers two calls (each entry is a call the list states) and
+	// this arm still answers one merged call, because here they are one call's
+	// bytes in progress. Recorded rather than decided: the two readings belong to
+	// the two spellings of the same turn (2026-09-28 audit, round 82 — see the
+	// two-spellings rule the gateway leg's round 82 writes down).
 	canExtend := func(accArgs, delta string) bool {
 		a := strings.TrimSpace(accArgs)
 		d := strings.TrimSpace(delta)
@@ -3552,15 +3561,31 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					}
 				}
 			} else if refused {
-				// The frame IS a whole completion and it says nothing. Falling
-				// through to the delta loop let the finish_reason it carried
-				// complete an EMPTY turn with a 200, while the unframed twin of
-				// the same document and the gateway leg both refuse it — the
-				// verdict depended on the shape the upstream chose, which is
-				// exactly what routing the frame through this adoption exists
-				// to prevent (2026-09-27 audit, round 46, A46-3).
-				upstreamErr = "upstream returned an empty completion"
-				break
+				// The frame IS a whole completion and it says nothing. It is
+				// dropped — the refusal happens before this adoption writes
+				// anything, so nothing the frame carried is emitted or
+				// accounted — and the loop reads on to the frames after it.
+				//
+				// It does NOT end the turn here. Refusing the WHOLE stream
+				// because one frame of it was empty threw away every frame
+				// after it: `[{message content ""},{delta "hi"},{delta "hi"},
+				// {finish stop}]` reached the client as a 502 while the same
+				// frames with the empty one deleted answered "hihi" — the
+				// model's answer was on the wire and this leg refused to read
+				// it. Which shape the upstream chose decided the verdict, and
+				// that is what routing the frame through this adoption exists
+				// to prevent (2026-09-28 audit, round 82, F82-L2-A; round 47's
+				// C-F3 is the same reading for an adoption that wrote only
+				// text).
+				//
+				// What this branch still keeps is the verdict on a stream that
+				// REALLY says nothing: a turn whose every frame is dropped
+				// relays nothing, and the end-of-stream guard refuses it below
+				// (round 46's A46-3, whose control is a body of one such frame
+				// and `[DONE]`). Letting the refused frame fall through to the
+				// delta loop is what answered that turn 200 with an empty
+				// message, and that still does not happen.
+				continue
 			}
 		}
 
@@ -3717,8 +3742,35 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// startsANewToolCall; this is the spelling vendors
 							// actually write, and only that one was closed.
 							(strings.TrimSpace(acc.name) == "" && tc.Function.Name != "") ||
-							(adoptedCallAt[slot] == nil &&
-								(tc.ID != "" || tc.Function.Name != "") &&
+							// A fragment that restates a call under the id or
+							// the name it states, with arguments the slot's own
+							// accumulated bytes cannot take, is not more of that
+							// call: it is the NEXT one.
+							//
+							// Asked of a slot the ADOPTION wrote as well. The
+							// call there is finished and the client holds its
+							// block, but the fragment's own object is one the
+							// slot cannot take, so folding it left the model's
+							// second call on no wire at all — and only when the
+							// vendor filed it under an index the stream had
+							// already used. Measured, `[{whole completion with
+							// c1 Bash {"a":1}}]` then a fragment `{index 0,id c1,
+							// name Bash, arguments {"b":2}}` reached the client
+							// as ONE call where the same fragment at index 1, or
+							// with no index, reached it as two, and where this
+							// leg's plain fragment arm answers the same two
+							// entries as two (the second re-minted) and its
+							// whole-list arm as two (2026-09-28 audit, round
+							// 82, F82-L2-B). Round 80's F80-L2-2 removed this
+							// guard from the argument-LESS clause below; this is
+							// the same reading one clause up.
+							//
+							// A genuine continuation of the adopted call still
+							// resolves to its slot and is still dropped: bytes
+							// the accumulated object can take (canExtend), or a
+							// fragment that names nothing (an argument-only
+							// continuation).
+							((tc.ID != "" || tc.Function.Name != "") &&
 								strings.TrimSpace(tc.Function.Arguments) != "" &&
 								!canExtend(acc.args.String(), tc.Function.Arguments)) ||
 							// The slot's call has accumulated NO arguments and a
@@ -3740,20 +3792,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// argument-only continuation (which names nothing) and
 							// a name-only restatement are both untouched.
 							//
-							// Asked of a slot the ADOPTION wrote as well, unlike
-							// the canExtend clause above: the call there takes no
-							// arguments, so a fragment naming it again WITH
-							// arguments has nothing of its own to be more of, and
-							// the block the client holds is a complete,
-							// runnable call without them. Guarded, the fragment
-							// fell through to the adoption's drop and the same
-							// document reached the client as one call here, two on
-							// this leg's plain fragment arm and two whole
-							// (2026-09-28 audit, round 80, F80-L2-2). The adopted
-							// tail the clause above is about — the same call
-							// restated with DIFFERENT arguments — is not this
-							// shape: there the slot's arguments are on the wire and
-							// finished, here they never existed.
+							// Asked of a slot the ADOPTION wrote as well. The
+							// call there takes no arguments, so a fragment naming
+							// it again WITH arguments has nothing of its own to
+							// be more of, and the block the client holds is a
+							// complete, runnable call without them. Guarded, the
+							// fragment fell through to the adoption's drop and
+							// the same document reached the client as one call
+							// here, two on this leg's plain fragment arm and two
+							// whole (2026-09-28 audit, round 80, F80-L2-2). The
+							// shape the clause above is about — the same call
+							// restated over an object that is FINISHED — is split
+							// off as a call of its own there too (round 82's
+							// F82-L2-B); here the slot holds no arguments at all,
+							// so the fragment's bytes are not even arguably more
+							// of that call.
 							(acc.name != "" &&
 								tc.Function.Name == acc.name &&
 								strings.TrimSpace(acc.args.String()) == "" &&
@@ -4040,6 +4093,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// (2026-09-28 audit, round 81, L2-2). A continuation of an
 					// adopted call still resolves to the adopted call's own slot
 					// and is still dropped: that is the reading this gate keeps.
+					// What reaches this gate is exactly the fragment that did NOT
+					// split above — one that names nothing (an argument-only
+					// continuation), or one whose bytes the slot's own arguments
+					// can take — since a fragment that names the adopted call
+					// with an object the slot cannot take is the NEXT call and is
+					// split onto a slot of its own (2026-09-28 audit, round 82,
+					// F82-L2-B; the word "continuation" was wider than the code,
+					// which dropped that second call too).
 					if adoptedCallAt[slot] != nil {
 						// The id this fragment states belongs to the TURN even
 						// though nothing of it can be delivered, so it is
