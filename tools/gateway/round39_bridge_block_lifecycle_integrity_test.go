@@ -328,8 +328,20 @@ func TestANameArrivingLateDoesNotStartAfterALaterBlock(t *testing.T) {
 }
 
 // TestArgumentsAfterABlockClosedAreNotWritten is B-F7's second half: a closed
-// block cannot be reopened, so a fragment that arrives afterwards belongs to a
-// call the client has already been told is finished.
+// block cannot be reopened, so a fragment that arrives afterwards is not more of
+// that call — the client has been told the call is finished.
+//
+// REVISED (2026-09-28 audit, round 76): the fragment states no NAME, so it is
+// not a call on any arm of this leg — its bytes are the model's prose, relayed
+// as a TEXT block (round 75, and round 76's F76-L3-1). This pin used to demand
+// that the bytes appear nowhere at all after the first block closed, a reading
+// recorded in round 60 as a deliberate divergence from the document arm (round
+// 60's note: "round 60's F60-L3-2 asked for the two to agree and is NOT fixed").
+// Measured on the faithful body, both document arms have always relayed these
+// bytes as prose; only the frame arm dropped them, and a drop is the model's
+// output reaching no client. What this pin must hold is what it was written for:
+// the CLOSED BLOCK is not written into — no partial_json delta follows its stop
+// — and the bytes are delivered as text instead.
 func TestArgumentsAfterABlockClosedAreNotWritten(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -359,8 +371,12 @@ func TestArgumentsAfterABlockClosedAreNotWritten(t *testing.T) {
 	if stopIdx < 0 {
 		t.Fatalf("premise: no block was closed:\n%s", stream)
 	}
-	if tail := stream[stopIdx:]; strings.Contains(tail, "more") {
-		t.Errorf("an argument fragment was written after its block had been closed:\n%s\nthe client has been told that call is finished and the wire has no way to reopen it", stream)
+	tail := stream[stopIdx:]
+	if strings.Contains(tail, `"partial_json":"{\"more\":1}"`) {
+		t.Errorf("an argument fragment was written into the closed block:\n%s\nthe client has been told that call is finished and the wire has no way to reopen it", stream)
+	}
+	if !strings.Contains(tail, `"text":"{\"more\":1}"`) {
+		t.Errorf("the nameless fragment's bytes reached no client at all:\n%s\nan entry that names no call is the model's prose on every arm of this leg, and the other two relay these bytes as text (2026-09-28 audit, round 76, F76-L3-1)", stream)
 	}
 }
 

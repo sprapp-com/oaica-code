@@ -45,18 +45,33 @@ func TestTheChunkedSecondObjectAtOneIndexIsTheNextCallOnThisLeg(t *testing.T) {
 }
 
 // TestAnObjectAfterAFreeformLineIsNotMoreOfItOnThisLeg is F61-L3-2: a complete
-// object arriving after a free-form line the slot already holds. The document
-// arm answers the line alone.
+// object arriving after a free-form line the slot already holds. It is not more
+// of that line — appending handed the client `{"_raw":"echo hi{\"c\":3}"}`, a
+// command the model never wrote.
+//
+// REVISED (2026-09-28 audit, round 76): the body the two arms are asked is now
+// the SAME body. This pin used to hand the document arm the first entry alone
+// ("the document arm answers the line alone"), and the frame arm's second
+// fragment was therefore compared against a document that never carried those
+// bytes — which is how a drop on one arm passed as agreement. The fragment
+// states no name, so it is not a call on ANY arm of this leg: its bytes are
+// relayed to the client as TEXT (round 75, and round 76's F76-L3-1). Measured
+// with the faithful body, the document arm has always relayed them as prose,
+// and the frame arm — the arm that dropped them — now does too.
 func TestAnObjectAfterAFreeformLineIsNotMoreOfItOnThisLeg(t *testing.T) {
 	ids, parts, text := r60FrameArm(t,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Bash","arguments":"echo hi"}}]}}]}`,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"c\":3}"}}]}}]}`,
 	)
 	wantIDs, wantParts, wantText := r60DocArm(t, `{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[`+
-		`{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"echo hi"}}]},`+
+		`{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"echo hi"}},`+
+		`{"index":0,"type":"function","function":{"arguments":"{\"c\":3}"}}]},`+
 		`"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}`)
+	if text != `{"c":3}` {
+		t.Fatalf("CONTROL: with the faithful body the nameless entry's bytes are prose on this leg, got %q", text)
+	}
 	r60ArmSame(t, ids, parts, text, wantIDs, wantParts, wantText,
-		"the model's free-form command is delivered whole (round 51's G1), so an object arriving after it is a call the model never wrote: it was appended to the line and the client ran `{\"c\":3}` glued to `echo hi` (2026-09-28 audit, round 61, F61-L3-2)", "")
+		"the model's free-form command is delivered whole (round 51's G1), so an object arriving after it is not more of that line: appended, the client ran `{\"c\":3}` glued to `echo hi` (2026-09-28 audit, round 61, F61-L3-2). The entry states no name, so the bytes are prose — one answer from every arm (round 76)", "")
 }
 
 // TestThePinnedFragmentWiresStillAnswerOnThisLeg holds the wires this round's

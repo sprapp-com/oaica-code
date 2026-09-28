@@ -2624,12 +2624,9 @@ func (b *anthropicBridge) finalize() {
 	// the model's readable output. Dropped instead, the bytes the upstream wrote
 	// and billed for reached no client at all on this arm, and the turn was
 	// refused as an empty completion (2026-09-27 audit, round 53).
-	unnamedArgs := []string{}
+	unnamedRuns := unnamedRunsOf(msg.ToolCalls)
 	for _, tc := range msg.ToolCalls {
 		if strings.TrimSpace(firstNonEmptyStr(tc.Function.Name, tc.Name)) == "" {
-			if a := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments); a != "" {
-				unnamedArgs = append(unnamedArgs, a)
-			}
 			continue
 		}
 		input, ok := callInput(firstNonEmptyStr(tc.Function.Arguments, tc.Arguments), truncated)
@@ -2747,8 +2744,12 @@ func (b *anthropicBridge) finalize() {
 	// relays the same fragments: finishStream opens the calls it can name first
 	// and hands whatever an unnamed fragment carried to the client as text at the
 	// end of the turn.
-	for _, a := range unnamedArgs {
-		respBlocks = append(respBlocks, map[string]any{"type": "text", "text": a})
+	// One text block per RUN of nameless entries, which is the unit the adopted
+	// arm and the frame arm relay: this loop wrote one block per ENTRY, so one
+	// document reached the client as two text blocks under `stream:false` and
+	// one under `stream:true` (2026-09-28 audit, round 76, F76-L3-2).
+	for _, run := range unnamedRuns {
+		respBlocks = append(respBlocks, map[string]any{"type": "text", "text": run})
 	}
 	// Anthropic's contract — the one this bridge translates INTO — is that
 	// input_tokens is the UNCACHED prompt and cache_read_input_tokens the
@@ -3130,7 +3131,41 @@ func (b *anthropicBridge) flushHeldText() {
 // a stream that states neither an index nor an id shared one block, the second
 // name discarded and its arguments concatenated onto the first's input
 // (2026-09-27 audit, round 37, B-F2).
+// toolKey names the block a fragment belongs to. A fragment the upstream never
+// NAMED is not a call on this arm: its bytes are relayed to the client as TEXT
+// (the nameless arm of finishStream), and a block written from it would carry a
+// name the model never wrote. Where the wire puts such a fragment on a block
+// that IS a call — the same id restated, or the slot the previous fragment
+// left — its bytes are not that call's arguments, and no block of that call can
+// carry them: written there they were refused at the write (callArgsExtend) and
+// lost, so the model's own output reached no client at all while both document
+// arms of the same body answer them as prose (2026-09-28 audit, round 76,
+// F76-L3-1). The fragment is given a block of its own, which the nameless arm
+// relays.
+//
+// The test is the WRITE's own (callArgsExtend), so a nameless fragment whose
+// bytes ARE more of what the block holds — the continuation a vendor splits
+// across a nameless prefix, and the second half of one contiguous nameless run
+// — keeps going into that block, exactly as it did before this round. What
+// splits off is a fragment the block's bytes CANNOT take, and that is the same
+// rule whether the block is a call (its arguments are finished, so these are
+// not its arguments) or a nameless run's own text (the wire put a call, or a
+// non-concatenable fragment, between the two halves — the document arms write
+// one text block per CONTIGUOUS run, so the later half is a run of its own).
 func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
+	key := b.routeToolKey(upIdx, id, name, args)
+	if strings.TrimSpace(name) != "" || strings.TrimSpace(args) == "" {
+		return key
+	}
+	cur := b.toolBlocks[key]
+	if cur == nil || callArgsExtend(cur.args.String(), args) {
+		return key
+	}
+	b.synthSeq++
+	return "?" + strconv.Itoa(b.synthSeq)
+}
+
+func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string {
 	if upIdx != nil {
 		key := "#" + strconv.Itoa(*upIdx)
 		if rekeyed, ok := b.indexKeys[*upIdx]; ok {
@@ -4911,7 +4946,14 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 			b.reservedIDs[tc.ID] = true
 		}
 	}
-	unnamedArgs := []string{}
+	// The nameless entries' bytes, grouped into one run per CONTIGUOUS stretch
+	// of them: a run is the span between the calls the wire names, and it is the
+	// unit the other two arms relay — the frame path holds one nameless block
+	// per such span (its adjacent nameless fragments share a block) and the
+	// non-stream path writes one text block per run. Written as one block per
+	// ENTRY, adoption answered a two-entry run as one text block where the
+	// non-stream path answered two (2026-09-28 audit, round 76, F76-L3-2).
+	unnamedRuns := unnamedRunsOf(choice.Message.ToolCalls)
 	for i, tc := range choice.Message.ToolCalls {
 		name := firstNonEmptyStr(tc.Function.Name, tc.Name)
 		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
@@ -4932,9 +4974,6 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 			// so the rule that drops a truncated NAMED call (below) has nothing to
 			// drop here — the bytes reach the client as prose either way, and the
 			// client leg's adopt arm relays them the same way (round 55).
-			if args != "" {
-				unnamedArgs = append(unnamedArgs, args)
-			}
 			continue
 		}
 		if _, ok := callInput(args, truncated); !ok {
@@ -4970,8 +5009,17 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// end of the turn. Emitting one mid-loop put a document carrying both kinds
 	// of call in a different block order depending on which arm relayed it
 	// (2026-09-28 audit, round 55).
-	for _, a := range unnamedArgs {
-		b.textDelta(a)
+	//
+	// Parked as a nameless block rather than emitted here, so EVERY arm relays
+	// these bytes at the same point of the turn: written straight to a text
+	// block, this arm's text went out while the calls it had not opened yet were
+	// still waiting for their arguments (a call with none is held until the turn
+	// ends), so one document reached the client as [text][tool_use] when it
+	// streamed and as [tool_use][text] when it did not (2026-09-28 audit, round
+	// 76, F76-L3-3). The nameless arm of finishStream relays every run in the
+	// same pass, after the blocks that name themselves.
+	for _, run := range unnamedRuns {
+		b.parkUnnamedText(run)
 	}
 	if reason != "" {
 		b.sse.stopMsg = reason
@@ -4992,6 +5040,52 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// (2026-09-27 audit, round 41, B41-1).
 	b.stateCacheHit(u.detailsCachedTokens(), u.PromptCacheHitTokens)
 	return true
+}
+
+// unnamedRunsOf groups the entries the upstream never named into one text run
+// per CONTIGUOUS stretch of them: a run is the span between the calls the wire
+// names, and it is the unit every arm relays — the frame path holds one
+// nameless block per such span (its adjacent nameless fragments share a block,
+// see the id-less arm of routeToolKey) and each document arm writes one text
+// block per run. One block per ENTRY instead answered a two-entry run as two
+// text blocks where this bridge's own other document arm answered one
+// (2026-09-28 audit, round 76, F76-L3-2).
+func unnamedRunsOf(calls []oaToolCall) []string {
+	var runs []string
+	prevNameless := false
+	for _, tc := range calls {
+		name := firstNonEmptyStr(tc.Function.Name, tc.Name)
+		if strings.TrimSpace(name) != "" {
+			prevNameless = false
+			continue
+		}
+		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
+		if args == "" {
+			prevNameless = true
+			continue
+		}
+		if prevNameless && len(runs) > 0 {
+			runs[len(runs)-1] += args
+		} else {
+			runs = append(runs, args)
+		}
+		prevNameless = true
+	}
+	return runs
+}
+
+// parkUnnamedText files bytes the upstream never named as a nameless block: a
+// block no content_block_start can open (the event that carries a name is the
+// only one that does) and which finishStream's nameless arm therefore relays to
+// the client as TEXT. It is the same destination the frame path gives the same
+// fragment — one block per run, in the order the runs were written (2026-09-28
+// audit, round 76, F76-L3-2 and F76-L3-3).
+func (b *anthropicBridge) parkUnnamedText(s string) {
+	b.synthSeq++
+	tb := &toolBlock{key: "?" + strconv.Itoa(b.synthSeq), index: -1}
+	tb.args.WriteString(s)
+	b.toolBlocks[tb.key] = tb
+	b.toolOrder = append(b.toolOrder, tb)
 }
 
 // bufferedCompletion reports whether the bytes this stream has buffered are a
