@@ -3164,13 +3164,23 @@ func (b *anthropicBridge) flushHeldText() {
 // the client read the model's prose out of order (2026-09-28 audit, round 77,
 // F77-L3-1 and F77-L3-2). What splits off is a fragment a CALL's bytes cannot
 // take — its arguments are finished, so these are not its arguments.
+//
+// A block that has already CLOSED cannot take anything either, whatever the
+// write's own test says of its bytes: the client has been told the call is
+// finished and the wire has no way to reopen the block, so a nameless fragment
+// routed in there is dropped (the closed-block log in toolDelta) and the model's
+// output reaches no client at all. A freeform call's arguments extend by the
+// write's test — more of a line is more of the call — so a nameless fragment
+// standing after a CLOSED freeform call was routed into it and lost, while both
+// document arms of the same body relay those bytes as prose (2026-09-28 audit,
+// round 81, F81-L3-3). Closed is the one state no fragment can be part of.
 func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	key := b.routeToolKey(upIdx, id, name, args)
 	if strings.TrimSpace(name) != "" || strings.TrimSpace(args) == "" {
 		return key
 	}
 	cur := b.toolBlocks[key]
-	if cur == nil || !namesItself(cur) || callArgsExtend(cur.args.String(), args) {
+	if cur == nil || !namesItself(cur) || (callArgsExtend(cur.args.String(), args) && !cur.closed) {
 		return key
 	}
 	b.synthSeq++
@@ -4412,14 +4422,27 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// (finishStream), which opens it with its empty input.
 			return
 		}
-		if tb.needsMint && !argsAreFinished(tb.args.String()) {
-			// The block has to be numbered by this bridge, and the arguments it
-			// is numbered FROM are not all in: opening now would mint the id of
-			// a half-written call — on the ordinary OpenAI order the name
-			// arrives on one fragment and the arguments on the next, and on
-			// that wire the mint hashed the empty prefix. Held until the
-			// object closes (the arguments stated so far follow in one delta
-			// below) or until the turn ends (finishStream).
+		if argsAreMidObject(tb.args.String()) {
+			// The arguments stated so far are an object the upstream has not
+			// finished writing, so opening now would hand the client the half an
+			// object — and the object it opens with is the input the client RUNS.
+			//
+			// This is the mint's own hold (a block this bridge numbers is
+			// numbered FROM its arguments, and on the ordinary OpenAI order the
+			// name arrives on one fragment and the arguments on the next, so a
+			// mint taken here hashed the empty prefix) asked of EVERY call. The
+			// arguments are a fact about the call, not about who numbers it: an
+			// upstream that states the id itself and then stops mid-object — the
+			// turn cut off at the token limit, or a mid-object block the wire
+			// moves on from — reached the client here as a call whose input was
+			// `{"a":` and no wrap at all, while the document arm of the same
+			// body drops the truncated call (its arguments never became an
+			// object) and wraps the mid-object one under `_raw`, which is what
+			// the client leg answers for both (2026-09-28 audit, round 81,
+			// F81-L3-1 and F81-L3-2). Held until the object closes (the
+			// arguments stated so far follow in one delta below) or until the
+			// turn ends, where finishStream applies the drop and the wrap the
+			// other arms apply.
 			return
 		}
 		if b.waitsForEarlierToolCall(tb) {

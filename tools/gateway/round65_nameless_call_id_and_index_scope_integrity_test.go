@@ -98,13 +98,20 @@ func TestTheFreshIndexThatClosesTheCallFinishesIt(t *testing.T) {
 	// And the fragment whose bytes are a whole object of its own does NOT finish
 	// the open call: it is a call the upstream never named, and its bytes are
 	// relayed as prose, exactly as the whole-list arm reads the same body.
+	//
+	// The call it leaves behind is left MID-OBJECT, and round 81 reversed what
+	// this case expects of those bytes: round 65 pinned them delivered as they
+	// stand (`{"cmd":"ls"`), because a round-52-era reading had the block out
+	// before the turn's verdict was known. With the call held until its object
+	// closes, the wrap the two document arms of this body write is reachable
+	// here too (2026-09-28 audit, round 81, F81-L3-2).
 	ownIDs, ownParts, ownText := r60FrameArm(t,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"Bash","arguments":"{\"cmd\":"}}]}}]}`,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"a","function":{"name":"Bash","arguments":"\"ls\""}}]}}]}`,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{\"p\":1}"}}]}}]}`,
 	)
-	if len(ownIDs) != 1 || len(ownParts) != 1 || ownParts[0] != `{"cmd":"ls"` || ownText != `{"p":1}` {
-		t.Errorf("a nameless fragment at a fresh index whose bytes do not finish the open call is not a continuation of it: got ids=%v parts=%v text=%q, want one call with the open arguments and the object relayed as prose", ownIDs, ownParts, ownText)
+	if len(ownIDs) != 1 || len(ownParts) != 1 || ownParts[0] != `{"_raw":"{\"cmd\":\"ls\""}` || ownText != `{"p":1}` {
+		t.Errorf("a nameless fragment at a fresh index whose bytes do not finish the open call is not a continuation of it: got ids=%v parts=%v text=%q, want one call with the open arguments kept as the _raw object and the object relayed as prose", ownIDs, ownParts, ownText)
 	}
 }
 

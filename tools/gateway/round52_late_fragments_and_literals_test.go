@@ -120,10 +120,18 @@ func TestALateFragmentCompletesTheCallItBelongsTo(t *testing.T) {
 // TestATruncatedCallIsNotACall is the guard round 52 left behind, and the
 // property its G1 finding is really about: a call the model was cut off inside
 // is not a call. Nothing completes it — no later fragment carries the rest, and
-// nothing follows it — so the client holds an unterminated input and the turn
-// is the upstream's truncation. The verdict is taken over the bytes the client
-// was HANDED; a fragment that arrives after its block closed, or that never
-// arrives, cannot promote it to tool_use.
+// nothing follows it — so the turn is the upstream's truncation. The verdict is
+// taken over the bytes the client was HANDED; a fragment that arrives after its
+// block closed, or that never arrives, cannot promote it to tool_use.
+//
+// Round 52 read that as "the half object still goes out, and the verdict says
+// the call is not one", because the block was already open by the time the
+// turn's verdict was known and the wire cannot un-send a block. Round 81 holds
+// a call whose arguments are half an object until the object closes or the turn
+// ends, so the block is never opened and the reading the two document arms of
+// the same body write — no tool block at all, the turn's own verdict — is the
+// one taken (2026-09-28 audit, round 81, F81-L3-1, which reverses this
+// expectation; the name above was already the property being pinned).
 func TestATruncatedCallIsNotACall(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -141,8 +149,8 @@ func TestATruncatedCallIsNotACall(t *testing.T) {
 	srv := round36Gateway(t, upstream)
 	stream := round36Stream(t, srv, round44AskStream)
 
-	if got, ok := round51StreamArgs(t, stream)[0]; !ok || got != `{"path":"a` {
-		t.Errorf("the truncated call reaches the client as %q, want the unterminated {\"path\":\"a the model wrote", got)
+	if got, ok := round51StreamArgs(t, stream)[0]; ok {
+		t.Errorf("the truncated call reaches the client as %q, want no tool_use block at all: the model was cut off inside the arguments, and half an object is not an input any client can parse — the two document arms of this body hand the client no tool block for the same turn (2026-09-28 audit, round 81, F81-L3-1, reversing round 52's reading)", got)
 	}
 	if reason := round52StopReason(t, stream); reason != "max_tokens" {
 		t.Errorf("the turn's stop_reason is %q, want max_tokens:\n%s\nthe upstream truncated mid-call and nothing completed it; reporting tool_use promises the client a call the model never finished writing", reason, stream)
