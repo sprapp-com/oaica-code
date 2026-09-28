@@ -699,8 +699,20 @@ func (w *WebSearchAnthropicWriter) ensureStreamMessageStart(usage anthropic.Usag
 		return nil
 	}
 
+	// The estimate is filled in only where the upstream stated NOTHING: the
+	// cache read is tested for presence, exactly as withInputEstimate above (and
+	// the converter) tests it — a stated zero is a reading. This site is the
+	// last one to keep asking by value, and it is the site that matters most on
+	// this route: writeTerminalResponse runs withInputEstimate BEFORE this call,
+	// so a usage reaching here with input_tokens 0 states a cache read (or has
+	// no size to estimate at all), which makes the by-value branch's only live
+	// effect the substitution of the estimate for a stated zero. Measured: a
+	// turn whose upstream states {"prompt_eval_cached_count": 0} and no prompt
+	// count answered message_start input_tokens 82 and message_delta 0, while
+	// the whole-document arm of the same handler answered 0 (2026-09-28 audit,
+	// round 69, F69-L1-1).
 	inputTokens := usage.InputTokens
-	if inputTokens == 0 && optionalIntValue(usage.CacheReadInputTokens) == 0 {
+	if inputTokens == 0 && usage.CacheReadInputTokens == nil {
 		inputTokens = w.estimatedInputTokens
 	}
 

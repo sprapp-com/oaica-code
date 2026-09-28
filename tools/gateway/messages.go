@@ -2682,6 +2682,33 @@ func (b *anthropicBridge) finalize() {
 				continue
 			}
 			if owner, ok := b.statedIDOwner[id]; ok && owner != identity {
+				// A second, DIFFERENT call under an id this list already
+				// stated is re-minted rather than dropped (round 45's A45-3) —
+				// and that is this loop's answer to the document whose two
+				// entries split ONE call's arguments (same id, same name, the
+				// second continuing an object the first left unfinished), which
+				// is the whole-document spelling of the fragment wire rounds 63
+				// and 64 read as one call: the frame arm and the adopted arm
+				// fold those entries into the one call, and this arm answers
+				// two — the second under a minted id — because a listed entry
+				// is a call here (rounds 46 C-F1, 47 G47-1, 48 C-F1).
+				//
+				// Recorded rather than fixed (2026-09-28 audit, round 69, F3,
+				// rejected): the divergence is real but the frame spelling's
+				// reading is not available to this one. The folding arms hold an
+				// accumulator, so they can see that the second fragment's bytes
+				// continue the first's half-written object; a document lists
+				// entries and states each one's index, and the reading this loop
+				// would need — "this entry is not a call of its own, it is more
+				// of the previous entry's" — is not derivable from a list whose
+				// entries are complete calls on every other wire this bridge
+				// serves, and applying it would overwrite A45-3, whose pinned
+				// case is the same id over two different arguments. Measured:
+				// the CLIENT leg's document arm answers the same document the
+				// same way (two calls, the second minted, both `_raw`), so this
+				// is the document spelling's reading across the legs rather
+				// than this arm's outlier — the frame spelling is what differs,
+				// on all three.
 				id = ""
 			} else {
 				b.statedIDOwner[id] = identity
@@ -4714,7 +4741,15 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	// (2026-09-27 audit, round 45, B45-13). A truncated turn that carries a
 	// COMPLETE call is still a call: the test is the arguments' parseability,
 	// exactly as callInput's other callers ask it.
-	truncated := choice.FinishReason == "length"
+	// The LAST finish_reason any choice stated, read off the same helper the
+	// document arm and this bridge's verdict use — this path hand-writes one
+	// turn the two of them each write another way, and reading Choices[0] here
+	// put the truncation gate at odds with the verdict eight lines below it
+	// inside one arm, and at odds with both other arms: a turn the last choice
+	// called cut short was relayed as a runnable call whose input is half an
+	// object, under stop_reason tool_use (2026-09-28 audit, round 69).
+	reason := statedFinishReason(resp)
+	truncated := reason == "length"
 	// Every id this document states is reserved before the walk takes a single
 	// mint, exactly as finalize does for the non-stream list it is handed: this
 	// path holds the same whole completion, and without the reservation the
@@ -4769,8 +4804,8 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 	for _, a := range unnamedArgs {
 		b.textDelta(a)
 	}
-	if choice.FinishReason != "" {
-		b.sse.stopMsg = choice.FinishReason
+	if reason != "" {
+		b.sse.stopMsg = reason
 	}
 	u := resp.Usage.nonNegative()
 	if u.PromptTokens > 0 {

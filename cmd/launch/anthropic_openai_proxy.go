@@ -1023,10 +1023,6 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 			Thinking:  reasoningOf(c.Message.ReasoningContent, c.Message.Reasoning),
 			ToolCalls: nil,
 		}
-		// A turn the upstream ended at the token limit (finish_reason "length")
-		// must not have its unfinished argument fragments dressed up as calls;
-		// see parseOpenAIToolCalls.
-		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls, c.FinishReason == "length")
 		// The LAST finish_reason any choice stated, which is what this leg's
 		// fragment arm reads off the same field: which of an upstream's choices
 		// carried the reason is not this leg's to decide, and reading
@@ -1039,6 +1035,15 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 				reason = ch.FinishReason
 			}
 		}
+		// A turn the upstream ended at the token limit (finish_reason "length")
+		// must not have its unfinished argument fragments dressed up as calls;
+		// see parseOpenAIToolCalls. Asked of the same last-stated reason the
+		// verdict below is asked of: reading Choices[0] here left this function
+		// contradicting itself on a two-choice completion — it either relayed a
+		// half-written call as runnable under stop_reason tool_use, or dropped a
+		// call the turn's own last reason asked for, while the fragment arm
+		// answered max_tokens for the same body (2026-09-28 audit, round 69).
+		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls, reason == "length")
 		chatResp.DoneReason = mapFinishReason(reason)
 	}
 	if resp.Usage != nil {
@@ -2852,6 +2857,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// this answers.
 	restatesAccumulatedCall := func(acc *toolAccum, id, name, args string) bool {
 		if acc == nil || acc.name == "" {
+			return false
+		}
+		// At least one side must have stated an id. Two identical calls that
+		// state none are two calls — A45-2's rule, and this leg's own whole-list
+		// parser records the same thing (parseOpenAIToolCalls folds a repeated
+		// entry only when the list STATED an id for it, statedCallIdentities).
+		// Folding them here made the model's second tool request vanish on the
+		// delta wire while the non-stream arm, the adoption arm and the same
+		// bytes with no index stated all answered two — the client ran the tool
+		// once under stop_reason tool_use where the model asked twice
+		// (2026-09-28 audit, round 69).
+		if id == "" && acc.id == "" {
 			return false
 		}
 		if id != "" && id != acc.id {
