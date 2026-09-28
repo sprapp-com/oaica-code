@@ -161,6 +161,40 @@ func catalogAgeDays(now time.Time) int {
 	return days
 }
 
+// CatalogStatus is the cached catalog's provenance, for `oaica model catalog
+// status`: where it came from, how old it is, what it hashes to, and what it
+// holds. No network — the command answers on a box with no route out, which is
+// exactly when somebody wants to know what is cached.
+func CatalogStatus() (CatalogSyncReport, string) {
+	path, err := catalogCachePath()
+	if err != nil {
+		return CatalogSyncReport{}, "catalog: no cache path (" + err.Error() + ")"
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return CatalogSyncReport{}, fmt.Sprintf("catalog: none cached at %s — run `oaica model catalog sync`", path)
+	}
+	f, perr := parseModelsDevCatalog(b)
+	if perr != nil {
+		return CatalogSyncReport{}, fmt.Sprintf("catalog: %s is not readable as a models.dev payload (%v) — run `oaica model catalog sync`", path, perr)
+	}
+	sum := sha256.Sum256(b)
+	models := 0
+	for _, p := range f.Providers {
+		models += len(p.Models)
+	}
+	days := catalogAgeDays(time.Now())
+	age := fmt.Sprintf("%d days", days)
+	if days == 0 {
+		age = "today"
+	} else if days == 1 {
+		age = "1 day"
+	}
+	line := fmt.Sprintf("catalog: %s — %d providers, %d models, synced %s ago, sha256 %s",
+		path, len(f.Providers), models, age, hex.EncodeToString(sum[:])[:16])
+	return CatalogSyncReport{Providers: len(f.Providers), Models: models, FromCache: true}, line
+}
+
 func sameBytes(a, b []byte) bool {
 	ha, hb := sha256.Sum256(a), sha256.Sum256(b)
 	return hex.EncodeToString(ha[:]) == hex.EncodeToString(hb[:])

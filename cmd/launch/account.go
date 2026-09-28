@@ -224,13 +224,14 @@ func (c *launcherClient) accountStateUpdateSource(ctx context.Context) <-chan *A
 func availabilityBadge(item ModelItem, state AccountState) string {
 	// Router-reported backend health outranks account state — a dead
 	// upstream is not fixable by signing in.
-	if item.AvailabilityBadge == "unhealthy" {
-		return "unhealthy"
-	}
-	// A catalogue row nothing confirmed outranks the account question too: it
-	// is about whether the model is still served, not about who may call it.
-	if item.AvailabilityBadge == "unverified" {
-		return "unverified"
+	// A badge the ROW already carries is the row's own status and outranks the
+	// account question, which is about who may call the model rather than about
+	// whether it can be reached at all: the router's "unhealthy", a catalog
+	// row's "unverified" (nothing on the wire confirmed it), a first-party
+	// model nothing resolved ("unavailable"). An empty badge means the producer
+	// stated nothing, so the account state is the only evidence there is.
+	if item.AvailabilityBadge != "" {
+		return item.AvailabilityBadge
 	}
 	if !isCloudModelName(item.Name) {
 		return ""

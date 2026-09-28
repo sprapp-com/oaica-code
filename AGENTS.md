@@ -39,5 +39,9 @@ scripts/sync-upstream.sh verify   # the same gate CI runs
 ```
 
 Policy — merge never rebase, never `git checkout --theirs` a shared file — and
-the per-path resolution recipes are in `docs/UPSTREAM_SYNC.md`. The script's
+the per-path resolution recipes are in `docs/UPSTREAM_SYNC.md`.
+
+The picker's provider and model list is ported from models.dev, corrected by
+`cmd/launch/providers/oaica.json` and refreshed with `oaica model catalog sync`
+— see `docs/CATALOG.md` before touching either file. The script's
 tests are `scripts/tests/upstream_sync_test.sh`.

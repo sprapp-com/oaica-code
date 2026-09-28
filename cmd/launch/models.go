@@ -42,6 +42,73 @@ var ollamaCloudAliasCatalog = []ModelItem{
 	{Name: "qwen3.5", Description: "Reasoning, coding, and visual understanding locally", Recommended: true, VRAMBytes: 14 * format.GigaByte},
 }
 
+// firstPartyOverlayRows lists oaica's own models, from the overlay that ships
+// in the binary (providers/oaica.json). Their endpoint is resolved at launch,
+// so the row carries no base URL: what it does carry is the window and output
+// budget the overlay states, which is what sizes a session.
+//
+// A row here is Recommended, which is what puts it in the picker's "OAICA
+// Models" section. Whether it is AVAILABLE is a question the caller answers:
+// buildModelListWithRecommendations marks the ones the router did not list, so
+// this stays a pure read of the embedded overlay (no fetch, no network).
+func firstPartyOverlayRows() []ModelItem {
+	models := overlayFirstPartyModels()
+	out := make([]ModelItem, 0, len(models))
+	for _, m := range models {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		out = append(out, ModelItem{
+			Name:            id,
+			Description:     firstNonEmpty(strings.TrimSpace(m.DisplayName), id),
+			Recommended:     true,
+			MaxOutputTokens: m.Output,
+			Details:         api.ModelDetails{ContextLength: m.Context},
+		})
+	}
+	return out
+}
+
+// firstPartyEndpointConfigured reports whether oaica's own models have an
+// endpoint to launch against — the gateway override, and nothing else. The
+// router needs no check here: when it answered, its own list is already in the
+// picker, and when it did not answer, it is not an endpoint a row could launch
+// against anyway.
+func firstPartyEndpointConfigured() bool {
+	return oaicaGatewayURLOverride() != ""
+}
+
+// isFirstPartyOverlayModel reports whether a picker name is one of oaica's own
+// models (the overlay's list), as opposed to a row some provider serves.
+func isFirstPartyOverlayModel(name string) bool {
+	for _, m := range overlayFirstPartyModels() {
+		if strings.TrimSpace(m.ID) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// catalogOfflineNotice is the one line shown when no catalog has been synced,
+// so an empty external-provider list says why and names the fix.
+func catalogOfflineNotice() string {
+	if _, ok := loadModelsDevCatalog(); ok {
+		return ""
+	}
+	return "no model catalog yet — run `oaica model catalog sync` to list external providers"
+}
+
+// catalogAgeNotice makes staleness visible past 30 days rather than silent: the
+// catalog is a snapshot of what vendors serve, and a snapshot nobody refreshed
+// is the thing that makes a picker offer a model that was retired.
+func catalogAgeNotice(days int) string {
+	if days <= 30 {
+		return ""
+	}
+	return fmt.Sprintf("model catalog is %d days old — run `oaica model catalog sync` to refresh", days)
+}
+
 func displayVRAM(vramBytes int64) string {
 	if vramBytes <= 0 {
 		return ""
@@ -540,6 +607,31 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 		items = append(items, rec)
 		if isCloudModelName(rec.Name) {
 			cloudModels[rec.Name] = true
+		}
+	}
+
+	// oaica's own models last, so they are in the list even when nothing
+	// resolved them: a row the router listed is already here (and available),
+	// and one that is not gets the unavailable mark rather than being hidden,
+	// because hiding our own model makes it look like it vanished.
+	//
+	// Only when something is pointed at that could serve them. The router's own
+	// list is the other way these models reach the picker, and a first-party id
+	// that list did not carry is a model the router does not serve — so the
+	// gate is the gateway override alone. A row listed with no endpoint behind
+	// it is exactly the row this picker refuses to pad.
+	if firstPartyEndpointConfigured() {
+		present := make(map[string]bool, len(items))
+		for _, item := range items {
+			present[item.Name] = true
+		}
+		for _, fp := range firstPartyOverlayRows() {
+			if present[fp.Name] {
+				continue
+			}
+			present[fp.Name] = true
+			fp.AvailabilityBadge = "unavailable"
+			items = append(items, fp)
 		}
 	}
 

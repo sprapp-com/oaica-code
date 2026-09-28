@@ -148,6 +148,35 @@ func hasSourcePrefix(model string) bool {
 // it. Order: user remote ("<remote>/<id>" or a bare id exactly one remote
 // serves) -> "<model>:local" (a running `oaica serve`) -> OAICA router ->
 // local Ollama daemon. The error names every place that was tried.
+// oaicaGatewayTokenEnv names the environment variable the gateway credential
+// comes from, for the child-environment scrubber (see credentialEnvNames). The
+// variable is never read anywhere else.
+const oaicaGatewayTokenEnv = "OAICA_GATEWAY_TOKEN"
+
+// oaicaGatewayURLOverride is OAICA_GATEWAY_URL, without its trailing slash: the
+// base every first-party model resolves to when it is set.
+func oaicaGatewayURLOverride() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("OAICA_GATEWAY_URL")), "/")
+}
+
+// oaicaGatewayTokenOverride is the gateway credential, if the host configured
+// one. Empty is the common case: a gateway on the same box usually runs with an
+// empty api_keys list, which is open by design.
+func oaicaGatewayTokenOverride() string {
+	return strings.TrimSpace(os.Getenv(oaicaGatewayTokenEnv))
+}
+
+// isFirstPartyGatewayModel reports whether a model id is one of oaica's own
+// SKUs — a bare "oaica-*" id, or the same id written with the explicit
+// "router/"/"oaica/" source prefix. Everything else keeps resolving through the
+// ordinary chain, so the override can never hijack somebody else's model.
+func isFirstPartyGatewayModel(model string) bool {
+	if isBareRouterSKU(model) {
+		return true
+	}
+	return strings.HasPrefix(model, "router/") || strings.HasPrefix(model, "oaica/")
+}
+
 func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -186,6 +215,30 @@ func resolveLaunchEndpoint(model string) (launchEndpoint, error) {
 		if ep, ok := resolveRemoteEndpoint(model); ok {
 			return launchEndpoint{RemoteEndpoint: ep, Source: sourceUserRemote}, nil
 		}
+	}
+
+	// OAICA_GATEWAY_URL points oaica's own models at one gateway. The gateway's
+	// port differs per machine, so a first-party SKU cannot carry a fixed
+	// endpoint; this is how a host says where its gateway is. It is checked
+	// here — after the alias, the native Claude prefix, the user-remote lookup
+	// and the ":local" servers — so it redirects our own models without
+	// reordering anything else: a user's remote still beats it for that
+	// remote's ids, an alias still beats everything, and a `<model>:local`
+	// entry still means the box that is serving it.
+	//
+	// OAICA_GATEWAY_TOKEN carries the credential when the gateway requires one
+	// (its config's api_keys); TokenEnv is set from it so the scrubber keeps it
+	// out of the agent's environment, the same rule the router leg follows.
+	if gw := oaicaGatewayURLOverride(); gw != "" && isFirstPartyGatewayModel(model) {
+		upstream := strings.TrimPrefix(strings.TrimPrefix(model, "router/"), "oaica/")
+		ep := RemoteEndpoint{
+			Name: "oaica-gateway", BaseURL: gw + "/v1", Token: oaicaGatewayTokenOverride(),
+			UpstreamModel: upstream, Wire: "openai", ToolFormat: "tool_calls", ToolReliable: true,
+		}
+		if ep.Token != "" {
+			ep.TokenEnv = oaicaGatewayTokenEnv
+		}
+		return launchEndpoint{Source: sourceRouter, RemoteEndpoint: ep}, nil
 	}
 
 	base, wasLocal := oaicaStripLocalTag(model)

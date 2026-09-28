@@ -200,6 +200,8 @@ Environment variables:
 | Variable | Purpose |
 |---|---|
 | `OAICA_API_KEY` | Hosted API key (overrides the saved one) |
+| `OAICA_GATEWAY_URL` | Point oaica's own models (`oaica-*`) at one gateway instead of the hosted router — see [docs/CATALOG.md](docs/CATALOG.md) |
+| `OAICA_GATEWAY_TOKEN` | Credential for that gateway, when it requires one (scrubbed from child environments) |
 | `OAICA_ADMIN_KEY` | Operator admin key — `oaica router`'s provider-registry commands require it, and `OAICA_API_KEY` will not do ("auth commands need the operator admin key"); `oaica auth` writes the local store and needs no admin key |
 | `OAICA_LICENSE_KEY` | License key for gated models. Read in preference to `~/.oaica/license.json`, for a deployment that injects the key from a secret manager; `~/.oaica/license_env.json` records only a hash of it and when it was last validated |
 | `OAICA_HOST` | Override the hosted API base URL |
@@ -225,12 +227,21 @@ so deleting any part of it is meant to be a deliberate act, not a step in
 uninstalling. Prefer targeted removal over the directory — and never the
 directory while model weights you still want are in it.
 
+Portable across providers — the provider and model list is ported from
+[models.dev](https://models.dev) and corrected by a small embedded overlay, so a
+new provider or a revised context window reaches the picker without a code
+change. `oaica model catalog sync` refreshes it; `oaica model catalog status`
+says what this box is using. See [docs/CATALOG.md](docs/CATALOG.md).
+
 ## Docs
 
 - [docs/ENTERPRISE.md](docs/ENTERPRISE.md) — data handling, what it writes to
   disk, install/pinning/air-gapped, and what has not been tested (for a
   security review)
 - [docs/LOCAL_USE.md](docs/LOCAL_USE.md) — self-hosting in detail
+- [docs/CATALOG.md](docs/CATALOG.md) — the ported models.dev catalog: its
+  layers, `oaica model catalog sync`/`status`, what a refusal means, offline
+  behaviour, and first-party endpoints
 - [docs/RELEASE.md](docs/RELEASE.md) — cutting a release
 - [docs/SITE_BUILDER.md](docs/SITE_BUILDER.md) — the static site builder
 - [docs/CLAUDE_TIERS.md](docs/CLAUDE_TIERS.md) — plan on one model, execute

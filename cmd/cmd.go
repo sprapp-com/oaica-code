@@ -2544,6 +2544,46 @@ files or fills in a model_path on a pathless entry.`,
 			return nil
 		},
 	}
+	catalogCmd := &cobra.Command{
+		Use:   "catalog",
+		Short: "Manage the ported models.dev provider catalog",
+	}
+	catalogSyncCmd := &cobra.Command{
+		Use:   "sync",
+		Short: "Fetch the models.dev catalog and adopt it if it still matches what oaica reads",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			url, _ := cmd.Flags().GetString("url")
+			rep, err := launch.CatalogSync(url)
+			if err != nil {
+				// A refusal is a failure of the contract check, and the cached
+				// catalog is still in use: non-zero exit so a script notices.
+				return err
+			}
+			src := "fresh"
+			switch {
+			case rep.Unchanged:
+				src = "unchanged"
+			case rep.FromCache:
+				src = "cached/304"
+			}
+			fmt.Printf("catalog %s from %s: %d providers, %d models\n", src, rep.URL, rep.Providers, rep.Models)
+			return nil
+		},
+	}
+	catalogSyncCmd.Flags().String("url", "", "Catalog URL (default: https://models.dev/api.json; file:// paths accepted)")
+	catalogStatusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show the cached catalog: path, age, sha256, provider and model counts",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, line := launch.CatalogStatus()
+			fmt.Println(line)
+			return nil
+		},
+	}
+	catalogCmd.AddCommand(catalogSyncCmd, catalogStatusCmd)
+	modelCmd.AddCommand(catalogCmd)
 	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd, modelSyncCmd, modelScanCmd)
 
 	// remote — CRUD over ~/.oaica/remotes.json (see cmd/launch/user_remotes.go),
