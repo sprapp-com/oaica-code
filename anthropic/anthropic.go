@@ -1753,6 +1753,29 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			// (2026-09-28 audit, round 77, F77-L1-1). An entry with no
 			// arguments has nothing to relay and still writes no block.
 			if tc.Function.Arguments.Len() > 0 {
+				// A block already open at this index must be CLOSED before a
+				// text block takes it, exactly as the two sites above close
+				// theirs. A reasoning model that hit a nameless entry straight
+				// after its thinking — the shape a capability-thinking model
+				// served with the laguna parser produces — reached a streaming
+				// client with the thinking block never closed and its index
+				// reused: the client, keying blocks by index, lost the model's
+				// reasoning, and the events it received were not a legal
+				// sequence at all, while the document arm answered the same body
+				// [thinking, text(args)]. Prose following the entry went to an
+				// index whose block was never started and was lost with it
+				// (2026-09-28 audit, round 78, F78-L1-1).
+				if c.thinkingStarted && !c.thinkingDone {
+					c.thinkingDone = true
+					events = append(events, StreamEvent{
+						Event: "content_block_stop",
+						Data: ContentBlockStopEvent{
+							Type:  "content_block_stop",
+							Index: c.contentIndex,
+						},
+					})
+					c.contentIndex++
+				}
 				if !c.textStarted {
 					c.textStarted = true
 					events = append(events, StreamEvent{
