@@ -1679,6 +1679,21 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 	if c.firstWrite {
 		c.firstWrite = false
 		// Use actual metrics if available, otherwise use estimate
+		//
+		// RECORDED DIVERGENCE (2026-09-28 audit, round 85, R85-L1-2), measured
+		// and left in place: this arm reads the metrics of the FIRST chunk that
+		// carries any, while the buffered arm reads the LAST (server/routes.go's
+		// merge lane keeps only the chunk it ends on, `resp = t`), so a turn
+		// whose chunks state metrics before its final one reports two prompt
+		// sizes — the streamed arm the earlier count, the buffered arm the
+		// estimate, because the merge lane carried no metrics at all. No
+		// producer on this surface states metrics on a non-final chunk: the
+		// local runner fills them only on its final one, and intermediate
+		// metrics are gated on `req.Format != nil` (server/routes.go,
+		// includeIntermediateMetrics), which the Anthropic surface never sets.
+		// Recorded, not changed: which chunk's count is the turn's is a rule
+		// both arms must answer the same way, and no live body asks the
+		// question yet.
 		usage := UsageFromMetrics(r.Metrics)
 		c.inputTokens = usage.InputTokens
 		c.cacheReadTokens = usage.CacheReadInputTokens

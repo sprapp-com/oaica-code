@@ -321,6 +321,23 @@ func (e *webSearchLoopError) Error() string {
 }
 
 func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
+	// RECORDED DIVERGENCE (2026-09-28 audit, round 85, R85-L1-1), measured and
+	// left in place. A search turn whose call chunk is ALSO its last commits the
+	// terminal result synchronously (below, in the hasWebSearch+stream branch),
+	// so an error frame arriving behind that chunk is swallowed here: the
+	// streamed arm hands the client a complete successful answer where the
+	// buffered arm of the same upstream body refuses it with the sentence. The
+	// other ordering of the same family is handled (round 72's fix, above).
+	// Closing it means holding the loop result until the request ends, so a
+	// frame that follows the chunk can still be read — and there is no hook for
+	// "the request ended" on this writer (the flush after the last chunk is the
+	// flush of every chunk), so the hold would have nothing to release it.
+	// Nothing on this surface emits a frame after a done chunk today: the local
+	// runner writes its final chunk and returns (llm/llama_server.go: `fn(finalResp);
+	// return nil`), and cloud models bypass this middleware entirely
+	// (server/routes.go: `/v1/messages` carries cloudPassthroughMiddleware).
+	// Recorded rather than fixed, like F68-L1-1: a future producer — any runner
+	// or relay that errors after a done chunk — trips it silently.
 	if w.terminalSent {
 		return len(data), nil
 	}
