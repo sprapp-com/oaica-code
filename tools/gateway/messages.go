@@ -3124,9 +3124,24 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// unnamed sent that chunk to a freshly minted block — the call
 			// reached the client unterminated and the byte that finished it was
 			// relayed as prose (2026-09-28 audit, round 64, F64-L3-3).
+			//
+			// The carried call must be MID-OBJECT, and this is the same
+			// predicate the fresh-index fallback below was moved to in round 66
+			// (F66-L3-1) — this route kept the older one. argsAreFinished("") is
+			// false, so asking the negation folded a whole object into a call
+			// that had written NOTHING: an empty argument list is a complete
+			// argument list, so those bytes are not its first arguments but a
+			// fragment of a call that never named itself, which every other arm
+			// of the same body relays as text the client does not run. Measured:
+			// a call stating its id and name with no arguments, then a nameless
+			// fragment at a fresh index stating the same id and `{"x":1}`, ran
+			// Bash with `{"x":1}` on this arm and answered an argument-less Bash
+			// with `{"x":1}` relayed as prose on the document arm, from one
+			// upstream answer (2026-09-28 audit, round 67, F67-L3-1). A
+			// mid-object list or a finished one is unchanged by the swap.
 			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
 				(name == "" || carried.name == "" || name == carried.name) &&
-				!argsAreFinished(carried.args.String()) {
+				argsAreMidObject(carried.args.String()) {
 				b.noteIndexKey(*upIdx, carried.key)
 				b.lastToolKey = carried.key
 				return carried.key
@@ -5031,10 +5046,22 @@ func (b *anthropicBridge) nothingRelayed() bool {
 // content and not names alone: round 39's B-F8 requires the raw arguments of a
 // call the upstream never named to stay readable to the client, so that turn is
 // NOT empty (2026-09-27 audit, round 47, G47-3).
+//
+// "Names itself" is namesItself, not a bare non-empty name: a name of
+// whitespace is no more a name than an absent one, which is the test the
+// block-open guard and finishStream's truncated-turn opener were moved to in
+// round 66 (F66-L3-2) and the test every whole-list arm uses to decide whether
+// an entry introduces a call. Reading " " as present made a stream whose only
+// content was a blank-named fragment with no arguments count as one that had
+// said something: the same upstream answer was relayed as a COMPLETED empty
+// turn (stop_reason end_turn, no error) where the document arm of the same body
+// answers 502 (2026-09-28 audit, round 67, F67-L3-2). A blank-named call that
+// states arguments is still counted, because those bytes are owed to the client
+// (round 39's B-F8).
 func (b *anthropicBridge) callsCarryingOutput() int {
 	n := 0
 	for _, tb := range b.toolOrder {
-		if tb.name != "" || tb.args.Len() > 0 {
+		if namesItself(tb) || tb.args.Len() > 0 {
 			n++
 		}
 	}

@@ -322,13 +322,29 @@ func (u *openAIUsage) statedPromptTokens() bool {
 	return u != nil && u.PromptTokens > 0
 }
 
+// cacheMeasured reports whether a usage object states a cache reading at all,
+// which is the ONE rule both arms key the presence of cache_read_input_tokens
+// on: the details object being present (a build that always emits it, populated
+// only on a hit, states a 0 when there was none) or the sibling
+// prompt_cache_hit_tokens being non-zero. An object that states neither has no
+// reading to relay and the field stays absent — so "no measurement" and "a
+// measurement of zero" are different answers, and each arm has to give the same
+// one. Keying the streaming arm's patch on `cached > 0` instead made them differ
+// for exactly that zero: `{"prompt_tokens":100,...,"prompt_tokens_details":{"cached_tokens":0}}`
+// reached the client with cache_read_input_tokens:0 as a whole document and
+// without the field at all as a stream, from one body with one `stream` flag
+// (2026-09-28 audit, round 67, F67-L2-2).
+func (u *openAIUsage) cacheMeasured() bool {
+	return u != nil && (u.PromptTokensDetails != nil || u.PromptCacheHitTokens != 0)
+}
+
 // cacheReadPtr renders a measured cache-read count as the optional field the
 // Anthropic wire carries (api.Metrics.PromptEvalCachedCount is *int): nil when
 // the upstream stated no cache measurement at all, so a response with no
 // reading keeps the shape it had, and a stated count — including a stated 0 —
 // travels as the measurement it is.
 func cacheReadPtr(u *openAIUsage) *int {
-	if u == nil || (u.PromptTokensDetails == nil && u.PromptCacheHitTokens == 0) {
+	if !u.cacheMeasured() {
 		return nil
 	}
 	// UNCLAMPED: this is a reporting site, and the prompt total above it has
@@ -3215,7 +3231,30 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 		}
 
-		for _, choice := range chunk.Choices {
+		for ci, choice := range chunk.Choices {
+			if ci > 0 {
+				// One client request produced one message here, and the arm that
+				// read the same turn as a whole document reads its FIRST choice
+				// (openAIResponseToChatResponse reads Choices[0]; this proxy
+				// never states `n`, so a second choice is the upstream's own
+				// doing). Folding every choice's deltas into that one message
+				// spliced the alternatives together: a chunk carrying
+				// "A" at index 0 and "B" at index 1 reached the client as "AB"
+				// streamed and "A" whole, from one body with one `stream` flag —
+				// text the model never wrote, in the client's conversation
+				// (2026-09-28 audit, round 67, F67-L2-1).
+				//
+				// Positional, not `choice.Index == 0`: a vendor numbering its
+				// choices from 1 is still relayed the way the whole arm relays
+				// it. The finish_reason is the exception — it is scanned on
+				// every entry, because which choice carried it is not this
+				// arm's to decide.
+				if choice.FinishReason != "" {
+					finishReason = choice.FinishReason
+					completed = true
+				}
+				continue
+			}
 			d := choice.Delta
 
 			// Reasoning content → thinking delta. It counts toward the output
@@ -3673,7 +3712,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	if total < cached {
 		total = cached
 	}
-	if finalUsage != nil && (statedPrompt || cached > 0) {
+	cacheMeasured := finalUsage.cacheMeasured()
+	if finalUsage != nil && (statedPrompt || cached > 0 || cacheMeasured) {
 		// An upstream that reports the whole prompt as cache-read leaves the
 		// uncached count at 0, and the converter only overwrites message_start's
 		// seeded estimate when PromptEvalCount > 0 — so without this the client
@@ -3681,10 +3721,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// the same full prompt: 2x the real prompt for a fully-cached turn, and
 		// Claude Code's context meter and auto-compaction sum both fields
 		// (2026-09-26 audit). A stated prompt, or a stated hit, owns the field.
+		//
+		// The third term is the presence rule itself: a usage object that states
+		// a cache reading of zero still states a reading, and the arm that read
+		// the same object as a whole document has always relayed it. Asking
+		// `cached > 0` here made the field's presence depend on the framing
+		// (2026-09-28 audit, round 67, F67-L2-2), which is what cacheMeasured
+		// exists to make impossible — both arms ask the same question of the same
+		// object now.
 		for i := range events {
 			if d, ok := events[i].Data.(anthropic.MessageDeltaEvent); ok {
 				d.Usage.InputTokens = total - cached
-				if cached > 0 {
+				if cacheMeasured {
 					d.Usage.CacheReadInputTokens = intPtr(cached)
 				}
 				events[i].Data = d

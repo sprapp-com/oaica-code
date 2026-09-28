@@ -2933,12 +2933,20 @@ func (c *entitlementCache) fetchAndDecide(label string) (bool, string, bool, boo
 // checkWindowCap is the enforcement side of meterhub's
 // /subscribers/usage instrumentation (tools/meterhub's planLimits): an
 // active/past_due subscriber can still be over their plan's rolling 5h or
-// 7d token cap (docs/PRICING.md's "real throttle" column), which is a
-// distinct condition from their subscription status. Only reached once
-// status is already known active/past_due — a canceled/suspended key
-// never gets this far. Same fail-open/fail-closed policy as the status
-// check: a meterhub hiccup here degrades to c.failOpen rather than
-// blocking (or silently admitting) every request while it's unreachable.
+// 7d REQUEST cap (docs/PRICING.md's tiers), which is a distinct condition
+// from their subscription status. Only reached once status is already
+// known active/past_due — a canceled/suspended key never gets this far.
+// Same fail-open/fail-closed policy as the status check: a meterhub
+// hiccup here degrades to c.failOpen rather than blocking (or silently
+// admitting) every request while it's unreachable.
+//
+// The cap counts REQUESTS as of 2026-09-28, not tokens: the `over` flags
+// this decodes are computed on the window's request count (usage rows are
+// one per request — request_id is that table's primary key), which is
+// what the rate card sells. The window's token total is still reported
+// beside it for the audit trail and no longer gates anything, so an old
+// binary of this gateway reading a current meterhub is capped by
+// requests too — the flag, not this file, carries the semantics.
 //
 // The third return, authoritative, is fetchAndDecide's 4th: false when this
 // answer came from a DEGRADED path rather than an actual usage lookup, so
@@ -2981,10 +2989,10 @@ func (c *entitlementCache) checkWindowCap(label string) (allowed bool, reason st
 		return false, "usage check failed", false
 	}
 	if u.Window5h.Over {
-		return false, "rate limit: 5-hour token cap exceeded, resets on a rolling window", true
+		return false, "rate limit: 5-hour request cap exceeded, resets on a rolling window", true
 	}
 	if u.Window7d.Over {
-		return false, "rate limit: weekly token cap exceeded, resets on a rolling window", true
+		return false, "rate limit: weekly request cap exceeded, resets on a rolling window", true
 	}
 	return true, "", true
 }

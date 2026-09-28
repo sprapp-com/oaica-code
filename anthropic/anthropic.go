@@ -1412,6 +1412,20 @@ type StreamConverter struct {
 	// synthesized id cannot land on one the upstream stated for another call
 	// in the same turn (2026-09-27 audit, round 46, A46-4).
 	mintedIDs map[string]bool
+	// seenInCall counts, per id-less call identity, how many times this TURN
+	// has already stated it, so the second and later occurrences get the
+	// distinct key and id a bare repeat is entitled to. It is converter state
+	// rather than a local of Process because Process is called once per
+	// UPSTREAM CHUNK, not once per message: middleware/anthropic.go:87 loops
+	// the converter over every chunk of one response, and server/routes.go
+	// hands the NON-stream arm the concatenation of exactly those chunks.
+	// A counter born per chunk therefore split a bare repeat only when the
+	// runner happened to flush the two calls in one chunk: the same model
+	// output answered two tool_use blocks whole and one streamed, and the
+	// client never ran the call the model asked for twice (2026-09-28 audit,
+	// round 67, F67-L1-1). Non-stream's own counter (anthropic.go:1201) is
+	// response-scoped, which is the same scope as this one — one turn.
+	seenInCall map[string]int
 }
 
 func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConverter {
@@ -1423,6 +1437,7 @@ func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConve
 		toolCallsSent:        make(map[string]bool),
 		statedIDOwner:        make(map[string]string),
 		mintedIDs:            make(map[string]bool),
+		seenInCall:           make(map[string]int),
 	}
 }
 
@@ -1563,7 +1578,6 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		})
 	}
 
-	seenInCall := make(map[string]int, len(r.Message.ToolCalls))
 	for _, tc := range r.Message.ToolCalls {
 		if tc.ID != "" {
 			c.mintedIDs[tc.ID] = true
@@ -1607,17 +1621,25 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		// indistinguishable), and the client gets a stable synthesized id to
 		// echo back in tool_result.
 		//
-		// The dedup is ACROSS Process calls, not within one: a list that names
-		// the same id-less call twice says two calls — the caller's accumulator
+		// The counter is TURN-scoped, not Process-scoped: a turn that names the
+		// same id-less call twice says two calls — the caller's accumulator
 		// splits a bare repeat (a name restated over a call that accumulated no
 		// arguments) into a second call, which IS the rule both legs adopted
 		// (2026-09-27 audit, round 39, B-F9), and collapsing the pair here
 		// delivered one tool_use where the model asked for two, making that fix
 		// inert on this wire (2026-09-27 audit, round 40, A40-6). The second and
-		// later occurrences of a key within a list take a distinct key and a
-		// distinct id — two tool_use blocks with one id cannot be answered
-		// separately — while a restatement of an already-sent call in a LATER
-		// call still dedups, which is what this map is for.
+		// later occurrences of a key take a distinct key and a distinct id —
+		// two tool_use blocks with one id cannot be answered separately. Process
+		// is called once per upstream CHUNK of the one response, so a call the
+		// upstream repeated in a later chunk is the same repeat as one inside a
+		// single chunk: the counter used to be born per chunk, which made the
+		// answer depend on the runner's flush boundary — two blocks whole, one
+		// streamed, from one model output (2026-09-28 audit, round 67,
+		// F67-L1-1).
+		//
+		// toolCallsSent below still dedups a call the upstream restates under a
+		// STATED id, which is the wire the client's accumulator treats as one
+		// call restated rather than a second call.
 		base := "\x00" + tc.Function.Name + "\x00" + string(argsSeed)
 		// As in ToMessagesResponse: a STATED id is the upstream's correlation
 		// key, a MINTED one is this converter's own synthesis, and only the
@@ -1645,8 +1667,8 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			}
 		}
 		if id == "" {
-			n := seenInCall[base]
-			seenInCall[base] = n + 1
+			n := c.seenInCall[base]
+			c.seenInCall[base] = n + 1
 			key = "\x00" + base
 			id = ToolCallIDFor(tc.Function.Name, string(argsSeed))
 			if n > 0 {
@@ -1657,6 +1679,24 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			// same turn STATES: the two would reach the client under one id,
 			// and the non-stream twin of this body reads such a pair as one
 			// call restated (2026-09-27 audit, round 46, A46-4).
+			//
+			// KNOWN RESIDUE, rejected rather than half-fixed (2026-09-28
+			// audit, round 67, F67-L1-2): the pre-pass above only sees the ids
+			// of the chunk it is in, so an upstream that states, in a LATER
+			// chunk, an id equal to one this converter already minted leaves
+			// two blocks sharing it here, while the non-stream arm — handed
+			// the whole concatenated turn — bumps the minted one and keeps the
+			// stated id. Reproduced: id-less `Bash {"cmd":"ls"}` then a chunk
+			// stating call_83cf9330 for a Read gives stream
+			// [call_83cf9330 call_83cf9330] and whole [call_131b6fb
+			// call_83cf9330]. Closing it needs whole-turn buffering (the id is
+			// already on the wire when the colliding chunk arrives) — the held-
+			// delta wall round 65's R65-L3-2 hit. Re-minting the STATED id
+			// instead is not a fix: today the two arms at least agree on which
+			// call call_83cf9330 names, and re-minting would make the stated id
+			// resolve to a different call per arm, which is the cross-leg echo
+			// F66-L2-1 exists to prevent. Left as is, with the residue
+			// recorded.
 			mintedKey := string(argsSeed)
 			if n > 0 {
 				mintedKey = string(argsSeed) + "#" + strconv.Itoa(n)
