@@ -2438,6 +2438,49 @@ func (b *anthropicBridge) LedgerStatus(upstream int) int {
 	return upstream
 }
 
+// DocumentServed reports whether the turn the client was actually served is the
+// whole completion document this bridge buffered — the one question both the
+// meter (usageRecorder.finish) and EstimatedUsage have to ask before they read
+// those bytes as the turn.
+//
+// It is true when the turn is a document by construction (the non-stream arm:
+// the bridge translates the whole body, always) and when a STREAM will serve
+// one. It is false on the stream arm that relayed frames and then declined the
+// document: those bytes were never served, and a row or an estimate built from
+// them states counts the client was never told
+// (2026-09-29 audit, round 87, F87-L3-1).
+//
+// The stream arm cannot be answered by sse.adoptedDoc alone, because that flag
+// is set by adoptWholeStream — and both readers of this method (the meter's
+// finish() and EstimatedUsage) run from completionHandler, BEFORE messagesHandler
+// calls finalize(). Asking the flag there answered false for every stream, so
+// the meter fell through to the recorder's scan of the frames and the row kept a
+// frame's earlier usage statement for a turn whose client was served the
+// document — 9000/500 booked where the client read 7/3 (2026-09-29 audit, round
+// 87, F87-L3-2). The same ordering is why noAnswer's two callers share one
+// predicate (round 25): the question is answered here from the SAME terms
+// adoptWholeStream will judge it by — nothing relayed, and a buffered document
+// that says something — so the two cannot drift. The terms are read, never
+// written: emitting the adoption is finalize's job.
+func (b *anthropicBridge) DocumentServed() bool {
+	if !b.stream || b.sse.adoptedDoc {
+		return true
+	}
+	// startSent is the whole of the question that the buffer cannot answer for
+	// itself. finalize() feeds the one unterminated line left in the frame buffer
+	// (flushStreamTail) BEFORE it judges adoption, and that feed can set
+	// startSent — but only for a line that begins `data:`, and a body whose
+	// buffered bytes contain a `data:` line is not the buffered completion at
+	// all: bufferedCompletion concatenates the two buffers and parses them as one
+	// document, which such a body cannot be. So the pending line cannot change
+	// this answer, and no second term mirrors the feed.
+	if b.sse.startSent {
+		return false
+	}
+	resp, ok := b.bufferedCompletion()
+	return ok && documentSaysSomething(resp)
+}
+
 // EstimatedUsage reports the counts this bridge measured for itself, for a turn
 // whose upstream stated no usage at all. The recorder reads the upstream's own
 // bytes, so it has nothing to record for such a turn and its row read
@@ -2461,8 +2504,15 @@ func (b *anthropicBridge) LedgerStatus(upstream int) int {
 // answered the estimate for a prompt the upstream had stated — the same defect
 // one layer down. bufferedCompletion() is the same bytes the recorder read
 // (2026-09-27 audit, round 40, B40-2).
+//
+// The document is read only when it is the turn the CLIENT was served
+// (DocumentServed). A stream that relayed frames and then met a whole
+// completion it declined to adopt still holds those bytes, and reading them as
+// the turn answered counts for an answer the client never received — the row
+// stated 9000/500 for a turn whose client read one token of "hi", unbounded by
+// anything but docBufferLimit (2026-09-29 audit, round 87, F87-L3-1).
 func (b *anthropicBridge) EstimatedUsage() (usage, bool) {
-	if doc, ok := b.bufferedCompletion(); ok {
+	if doc, ok := b.bufferedCompletion(); ok && b.DocumentServed() {
 		u := doc.Usage.nonNegative()
 		// The UNCLAMPED hit: the prompt is raised to it below, and reading it
 		// through cachedTokens() first clamped it to the stated prompt, so this

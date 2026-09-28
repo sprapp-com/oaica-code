@@ -1887,6 +1887,44 @@ func (u *usageRecorder) scanSSE(p []byte) {
 }
 
 func (u *usageRecorder) finish() {
+	// The bytes in body+tail are the non-`data:` bytes of the UPSTREAM's answer,
+	// and they are read as the turn only when the writer that decided what to
+	// serve says the turn WAS that document. On the stream arm that relayed
+	// frames and then declined a whole completion, the document was never served:
+	// booking its usage charged the client's session for an answer it never
+	// received and told the row the upstream's word for counts the client was
+	// never given — one body, two readings, and the row's was not the served one
+	// (2026-09-29 audit, round 87, F87-L3-1).
+	served := true
+	if d, ok := u.ResponseWriter.(interface{ DocumentServed() bool }); ok {
+		served = d.DocumentServed()
+	}
+	raw := make([]byte, 0, u.body.Len()+u.tail.Len())
+	raw = append(raw, u.body.Bytes()...)
+	raw = append(raw, u.tail.Bytes()...)
+	// A document with no trailing newline never leaves the scanner's
+	// partial-line buffer — the loop above only consumes whole lines — so it is
+	// the tail, not the body, that holds the last (here: only) line.
+	var doc struct {
+		Usage *usage `json:"usage"`
+	}
+	document := json.Unmarshal(raw, &doc) == nil && doc.Usage != nil
+	if !served {
+		return
+	}
+	if document {
+		// The document IS the turn (an adopted stream document, or the
+		// non-stream arm): its usage is the turn's, and it stands over a usage
+		// statement an EARLIER frame made. Adoption copies the document's counts
+		// into what the client is told, so a row that kept the frame's numbers
+		// booked 9000/500 for a turn whose client read 7/3 — the two statements
+		// were never reconciled and the row kept the one that was not the turn
+		// (2026-09-29 audit, round 87, F87-L3-2). The scan above still wins
+		// wherever no document was served (round 39, B-F3's other half).
+		u.usage = *doc.Usage
+		u.seen = true
+		return
+	}
 	if u.seen {
 		return
 	}
@@ -1895,20 +1933,7 @@ func (u *usageRecorder) finish() {
 	// bridge adopts it as the turn — so the body really does carry the usage,
 	// and returning early here recorded prompt=0/completion=0/cost=0 for a turn
 	// the client was served and the upstream billed (2026-09-27 audit, round 39,
-	// B-F3). The scan above still wins whenever a usage chunk existed.
-	// A document with no trailing newline never leaves the scanner's partial-line
-	// buffer — the loop above only consumes whole lines — so it is the tail, not
-	// the body, that holds the last (here: only) line.
-	raw := make([]byte, 0, u.body.Len()+u.tail.Len())
-	raw = append(raw, u.body.Bytes()...)
-	raw = append(raw, u.tail.Bytes()...)
-	var doc struct {
-		Usage *usage `json:"usage"`
-	}
-	if json.Unmarshal(raw, &doc) == nil && doc.Usage != nil {
-		u.usage = *doc.Usage
-		u.seen = true
-	}
+	// B-F3).
 }
 
 func newRequestID() string {
