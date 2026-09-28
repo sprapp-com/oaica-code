@@ -71,6 +71,12 @@ var ErrCancelled = launch.ErrCancelled
 type SelectItem struct {
 	Name        string
 	Description string
+	// Frequent marks a model this machine actually runs (see
+	// launch.ModelItem.Frequent). It leads every other section, in the order
+	// given — that order IS the ranking, so ReorderItems must not re-sort it —
+	// and it is a PARTITION flag like the others: a row marked Frequent renders
+	// in that section alone, never twice.
+	Frequent    bool
 	Recommended bool
 	// Local marks a model served by this box's own `oaica serve` — see
 	// launch.ModelItem.Local's doc. Renders in its own "Local" section,
@@ -119,6 +125,7 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 		out[i] = SelectItem{
 			Name:              item.Name,
 			Description:       item.Description,
+			Frequent:          item.Frequent,
 			Recommended:       item.Recommended,
 			Local:             item.Local,
 			Remote:            item.Remote,
@@ -138,9 +145,14 @@ func ConvertItems(items []launch.SelectionItem) []SelectItem {
 // loop re-splits into the four sections from this flat list, so section
 // membership AND within-section order both come from here.
 func ReorderItems(items []SelectItem) []SelectItem {
-	var loc, rec, olc, rem, other []SelectItem
+	var freq, loc, rec, olc, rem, other []SelectItem
 	for _, item := range items {
 		switch {
+		case item.Frequent:
+			// First, and in the caller's order — that order is the ranking
+			// (launch.topFrequentModels), so this group is NOT sorted by name
+			// the way the others are.
+			freq = append(freq, item)
 		case item.Local:
 			loc = append(loc, item)
 		case item.OllamaCloud:
@@ -172,7 +184,7 @@ func ReorderItems(items []SelectItem) []SelectItem {
 	})
 	sort.SliceStable(loc, func(a, b int) bool { return byName(loc[a], loc[b]) })
 	sort.SliceStable(other, func(a, b int) bool { return byName(other[a], other[b]) })
-	return append(append(append(append(loc, rec...), olc...), rem...), other...)
+	return append(append(append(append(append(freq, loc...), rec...), olc...), rem...), other...)
 }
 
 // isBuiltinAggregatorProvider reports whether name is namespaced under one
@@ -307,7 +319,7 @@ func (m selectorModel) otherStart() int {
 	}
 	filtered := m.filteredItems()
 	for i, item := range filtered {
-		if !item.Local && !item.Remote && !item.Recommended {
+		if !item.Frequent && !item.Local && !item.Remote && !item.Recommended {
 			return i
 		}
 	}
@@ -705,9 +717,14 @@ func (m selectorModel) renderContent() string {
 		// router-catalog entry are never ambiguous with each other, even when
 		// they share a base name. Section order matches ReorderItems' flat
 		// order, so key navigation always tracks the displayed rows.
-		var localItems, ollamaItems, remoteItems, recItems, otherItems []int
+		var freqItems, localItems, ollamaItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
+			case item.Frequent:
+				// First: the models this machine actually runs. A row marked
+				// Frequent renders here and ONLY here — the sections partition
+				// the list, so the same model never appears twice.
+				freqItems = append(freqItems, i)
 			case item.Local:
 				localItems = append(localItems, i)
 			case item.OllamaCloud:
@@ -732,6 +749,13 @@ func (m selectorModel) renderContent() string {
 			pa, pb := isBuiltinAggregatorProvider(filtered[remoteItems[a]].Name), isBuiltinAggregatorProvider(filtered[remoteItems[b]].Name)
 			return pa && !pb
 		})
+
+		if len(freqItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Frequently used"))
+			s.WriteString("\n")
+			renderSectionRows(&s, m.cursor, filtered, freqItems, pinnedSectionCap, m.renderItem)
+			s.WriteString("\n")
+		}
 
 		if len(localItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Local Models"))
@@ -767,7 +791,7 @@ func (m selectorModel) renderContent() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
+			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(freqItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}
@@ -1061,7 +1085,7 @@ func (m multiSelectorModel) otherStart() int {
 	}
 	filtered := m.filteredItems()
 	for i, item := range filtered {
-		if !item.Local && !item.Remote && !item.Recommended {
+		if !item.Frequent && !item.Local && !item.Remote && !item.Recommended {
 			return i
 		}
 	}
@@ -1357,9 +1381,14 @@ func (m multiSelectorModel) View() string {
 		// Split into pinned local, pinned remote, pinned recommended, and
 		// scrollable others (matches single-select layout — see the doc
 		// comment there).
-		var localItems, ollamaItems, remoteItems, recItems, otherItems []int
+		var freqItems, localItems, ollamaItems, remoteItems, recItems, otherItems []int
 		for i, item := range filtered {
 			switch {
+			case item.Frequent:
+				// First: the models this machine actually runs. A row marked
+				// Frequent renders here and ONLY here — the sections partition
+				// the list, so the same model never appears twice.
+				freqItems = append(freqItems, i)
 			case item.Local:
 				localItems = append(localItems, i)
 			case item.OllamaCloud:
@@ -1378,6 +1407,13 @@ func (m multiSelectorModel) View() string {
 			pa, pb := isBuiltinAggregatorProvider(filtered[remoteItems[a]].Name), isBuiltinAggregatorProvider(filtered[remoteItems[b]].Name)
 			return pa && !pb
 		})
+
+		if len(freqItems) > 0 {
+			s.WriteString(sectionHeaderStyle.Render("Frequently used"))
+			s.WriteString("\n")
+			renderSectionRows(&s, m.cursor, filtered, freqItems, pinnedSectionCap, renderItem)
+			s.WriteString("\n")
+		}
 
 		if len(localItems) > 0 {
 			s.WriteString(sectionHeaderStyle.Render("Local Models"))
@@ -1414,7 +1450,7 @@ func (m multiSelectorModel) View() string {
 			s.WriteString(sectionHeaderStyle.Render("More"))
 			s.WriteString("\n")
 
-			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
+			maxOthers := maxSelectorItems - min(len(recItems), pinnedSectionCap) - min(len(freqItems), pinnedSectionCap) - min(len(localItems), pinnedSectionCap) - min(len(ollamaItems), pinnedSectionCap) - min(len(remoteItems), pinnedSectionCap)
 			if maxOthers < 3 {
 				maxOthers = 3
 			}

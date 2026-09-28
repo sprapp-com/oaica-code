@@ -377,6 +377,12 @@ type SupportedIntegration interface {
 type ModelItem struct {
 	Name        string
 	Description string
+	// Frequent marks a model this machine actually runs (topFrequentModels,
+	// model_frequency.go). The picker renders these in their own "Frequently
+	// used" section, FIRST and in ranking order — see selector.go's render
+	// split. Like the other section flags it is a partition: a row marked
+	// Frequent renders in that section alone, never twice.
+	Frequent    bool
 	Recommended bool
 	// Local marks a model served by this box's own `oaica serve` (the
 	// "<model>:local" tagged entries) — the picker renders these in their
@@ -413,8 +419,11 @@ type ModelItem struct {
 
 // SelectionItem represents a model row after launch has derived selector-only UI state.
 type SelectionItem struct {
-	Name              string
-	Description       string
+	Name        string
+	Description string
+	// Frequent marks a model this machine actually runs — see
+	// ModelItem.Frequent.
+	Frequent          bool
 	Recommended       bool
 	Local             bool
 	Remote            bool

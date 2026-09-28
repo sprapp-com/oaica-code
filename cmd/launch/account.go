@@ -139,6 +139,7 @@ func ApplyAccountStateToSelectionItems(items []ModelItem, state AccountState) []
 		out[i] = SelectionItem{
 			Name:              item.Name,
 			Description:       item.Description,
+			Frequent:          item.Frequent,
 			Recommended:       item.Recommended,
 			Local:             item.Local,
 			Remote:            item.Remote,

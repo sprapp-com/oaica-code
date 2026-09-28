@@ -617,11 +617,18 @@ func buildModelListWithRecommendations(existing []modelInfo, recommendations []M
 		freqRank[name] = i + 1
 	}
 	for i := range items {
-		if freqRank[items[i].Name] > 0 && !strings.Contains(items[i].Description, "frequently used") {
-			if items[i].Description != "" {
-				items[i].Description = "frequently used · " + items[i].Description
-			} else {
-				items[i].Description = "frequently used"
+		if freqRank[items[i].Name] > 0 {
+			// The picker's own section, not just a prefix on the description:
+			// the section headers are how a user tells a local model from a
+			// router SKU from a remote, and "what I actually run" deserves the
+			// same treatment (see selector.go's render split).
+			items[i].Frequent = true
+			if !strings.Contains(items[i].Description, "frequently used") {
+				if items[i].Description != "" {
+					items[i].Description = "frequently used · " + items[i].Description
+				} else {
+					items[i].Description = "frequently used"
+				}
 			}
 		}
 	}
