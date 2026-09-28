@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/auth"
 	"github.com/ollama/ollama/envconfig"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
@@ -339,7 +340,14 @@ func hasAnthropicWebSearchTool(body []byte) bool {
 	}
 
 	for _, tool := range payload.Tools {
-		if strings.HasPrefix(strings.TrimSpace(tool.Type), "web_search") {
+		// The same test the middleware and the converter ask
+		// (anthropic.IsWebSearchToolType). This read the type TRIMMED, so a body
+		// whose type was spelled " web_search_20250305" was a web_search turn
+		// here — served by the local surface rather than relayed — and an
+		// ordinary turn to the middleware that then installed no takeover: the
+		// request was answered with NEITHER arm, and the body's own spelling
+		// decided it (2026-09-28 audit, round 83, F83-L1-2).
+		if anthropic.IsWebSearchToolType(tool.Type) {
 			return true
 		}
 	}

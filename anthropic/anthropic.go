@@ -1134,9 +1134,26 @@ func formatWebSearchToolResultContent(content any) string {
 	}
 }
 
+// IsWebSearchToolType reports whether a tool's `type` is the web_search server
+// tool. The test is EXACT — the type must be prefixed by "web_search" as it is
+// written — and every leg asks it the same way: this converter, the anthropic
+// middleware's takeover, and the cloud proxy that decides whether such a body
+// is served locally or relayed. One body must not be a search turn on one leg
+// and an ordinary turn on another, or be served locally by a proxy that thought
+// it saw the tool while the middle of the request installs no takeover at all
+// (2026-09-28 audit, round 83, F83-L1-2). The gateway is a separate module and
+// keeps its own copy of this test; it reads the same way.
+//
+// A whitespace-padded type (`" web_search_20250305"`) is NOT the tool: it is
+// not the string the wire specified, and the leg that trims it disagrees with
+// every other reader about the same body.
+func IsWebSearchToolType(t string) bool {
+	return strings.HasPrefix(t, "web_search")
+}
+
 // convertTool converts an Anthropic Tool to an Ollama api.Tool, returning true if it's a server tool
 func convertTool(t Tool) (api.Tool, bool, error) {
-	if strings.HasPrefix(t.Type, "web_search") {
+	if IsWebSearchToolType(t.Type) {
 		props := api.NewToolPropertiesMap()
 		props.Set("query", api.ToolProperty{
 			Type:        api.PropertyType{"string"},

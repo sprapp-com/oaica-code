@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -245,6 +246,28 @@ type WebSearchAnthropicWriter struct {
 	// are in carriedNarrationBlocks: they are the model's output and no other
 	// arm drops them (round 82, F82-L1-4).
 	lateRuns []lateNarrationRun
+
+	// turnContent and turnThinking are this turn's own narration — every
+	// chunk's prose and reasoning, in the order the chunks arrived — and
+	// turnNarrationDone is closed once the turn has ended, so the loop can wait
+	// for the last of it.
+	//
+	// The loop hands the MODEL an account of the turn that asked to search
+	// (buildWebSearchAssistantMessage). The whole-document arm is handed the
+	// merged message and gives it the whole turn; this arm started the loop
+	// from the ONE chunk that carried the search call, so a model that wrote
+	// its prose and then searched across two chunks was told it had said only
+	// the second stretch — or NOTHING at all when the call stood in a chunk of
+	// its own, though the client had already been shown every word. Two clients
+	// of one upstream body then got their continuation from two different
+	// accounts of the same turn, and the model answered a conversation that
+	// contradicted the one the client was reading (2026-09-28 audit, round 83,
+	// F83-L1-1). Only the streaming arm is wrong here, so only it waits: the
+	// search itself still runs while the turn is being generated.
+	turnContent       strings.Builder
+	turnThinking      strings.Builder
+	turnNarrationDone chan struct{}
+	turnNarrationOnce sync.Once
 }
 
 // lateNarrationRun is one narration block absorbed while the loop was in
@@ -299,6 +322,7 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	// (2026-09-28 audit, round 72, F72-L1-1).
 	if sentence, status, ok := upstreamErrorFrame(data); ok {
 		w.terminalSent = true
+		w.finishTurnNarration()
 		return w.inner.failTurn(sentence, status)
 	}
 
@@ -308,11 +332,22 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	}
 	w.recordObservedUsage(chatResponse.Metrics)
 
+	// Every chunk of a search turn belongs to the account the loop hands the
+	// model, not only the chunk that carried the call (F83-L1-1). Accumulated
+	// as it arrives — from the turn's FIRST chunk, which is written before
+	// anything knows a search is coming — because by the time the loop reads it
+	// the turn is over.
+	w.turnContent.WriteString(chatResponse.Message.Content)
+	w.turnThinking.WriteString(chatResponse.Message.Thinking)
+
 	if w.stream && w.loopInFlight {
 		w.absorbLateNarration(chatResponse)
 		if !chatResponse.Done {
 			return len(data), nil
 		}
+		// The turn is over and this is the last of its narration: the loop may
+		// read the account now (F83-L1-1).
+		w.finishTurnNarration()
 		if err := w.writeLoopResult(); err != nil {
 			return len(data), err
 		}
@@ -373,6 +408,10 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 		)
 		w.startLoopWorker(chatResponse, webSearchCall)
 		if chatResponse.Done {
+			// The chunk that asked to search was the turn's last, so its
+			// narration is the turn's whole: the loop may read it now
+			// (F83-L1-1).
+			w.finishTurnNarration()
 			if err := w.writeLoopResult(); err != nil {
 				return len(data), err
 			}
@@ -478,6 +517,30 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 		)
 
 		assistantMsg := buildWebSearchAssistantMessage(currentResponse, currentToolCall)
+		// The turn the FIRST iteration answers was streamed to this arm one
+		// chunk at a time, and the loop was started by the chunk that carried
+		// the search call alone: what the model is told it said has to be the
+		// whole turn, the same account the whole-document arm builds from its
+		// merged message (F83-L1-1). Every later iteration's response is a
+		// whole message off the follow-up call, so it is its own account.
+		if loop == 1 && w.turnNarrationDone != nil {
+			content, thinking, err := w.waitForTurnNarration(ctx)
+			if err != nil {
+				logutil.TraceContext(ctx, "anthropic middleware: turn narration never completed",
+					"loop", loop,
+					"error", err,
+				)
+				return anthropic.MessagesResponse{}, &webSearchLoopError{
+					code:    "api_error",
+					query:   query,
+					usage:   usage,
+					err:     err,
+					content: append(slices.Clone(serverContent), carriedNarrationBlocks(currentResponse)...),
+				}
+			}
+			assistantMsg.Content = content
+			assistantMsg.Thinking = thinking
+		}
 		toolResultMsg := api.Message{
 			Role:       "tool",
 			Content:    formatWebSearchResultsForToolMessage(searchResp.Results),
@@ -576,6 +639,9 @@ func (w *WebSearchAnthropicWriter) startLoopWorker(initialResponse api.ChatRespo
 	w.loopBaseCacheReadTok = initialUsage.CacheReadInputTokens
 	w.loopBaseOutputTok = initialUsage.OutputTokens
 	w.loopResultCh = make(chan webSearchLoopResult, 1)
+	// The turn this loop was started by is still being streamed: the loop reads
+	// its narration once this closes (F83-L1-1).
+	w.turnNarrationDone = make(chan struct{})
 	w.loopInFlight = true
 	logutil.Trace("anthropic middleware: loop worker started",
 		"usage", initialUsage,
@@ -592,6 +658,36 @@ func (w *WebSearchAnthropicWriter) startLoopWorker(initialResponse api.ChatRespo
 			loopErr:  loopErr,
 		}
 	}()
+}
+
+// finishTurnNarration marks this turn's narration complete: every chunk of it
+// has been seen, so the loop may hand the model its account of the turn
+// (F83-L1-1). Called from every path that ends the turn — the done chunk, and
+// the error frame that ends it instead. On the arm where no loop is in flight
+// it does nothing: there is no one waiting.
+func (w *WebSearchAnthropicWriter) finishTurnNarration() {
+	if w.turnNarrationDone == nil {
+		return
+	}
+	w.turnNarrationOnce.Do(func() { close(w.turnNarrationDone) })
+}
+
+// waitForTurnNarration blocks until this turn has ended, and returns the turn's
+// own prose and reasoning as the model wrote them — what the whole-document arm
+// of the same body is handed in its merged message. The loop's search is not
+// delayed by this: it runs while the turn is still being generated, and only
+// the follow-up that needs the account waits for it (F83-L1-1).
+//
+// ctx is the loop's own: a client that goes away, or an upstream that never
+// ends its turn, must not leave the worker waiting on a turn that will never
+// finish.
+func (w *WebSearchAnthropicWriter) waitForTurnNarration(ctx context.Context) (string, string, error) {
+	select {
+	case <-w.turnNarrationDone:
+		return w.turnContent.String(), w.turnThinking.String(), nil
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	}
 }
 
 func (w *WebSearchAnthropicWriter) writeLoopResult() error {
@@ -1565,10 +1661,12 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 	}
 }
 
-// hasWebSearchTool checks if the request tools include a web_search tool
+// hasWebSearchTool checks if the request tools include a web_search tool. The
+// test is anthropic.IsWebSearchToolType, which is the one every leg asks
+// (2026-09-28 audit, round 83, F83-L1-2).
 func hasWebSearchTool(tools []anthropic.Tool) bool {
 	for _, tool := range tools {
-		if strings.HasPrefix(tool.Type, "web_search") {
+		if anthropic.IsWebSearchToolType(tool.Type) {
 			return true
 		}
 	}
