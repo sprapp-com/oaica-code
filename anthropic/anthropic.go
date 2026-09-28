@@ -1183,6 +1183,22 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	// sibling in the stream converter, which always emits a block.
 	content := make([]ContentBlock, 0, 1)
 
+	// outputRunsOK says the turn still knows the order its own output arrived
+	// in, reasoning included. A buffered turn merges its chunks, and the run
+	// list the lane hands over is the order the STREAMING arm of this leg opens
+	// its blocks at — reasoning closes where prose or a call arrives, prose
+	// closes where reasoning or a call arrives. Without it this arm could only
+	// write one merged reasoning block first, so `thinking / call / thinking /
+	// text` reached a client that asked for no stream as four blocks' worth of
+	// content in three, and `thinking / text / thinking` — no call at all — in
+	// two where the streaming arm writes three (2026-09-28 audit, round 79,
+	// F79-L1-1). Reported as F68-L1-1 and rejected for want of a live producer;
+	// the buffered lane exhibited one, because it sees every chunk. The list is
+	// trusted only when it accounts for the turn exactly, and this arm then
+	// reads it in preference to ContentRuns, which says only where the CALLS
+	// fell.
+	outputRunsOK := r.Message.OutputRunsAccountFor()
+
 	// thinking, then text, then tool_use — and deliberately NOT the arrival
 	// order the streaming converter preserves. A whole document has no order
 	// left to read: api.ChatResponse carries ONE merged text string and one
@@ -1198,7 +1214,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	// losing one, and closing it means carrying a per-block order through
 	// api.ChatResponse — a shape every site in all three legs shares — to fix
 	// a case nothing has been seen to send.
-	if r.Message.Thinking != "" {
+	if r.Message.Thinking != "" && !outputRunsOK {
 		content = append(content, ContentBlock{
 			Type:     "thinking",
 			Thinking: ptr(r.Message.Thinking),
@@ -1238,7 +1254,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		content = append(content, b)
 	}
 
-	if !runsMode && r.Message.Content != "" {
+	if !outputRunsOK && !runsMode && r.Message.Content != "" {
 		content = append(content, ContentBlock{
 			Type: "text",
 			Text: ptr(r.Message.Content),
@@ -1395,7 +1411,45 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		}, true
 	}
 
-	if runsMode {
+	if outputRunsOK {
+		// The order the model wrote, reasoning included: a text run is prose, a
+		// thinking run is a block of its own, and a call run is the next entry
+		// of ToolCalls. addBlock joins a text run to the text block before it,
+		// so a run boundary the arm writes NO block for — a fragment the
+		// upstream never named, a restatement of a call already written — leaves
+		// the prose in ONE block, which is what the streaming arm does by never
+		// closing its text block there (round 76's F76-L1-1).
+		ci := 0
+		for _, run := range r.Message.OutputRuns {
+			switch run.Kind {
+			case "thinking":
+				if run.Text == "" {
+					continue
+				}
+				content = append(content, ContentBlock{
+					Type:     "thinking",
+					Thinking: ptr(run.Text),
+				})
+			case "text":
+				if run.Text == "" {
+					continue
+				}
+				addBlock(ContentBlock{Type: "text", Text: ptr(run.Text)})
+			case "call":
+				if ci >= len(r.Message.ToolCalls) {
+					continue
+				}
+				tc := r.Message.ToolCalls[ci]
+				ci++
+				if block, ok := blockFor(tc); ok {
+					if block.Type == "tool_use" {
+						toolBlocks++
+					}
+					addBlock(block)
+				}
+			}
+		}
+	} else if runsMode {
 		// The order the model wrote: run i is the text that arrived before
 		// ToolCalls[i], and the last run follows the final call.
 		//

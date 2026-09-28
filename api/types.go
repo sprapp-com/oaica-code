@@ -195,6 +195,14 @@ func (t Tool) String() string {
 // Message is a single message in a chat sequence. The message contains the
 // role ("system", "user", or "assistant"), the content and an optional list
 // of images.
+// OutputRun is one run of a buffered turn's output, in the order the model
+// produced it: a stretch of prose, a stretch of reasoning, or the call it made.
+// See Message.OutputRuns.
+type OutputRun struct {
+	Kind string `json:"kind"` // "text", "thinking" or "call"
+	Text string `json:"text,omitempty"`
+}
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -227,8 +235,55 @@ type Message struct {
 	// is what the streaming arm does by never closing its text block there
 	// (2026-09-28 audit, round 76, F76-L1-1).
 	ContentRuns []string `json:"content_runs,omitempty"`
-	ToolName    string   `json:"tool_name,omitempty"`
-	ToolCallID  string   `json:"tool_call_id,omitempty"`
+	// OutputRuns, when it is present, is this turn's own output — its reasoning
+	// and its prose — as the ordered list of runs it arrived in, so that a
+	// BUFFERED (non-streaming) turn can be written in the order the streaming
+	// arm of the same leg relays it. A run is a contiguous stretch of one kind:
+	// a "text" run is prose, a "thinking" run is reasoning, and a "call" run
+	// stands for the next entry of ToolCalls. The boundaries are exactly the
+	// ones the streaming arm opens a block at — reasoning closes where prose or
+	// a call arrives, prose closes where reasoning or a call arrives — because
+	// an agentic reasoning model re-emits its reasoning between tool calls, and
+	// a turn merged into one Thinking string loses that. ContentRuns keeps the
+	// text boundaries relative to the CALLS alone, which is all a reader that
+	// cannot use this list needs.
+	//
+	// This list is the fuller of the two and a reader prefers it, but only when
+	// it accounts for the turn exactly: the text runs joining to Content, the
+	// thinking runs to Thinking, and one "call" run per entry of ToolCalls.
+	// Anything else — including a kind the reader does not know — is a shape it
+	// must not trust, and it falls back to ContentRuns and then to the merged
+	// fields (2026-09-28 audit, round 79, F79-L1-1).
+	OutputRuns []OutputRun `json:"output_runs,omitempty"`
+	ToolName   string      `json:"tool_name,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+}
+
+// OutputRunsAccountFor reports whether this message's OutputRuns account for
+// the turn exactly — the text runs joining to Content, the thinking runs to
+// Thinking, and one "call" run per entry of ToolCalls. A reader may not trust a
+// run list that does not add up, and the lane that writes one asks this before
+// handing it over so a shape that would have to be second-guessed never reaches
+// the wire (2026-09-28 audit, round 79, F79-L1-1).
+func (m *Message) OutputRunsAccountFor() bool {
+	if len(m.OutputRuns) == 0 {
+		return false
+	}
+	var text, think strings.Builder
+	calls := 0
+	for _, run := range m.OutputRuns {
+		switch run.Kind {
+		case "text":
+			text.WriteString(run.Text)
+		case "thinking":
+			think.WriteString(run.Text)
+		case "call":
+			calls++
+		default:
+			return false
+		}
+	}
+	return text.String() == m.Content && think.String() == m.Thinking && calls == len(m.ToolCalls)
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {

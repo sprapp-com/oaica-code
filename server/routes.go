@@ -2496,6 +2496,23 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		anthropicSurface := c.GetBool("anthropic_messages")
 		var contentRuns []string
 		var run strings.Builder
+		// outputRuns is the same turn as the ordered list of runs the streaming
+		// arm of this leg opens its blocks at. This lane already sees every
+		// chunk that arm sees, so it has the order; it was merging it away, and
+		// one upstream body then reached a client that asked for no stream in a
+		// different block structure than a client that streamed it — reasoning
+		// from either side of a call in ONE thinking block, reasoning around
+		// prose in one where the stream writes two (2026-09-28 audit, round 79,
+		// F79-L1-1). The order inside one chunk is the order the converter asks
+		// them in: reasoning, then prose, then the calls it carries.
+		var outputRuns []api.OutputRun
+		appendOutputRun := func(kind, text string) {
+			if len(outputRuns) > 0 && outputRuns[len(outputRuns)-1].Kind == kind {
+				outputRuns[len(outputRuns)-1].Text += text
+				return
+			}
+			outputRuns = append(outputRuns, api.OutputRun{Kind: kind, Text: text})
+		}
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
@@ -2509,6 +2526,17 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 						run.Reset()
 						for i := 1; i < len(t.Message.ToolCalls); i++ {
 							contentRuns = append(contentRuns, "")
+						}
+					}
+					if t.Message.Thinking != "" {
+						appendOutputRun("thinking", t.Message.Thinking)
+					}
+					if t.Message.Content != "" {
+						appendOutputRun("text", t.Message.Content)
+					}
+					if len(t.Message.ToolCalls) > 0 && (len(req.Tools) > 0 || anthropicSurface) {
+						for range t.Message.ToolCalls {
+							appendOutputRun("call", "")
 						}
 					}
 				}
@@ -2574,6 +2602,19 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 					resp.Message.ContentRuns = contentRuns
 				}
 			}
+		}
+
+		// The ordered run list, handed over only when it accounts for the turn
+		// exactly — the text runs joining to the merged content, the thinking
+		// runs to the merged reasoning, one call run per kept call. A list that
+		// does not add up is not one a reader may trust, so the wire never
+		// carries it and a reader falls back to ContentRuns and then to the
+		// merged fields (2026-09-28 audit, round 79, F79-L1-1). Asked for a turn
+		// with no calls as well: reasoning either side of prose is two runs, and
+		// the text-only ContentRuns above cannot say so.
+		resp.Message.OutputRuns = outputRuns
+		if !resp.Message.OutputRunsAccountFor() {
+			resp.Message.OutputRuns = nil
 		}
 
 		c.JSON(http.StatusOK, resp)
