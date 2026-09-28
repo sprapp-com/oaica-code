@@ -3327,6 +3327,27 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				adoptedWhole = true
 				adoptedCalls = wroteCalls
 				adoptedCallAt = wrote
+				// The slots the adoption filled are SLOTS THIS STREAM HAS USED,
+				// and the stream's own counter has to know it. The counter is
+				// what a call split off a repeated index is given (see the split
+				// below), and the adoption numbers the slots it writes from zero
+				// without touching it — so with more than one call in the frame
+				// the split's fresh slot was often one the client had already
+				// been given a closed block for, and the fragment was dropped by
+				// the very gate the split exists to escape: a tool the model
+				// asked for never reached the client, while the same calls
+				// written wholly inside the frame, or wholly as deltas, arrived
+				// whole (2026-09-28 audit, round 72, F72-L2-1). The split is
+				// also the only writer of a fresh slot that can reach an adopted
+				// one — a stated index is the upstream's own answer and an
+				// index-less call that starts a new one is given this counter —
+				// so raising it here is what keeps every call after the adoption
+				// off the slots the adoption closed.
+				for slot := range adoptedCallAt {
+					if slot >= nextFreeToolSlot {
+						nextFreeToolSlot = slot + 1
+					}
+				}
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. Falling
 				// through to the delta loop let the finish_reason it carried
