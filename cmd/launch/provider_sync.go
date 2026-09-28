@@ -8,12 +8,9 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
@@ -80,61 +77,34 @@ func ProviderSync(url string) (ProviderSyncReport, error) {
 	return ProviderSyncReport{URL: display, Count: len(f.Providers), FromCache: fromCache}, nil
 }
 
+// fetchProviderCatalogBody is fetchCatalogBody (catalog_sync.go) for this
+// catalogue's fixed cache path, plus one guard the shared helper cannot carry.
+//
+// fetchCatalogBody serves whatever body sits at the cache path it is handed,
+// which is right for the models.dev catalogue (one path, one source) but not
+// for this one: a cache written from a private mirror would answer a request
+// for the default catalogue, and the report would name the URL that was ASKED
+// FOR while handing back the mirror's contents (2026-09-26 audit, tenth round —
+// the transport-error sibling of the third-round 304 fix). So the cached body
+// is only accepted when it is known to have come from this URL
+// (catalogCacheSourcePath). On a 304 that is already implied by the ETag
+// binding, which is why the check is applied to the result of the fetch rather
+// than inside it: whatever path was used to serve the cache, the source must
+// vouch for the URL.
 func fetchProviderCatalogBody(url, etag string) (body []byte, newEtag string, fromCache bool, err error) {
-	if strings.HasPrefix(url, "file://") {
-		b, rerr := os.ReadFile(strings.TrimPrefix(url, "file://"))
-		return b, "", false, rerr
+	cachePath, err := providerCatalogCachePath()
+	if err != nil {
+		return nil, "", false, err
 	}
-
-	// The --url may carry the mirror's credential as userinfo
-	// (https://KEY@mirror/catalog.json). The request keeps it — that is how
-	// the mirror authenticates — but nothing written down or printed may:
-	// every message below, and the request builder's own parse error
-	// (NewRedactedRequest), use the redacted form. docs/ENTERPRISE.md names
-	// the catalog caches as a place a credential must never reach.
+	body, newEtag, fromCache, err = fetchCatalogBody(url, etag, cachePath)
+	if err != nil || !fromCache {
+		return body, newEtag, fromCache, err
+	}
 	display := redactBaseURL(url)
-	req, err := NewRedactedRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", false, err
+	if !catalogCacheSourceMatches(cachePath, display, defaultProviderSyncURL) {
+		return nil, "", false, fmt.Errorf("can't reach %s, and the catalogue cached at %s came from a different source — run this again while online", display, cachePath)
 	}
-	if etag != "" {
-		req.Header.Set("If-None-Match", etag)
-	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		// Offline: the cached copy is only usable when it is known to have come
-		// from THIS url — see catalogCacheSourcePath.
-		if cachePath, perr := providerCatalogCachePath(); perr == nil &&
-			catalogCacheSourceMatches(cachePath, display, defaultProviderSyncURL) {
-			if b, rerr := os.ReadFile(cachePath); rerr == nil {
-				return b, etag, true, nil
-			}
-		}
-		return nil, "", false, fmt.Errorf("couldn't reach %s: %w", display, redactErr(err))
-	}
-	defer resp.Body.Close()
-
-	switch {
-	case resp.StatusCode == http.StatusNotModified:
-		cachePath, perr := providerCatalogCachePath()
-		if perr != nil {
-			return nil, "", false, perr
-		}
-		b, rerr := os.ReadFile(cachePath)
-		if rerr != nil {
-			return nil, "", false, fmt.Errorf("%s returned 304 but no cache exists", display)
-		}
-		return b, etag, true, nil
-	case resp.StatusCode != http.StatusOK:
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, strings.TrimSpace(string(errBody)))
-	}
-
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, "", false, err
-	}
-	return b, resp.Header.Get("ETag"), false, nil
+	return body, newEtag, fromCache, nil
 }
 
 func parseProviderCatalogFile(b []byte) providerCatalogFile {
