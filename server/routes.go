@@ -2279,7 +2279,15 @@ const relayedSurfaceHeader = "X-Oaica-Surface"
 func applyRelayedSurfaceMark(c *gin.Context) {
 	switch c.GetHeader(relayedSurfaceHeader) {
 	case "anthropic":
+		// A surface is everything it sets locally, and the Anthropic middleware
+		// sets TWO marks: which wire the request came in on, and its own rule
+		// that lets an Anthropic client ask for thinking against a model that
+		// cannot think. Carrying one of them left the peer's capability gate
+		// deciding a relayed turn that the runner lane answers — one client
+		// body, 200 direct and 400 through the relay (2026-09-29 audit, round
+		// 97, F97-L1-1).
 		c.Set("anthropic_messages", true)
+		c.Set("relax_thinking", true)
 	case "openai", "responses":
 		c.Set(middleware.TranslatedSurfaceKey, true)
 	}
