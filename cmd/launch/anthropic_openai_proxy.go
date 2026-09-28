@@ -2812,6 +2812,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// keeps the wire's own order on both its arms (2026-09-28 audit, round 63,
 	// F63-L2-1).
 	toolArrival := map[int]int{}
+	// namelessFrags records the argument bytes of every entry the upstream never
+	// named, in the order the wire wrote them, so the flush can relay them as
+	// one text block in that order (see there). The accumulators hold the same
+	// bytes grouped by the slot the router filed them under, which is the order
+	// the SLOTS were first seen — a body whose nameless fragments interleave
+	// across two slots read back in a different order than the model wrote it
+	// (2026-09-28 audit, round 77, F77-L2-2).
+	type namelessFrag struct {
+		slot int
+		s    string
+	}
+	var namelessFrags []namelessFrag
 	nextToolArrival := 0
 	// nextFreeToolSlot is the slot for a call the upstream gave none: one that
 	// omits the index entirely, or one that states an index already carrying a
@@ -3138,6 +3150,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		var tcs []api.ToolCall
 		var unnamedText strings.Builder
+		// The nameless entries' bytes, in the order the WIRE wrote them, which
+		// is the order both document arms concatenate the same entries in (their
+		// own list order). A slot whose accumulator NAMED itself after these
+		// bytes arrived has adopted them as a call's arguments, so they are not
+		// prose and are left out here.
+		recorded := map[int]bool{}
+		for _, f := range namelessFrags {
+			if a := toolAccums[f.slot]; a != nil && strings.TrimSpace(a.name) == "" {
+				unnamedText.WriteString(f.s)
+				recorded[f.slot] = true
+			}
+		}
 		// droppedStatedIDs collects the ids stated by entries this flush does
 		// NOT hand to the converter — the nameless fragment below (its
 		// arguments relay as text) and the truncated fragment after it. The
@@ -3173,7 +3197,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// — so the same document's only output reached the client as
 				// text on the non-stream arm and on both of the gateway's arms,
 				// and vanished here (2026-09-28 audit, round 55).
-				if s := strings.TrimSpace(a.args.String()); s != "" {
+				// Bytes that reached no record (see namelessFrags): kept, so
+				// nothing the model wrote is dropped by the bookkeeping.
+				if s := strings.TrimSpace(a.args.String()); s != "" && !recorded[i] {
 					unnamedText.WriteString(s)
 				}
 				continue
@@ -3240,6 +3266,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// after this flush is a call of the next turn's output, not one of these.
 		toolArrival = map[int]int{}
 		nextToolArrival = 0
+		// The records belong to the accumulators this flush just answered.
+		namelessFrags = nil
 		if len(tcs) == 0 {
 			// Every accumulated call was a truncated fragment. Emitting an
 			// empty ToolCalls response would still make the converter say
@@ -3881,12 +3909,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					toolArrival[slot] = nextToolArrival
 					nextToolArrival++
 				}
-				if exists && restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) {
+				if exists && strings.TrimSpace(tc.Function.Name) != "" &&
+					restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) {
 					// The call this slot already carries, listed again: its
 					// arguments are on the wire and complete, so this fragment is
 					// neither more of them nor a second call — see the helper.
 					// Asked before the writes, because a text appended here is a
 					// text already delivered.
+					//
+					// Only an entry that NAMES the call can be that restatement.
+					// An entry that names nothing is not a call on this leg on any
+					// arm: its bytes are the model's prose, relayed as text, and
+					// this fold swallowed them whenever it happened to carry the
+					// same bytes as the call at its slot — one body's nameless
+					// entry reached the client as `{"_raw":"1}1}"}` on the
+					// fragment arm's twin (the gateway) and as NOTHING here, where
+					// both document arms of this leg answer the call and the text
+					// (2026-09-28 audit, round 77, F77-L2-1). A continuation of a
+					// free-form line does not reach this test as a restatement
+					// either: its bytes are more of the same line, which is what
+					// canExtend decides below.
 					continue
 				}
 				if tc.Index != nil {
@@ -3907,6 +3949,13 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				}
 				if tc.Function.Arguments != "" {
 					acc.args.WriteString(tc.Function.Arguments)
+					if strings.TrimSpace(acc.name) == "" {
+						// An entry the upstream never named, on an accumulator
+						// that still names nothing: these bytes are the model's
+						// prose, and prose is relayed in the order it was written
+						// (2026-09-28 audit, round 77, F77-L2-2).
+						namelessFrags = append(namelessFrags, namelessFrag{slot: slot, s: strings.TrimSpace(tc.Function.Arguments)})
+					}
 				}
 			}
 
