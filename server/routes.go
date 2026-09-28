@@ -2260,6 +2260,65 @@ func writeRelayedStatusError(c *gin.Context, apiError api.StatusError) {
 	}
 }
 
+// relayedSurfaceHeader names the surface the client on the FAR side of a relay
+// arrived on. The marks that lift upstream ollama's tool-call gate, and that
+// make a merged turn carry the run order its own streamed arm keeps, live in the
+// gin context of the process that saw that client — and a peer that merges a
+// relayed request has neither (2026-09-29 audit, round 96, F96-L1-1).
+const relayedSurfaceHeader = "X-Oaica-Surface"
+
+// applyRelayedSurfaceMark gives a request that arrived from a relay the marks
+// the client on the far side of it earns locally, so one client body reads the
+// same on every arm. Without it a peer merged a translated surface's turn under
+// the native wire's gate, and the client's own `stream` flag decided whether the
+// model's tool call survived at all: the buffered arm of every translated
+// surface dropped a call the runner lane relayed, and the Anthropic surface's
+// buffered arm merged the run order away — where the same surface's streamed arm
+// and the runner lane both keep it (2026-09-29 audit, round 96, F96-L1-1,
+// F96-L1-2).
+func applyRelayedSurfaceMark(c *gin.Context) {
+	switch c.GetHeader(relayedSurfaceHeader) {
+	case "anthropic":
+		c.Set("anthropic_messages", true)
+	case "openai", "responses":
+		c.Set(middleware.TranslatedSurfaceKey, true)
+	}
+}
+
+// relaySurfaceClient is the client a relay reaches its peer with. The peer is
+// serving the client on the far side of the relay, so it is told which surface
+// that client arrived on — see applyRelayedSurfaceMark. A request that did not
+// arrive on a translated surface carries no header: the native wire keeps
+// upstream's own reading of a request that declared no tools.
+func relaySurfaceClient(remoteURL *url.URL, c *gin.Context) *api.Client {
+	surface := ""
+	switch {
+	case c.GetBool("anthropic_messages"):
+		surface = "anthropic"
+	case c.GetBool(middleware.TranslatedSurfaceKey):
+		surface = "openai"
+	}
+	if surface == "" {
+		return api.NewClient(remoteURL, http.DefaultClient)
+	}
+	return api.NewClient(remoteURL, &http.Client{
+		Transport: &relaySurfaceRoundTripper{base: http.DefaultTransport, surface: surface},
+	})
+}
+
+// relaySurfaceRoundTripper states the surface on every request the relay makes
+// to its peer, without touching a byte of the body the peer is asked to serve.
+type relaySurfaceRoundTripper struct {
+	base    http.RoundTripper
+	surface string
+}
+
+func (t *relaySurfaceRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set(relayedSurfaceHeader, t.surface)
+	return t.base.RoundTrip(req)
+}
+
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	// The first chunk is read before the loop because an Anthropic client's
@@ -2778,6 +2837,10 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 }
 
 func (s *Server) ChatHandler(c *gin.Context) {
+	// A request that arrived from a relay is served for the client on the far
+	// side of that relay, which is the surface whose rules it must earn here.
+	applyRelayedSurfaceMark(c)
+
 	checkpointStart := time.Now()
 
 	var req api.ChatRequest
@@ -2939,7 +3002,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			return nil
 		}
 
-		client := api.NewClient(remoteURL, http.DefaultClient)
+		// The peer is told which surface this relay's client arrived on: it is
+		// about to apply its own merge rules to this turn (2026-09-29 audit,
+		// round 96, F96-L1-1).
+		client := relaySurfaceClient(remoteURL, c)
 		err = client.Chat(c, &req, fn)
 		if err == nil && !relayDone {
 			relayEndedWithoutAFinalResponse(c, relayChunks)
