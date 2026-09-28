@@ -3621,34 +3621,31 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 			d := choice.Delta
 
-			// A call the wire has already finished stands before the prose that
-			// followed it: a vendor feeds its calls in the order it wrote them,
-			// so a text (or reasoning) delta arriving now means the wire has
-			// moved past the arguments every call so far was receiving. Reading
-			// the same turn as ONE document says the same thing — the adopted
-			// whole completion is written in its own order, calls before the
-			// prose — while this arm kept the calls until the turn's end and
-			// wrote the prose as it arrived, so one body reached the client as
-			// text,tool_use streamed and tool_use,text whole (2026-09-28 audit,
-			// round 83, F83-L2-2).
+			// A call the wire has finished, followed by the prose that came
+			// after it, is written where the turn's own document arm writes it
+			// — the prose first, the call after: this arm holds every call
+			// until the turn's end and writes the prose as it arrives, which is
+			// the same order the converter's whole-message arm answers with
+			// (thinking, then text, then tool_use; anthropic/anthropic.go's
+			// F68-L1-1 note records that fixed order as deliberate), and the
+			// same order the non-stream arm of this leg answers with.
 			//
-			// Only calls with nothing left to receive are flushed. A call still
-			// mid-object stays where the wire left it: emitting it now would
-			// hand the client an argument string the model had not finished as
-			// its input (rounds 16, 17), which is worse than the order — and a
-			// fragment that has named nothing is not a call this leg may name.
-			if d.Content != "" || reasoningOf(d.ReasoningContent, d.Reasoning) != "" {
-				settled := len(toolAccums) > 0
-				for _, a := range toolAccums {
-					if strings.TrimSpace(a.name) == "" || !finishedObjectArgs(a.args.String()) {
-						settled = false
-						break
-					}
-				}
-				if settled {
-					flushToolCalls(false)
-				}
-			}
+			// Round 83 flushed a SETTLED call the moment prose arrived, on the
+			// premise that the document arm wrote calls before the prose. That
+			// premise is false, and the flush moved this arm off the document
+			// arm instead of onto it: one turn (call c1 Bash {"a":1}, then the
+			// prose "hi") measured [tool_use,text] here and [text,tool_use] as
+			// a non-stream body, as one whole frame carrying both, and as a
+			// fragment-then-whole-frame run — while the flush's own reference
+			// case was a whole frame whose content was EMPTY, where there is no
+			// prose to order against (2026-09-28 audit, round 84, R84-L2-1).
+			// The frame arm's order for that empty-content frame — the call
+			// block at the position the frame itself states — stands as the
+			// recorded F68-L1-1 divergence.
+			//
+			// Holding the call is also what keeps a call the wire was still
+			// writing out of the client's hands: emitting it early would hand
+			// over half an argument string as a finished input (rounds 16, 17).
 
 			// Reasoning content → thinking delta. It counts toward the output
 			// estimate below like the answer does: it was relayed to the client

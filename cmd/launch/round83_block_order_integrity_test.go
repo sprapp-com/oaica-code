@@ -1,7 +1,7 @@
 package launch
 
-// round83_block_order_integrity_test.go — leg 2, F83-L2-1 and F83-L2-2
-// (2026-09-28 audit, round 83).
+// round83_block_order_integrity_test.go — leg 2, F83-L2-1, and the reversal of
+// F83-L2-2 (2026-09-28 audit, rounds 83 and 84).
 //
 // One turn, two spellings. When the vendor writes the turn as a whole
 // completion the gateway adopts it and writes the message in the frame's own
@@ -13,12 +13,13 @@ package launch
 //     the adoption closed at the first emitted event, and a fragment that
 //     relayed anything — even bytes the turn had nowhere else to put — emitted
 //     one. The whole completion behind it was refused and its content, the
-//     model's answer, was never written (F83-L2-1).
-//   - The block order: a call the wire had finished, followed by the prose that
-//     came after it, was written text,tool_use streamed and tool_use,text whole
-//     (F83-L2-2).
-//
-// Both are pinned here against the two arms that must agree.
+//     model's answer, was never written (F83-L2-1, still pinned below).
+//   - The block order: round 83 read a finished call followed by prose as "the
+//     wire finished the call first, so the call block goes first" and flushed
+//     settled calls when prose arrived. Round 84 measured the premise false —
+//     the document arm writes the prose first — and the flush moved this arm
+//     off the document arm for that very turn, so the flush is reverted and the
+//     pin below reads the other way (R84-L2-1).
 
 import (
 	"encoding/json"
@@ -116,35 +117,37 @@ func TestAWholeCompletionAfterAFragmentIsStillAdopted(t *testing.T) {
 	}
 }
 
-// TestTheBlocksFollowTheWireWhenTheCallIsFinished is F83-L2-2. The wire states
-// a finished call and then prose. The arm that reads the turn as one document
-// writes the call block before the text block; the delta arm wrote the text
-// first and the call at the turn's end, so the client saw a different message
-// from the same body.
-func TestTheBlocksFollowTheWireWhenTheCallIsFinished(t *testing.T) {
+// TestAFinishedCallStandsWhereTheDocumentArmPutsIt REVERSES F83-L2-2. Round 83
+// read this turn as "the wire finished the call before it wrote the prose, so
+// the call block goes first", and flushed settled calls when prose arrived. The
+// premise was that the document arm writes calls before prose; measured, it
+// writes the prose first (the converter's fixed thinking→text→tool_use order,
+// F68-L1-1), so the flush moved the delta arm OFF the document arm for this
+// very turn — streamed [tool_use,text] where the same body as a non-stream
+// request, as one whole frame carrying both, and as a fragment-then-whole-frame
+// run all answer [text,tool_use] (2026-09-28 audit, round 84, R84-L2-1). The
+// call is held to the turn's end, as it was before round 83.
+func TestAFinishedCallStandsWhereTheDocumentArmPutsIt(t *testing.T) {
 	callDelta := `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"Bash","arguments":"{\"a\":1}"}}]}}]}`
-	adoptedCall := `data: {"id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{\"a\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}`
 	textDelta := `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a"}}]}`
 	fin := `data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
 
 	_, deltas, args := r83OrderArm(t, []string{callDelta, textDelta, fin, r81Done})
-	_, adopted, _ := r83OrderArm(t, []string{adoptedCall, textDelta, fin, r81Done})
-	if deltas != adopted {
-		t.Errorf("the same turn as deltas is %s and as one adopted frame is %s — the call was finished before the prose arrived, so the block order follows the wire on both (2026-09-28 audit, round 83, F83-L2-2)", deltas, adopted)
-	}
-	if !strings.HasPrefix(strings.TrimPrefix(deltas, `blocks=`), "tool_use,text") {
-		t.Errorf("streamed call-then-text = %s, want the call block first: the wire had finished the call's arguments before it wrote the prose (2026-09-28 audit, round 83, F83-L2-2)", deltas)
+	want := "text,tool_use"
+	if got := strings.TrimPrefix(deltas, `blocks=`); !strings.HasPrefix(got, want) {
+		t.Errorf("a finished call followed by prose streamed as %s, want %s — the prose block comes first because that is where this leg's own non-stream arm and the converter's whole-message arm put it, and the two spellings of one turn may not reach the client in different orders (2026-09-28 audit, round 84, R84-L2-1; reverses round 83's F83-L2-2)", deltas, want)
 	}
 	if args != `{"a":1}` {
 		t.Errorf("the emitted call's input is %q, want the wire's own `{\"a\":1}` (2026-09-28 audit, round 83)", args)
 	}
 }
 
-// TestACallStillBeingWrittenIsNotEmittedEarly guards the scope of F83-L2-2's
-// fix. The wire has not finished this call's arguments when the prose arrives,
-// so the call stays where it was and is written when its own bytes are done:
-// emitting it early would hand the client half an argument string as a
-// complete, executable call (rounds 16, 17).
+// TestACallStillBeingWrittenIsNotEmittedEarly guards the boundary the round-83
+// flush drew (and round 84's reversal keeps for a different reason). The wire
+// has not finished this call's arguments when the prose arrives, so the call
+// stays where it was and is written when its own bytes are done: emitting it
+// early would hand the client half an argument string as a complete,
+// executable call (rounds 16, 17).
 func TestACallStillBeingWrittenIsNotEmittedEarly(t *testing.T) {
 	open := `data: {"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"Bash","arguments":"{\"a\":"}}]}}]}`
 	textDelta := `data: {"id":"c","choices":[{"index":0,"delta":{"content":"a"}}]}`
