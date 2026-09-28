@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -945,9 +946,15 @@ type ResponsesStreamConverter struct {
 	reasoningItemID     string
 	reasoningStarted    bool
 	reasoningDone       bool
+	// reasoningItemIndex is the output_index the reasoning item was announced
+	// under.
+	reasoningItemIndex int
 
 	// Tool calls state (for final output)
 	toolCallItems []map[string]any
+	// toolCallItemIndexes[i] is the output_index toolCallItems[i] was announced
+	// under; the two slices are written together.
+	toolCallItemIndexes []int
 }
 
 // newEvent creates a ResponsesStreamEvent with the sequence number included in the data.
@@ -1139,6 +1146,7 @@ func (c *ResponsesStreamConverter) processThinking(thinking string) []ResponsesS
 	if !c.reasoningStarted {
 		c.reasoningStarted = true
 		c.reasoningItemID = fmt.Sprintf("rs_%d", rand.Intn(999999))
+		c.reasoningItemIndex = c.outputIndex
 
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
 			"output_index": c.outputIndex,
@@ -1227,6 +1235,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 			"arguments": tc.Function.Arguments,
 		}
 		c.toolCallItems = append(c.toolCallItems, toolCallItem)
+		c.toolCallItemIndexes = append(c.toolCallItemIndexes, idx)
 
 		// response.output_item.added for function call
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
@@ -1337,21 +1346,34 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 	// stated `[]` (2026-09-29 audit, round 94, F94-L1-2).
 	output := []any{}
 
-	// Add reasoning item if present
+	// The items are written in the order their own output_index claimed, because
+	// that is the order this same stream announced them to the client. A turn
+	// that CALLED and then narrated claimed 0 for the call and 1 for the message,
+	// and its text arrives after the call's item was opened — so a document that
+	// listed the message first told a client keying its bookkeeping on
+	// output_index (Codex, OMP) the opposite of what the events it had just read
+	// said (2026-09-29 audit, round 95, F95-L1-2). The order within one response
+	// is unchanged: text that arrives before a call still claims the lower index.
+	type finalItem struct {
+		index int
+		value any
+	}
+	items := make([]finalItem, 0, 1+len(c.toolCallItems))
+
+	// Reasoning item if present
 	if c.reasoningStarted {
-		output = append(output, map[string]any{
+		items = append(items, finalItem{c.reasoningItemIndex, map[string]any{
 			"id":                c.reasoningItemID,
 			"type":              "reasoning",
 			"summary":           []map[string]any{{"type": "summary_text", "text": c.accumulatedThinking}},
 			"encrypted_content": c.accumulatedThinking,
-		})
+		}})
 	}
 
-	// Add the message item if text was relayed, then the tool calls: a turn can
-	// hold both, and the client was sent deltas for the message whether or not
-	// a call followed (2026-09-27 audit, round 18).
+	// The message item if text was relayed. A turn that stated NO text gets no
+	// message item (2026-09-29 audit, round 94, F94-L1-2).
 	if c.contentStarted {
-		output = append(output, map[string]any{
+		items = append(items, finalItem{c.messageItemIndex, map[string]any{
 			"id":     c.itemID,
 			"type":   "message",
 			"status": "completed",
@@ -1362,12 +1384,17 @@ func (c *ResponsesStreamConverter) buildFinalOutput() []any {
 				"annotations": []any{},
 				"logprobs":    []any{},
 			}},
-		})
+		}})
 	}
 
-	// Add tool calls if present
-	for _, item := range c.toolCallItems {
-		output = append(output, item)
+	// The calls, each under the index it was announced with.
+	for i, item := range c.toolCallItems {
+		items = append(items, finalItem{c.toolCallItemIndexes[i], item})
+	}
+
+	sort.SliceStable(items, func(i, j int) bool { return items[i].index < items[j].index })
+	for _, it := range items {
+		output = append(output, it.value)
 	}
 
 	return output
