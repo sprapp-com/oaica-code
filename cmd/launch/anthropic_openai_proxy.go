@@ -3166,19 +3166,20 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// bytes arrived has adopted them as a call's arguments, so they are not
 		// prose and are left out here.
 		recorded := map[int]bool{}
-		// namelessBySlot holds the same bytes grouped by slot, in the order the
-		// wire wrote them: the flush relays them for a slot whose call the
-		// truncation gate drops below, and a call's own bytes are not prose, so
-		// the grouping has to stay a per-slot one (2026-09-28 audit, round 79,
-		// F79-L2-B).
-		namelessBySlot := map[int]string{}
+		// namelessFrags is the ONE record of these bytes that is in the order the
+		// wire wrote them, so it is also the record the relay is spelled from:
+		// which slots' bytes reach the client as prose is decided by the walk
+		// below — a slot whose accumulator still names nothing, and a slot whose
+		// call the truncation gate drops — and the text is written from it after
+		// that walk (2026-09-28 audit, round 80, F80-L2-1). Written during the
+		// walk it landed after every earlier slot's prose, and slots the wire
+		// introduced out of prose order put the model's output out of the order
+		// it wrote it in, which is what F77-L2-2 closed one loop over.
 		for _, f := range namelessFrags {
-			namelessBySlot[f.slot] += f.s
-			if a := toolAccums[f.slot]; a != nil && strings.TrimSpace(a.name) == "" {
-				unnamedText.WriteString(f.s)
-				recorded[f.slot] = true
-			}
+			recorded[f.slot] = true
 		}
+		// relayed marks the slots whose nameless bytes are prose on this flush.
+		relayed := map[int]bool{}
 		// droppedStatedIDs collects the ids stated by entries this flush does
 		// NOT hand to the converter — the nameless fragment below (its
 		// arguments relay as text) and the truncated fragment after it. The
@@ -3219,6 +3220,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				if s := strings.TrimSpace(a.args.String()); s != "" && !recorded[i] {
 					unnamedText.WriteString(s)
 				}
+				relayed[i] = true
 				continue
 			}
 			var args api.ToolCallFunctionArguments
@@ -3243,11 +3245,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// nothing is not a call (round 77) — and the call they were
 					// folded into is dropped here, so they would vanish with it.
 					// Relayed as the text every other arm of this body makes of
-					// them (2026-09-28 audit, round 79, F79-L2-B).
-					if !recorded[i] {
-						unnamedText.WriteString(namelessBySlot[i])
-						recorded[i] = true
-					}
+					// them (2026-09-28 audit, round 79, F79-L2-B), at the place
+					// the wire wrote them (round 80, F80-L2-1).
+					relayed[i] = true
 					continue
 				}
 				// Not a truncation: a model that emits freeform (non-JSON)
@@ -3260,6 +3260,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				ID:       a.id,
 				Function: api.ToolCallFunction{Name: a.name, Arguments: args},
 			})
+		}
+		// The relayed prose, in the order the wire wrote it — one entry per
+		// recorded fragment, so a slot's bytes land where the model put them and
+		// not where the slot was first seen (2026-09-28 audit, round 80,
+		// F80-L2-1).
+		for _, f := range namelessFrags {
+			if relayed[f.slot] {
+				unnamedText.WriteString(f.s)
+			}
 		}
 		// Reserved even when this flush emits nothing: the ids belong to the
 		// turn, and this converter answers the whole turn.
@@ -3730,7 +3739,22 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// The fragment must name the slot's own call, so an
 							// argument-only continuation (which names nothing) and
 							// a name-only restatement are both untouched.
-							(adoptedCallAt[slot] == nil && acc.name != "" &&
+							//
+							// Asked of a slot the ADOPTION wrote as well, unlike
+							// the canExtend clause above: the call there takes no
+							// arguments, so a fragment naming it again WITH
+							// arguments has nothing of its own to be more of, and
+							// the block the client holds is a complete,
+							// runnable call without them. Guarded, the fragment
+							// fell through to the adoption's drop and the same
+							// document reached the client as one call here, two on
+							// this leg's plain fragment arm and two whole
+							// (2026-09-28 audit, round 80, F80-L2-2). The adopted
+							// tail the clause above is about — the same call
+							// restated with DIFFERENT arguments — is not this
+							// shape: there the slot's arguments are on the wire and
+							// finished, here they never existed.
+							(acc.name != "" &&
 								tc.Function.Name == acc.name &&
 								strings.TrimSpace(acc.args.String()) == "" &&
 								strings.TrimSpace(tc.Function.Arguments) != "")) {
@@ -3965,6 +3989,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// the frame this leg adopted or as a delta
 						// (2026-09-28 audit, round 71, F71-L2-1).
 						conv.ReserveToolCallIDs(tc.ID)
+						// An entry that names nothing is not a call, so its bytes
+						// are the model's prose — and the block the adoption
+						// already wrote and closed is not where they can be
+						// delivered. Held in an accumulator of its own, which is
+						// what makes the flush relay them, in the order the wire
+						// wrote them and beside every other nameless entry's prose.
+						// Dropped instead, the model's output reached the client as
+						// nothing at all where this leg's whole-list arm relays it
+						// as text: the same rule, on the same drop, that the flush
+						// follows when the token limit cuts a call short (round 79,
+						// F79-L2-B) — this is the site that fix did not reach
+						// (2026-09-28 audit, round 80, F80-L2-4).
+						if args := strings.TrimSpace(tc.Function.Arguments); strings.TrimSpace(tc.Function.Name) == "" && args != "" {
+							held := nextFreeToolSlot
+							nextFreeToolSlot++
+							toolAccums[held] = &toolAccum{slot: held}
+							toolArrival[held] = nextToolArrival
+							nextToolArrival++
+							namelessFrags = append(namelessFrags, namelessFrag{slot: held, s: args})
+						}
 						continue
 					}
 				}
