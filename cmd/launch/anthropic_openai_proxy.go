@@ -2619,7 +2619,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 	// 200 — a dead turn reported as a successful one that consumed tokens
 	// (2026-09-26 audit).
 	if msg := upstreamErrorMessage(string(respBody), secret); msg != "" {
-		writeAnthropicError(w, http.StatusBadGateway, "upstream error: "+msg)
+		writeAnthropicError(w, http.StatusBadGateway, upstreamErrorPrefix+msg)
 		return false
 	}
 	var oaiResp openAIChatResponse
@@ -3088,6 +3088,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// line, match nothing, and report a truncated stream (see the adoption in
 	// the tail below).
 	var nonSSE strings.Builder
+	// eventBuf is the bytes of the SSE event being read, joined the way the SSE
+	// spec joins them: every `data:` line of one event, plus any line that
+	// carries no prefix, until the blank line that ends it. An error object
+	// arrives one line at a time — a vendor (or a CDN) that pretty-prints its
+	// JSON, or a sender that spreads a payload over several `data:` lines —
+	// and reading the stream line by line is what made that shape invisible
+	// here while the whole-body arm read it fine (2026-09-29 audit, round 87,
+	// F87-L2-2).
+	var eventBuf strings.Builder
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -3395,6 +3404,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		return adoptedCallAt[slot]
 	}
+	// heldCall is whether the turn already holds this call, wherever it is held:
+	// in an accumulator the stream is building, or in a call an adopted whole
+	// completion has already written for the client. Those are one question —
+	// "has this turn stated this call" — and both the fold's gate and its
+	// per-entry skip ask it. Asking only the accumulators let the frame spelling
+	// double a call the ADOPTION held: two frames carrying the same id-less call
+	// reached the client as two executable blocks under two ids, while the same
+	// two statements with the first spelled as a fragment reached it as one
+	// (2026-09-29 audit, round 87, F87-L2-1).
+	heldCall := func(name, args string) bool {
+		return accumHoldsTheCall(toolAccums, name, args) || accumHoldsTheCall(adoptedCallAt, name, args)
+	}
 	// namedBy reports whether a fragment stating this index is naming THIS call:
 	// the index the wire stated for the call, or, for a call whose fragments
 	// stated none, the slot it was given. It is the fragment arm's half of the
@@ -3421,7 +3442,24 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 		if line == "" {
+			// The blank line ends the event: what it held, joined, is the only
+			// reading of it that can recognise an object that spanned more than
+			// one line (2026-09-29 audit, round 87, F87-L2-2).
+			eventErr := eventErrorMessage(&eventBuf, secret)
+			if upstreamErr == "" && eventErr != "" {
+				upstreamErr = upstreamErrorPrefix + eventErr
+			}
 			continue
+		}
+		if int64(eventBuf.Len()) < httpbody.DefaultMax {
+			if eventBuf.Len() > 0 {
+				eventBuf.WriteByte('\n')
+			}
+			if payload, ok := strings.CutPrefix(line, "data:"); ok {
+				eventBuf.WriteString(strings.TrimSpace(payload))
+			} else {
+				eventBuf.WriteString(line)
+			}
 		}
 		if !strings.HasPrefix(line, "data:") {
 			// Not every failure arrives as an SSE frame: a 200 whose body is
@@ -3429,7 +3467,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// used to be skipped line by line until the stream "ended"
 			// cleanly with nothing in it.
 			if m := upstreamErrorMessage(line, secret); m != "" {
-				upstreamErr = m
+				upstreamErr = upstreamErrorPrefix + m
 			}
 			if int64(nonSSE.Len()) < httpbody.DefaultMax {
 				nonSSE.WriteString(line)
@@ -3462,7 +3500,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// Some upstreams report a mid-stream failure as an SSE frame
 			// carrying an error object rather than a choice.
 			if m := upstreamErrorMessage(payload, secret); m != "" {
-				upstreamErr = m
+				upstreamErr = upstreamErrorPrefix + m
 			}
 			continue
 		}
@@ -3475,7 +3513,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// the ordinary delta frames an answer is made of.
 		if strings.Contains(payload, `"error"`) {
 			if m := upstreamErrorMessage(payload, secret); m != "" {
-				upstreamErr = m
+				upstreamErr = upstreamErrorPrefix + m
 				continue
 			}
 		}
@@ -3535,7 +3573,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// the stream already holds is still left alone — and the two branches
 		// are mutually exclusive on `started` as it stood when the frame
 		// arrived, so a frame is never both adopted and folded.
-		if (started || len(toolAccums) > 0) && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
+		if (started || len(toolAccums) > 0) && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, heldCall) {
 			var doc openAIChatResponse
 			if err := json.Unmarshal([]byte(payload), &doc); err == nil && len(doc.Choices) > 0 && len(chunk.Choices) > 0 {
 				m := doc.Choices[0].Message
@@ -3555,7 +3593,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// comparison missed), and a freeform restatement had the two
 					// statements' bytes concatenated into a command the model
 					// never wrote. Both are F86-L2-1 (2026-09-28 audit, round 86).
-					if accumHoldsTheCall(toolAccums, tc.Function.Name, tc.Function.Arguments) {
+					if heldCall(tc.Function.Name, tc.Function.Arguments) {
 						continue
 					}
 					d.ToolCalls = append(d.ToolCalls, openAIStreamToolDelta{
@@ -3568,7 +3606,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 		}
 
-		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, toolAccums) {
+		if !started && len(toolAccums) == 0 && frameCarriesWholeCompletion(payload) && frameAddsToTheTurn(payload, heldCall) {
 			if adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
@@ -4328,6 +4366,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// and it emitted a COMPLETE, executable tool_use with
 	// stop_reason=tool_use either way. An agent then runs the fabricated
 	// call instead of retrying the turn (2026-09-26 audit).
+	// An event the upstream never closed with a blank line is still an event:
+	// a body that ends mid-object — the whole of a pretty-printed error, with
+	// no trailing newline — was recognised by nothing until here
+	// (2026-09-29 audit, round 87, F87-L2-2).
+	if upstreamErr == "" {
+		if m := eventErrorMessage(&eventBuf, secret); m != "" {
+			upstreamErr = upstreamErrorPrefix + m
+		}
+	}
+
 	if !completed {
 		// Nothing streamed and no error seen: the body may be a whole
 		// completion the upstream sent instead of frames. Adopt it as the turn
@@ -4560,7 +4608,7 @@ func accumHoldsTheCall(accums map[int]*toolAccum, name, args string) bool {
 // adopted when it carries something of its own; a frame that only restates the
 // calls the stream already holds is still not adopted, which is what that
 // clause was there for (round 56, F2; round 47, C-F3).
-func frameAddsToTheTurn(payload string, accums map[int]*toolAccum) bool {
+func frameAddsToTheTurn(payload string, held func(name, args string) bool) bool {
 	var resp openAIChatResponse
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
 		return false
@@ -4572,17 +4620,16 @@ func frameAddsToTheTurn(payload string, accums map[int]*toolAccum) bool {
 	if m.Content != "" || m.ReasoningContent != "" || m.Reasoning != "" {
 		return true
 	}
-	// A named call counts when the stream does not already hold it, whole:
-	// name for name and argument bytes for argument bytes, which is the
-	// comparison the restatement folds elsewhere on this leg make. It is asked
-	// CANONICALLY — `{"a": 1}` and `{"a":1}` are one call here as they are to
+	// A named call counts when the turn does not already hold it, whole: name
+	// for name and argument bytes for argument bytes, which is the comparison
+	// the restatement folds elsewhere on this leg make. It is asked CANONICALLY
+	// — `{"a": 1}` and `{"a":1}` are one call here as they are to
 	// `restatesAccumulatedCall` — because a frame restating a held call in the
 	// other spacing is the same restatement, and reading it as a new call is
 	// what the fold below would then relay twice (2026-09-28 audit, round 86,
-	// F86-L2-1).
-	held := func(name, args string) bool {
-		return accumHoldsTheCall(accums, name, args)
-	}
+	// F86-L2-1). What "held" means — the accumulators alone, or the calls an
+	// adopted whole completion wrote as well — is the caller's, because the
+	// caller is the one that knows both (2026-09-29 audit, round 87, F87-L2-1).
 	for _, tc := range m.ToolCalls {
 		name, args := tc.Function.Name, tc.Function.Arguments
 		if strings.TrimSpace(name) == "" && strings.TrimSpace(args) == "" {
@@ -4850,6 +4897,30 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 // cannot see it — the shape rules match URLs, and a vendor naming the key it
 // rejected writes it as ordinary prose — so it is redacted as a LITERAL too
 // (2026-09-26 audit, ninth round).
+// upstreamErrorPrefix is the qualifier every arm that reports an upstream's own
+// stated error puts in front of it. The whole-body arm has always said it; the
+// stream arms said the bare reason, so one upstream error object reached the
+// client as "upstream error: rate limited" when the turn was buffered and
+// "rate limited" when it was streamed (2026-09-29 audit, round 87, F87-L2-3).
+const upstreamErrorPrefix = "upstream error: "
+
+// eventErrorMessage reads the event just ended — its lines joined the way the
+// SSE spec joins them — and reports the upstream's own error when the event is
+// one, resetting the buffer either way. The `"error"` substring guard keeps the
+// parse off the ordinary delta frames an answer is made of (the same guard the
+// per-frame recognition uses).
+func eventErrorMessage(buf *strings.Builder, secret string) string {
+	if buf.Len() == 0 {
+		return ""
+	}
+	joined := buf.String()
+	buf.Reset()
+	if !strings.Contains(joined, `"error"`) {
+		return ""
+	}
+	return upstreamErrorMessage(joined, secret)
+}
+
 func upstreamErrorMessage(s, secret string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "{") {
