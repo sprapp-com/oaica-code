@@ -2742,7 +2742,7 @@ func (b *anthropicBridge) finalize() {
 		respBlocks = append(respBlocks, map[string]any{
 			"type": "tool_use", "id": id,
 			"name":  name,
-			"input": input,
+			"input": statedInputValue(callArgs, input),
 		})
 	}
 	// After the blocks that name themselves, which is where the stream path
@@ -3211,6 +3211,27 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				key = rekeyed
 			}
 		}
+		if id != "" && strings.TrimSpace(args) == "" && !restatesCarriedCall(b.toolBlocks[key], id, name, args) {
+			// An argument-less fragment that restates a call this bridge already
+			// holds — the same id, the same name, and the empty argument list
+			// the held call has — IS that call and not a new one, and the
+			// identity clause is the one the branch below asks of a fragment
+			// that states arguments (restatesCarriedIdentity). It has to be
+			// asked here as well, because the branch below is unreachable for a
+			// fragment that states none: the repeat opened a block of its own at
+			// the fragment's index, the held block was merged into that later
+			// one at the end of the turn, and the client's list came out
+			// [call_1, call_2] for a wire that wrote call_2 FIRST — while the
+			// same body's non-stream arm keeps the list's own order (2026-09-28
+			// audit, round 83, F83-L3-2).
+			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
+				(name == "" || carried.name == "" || name == carried.name) &&
+				restatesCarriedIdentity(carried, name, args) {
+				b.noteIndexKey(*upIdx, carried.key)
+				b.lastToolKey = carried.key
+				return carried.key
+			}
+		}
 		if id != "" && strings.TrimSpace(args) != "" && !restatesCarriedCall(b.toolBlocks[key], id, name, args) {
 			// A stated id names its call wherever the fragment writes it. The
 			// ordinary OpenAI order states the call's id on its introducing
@@ -3547,8 +3568,15 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 		// listed entry is naming a SECOND call — the reading startToolBlock's sweep
 		// already makes (round 46's G45-1 and round 57's F57-L3-1 are pinned by
 		// tests this clause would otherwise fold into one block).
+		// The identity clause is restatesCarriedCall's own question asked of the
+		// wires that predicate cannot read: an argument-less restatement of a
+		// call whose argument list is empty too has no finished arguments on
+		// either side for it to compare, so it fell through to the id's key,
+		// opened a second block, and the held call was merged into it at the end
+		// of the turn — the client's list came out in the wrong order on a wire
+		// the non-stream arm keeps (2026-09-28 audit, round 83, F83-L3-2).
 		if tb := b.blockCarrying(id, nil); tb != nil && (tb.statedID || tb.key == "!"+id) &&
-			restatesCarriedCall(tb, id, name, args) {
+			(restatesCarriedCall(tb, id, name, args) || restatesCarriedIdentity(tb, name, args)) {
 			if name != "" {
 				b.lastToolName = name
 			}
@@ -4008,6 +4036,12 @@ func toolCallIdentity(name, args string) string {
 // index-less arm split it into a SECOND block with a minted id — the model's one
 // call, delivered twice, and run twice (round 53's F4).
 //
+// "And both other legs do the same" was measured FALSE of one of them in round
+// 83: the adopted walk — the same document read entry by entry — had no fold, so
+// a list whose two entries restate one mid-object call answered TWO calls there
+// and ONE on this arm and on the client leg (F83-L3-1). The walk now makes the
+// same check this one does, with this one's own identity function.
+//
 // The stated id is what separates the two readings, exactly as it does in the
 // non-stream list: a fragment that repeats the same name and arguments under an
 // id the block does not hold is a second call the upstream numbered itself (the
@@ -4117,6 +4151,15 @@ func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
 // encoding/json on both sides, which sorts their keys — the other legs hold
 // them in a plain map[string]any inside the ordered top level, so this matches
 // there too.
+//
+// The ordered write is this file's only writer of argument text that a client
+// sees, and round 83 found one place that was not using it: the non-stream arm
+// built the block's `input` from the map callInput returns, so encoding/json
+// sorted the TOP level of what the client runs and a repeated key collapsed to
+// its last value there while the frame and adopted arms kept the model's own
+// bytes (F83-L3-3). statedInputValue is that arm's writer now — the same
+// canonical order, and a repeated key still takes its last value, which is what
+// the sibling leg's ordered map does with one (round 48's C-F5).
 //
 // Text that is not a JSON object has no keys to preserve and is kept as the
 // single-key "_raw" object, the shape the client leg and this bridge's own
@@ -4648,6 +4691,14 @@ func finishedObjectArgs(raw string) bool {
 // the held call opens the moment its own arguments arrive or, if they never do,
 // at the end of the turn (finishStream), which opens the waiting calls behind
 // it in this same order.
+//
+// Round 83 measured the last clause false for the shape where the held call
+// comes first and is RESTATED after the call that waited: the restatement did
+// not reuse the held block, so the held call was re-created at the end of
+// toolOrder and the end-of-turn sweep opened it behind its waiter — [call_1,
+// call_2] for a list written [call_2, call_1] (F83-L3-2). The clause holds
+// because routeToolKey now folds a restatement of a carried call, arguments or
+// none, back onto that call's key.
 func (b *anthropicBridge) waitsForEarlierToolCall(tb *toolBlock) bool {
 	for _, earlier := range b.toolOrder {
 		if earlier == tb {
@@ -5175,6 +5226,32 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		// 4096-body differential measures the document arms of all three legs
 		// agreeing on. The frame arm keeps the slot rule; it numbers fragments,
 		// where an index IS a slot.
+		//
+		// "In the list's own order" is a claim the round 83 audit measured FALSE
+		// for one shape before that walk grew its fold: a list that states an
+		// argument-less call first and restates it after another call came back
+		// [call_1, call_2] here and on the frame arm, where the non-stream arm of
+		// the same body kept [call_2, call_1] — the held call was swept to the
+		// end of the turn, behind the call that had waited for it (F83-L3-2).
+		// The order is kept because a restatement of a held call is that call
+		// and reuses its key (routeToolKey's two restatement folds); the fold
+		// above is what makes the repeat one call at all. Both halves are pinned
+		// in round83_document_entry_and_input_bytes_integrity_test.go.
+		// A restatement of the SAME call under the same stated id is one call
+		// the list stated twice, and the non-stream arm drops the repeat
+		// (statedIDOwner, round 48's C-F1) as both other legs do. This walk had
+		// no such fold, so a document whose two entries repeat one call — the
+		// same name and the same argument bytes, mid-object or whole — reached
+		// the client as TWO calls under `stream:true` and as one under
+		// `stream:false`, the second wearing a minted id (2026-09-28 audit,
+		// round 83, F83-L3-1). Asked before the entry is handed to toolDelta,
+		// which is the point where a block would be opened for it.
+		if tc.ID != "" {
+			if owner, ok := b.statedIDOwner[tc.ID]; ok && owner == toolCallIdentity(name, args) {
+				continue
+			}
+			b.statedIDOwner[tc.ID] = toolCallIdentity(name, args)
+		}
 		idx := i
 		b.toolDelta(&idx, tc.ID, name, args)
 	}
@@ -5375,7 +5452,15 @@ func deltaRelaysSomething(d oaDelta) bool {
 		return true
 	}
 	for _, tc := range d.ToolCalls {
-		if firstNonEmptyStr(tc.Function.Name, tc.Name) != "" ||
+		// The name is read the way every other reader of this field reads it
+		// (the adopt walk asks strings.TrimSpace(name) == "", namesItself asks
+		// it of a block): a name of whitespace is no more a name than an absent
+		// one, so an entry carrying only one relays nothing. Read bare, it
+		// committed message_start and made this arm answer 200 with an error
+		// event inside the stream where both document arms of the same body
+		// answer 502 — the ledger row booked 502 for a turn served as 200
+		// (2026-09-28 audit, round 83, F83-L3-4).
+		if strings.TrimSpace(firstNonEmptyStr(tc.Function.Name, tc.Name)) != "" ||
 			firstNonEmptyStr(tc.Function.Arguments, tc.Arguments) != "" {
 			return true
 		}
@@ -5645,6 +5730,34 @@ func (b *anthropicBridge) emit(event string, data any) {
 //
 // A call with no arguments at all is a call: the empty string is a complete
 // argument list for a tool that takes none.
+// statedInputValue is the value the non-stream arm writes as a block's input:
+// the argument text re-encoded the way an ORDERED map encodes it
+// (canonicalCallArgs: the keys in the order they were first written, each with
+// the last value the object gave it), or the parsed object when the text is not
+// an object at all.
+//
+// The map callInput returns answers the right QUESTION — is it an object, is it
+// freeform, is it truncated — and is the wrong BYTES to write: encoding/json
+// sorts its keys, so one upstream call reached the client with `{"a":2,"z":1}`
+// on this arm and with the model's own `{"z":1,"a":2}` on the frame and adopted
+// arms. The input is what the client RUNS, and both other legs hold the
+// arguments in an insertion-ordered map (api/types.go's
+// ToolCallFunctionArguments, marshalled in that order), so this arm was the
+// only reader that re-spelled the model's own key order (2026-09-28 audit,
+// round 83, F83-L3-3). A repeated key still takes its last value, which is what
+// that ordered map does with one and what round 48's C-F5 pinned here.
+//
+// Text that is not an object keeps the parsed value: the `_raw` wrapper for
+// freeform, the empty object for `null` and for no arguments at all (the block's
+// input is a required object on this wire).
+func statedInputValue(raw string, parsed map[string]any) any {
+	canonical := canonicalCallArgs(raw)
+	if strings.HasPrefix(canonical, "{") && json.Valid([]byte(canonical)) {
+		return json.RawMessage(canonical)
+	}
+	return parsed
+}
+
 func callInput(raw string, truncated bool) (map[string]any, bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
