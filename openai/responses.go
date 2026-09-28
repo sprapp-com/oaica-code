@@ -1149,13 +1149,27 @@ func (c *ResponsesStreamConverter) processThinking(thinking string) []ResponsesS
 		c.reasoningItemIndex = c.outputIndex
 
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
-			"output_index": c.outputIndex,
+			"output_index": c.reasoningItemIndex,
 			"item": map[string]any{
 				"id":      c.reasoningItemID,
 				"type":    "reasoning",
 				"summary": []any{},
 			},
 		}))
+		// The item claims its index HERE, the way the message item does, so
+		// that every later event about it can name the index it was announced
+		// at. It used to be claimed when the item was CLOSED, which meant a
+		// close that happened after another item had been announced named that
+		// item's index instead (2026-09-29 audit, round 96, F96-L1-3).
+		c.outputIndex++
+	} else if c.reasoningDone {
+		// Thinking that resumes after the item was closed — think, answer,
+		// think again — is the SAME item: the terminal document states one
+		// reasoning item whose summary is the whole of the thinking, and the
+		// buffered arm states the same turn. Reopened so the summary it closes
+		// with is the whole text rather than the prefix that had arrived when
+		// the answer interrupted it (round 96, F96-L1-3).
+		c.reasoningDone = false
 	}
 
 	// Accumulate thinking
@@ -1164,7 +1178,7 @@ func (c *ResponsesStreamConverter) processThinking(thinking string) []ResponsesS
 	// Emit delta
 	events = append(events, c.newEvent("response.reasoning_summary_text.delta", map[string]any{
 		"item_id":       c.reasoningItemID,
-		"output_index":  c.outputIndex,
+		"output_index":  c.reasoningItemIndex,
 		"summary_index": 0,
 		"delta":         thinking,
 	}))
@@ -1186,12 +1200,12 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 	events := []ResponsesStreamEvent{
 		c.newEvent("response.reasoning_summary_text.done", map[string]any{
 			"item_id":       c.reasoningItemID,
-			"output_index":  c.outputIndex,
+			"output_index":  c.reasoningItemIndex,
 			"summary_index": 0,
 			"text":          c.accumulatedThinking,
 		}),
 		c.newEvent("response.output_item.done", map[string]any{
-			"output_index": c.outputIndex,
+			"output_index": c.reasoningItemIndex,
 			"item": map[string]any{
 				"id":                c.reasoningItemID,
 				"type":              "reasoning",
@@ -1201,7 +1215,6 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 		}),
 	}
 
-	c.outputIndex++
 	return events
 }
 
