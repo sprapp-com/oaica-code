@@ -4464,6 +4464,30 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			tb, ok = nil, false
 		}
 	}
+	for _, o := range b.toolOrder {
+		// A call the wire has MOVED ON from is finished, whatever its bytes are.
+		// A block this bridge is HOLDING (the freeform or truncated line below,
+		// delivered whole at the end of the call) is never `b.cur`, so closeOpen
+		// never reaches it, and every fragment that followed was still routed
+		// into it: the nameless fragment after the NEXT call was folded into the
+		// earlier line, where the closed-block rule the round-81 pin states
+		// (F81-L3-3: a closed block leaves the run it was holding) relays it as
+		// prose. Closing a held call the moment another call is named is what
+		// that rule asks of it — the same reading, reached from the other side
+		// (2026-09-29 audit, round 98, F98-L3-1).
+		//
+		// The predicate is the FREEFORM line, not `!finishedObjectArgs`: a block
+		// holding a half-written OBJECT is still being written by the fragments
+		// that follow it, and closing one here measured RED on three pins of the
+		// wire that feeds one index across several calls (round 39's B-F7 family,
+		// rounds 63 and 77) — `TestALateFragmentCompletesTheCallItBelongsTo`,
+		// `TestACallInProgressIsNotClosedForTheNextOne`,
+		// `TestASecondNameMidObjectIsTheNextCall`.
+		if t := strings.TrimSpace(o.args.String()); o != tb && !o.started && !o.merged && namesItself(o) &&
+			t != "" && !strings.HasPrefix(t, "{") {
+			o.closed = true
+		}
+	}
 	if !ok {
 		tb = &toolBlock{key: key, index: -1}
 		b.toolBlocks[key] = tb
@@ -4631,7 +4655,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// (finishStream), which opens it with its empty input.
 			return
 		}
-		if argsAreMidObject(tb.args.String()) {
+		if !finishedObjectArgs(tb.args.String()) {
 			// The arguments stated so far are an object the upstream has not
 			// finished writing, so opening now would hand the client the half an
 			// object — and the object it opens with is the input the client RUNS.
@@ -4652,6 +4676,19 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// arguments stated so far follow in one delta below) or until the
 			// turn ends, where finishStream applies the drop and the wrap the
 			// other arms apply.
+			//
+			// `finishedObjectArgs`, not `argsAreMidObject`: a call whose stated
+			// arguments never began an object at all is not a half-object the
+			// next fragment completes — nothing the wire can send completes
+			// `echo hi`, or `"s"`, or `[1]`, or `42`, into a call the client can
+			// run — and holding it here is what lets the turn's end drop it as a
+			// truncated call, which is what BOTH document arms of that body do
+			// and what the client leg does (measured on the frozen tree: with
+			// `argsAreMidObject` the framed arm handed the client
+			// `call:call_1|Bash|{"_raw":"echo hi"}` where plain and adopted
+			// handed `[text:hi]`, and for a freeform call split across two
+			// fragments the framed arm minted a SECOND id where the whole body
+			// mints one). (2026-09-29 audit, round 98, F98-L3-1 and F98-L3-2.)
 			return
 		}
 		if b.waitsForEarlierToolCall(tb) {
