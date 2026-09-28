@@ -363,6 +363,17 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		c.Header("Content-Type", contentType)
 
 		relayChunks, relayDone := 0, false
+		// A client that asked for one document gets one document, decided once:
+		// a chunk that does not end the turn is held, not written, because the
+		// framing the relay writes is ndjson only for a streaming client. Writing
+		// a Done-less chunk put a whole document on the wire before the turn was
+		// known to be over, and the failure frame then appended after it left the
+		// client a body that is not JSON at all — 200, a complete-looking answer
+		// and no way to read either (2026-09-29 audit, round 92, F92-L1-5). Held
+		// bytes are the remote's own, so a turn that does end is byte-for-byte
+		// what it always was.
+		relayBuffered := req.Stream != nil && !*req.Stream
+		var relayHeld []byte
 		fn := func(resp api.GenerateResponse) error {
 			resp.Model = origModel
 			resp.RemoteModel = m.Config.RemoteModel
@@ -377,7 +388,16 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				return err
 			}
 
-			if _, err = c.Writer.Write(append(data, '\n')); err != nil {
+			line := append(data, '\n')
+			if relayBuffered && !resp.Done {
+				relayHeld = append(relayHeld, line...)
+				return nil
+			}
+			if relayBuffered && len(relayHeld) > 0 {
+				line = append(relayHeld, line...)
+				relayHeld = nil
+			}
+			if _, err = c.Writer.Write(line); err != nil {
 				return err
 			}
 			c.Writer.Flush()
@@ -2821,6 +2841,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		c.Header("Content-Type", contentType)
 
 		relayChunks, relayDone := 0, false
+		// See the generate branch above for why a non-streaming client's chunks
+		// are held until the turn is known to be over (2026-09-29 audit,
+		// round 92, F92-L1-5).
+		relayBuffered := req.Stream != nil && !*req.Stream
+		var relayHeld []byte
 		fn := func(resp api.ChatResponse) error {
 			resp.Model = origModel
 			resp.RemoteModel = m.Config.RemoteModel
@@ -2835,7 +2860,16 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				return err
 			}
 
-			if _, err = c.Writer.Write(append(data, '\n')); err != nil {
+			line := append(data, '\n')
+			if relayBuffered && !resp.Done {
+				relayHeld = append(relayHeld, line...)
+				return nil
+			}
+			if relayBuffered && len(relayHeld) > 0 {
+				line = append(relayHeld, line...)
+				relayHeld = nil
+			}
+			if _, err = c.Writer.Write(line); err != nil {
 				return err
 			}
 			c.Writer.Flush()
