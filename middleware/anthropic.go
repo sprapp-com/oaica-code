@@ -36,6 +36,57 @@ type AnthropicWriter struct {
 	// and auto-compaction that never fired, for a request the client can send
 	// just as easily (2026-09-27 audit, round 40, C40-6).
 	estimatedInputTokens int
+	// failed is set when an error frame ended this turn. Everything after it is
+	// nothing: the client has been told why the turn stopped, and a converter
+	// fed the frames that follow would write content events for a turn that is
+	// over (2026-09-28 audit, round 72, F72-L1-1).
+	failed bool
+}
+
+// upstreamErrorFrame reads the error frame the chat path puts into a 200 stream
+// when the generation dies partway (server/routes.go:2149-2166, filled from the
+// parser failure at :2947 and the completion error at :2954). Its shape is the
+// buffered path's own: a gin.H with an "error" string, and a "status" when the
+// upstream named one. The name is not a field of api.ChatResponse, so without
+// this reading the frame unmarshals to a zero chunk and the arm answers nothing
+// — the same body refused when buffered and silently truncated when streamed.
+func upstreamErrorFrame(data []byte) (sentence string, status int, ok bool) {
+	var frame struct {
+		Error  *string `json:"error"`
+		Status *int    `json:"status"`
+	}
+	if err := json.Unmarshal(data, &frame); err != nil {
+		return "", 0, false
+	}
+	if frame.Error == nil {
+		return "", 0, false
+	}
+	status = http.StatusInternalServerError
+	if frame.Status != nil && *frame.Status != 0 {
+		status = *frame.Status
+	}
+	return *frame.Error, status, true
+}
+
+// failTurn states the failure to the client in the shape the Anthropic wire
+// defines for it — the same error event the gateway leg emits for a mid-stream
+// error frame, and the same envelope the buffered arm answers with. The events
+// already sent cannot be un-sent, so a streaming turn delivers the error on the
+// wire rather than pretending it completed.
+func (w *AnthropicWriter) failTurn(sentence string, status int) (int, error) {
+	if w.failed {
+		return 0, nil
+	}
+	w.failed = true
+	if w.stream {
+		if err := w.writeEvent("error", anthropic.NewError(status, sentence)); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+	w.ResponseWriter.Header().Set("Content-Type", "application/json")
+	w.ResponseWriter.WriteHeader(status)
+	return 0, json.NewEncoder(w.ResponseWriter).Encode(anthropic.NewError(status, sentence))
 }
 
 // withInputEstimate fills in the prompt count a turn's usage does not state. It
@@ -109,9 +160,17 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 }
 
 func (w *AnthropicWriter) Write(data []byte) (int, error) {
+	if w.failed {
+		return len(data), nil
+	}
+
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
 		return w.writeError(data)
+	}
+
+	if sentence, status, ok := upstreamErrorFrame(data); ok {
+		return w.failTurn(sentence, status)
 	}
 
 	return w.writeResponse(data)
@@ -208,6 +267,16 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	code := w.Status()
 	if code != http.StatusOK {
 		return w.inner.writeError(data)
+	}
+
+	// A mid-stream error frame ends the turn here too. This arm absorbed the
+	// frame as narration while the loop was in flight and answered 200 with an
+	// empty body — the model's last words discarded and no reason given, while
+	// the buffered arm of the same turn refused it with the sentence
+	// (2026-09-28 audit, round 72, F72-L1-1).
+	if sentence, status, ok := upstreamErrorFrame(data); ok {
+		w.terminalSent = true
+		return w.inner.failTurn(sentence, status)
 	}
 
 	var chatResponse api.ChatResponse
