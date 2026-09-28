@@ -2217,12 +2217,33 @@ func relayEndedWithoutAFinalResponse(c *gin.Context, chunks int) {
 // A peer that stated no message still stated a status, and its own clients are
 // answered that status: falling back to Error() keeps the cause, where an empty
 // string becomes the middleware's generic "something went wrong" sentence.
+//
+// This is a DELIBERATE divergence from the runner lane, pinned by round 93
+// (round93_relayed_refusal_body_test.go): the runner lane writes
+// `gin.H{"error": serr.ErrorMessage}` whatever that field holds (routes.go:3254,
+// :3382), so a failure whose text is empty reaches a direct client as
+// `{"error":""}` where the same relayed turn is answered
+// `{"error":"500 Internal Server Error"}`. Round 95 measured the pair and left it
+// standing — the relayed reading is the more useful of the two, and improving
+// the other means changing the runner lane's contract on every surface rather
+// than an audit round's edit (2026-09-29 audit, round 95, F95-L1-4, recorded).
 func writeRelayedStatusError(c *gin.Context, apiError api.StatusError) {
 	msg := apiError.ErrorMessage
 	if msg == "" {
 		msg = apiError.Error()
 	}
 	if !c.Writer.Written() {
+		// The relay fixed its own Content-Type before it consulted the peer
+		// (routes.go:2879-2883) and gin will not replace a header that is already
+		// set, so a peer that refused the whole turn as one document reached a
+		// native client as `application/x-ndjson` — where the direct lane's
+		// byte-identical answer, and every translated surface on both lanes, is
+		// `application/json` (2026-09-29 audit, round 95, F95-L1-3). The direct
+		// lane corrects it in the same place (routes.go:2284). A non-streaming
+		// relay already said `application/json; charset=utf-8` and keeps it.
+		if ct := c.Writer.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			c.Header("Content-Type", "application/json")
+		}
 		c.JSON(apiError.StatusCode, gin.H{"error": msg})
 		return
 	}
