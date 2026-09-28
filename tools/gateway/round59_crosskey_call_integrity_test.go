@@ -137,13 +137,25 @@ func TestTheCallsRestatedUnderTheirOwnIDsAreOneEach(t *testing.T) {
 // F59-C-1 and F59-C-2: the turn's first call opened index-less, named later by
 // the index 0 the client leg parks it at.
 func TestTheCallIntroducedWithoutAnIndexIsReachableByTheIndexThatNamesIt(t *testing.T) {
-	t.Run("the call restated at index 0", func(t *testing.T) {
+	// REVERSED by round 73 (F73-L3-2). Round 59 read this wire as ONE call, on
+	// the claim that "the client leg parks an index-less call at slot 0 and
+	// finds it there". Measured, that is false: the client leg's fragment arm
+	// answers this wire with TWO blocks, because neither listing states an id —
+	// round 69 narrowed exactly that rule on that leg ("at least one side must
+	// have stated an id"), and its non-stream list arm and the local converter
+	// agree (round 73's measurement: leg 1 two, leg 2 two, this bridge's own
+	// document arm two). This arm was the only one folding two calls that named
+	// themselves nowhere into one, so an upstream asking for the same tool
+	// twice lost a call here and nowhere else. What round 59 was right about is
+	// kept: the second fragment is NOT appended to the first — it opens a block
+	// of its own, and no arm hands the client `{"a":1}{"a":1}`.
+	t.Run("the call restated at index 0 is a second call", func(t *testing.T) {
 		ids, parts, body := r59FrameBlocks(t,
 			`data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"Bash","arguments":"{\"a\":1}"}}]}}]}`,
 			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Bash","arguments":"{\"a\":1}"}}]}}]}`,
 		)
-		if len(ids) != 1 || parts[0] != `{"a":1}` {
-			t.Errorf("a call introduced with no index and named again at index 0 reached the client as %d block(s) %v %v, want the model's one call — the client leg parks an index-less call at slot 0 and finds it there, and this bridge's synthetic key was unreachable from \"#0\": the one call was delivered TWICE, under two ids, and an agent loop runs it twice (2026-09-28 audit, round 59, F59-C-1)\n%s",
+		if len(ids) != 2 || parts[0] != `{"a":1}` || parts[1] != `{"a":1}` {
+			t.Errorf("two calls that named themselves nowhere and both carry the same finished arguments reached the client as %d block(s) %v %v, want two: a wire that states no id for a call states nothing that makes a second listing the same call, which is what both other legs and this bridge's own document arm read it as (2026-09-28 audit, round 73, F73-L3-2)\n%s",
 				len(ids), ids, parts, body)
 		}
 	})

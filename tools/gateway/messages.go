@@ -3921,6 +3921,27 @@ func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
 		// key names as a repeat of the first.
 		return false
 	}
+	// The call this fragment restates must be one the UPSTREAM named. Two
+	// entries that state the same name and the same finished arguments and no
+	// id at all are two calls, not one call listed twice: nothing in the wire
+	// says they are the same call, and both other legs read that wire with two
+	// blocks — the client leg's fragment arm folds only onto a twin whose id
+	// the upstream STATED, and its list arm records such a twin the same way
+	// (A45-2). Folded here regardless, this arm answered the same body with ONE
+	// block where the client leg and the local server answer two, so an
+	// upstream asking for the same tool twice lost one of the two calls on this
+	// leg alone (2026-09-28 audit, round 73, F73-L3-2). F1 and F2 both restate a
+	// call whose id the upstream stated — on the introducing chunk, or on the
+	// chunk before the repeat — so they are untouched by this.
+	//
+	// The block that was already OPEN when the id arrived (the B45-1 re-key)
+	// owns a stated id without carrying it as its own: it had already told the
+	// client the minter's id, so `statedID` is false for the rest of the stream
+	// and the id it was re-keyed to is the key it is held under — the same
+	// disjunction the mint's guard above reads (F59-L3-3, F59-L3-5).
+	if !tb.statedID && tb.key != "!"+id {
+		return false
+	}
 	if name != "" && name != tb.name {
 		return false
 	}
@@ -4897,7 +4918,20 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		if _, ok := callInput(args, truncated); !ok {
 			continue
 		}
+		// The entry's slot: the index the wire states for it, else its position
+		// in the list. A list entry that states no index is a call the upstream
+		// named in the list's own order, which is the position — but one that
+		// DOES state an index names the same slot the frame arm would number it
+		// by, and that is the slot identity `restatesCarriedCall` folds on. Read
+		// as the position alone, an entry restating a call the list already
+		// stated under that call's own index (`"index":0` on the second entry of
+		// a two-entry list) opened a SECOND block with a minted id while this
+		// leg's own frame arm — and the client leg's fragment arm — answered the
+		// same body with one (2026-09-28 audit, round 73, F73-L2-1).
 		idx := i
+		if tc.Index != nil {
+			idx = *tc.Index
+		}
 		b.toolDelta(&idx, tc.ID, name, args)
 	}
 	// After the blocks that name themselves, which is where the other two arms
