@@ -40,11 +40,16 @@ func itoa73(n int) string {
 	return "1"
 }
 
-// r73ArglessHolderWhole is the same two calls as one whole completion.
+// r73ArglessHolderWhole is the same two calls as one whole completion — with
+// the SAME stated indexes as r73FragWire's frames, because a pin that compares
+// two spellings has to compare one body: written before round 74 without them,
+// it read a whole document whose entries state no index at all against a stream
+// whose frames state 0 and 1, so it was pinning agreement between two different
+// bodies (2026-09-28 audit, round 74, F74-2).
 const r73ArglessHolderWhole = `{"id":"c","object":"chat.completion","model":"glm-5.3","choices":[{"index":0,` +
 	`"message":{"role":"assistant","content":"","tool_calls":[` +
-	`{"id":"call_c","function":{"name":"Bash","arguments":""}},` +
-	`{"id":"call_c","function":{"name":"Bash","arguments":"{\"a\": 1}"}}]},` +
+	`{"index":0,"id":"call_c","function":{"name":"Bash","arguments":""}},` +
+	`{"index":1,"id":"call_c","function":{"name":"Bash","arguments":"{\"a\": 1}"}}]},` +
 	`"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":10}}`
 
 // TestACallRestatedAtAFreshIndexIsItsOwnCall is the F73-L2-2 pin.

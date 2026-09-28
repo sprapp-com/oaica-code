@@ -836,19 +836,34 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 	// seenInList counts how often each call identity has appeared in this
 	// list, so a repeat takes the streaming converter's "#n" rule (A45-2).
 	seenInList := make(map[string]int, len(tcs))
-	// statedCallSlots holds, per identity, the SLOT every call this list stated
-	// an id for occupies — the index it names, or, when it names none, the
-	// position it is listed at. A later id-less entry repeating one of them is
+	// statedCallSlots holds, per identity, EVERY slot a call this list stated an
+	// id for occupies — the index it names, or, when it names none, the slot the
+	// numbering below gives it. A later id-less entry repeating one of them is
 	// that call restated rather than a second call, but only when it NAMES that
 	// slot: the frame arms of both this leg and the gateway leg fold exactly
-	// there and nowhere else (see the fold below).
-	statedCallSlots := make(map[string]int, len(tcs))
+	// there and nowhere else (see the fold below). A SET and not a single slot,
+	// because a call listed twice under its own id was stated at two slots and a
+	// restatement naming EITHER of them is the same call listed again; keeping
+	// only the last one read the earlier slot as a fresh one and minted a second
+	// call for it (2026-09-28 audit, round 74, F74-3).
+	statedCallSlots := make(map[string]map[int]bool, len(tcs))
+	// nextFreeSlot numbers the entries the way this leg's FRAGMENT arm numbers
+	// the fragments of the same wire: an entry that states an index occupies that
+	// index, and an entry that states none takes the next free slot, this counter
+	// being kept above every index the list has stated. The two arms only agree
+	// while they number slots the same way, and a restatement is folded by the
+	// SLOT its twin occupies. Numbered by list position instead, an index-less
+	// entry that followed a stated index was given a slot the fragment arm had
+	// given to a different call, so the same body answered one call on one arm
+	// and two on the other — eight bodies that agreed before round 73 diverged
+	// the moment the fold became slot-aware (2026-09-28 audit, round 74, F74-1).
+	nextFreeSlot := 0
 	for _, tc := range tcs {
 		if tc.ID != "" {
 			usedIDs[tc.ID] = true
 		}
 	}
-	for i, tc := range tcs {
+	for _, tc := range tcs {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call on this path either:
 			// its arguments reach the client as TEXT (relayUnnamedCallArguments,
@@ -927,16 +942,34 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		// that reads it (2026-09-28 audit, round 73, F73-L2-1). An entry that
 		// names no slot names nothing to fold onto: this list's positions are
 		// not slots the wire stated.
+		//
+		// Which slot a twin occupies is asked of the numbering the fragment arm
+		// uses, one entry at a time (nextFreeSlot above), and the answer is a SET
+		// of the slots this identity was stated at — round 73 asked both of the
+		// entry's list position and of the last slot it saw, and each of those
+		// lost a call the wire had asked for (2026-09-28 audit, round 74, F74-1
+		// and F74-3).
+		// The slot this entry occupies, numbered as the fragment arm numbers it.
+		slot := nextFreeSlot
+		if tc.Index != nil {
+			slot = *tc.Index
+			if slot >= nextFreeSlot {
+				nextFreeSlot = slot + 1
+			}
+		} else {
+			nextFreeSlot++
+		}
 		if tc.ID == "" {
-			if slot, stated := statedCallSlots[identity]; stated && tc.Index != nil && *tc.Index == slot {
+			if slots, stated := statedCallSlots[identity]; stated && tc.Index != nil && slots[*tc.Index] {
 				continue
 			}
 		} else {
-			slot := i
-			if tc.Index != nil {
-				slot = *tc.Index
+			slots := statedCallSlots[identity]
+			if slots == nil {
+				slots = map[int]bool{}
+				statedCallSlots[identity] = slots
 			}
-			statedCallSlots[identity] = slot
+			slots[slot] = true
 		}
 		id := tc.ID
 		minted := false
@@ -2699,6 +2732,17 @@ type toolAccum struct {
 	id   string
 	name string
 	args strings.Builder
+	// slot is the slot this call sits at — its own number, because the fold
+	// below has to ask whether a fragment is naming THIS call's slot and the
+	// map key is not passed to every rule that asks about an occupant.
+	slot int
+	// statedSlots are the indices the wire itself stated for this call. A call
+	// introduced at one index and split onto another slot keeps the index the
+	// upstream stated for it (round 59's F59-L2-1), and that index — not the
+	// slot the call ended up at — is what a later fragment has to name to be
+	// this call restated. Empty for a call whose fragments stated no index at
+	// all; such a call is named by the slot it was given.
+	statedSlots map[int]bool
 }
 
 func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int, secret string) bool {
@@ -3250,6 +3294,28 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		return adoptedCallAt[slot]
 	}
+	// namedBy reports whether a fragment stating this index is naming THIS call:
+	// the index the wire stated for the call, or, for a call whose fragments
+	// stated none, the slot it was given. It is the fragment arm's half of the
+	// slot rule the whole-list arm applies to the same bytes (round 74's F74-1),
+	// and it is what a restatement has to satisfy to be the call it repeats: a
+	// fragment stating a FRESH index is the wire's own signal for a new call
+	// (rounds 61 and 73), EXCEPT where that index is the slot the accumulated
+	// call's own statement identifies — the call introduced without an index sits
+	// at the slot it was allocated, and the restatement that names it is that
+	// call listed again. Asking "is this index fresh?" instead of "does this
+	// index name this call?" lost exactly that case, and the same body's
+	// whole-list arm answered one call where this arm answered two (2026-09-28
+	// audit, round 74, F74-1a).
+	namedBy := func(acc *toolAccum, stated int) bool {
+		if acc == nil {
+			return false
+		}
+		if len(acc.statedSlots) == 0 {
+			return acc.slot == stated
+		}
+		return acc.statedSlots[stated]
+	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -3449,10 +3515,22 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			for _, tc := range d.ToolCalls {
 				slot := 0
 				indexed := tc.Index != nil
+				// freshIndex is the index this fragment states being one the
+				// stream has never written. Both routes above already read a
+				// fresh index as this leg's own signal for a new call — the id
+				// route refuses one (round 73's F73-L2-2), the name route is
+				// asked only at a seen index (round 61's F61-L2-3) — and the
+				// restatement fold below is the third reader of the same
+				// question. It asks it as namedBy does: not "is this index
+				// fresh?" but "does this index name the call the slot holds?".
+				// See namedBy for the body that asks the two differently
+				// (2026-09-28 audit, round 74, F74-1b).
+				freshIndex := false
 				if indexed {
 					slot = *tc.Index
 					indexSeen := seenIndex[slot]
 					seenIndex[slot] = true
+					freshIndex = !indexSeen
 					if cur, ok := indexSlot[slot]; ok {
 						// The index names the SLOT; the call that slot holds is
 						// what a fragment stating the index continues. A vendor
@@ -3481,7 +3559,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// ordinary wire — where the stated id restates the call the
 					// index names — is untouched, and round 56's F1 restatement,
 					// whose call is finished, keeps its own slot.
-					if stated, ok := openSlotStating(tc.ID, tc.Function.Name, indexSeen, indexed && !indexSeen); ok {
+					if stated, ok := openSlotStating(tc.ID, tc.Function.Name, indexSeen, freshIndex); ok {
 						slot = stated
 					}
 					// A fragment that states NO id and no name is an argument
@@ -3522,7 +3600,8 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						}
 					}
 					if acc := slotCall(slot); acc != nil &&
-						!restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) &&
+						!(restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) &&
+							namedBy(acc, *tc.Index)) &&
 						((tc.ID != "" && acc.id != "" && tc.ID != acc.id) ||
 							(tc.Function.Name != "" && acc.name != "" && tc.Function.Name != acc.name) ||
 							(adoptedCallAt[slot] == nil &&
@@ -3719,7 +3798,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				}
 				acc, exists := toolAccums[slot]
 				if !exists {
-					acc = &toolAccum{}
+					acc = &toolAccum{slot: slot}
 					toolAccums[slot] = acc
 					toolArrival[slot] = nextToolArrival
 					nextToolArrival++
@@ -3731,6 +3810,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// Asked before the writes, because a text appended here is a
 					// text already delivered.
 					continue
+				}
+				if tc.Index != nil {
+					// The index the wire stated for this call, kept whether the
+					// fragment opened the call or was routed into it: it is what a
+					// later restatement has to name, and the slot the call ended
+					// up at need not be it (a split re-points the index).
+					if acc.statedSlots == nil {
+						acc.statedSlots = map[int]bool{}
+					}
+					acc.statedSlots[*tc.Index] = true
 				}
 				if tc.ID != "" {
 					acc.id = tc.ID
@@ -4081,7 +4170,7 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			if strings.TrimSpace(tc.Function.Name) == "" {
 				continue
 			}
-			acc := &toolAccum{id: tc.ID, name: tc.Function.Name}
+			acc := &toolAccum{id: tc.ID, name: tc.Function.Name, slot: slot}
 			if tc.Function.Arguments != "" {
 				acc.args.WriteString(tc.Function.Arguments)
 			}
