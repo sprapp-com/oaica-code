@@ -3729,6 +3729,27 @@ func (b *anthropicBridge) idHeldByASeparateCall(tb *toolBlock, id string) bool {
 	return false
 }
 
+// namedBlockCarrying is blockCarrying restricted to blocks that NAME
+// themselves: the holders the client can actually see. A block the upstream
+// never named opens no tool_use at all (round 39's B-F8), so it is not a holder
+// — and a sweep that stopped at one skipped the guard below entirely, letting a
+// restated call open a SECOND block under the id while the named block that
+// carried it sat beside it. Two tool_use blocks under one id get one tool_result
+// for two calls, and both whole-document arms answer the wire with one block
+// (2026-09-28 audit, round 70, R70-L3-1).
+func (b *anthropicBridge) namedBlockCarrying(id string, tb *toolBlock) *toolBlock {
+	if id == "" {
+		return nil
+	}
+	for _, other := range b.toolOrder {
+		if other == tb || other.merged || other.id != id || !namesItself(other) {
+			continue
+		}
+		return other
+	}
+	return nil
+}
+
 // blockCarrying returns the block other than tb that already carries id, or nil
 // when no block does.
 func (b *anthropicBridge) blockCarrying(id string, tb *toolBlock) *toolBlock {
@@ -4368,7 +4389,7 @@ func (b *anthropicBridge) startToolBlock(tb *toolBlock) bool {
 	if tb.started || tb.merged {
 		return false
 	}
-	if other := b.blockCarrying(tb.id, tb); other != nil && namesItself(other) {
+	if other := b.namedBlockCarrying(tb.id, tb); other != nil {
 		// The id this call is about to carry is one another block already
 		// carries, and the client can answer a tool_use only once: two blocks
 		// under one id get one tool_result for two calls. What that makes this
