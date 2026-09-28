@@ -4209,7 +4209,19 @@ func toolCallIdentity(name, args string) string {
 // B-F9). What the wire states is what separates them, and neither arm may
 // concatenate them into input no one can run.
 func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
-	if tb == nil || tb.name == "" {
+	// The block must be a CALL, which is exactly what namesItself asks: a block
+	// whose name is whitespace was opened by no name at all — no arm of this
+	// bridge ever opens a call for it (round 39's B-F8) — so a fragment arriving
+	// at it is not "the call already carried, listed again", and must not be
+	// DROPPED for saying so. Read raw, a blank-named block declared itself the
+	// carried call and a byte-identical repeat of an entry no arm delivers as a
+	// call vanished here: the model's bytes reached no client at all, where the
+	// document spellings of the same body relay every copy as prose (2026-09-29
+	// audit, round 97, R97-L3-3 — measured, two and three copies of
+	// `{"name":"  ","arguments":"{\"h\":8}"}` reached the client as 7 bytes on
+	// this arm and 14/21 on the document arms). Whitespace is the same empty
+	// name wherever it is asked (namesItself is TrimSpace, round 66/67's rule).
+	if tb == nil || !namesItself(tb) {
 		return false
 	}
 	if id != "" && id != tb.id && tb.key != "!"+id {
