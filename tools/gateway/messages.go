@@ -4918,20 +4918,28 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		if _, ok := callInput(args, truncated); !ok {
 			continue
 		}
-		// The entry's slot: the index the wire states for it, else its position
-		// in the list. A list entry that states no index is a call the upstream
-		// named in the list's own order, which is the position — but one that
-		// DOES state an index names the same slot the frame arm would number it
-		// by, and that is the slot identity `restatesCarriedCall` folds on. Read
-		// as the position alone, an entry restating a call the list already
-		// stated under that call's own index (`"index":0` on the second entry of
-		// a two-entry list) opened a SECOND block with a minted id while this
-		// leg's own frame arm — and the client leg's fragment arm — answered the
-		// same body with one (2026-09-28 audit, round 73, F73-L2-1).
+		// The entry's slot is its POSITION in the list, and only that. Round 73
+		// read the index a DOCUMENT entry states as its slot, to make this arm
+		// fold the way the frame arm and the client leg's fragment arm fold one
+		// body (`"index":0` on the second entry of a two-entry list, repeating a
+		// call the list stated). It did fold it — and in doing so it split this
+		// leg against ITSELF: the document arm is reachable twice, once adopted
+		// inside a streaming request and once as the plain non-stream answer, and
+		// only the adopted copy was given the slot read. One upstream body then
+		// reached the client as one tool_use under `stream:true` and two under
+		// `stream:false`, the second under a different id, which is the split
+		// round 73 set out to remove rather than move (measured 2026-09-28, round
+		// 74, F74-L3-1: doc=[call_1] frames=[call_1] nostream=[call_1 call_7ff51383]
+		// after round 73, doc=[call_1 call_7ff51383] nostream=[call_1 call_7ff51383]
+		// before it).
+		//
+		// A tool_calls LIST has no slot identity to fold on: each entry of it is a
+		// call the upstream named, in the list's own order — which is what this
+		// arm has always said (see `restatesCarriedCall`'s callers) and what the
+		// 4096-body differential measures the document arms of all three legs
+		// agreeing on. The frame arm keeps the slot rule; it numbers fragments,
+		// where an index IS a slot.
 		idx := i
-		if tc.Index != nil {
-			idx = *tc.Index
-		}
 		b.toolDelta(&idx, tc.ID, name, args)
 	}
 	// After the blocks that name themselves, which is where the other two arms
