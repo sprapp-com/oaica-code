@@ -5248,7 +5248,28 @@ func (b *anthropicBridge) adoptWholeStream() bool {
 		// which is the point where a block would be opened for it.
 		if tc.ID != "" {
 			if owner, ok := b.statedIDOwner[tc.ID]; ok && owner == toolCallIdentity(name, args) {
-				continue
+				// ... and only when the block the id names already holds these
+				// very bytes. The identity folds an empty argument list and `{}`
+				// together (canonicalCallArgs("") is "{}"), so a held call the
+				// upstream never gave arguments and a restatement that gives it
+				// `{}` are ONE call by identity and not one by bytes: dropping
+				// the entry there lost the only delta the call ever had, and the
+				// client was handed a block whose arguments had never been
+				// written — where the frame arm folds those bytes into the held
+				// block and delivers them, and this bridge's own non-stream arm
+				// builds the block's input as `{}` either way (2026-09-28 audit,
+				// round 84, R84-L3-3). The same clause is what keeps a list whose
+				// three entries state an id on a Read call and then twice on the
+				// same Bash call at three calls: the Bash entries are not
+				// restatements of anything the Read's id names, and the held
+				// block's bytes are what says so (R84-L3-2). A repeat that adds
+				// nothing is still dropped, which is what keeps one call listed
+				// twice from opening a second block (round 83's F83-L3-1).
+				if carried := b.blockCarrying(tc.ID, nil); carried != nil &&
+					strings.TrimSpace(carried.args.String()) != "" &&
+					canonicalCallArgs(carried.args.String()) == canonicalCallArgs(args) {
+					continue
+				}
 			}
 			b.statedIDOwner[tc.ID] = toolCallIdentity(name, args)
 		}
@@ -5750,6 +5771,23 @@ func (b *anthropicBridge) emit(event string, data any) {
 // Text that is not an object keeps the parsed value: the `_raw` wrapper for
 // freeform, the empty object for `null` and for no arguments at all (the block's
 // input is a required object on this wire).
+//
+// Round 84 measured what this writer is and is not. It is the whole-body
+// writer: the key ORDER is the model's (the half round 83 fixed), and
+// everything else about the bytes is the canonical encoding's — numbers go
+// through float64 (`9007199254740993` reaches the client as `...992`,
+// `1E+2` as `100`), strings gain encoding/json's HTML escapes
+// (`<b>` as `\u003cb\u003e`), nested objects are re-encoded with sorted keys, and a text
+// whose numbers overflow float64 is replaced by the `{"_raw":…}` shape. The
+// adopted and frame arms write the model's own bytes for all of those
+// (R84-L3-1). Recorded rather than fixed: the client leg answers this arm's
+// spelling exactly — measured on both of ITS spellings, `{"n":9007199254740993}`
+// reaches the client as `{"n":9007199254740992}` there too — and the two
+// streaming arms here differ because an object's bytes go out AS THEY ARRIVE
+// (round 51's rule), which is what rounds 51, 72 and 80 each decided in favour
+// of. Closing the split means withholding every object's bytes until the turn
+// ends, which is the client leg's model, not a change this arm can make alone;
+// it is the byte-level twin of anthropic/anthropic.go's F68-L1-1.
 func statedInputValue(raw string, parsed map[string]any) any {
 	canonical := canonicalCallArgs(raw)
 	if strings.HasPrefix(canonical, "{") && json.Valid([]byte(canonical)) {

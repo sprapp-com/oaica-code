@@ -237,4 +237,3 @@ func r80Leg3Doc(entries, fin string) string {
 		`"tool_calls":[` + entries + `]},"finish_reason":"` + fin + `"}],` +
 		`"usage":{"prompt_tokens":10,"completion_tokens":10}}`
 }
-
