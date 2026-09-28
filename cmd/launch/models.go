@@ -702,6 +702,11 @@ func modelItemFromInventory(name string, info modelInfo, item ModelItem) ModelIt
 	item.Size = info.Size
 	item.Details = info.Details
 	item.Remote = info.Remote
+	// A catalogue row the remote never confirmed is badged, so a model listed
+	// from a synced document is not read as one the vendor just answered for.
+	if info.Unverified {
+		item.AvailabilityBadge = "unverified"
+	}
 	// OpenRouter's zero-cost models carry the ":free" suffix; label them
 	// inline so they're spottable in the picker without opening the
 	// pricing page (an existing description gets the tag appended).

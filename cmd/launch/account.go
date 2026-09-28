@@ -227,6 +227,11 @@ func availabilityBadge(item ModelItem, state AccountState) string {
 	if item.AvailabilityBadge == "unhealthy" {
 		return "unhealthy"
 	}
+	// A catalogue row nothing confirmed outranks the account question too: it
+	// is about whether the model is still served, not about who may call it.
+	if item.AvailabilityBadge == "unverified" {
+		return "unverified"
+	}
 	if !isCloudModelName(item.Name) {
 		return ""
 	}

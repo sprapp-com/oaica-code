@@ -1100,11 +1100,34 @@ func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]Laun
 	// inherit MiniMax's cloud model ids (the lookup is by NAME) and offer them
 	// against a box that serves none of them.
 	var declared map[string]providerCatalogModelLimit
+	// catalog is the models.dev list, which is the SAME vendor list the declared
+	// map is a correction to — so it is gated on CatalogOrigin for the same
+	// reason (`oaica remote add minimax-coding-plan <your own box>` must not
+	// inherit MiniMax's cloud ids because the NAME matches).
+	var catalog []catalogModelRow
 	if r.CatalogOrigin {
 		declared = providerCatalogDeclaredModels(r.Name)
+		catalog = catalogRowsFor(r.Name)
 	}
-	if sweepErr != nil && len(declared) == 0 {
+	if sweepErr != nil && len(declared) == 0 && len(catalog) == 0 {
 		return nil, sweepErr
+	}
+	// The sweep did not answer (no error — an endpoint with no model list at
+	// all — or one we could not read): the catalog lists the models instead of
+	// the empty section this used to produce, marked unverified because nothing
+	// confirmed the vendor still serves them.
+	if sweepErr != nil || len(sweptIDs) == 0 {
+		if rows := catalogFallbackModels(r, catalog); len(rows) > 0 {
+			return rows, nil
+		}
+	}
+	// The sweep answered, so it is the authority on WHICH models this provider
+	// serves — but a /v1/models response is a list of ids and no windows, and
+	// the catalog is where the windows are (catalogRowsFor has already applied
+	// the overlay's corrections to them).
+	windows := make(map[string]providerCatalogModelLimit, len(catalog))
+	for _, c := range catalog {
+		windows[c.ID] = providerCatalogModelLimit{Context: c.Context, Output: c.Output}
 	}
 	d := r.Descriptor()
 	rm := make([]LaunchModel, 0, len(sweptIDs)+len(declared))
@@ -1126,7 +1149,7 @@ func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]Laun
 		// the catalog declares a window for came out at 0 and the launch fell
 		// back to defaultAgentContextLength (128000) on a vendor whose real
 		// window is 400000 (2026-09-26 audit).
-		if lim, ok := declared[id]; ok {
+		if lim, ok := windows[id]; ok {
 			if row.ContextLength <= 0 {
 				row.ContextLength = lim.Context
 			}
@@ -1159,6 +1182,38 @@ func remoteLaunchModels(r userRemote, sweptIDs []string, sweepErr error) ([]Laun
 	return rm, nil
 }
 
+// catalogFallbackModels is the list for a remote whose own /v1/models could not
+// be read — or that serves no model list at all (the Anthropic-compatible
+// subscription endpoints). The catalog already merges the overlay's declared
+// ids, so this covers both documents at once.
+//
+// Every row is marked Unverified: nothing here was confirmed by the endpoint
+// the model would actually run on, and a stale cache is the normal case for a
+// list that syncs on its own schedule. A vendor that charges nothing and a row
+// we know nothing about then at least show up as a choice rather than as an
+// empty section.
+func catalogFallbackModels(r userRemote, catalog []catalogModelRow) []LaunchModel {
+	if len(catalog) == 0 {
+		return nil
+	}
+	d := r.Descriptor()
+	rm := make([]LaunchModel, 0, len(catalog))
+	for _, c := range catalog {
+		rm = append(rm, LaunchModel{
+			Name:            r.Name + "/" + c.ID,
+			Remote:          true,
+			Unverified:      true,
+			ToolCapable:     c.ToolCall,
+			ContextLength:   c.Context,
+			MaxOutputTokens: c.Output,
+			Wire:            d.Wire,
+			ToolFormat:      d.ToolFormat,
+			ToolReliable:    d.ToolReliable,
+		}.WithCloudLimits())
+	}
+	return rm
+}
+
 func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 	remotes, errs := launchSweepRemotes()
 	if len(remotes) == 0 {
@@ -1175,7 +1230,15 @@ func userRemoteLaunchModelsLive() ([]LaunchModel, []error) {
 		wg.Add(1)
 		go func(i int, r userRemote) {
 			defer wg.Done()
-			ids, ferr := fetchRemoteModelsCached(r)
+			// A keyless vendor row is not swept at all: the catalog already
+			// lists it, and the sweep would only spend its timeout learning
+			// that (see remoteNeedsSweep). The rows then come out unverified,
+			// which is the honest reading of a list no endpoint confirmed.
+			var ids []string
+			var ferr error
+			if remoteNeedsSweep(r) {
+				ids, ferr = fetchRemoteModelsCached(r)
+			}
 			rm, rerr := remoteLaunchModels(r, ids, ferr)
 			if rerr != nil {
 				results[i] = result{err: rerr}

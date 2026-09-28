@@ -57,6 +57,13 @@ type LaunchModel struct {
 	// A name-shaped predicate got both of those wrong in opposite directions
 	// (2026-09-26 audit).
 	LiveSource string `json:"live_source,omitempty"`
+	// Unverified marks a row listed from the catalog on behalf of a remote
+	// whose own /v1/models never answered — or whose key we do not have, so we
+	// never asked. The row is a real choice (the vendor's own catalogue says
+	// so) but nothing on the wire confirmed it is still served, and the price
+	// and window are the catalogue's claims rather than a measurement. The
+	// picker badges it; routing does not treat it differently.
+	Unverified bool
 }
 
 // The two live row families, as stamped on LaunchModel.LiveSource.
