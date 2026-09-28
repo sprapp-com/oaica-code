@@ -2149,8 +2149,16 @@ func TestWebSearchStreamingImmediateTakeover(t *testing.T) {
 	if !containsString(textDeltas, "After search.") {
 		t.Fatalf("expected post-search text delta, got %v", textDeltas)
 	}
-	if containsString(textDeltas, "ignored chunk") {
-		t.Fatalf("unexpected text from chunks after takeover: %v", textDeltas)
+	// The chunks that arrive after the takeover were DISCARDED here, and this
+	// test used to require it. They are carried now, because the whole-document
+	// arm of the same handler sees one merged message and keeps their text: a
+	// client served by this arm must not be shown less of the model's answer
+	// than the same turn served whole, and round 56 settled the same question
+	// the same way for the chunk that carried the call (2026-09-28 audit,
+	// round 70, F70-L1-2). The narration lands in the loop's terminal response,
+	// before the search blocks, which is where the document arm puts it.
+	if !containsString(textDeltas, "ignored chunk") {
+		t.Fatalf("the narration of the chunks that followed the takeover is the model's own answer and the whole-document arm keeps it, so this arm must carry it too: %v", textDeltas)
 	}
 }
 

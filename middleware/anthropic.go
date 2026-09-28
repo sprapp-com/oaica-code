@@ -145,6 +145,30 @@ type WebSearchAnthropicWriter struct {
 	streamHasOpenBlock   bool
 	streamOpenBlockIndex int
 	streamNextIndex      int
+
+	// pendingCallChunks holds streaming chunks that carry a tool call but no
+	// web_search call, because this arm cannot yet know what the TURN is. A
+	// client tool call that arrived before the model asked to search is a call
+	// the whole-document arm drops — the loop takes the turn over — but this
+	// arm writes chunks as they come, and a tool_use already handed to the
+	// client cannot be taken back. So such a chunk waits for the next one: if
+	// that carries the search call the held calls are dropped (their text and
+	// thinking still go out, which is what the document arm keeps), and
+	// otherwise the held chunk goes out unchanged. The wait is one chunk — the
+	// runner's tool parser emits each completed call in its own chunk
+	// (server/routes.go) — so a turn that never searches streams its calls at
+	// the same boundary it always did (2026-09-28 audit, round 70, F70-L1-1).
+	pendingCallChunks []api.ChatResponse
+	// lateThinking and lateText are the narration of every chunk this arm
+	// discarded while the loop was in flight. The loop's terminal response is
+	// built by the worker from the ONE chunk that carried the search call, so
+	// the model's later prose would otherwise be lost here while the
+	// whole-document arm — which sees the merged message — carries it. Merged
+	// into the terminal's leading narration at write time, which is after
+	// every such chunk has arrived (the terminal is written on the done
+	// chunk) (2026-09-28 audit, round 70, F70-L1-2).
+	lateThinking string
+	lateText     string
 }
 
 const maxWebSearchLoops = 3
@@ -185,6 +209,7 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	w.recordObservedUsage(chatResponse.Metrics)
 
 	if w.stream && w.loopInFlight {
+		w.absorbLateNarration(chatResponse)
 		if !chatResponse.Done {
 			return len(data), nil
 		}
@@ -207,6 +232,15 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 
 	if !hasWebSearch {
 		if w.stream {
+			if !chatResponse.Done && len(chatResponse.Message.ToolCalls) > 0 {
+				// A call the model asked for, in a turn that may still turn out
+				// to be a search turn. Held, not written: see the field.
+				w.pendingCallChunks = append(w.pendingCallChunks, chatResponse)
+				return len(data), nil
+			}
+			if err := w.releasePendingCallChunks(true); err != nil {
+				return 0, err
+			}
 			if err := w.writePassthroughStreamChunk(chatResponse); err != nil {
 				return 0, err
 			}
@@ -216,6 +250,12 @@ func (w *WebSearchAnthropicWriter) Write(data []byte) (int, error) {
 	}
 
 	if w.stream {
+		// The turn is a search turn, so the calls it asked for before it asked
+		// to search are ones the whole-document arm drops: release the held
+		// chunks without them.
+		if err := w.releasePendingCallChunks(false); err != nil {
+			return 0, err
+		}
 		// Let the original generation continue to completion while web search runs in parallel.
 		logutil.Trace("anthropic middleware: starting async web_search loop",
 			"tool_call", anthropic.TraceToolCall(webSearchCall),
@@ -463,6 +503,7 @@ func (w *WebSearchAnthropicWriter) writeLoopResult() error {
 	logutil.Trace("anthropic middleware: loop worker done", "resp", anthropic.TraceMessagesResponse(result.response))
 
 	w.applyObservedUsageDelta(&result.response)
+	w.mergeLateNarration(&result.response)
 	return w.writeTerminalResponse(result.response)
 }
 
@@ -661,6 +702,77 @@ func (w *WebSearchAnthropicWriter) callFollowUpChat(ctx context.Context, message
 	logutil.TraceContext(ctx, "anthropic middleware: followup decoded", "resp", anthropic.TraceChatResponse(chatResp))
 
 	return chatResp, nil
+}
+
+// absorbLateNarration records the narration of a chunk this arm is about to
+// discard, so the loop's terminal can carry it (F70-L1-2).
+func (w *WebSearchAnthropicWriter) absorbLateNarration(chatResponse api.ChatResponse) {
+	w.lateThinking += chatResponse.Message.Thinking
+	w.lateText += chatResponse.Message.Content
+}
+
+// releasePendingCallChunks writes out the streaming chunks this arm held back
+// because they carried a tool call. keepCalls is the decision they were held
+// for: true once the turn is known not to be a search turn (the calls are the
+// client's, and go out as they stand), false when a web_search call arrived
+// (the loop takes the turn over, so the calls are dropped and only the text
+// and thinking of those chunks — what the document arm keeps — are relayed).
+func (w *WebSearchAnthropicWriter) releasePendingCallChunks(keepCalls bool) error {
+	pending := w.pendingCallChunks
+	w.pendingCallChunks = nil
+	for _, chunk := range pending {
+		if !keepCalls {
+			chunk.Message.ToolCalls = nil
+			// Nothing left of it: a chunk that carried only the call says
+			// nothing once the call is gone, and writing it would open a block
+			// for an empty message.
+			if chunk.Message.Content == "" && chunk.Message.Thinking == "" {
+				continue
+			}
+		}
+		if err := w.writePassthroughStreamChunk(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeLateNarration folds the narration absorbed while the loop was in flight
+// into the loop's terminal response, replacing the response's leading narration
+// run (what carriedNarrationBlocks wrote for the turn that asked to search).
+// Appending to that run rather than adding blocks after it is what keeps the
+// streamed turn's block order the whole-document arm's, where the model's whole
+// prose is one merged message and its narration is emitted together.
+func (w *WebSearchAnthropicWriter) mergeLateNarration(response *anthropic.MessagesResponse) {
+	if w.lateThinking == "" && w.lateText == "" {
+		return
+	}
+	lead := 0
+	for lead < len(response.Content) && (response.Content[lead].Type == "thinking" || response.Content[lead].Type == "text") {
+		lead++
+	}
+	thinking := ""
+	text := ""
+	for _, b := range response.Content[:lead] {
+		if b.Type == "thinking" && b.Thinking != nil {
+			thinking += *b.Thinking
+		}
+		if b.Type == "text" && b.Text != nil {
+			text += *b.Text
+		}
+	}
+	thinking += w.lateThinking
+	text += w.lateText
+	combined := make([]anthropic.ContentBlock, 0, 2)
+	if thinking != "" {
+		t := thinking
+		combined = append(combined, anthropic.ContentBlock{Type: "thinking", Thinking: &t})
+	}
+	if text != "" {
+		t := text
+		combined = append(combined, anthropic.ContentBlock{Type: "text", Text: &t})
+	}
+	response.Content = append(combined, response.Content[lead:]...)
 }
 
 func (w *WebSearchAnthropicWriter) writePassthroughStreamChunk(chatResponse api.ChatResponse) error {
