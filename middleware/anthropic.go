@@ -1242,6 +1242,14 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 		// Set think to nil when being used with Anthropic API to connect to tools like claude code
 		c.Set("relax_thinking", true)
 
+		// Which wire this request came in on. The routes' document arm keeps
+		// upstream ollama's rule that a request which declared no tools does not
+		// surface the model's tool calls; this surface's streaming arm relays
+		// every chunk verbatim and has no such gate, and both other translation
+		// legs relay the call. Recording the surface is what lets the two arms
+		// of one handler agree (2026-09-28 audit, round 73, F73-L1-1).
+		c.Set("anthropic_messages", true)
+
 		var b bytes.Buffer
 		if err := json.NewEncoder(&b).Encode(chatReq); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, anthropic.NewError(http.StatusInternalServerError, err.Error()))
@@ -1296,6 +1304,12 @@ func AnthropicMessagesMiddleware() gin.HandlerFunc {
 		}
 
 		c.Next()
+
+		// An upstream channel that closes without a single chunk is refused
+		// inside the streaming arm itself (server/routes.go streamResponse, and
+		// the document arm of writeChatResponse): nothing may be written here
+		// after c.Next(), because the arm's own flush has already put the 200
+		// status on the wire by then (2026-09-28 audit, round 73, F73-L1-2).
 	}
 }
 

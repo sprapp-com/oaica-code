@@ -2136,10 +2136,32 @@ func waitForStream(c *gin.Context, ch chan any) {
 
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
+	// The first chunk is read before the loop because an Anthropic client's
+	// channel that closes without stating a single chunk is refused as a whole
+	// document, and after c.Stream has run there is nothing left to refuse with:
+	// c.Stream flushes on every pass — including the pass that finds the channel
+	// closed — and that flush puts the 200 status on the wire (gin's
+	// WriteHeaderNow marks the writer written). Peeking here is what keeps the
+	// streamed arm's answer the same as the buffered arm's, and the same as the
+	// other two translation legs' 502 (2026-09-28 audit, round 73, F73-L1-2). A
+	// turn that ENDS with no content is not this shape: its chunks arrive, so
+	// the peek succeeds and the turn is stated as usual.
+	first, havePending := <-ch
+	if !havePending && c.GetBool("anthropic_messages") {
+		c.Header("Content-Type", "application/json")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream returned an empty stream"})
+		return
+	}
 	c.Stream(func(w io.Writer) bool {
-		val, ok := <-ch
-		if !ok {
-			return false
+		val := first
+		if havePending {
+			havePending = false
+		} else {
+			v, ok := <-ch
+			if !ok {
+				return false
+			}
+			val = v
 		}
 
 		// errors are provided as a gin.H with an "error" field and
@@ -2426,13 +2448,28 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		var allLogprobs []api.Logprob
 		var sbThinking strings.Builder
 		var sbContent strings.Builder
+		// arrived records that the upstream stated anything at all. A channel
+		// that closes without a single chunk is not a turn: the streaming arm of
+		// this same handler writes nothing for it, and both other translation
+		// legs refuse it with a 502 (2026-09-28 audit, round 73, F73-L1-2).
+		arrived := false
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
+				arrived = true
 				sbThinking.WriteString(t.Message.Thinking)
 				sbContent.WriteString(t.Message.Content)
 				resp = t
-				if len(req.Tools) > 0 {
+				// Upstream ollama's rule — a request that declared no tools does
+				// not surface the model's tool calls — belongs to the native
+				// wire. On the Anthropic surface the STREAMING arm of this very
+				// handler relays every chunk verbatim, with no such gate, and
+				// both other translation legs relay the call: one client
+				// request produced an empty prose turn buffered and an
+				// executable tool_use streamed for one upstream body
+				// (2026-09-28 audit, round 73, F73-L1-1). The gate is kept for
+				// the native wire and lifted where the arms must agree.
+				if len(req.Tools) > 0 || c.GetBool("anthropic_messages") {
 					toolCalls = append(toolCalls, t.Message.ToolCalls...)
 				}
 				if len(t.Logprobs) > 0 {
@@ -2455,6 +2492,15 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
 				return
 			}
+		}
+
+		if !arrived && c.GetBool("anthropic_messages") {
+			// The Anthropic surface refuses this shape the way the other two
+			// legs do. The native wire keeps its own answer: this handler is
+			// shared, and upstream ollama's reading of an empty channel is not
+			// this surface's to change (2026-09-28 audit, round 73, F73-L1-2).
+			c.JSON(http.StatusBadGateway, gin.H{"error": "upstream returned an empty stream"})
+			return
 		}
 
 		resp.Message.Content = sbContent.String()
