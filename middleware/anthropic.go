@@ -155,6 +155,21 @@ func (w *AnthropicWriter) writeResponse(data []byte) (int, error) {
 
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
 	response := anthropic.ToMessagesResponse(w.id, chatResponse)
+	// The buffered arm used to state whatever model the UPSTREAM reported:
+	// ToMessagesResponse is handed a ChatResponse and has no way to know what
+	// the client asked for, and the server rewrites a suffixed name
+	// (`kimi-k2.5:cloud`) to the bare one before the request leaves. So one
+	// /v1/messages body answered with two different `model` strings depending on
+	// `stream`, and the buffered one named a model the client had never asked
+	// for. The converter already carries the client's own string — it is what
+	// the streamed arm's message_start states — so the buffered arm states it
+	// too (2026-09-28 audit, round 84, R84-L1-1). The nil check is for writers
+	// built by hand (the web_search tests construct one); a request with no
+	// model never reaches here — the middleware rejects it as invalid before
+	// the upstream is called.
+	if w.converter != nil {
+		response.Model = w.converter.Model
+	}
 	response.Usage = withInputEstimate(response.Usage, w.estimatedInputTokens)
 	logutil.Trace("anthropic middleware: converted response", "resp", anthropic.TraceMessagesResponse(response))
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
