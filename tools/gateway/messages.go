@@ -4270,6 +4270,20 @@ func (b *anthropicBridge) flushToolArgs(tb *toolBlock) {
 	// the client parses.
 	first := tb.emitted == 0
 	pending := whole[tb.emitted:]
+	// An object the model stated behind leading whitespace is delivered from the
+	// object's first byte. The whitespace is not part of any object the client
+	// can use, and what it accumulates is the object either way — but this
+	// bridge delivers the block's whole text at once when the arguments are
+	// over, so a body that restated one call's arguments as whitespace and then
+	// as `{}` reached the client as `      {}` on the fragment spelling and as
+	// `{}` on the one-list spelling, where the client leg answers `{}` under
+	// both. The gate above already withholds a text until it trims to an object;
+	// this is the same rule applied to the bytes it then hands over
+	// (2026-09-28 audit, round 72, F72-L3-1). Whitespace INSIDE the object is
+	// kept — it is part of the text the model stated.
+	if first && strings.HasPrefix(strings.TrimSpace(whole), "{") {
+		pending = strings.TrimSpace(whole)
+	}
 	tb.emitted = tb.args.Len()
 	if first {
 		if wrapped, ok := rawArgsObject(whole); ok {
