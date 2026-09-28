@@ -775,22 +775,19 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 		})
 	}
 
-	if len(chatResponse.Message.ToolCalls) > 0 {
-		toolCalls := ToToolCalls(chatResponse.Message.ToolCalls)
-		for i, tc := range toolCalls {
-			output = append(output, ResponsesOutputItem{
-				ID:        fmt.Sprintf("fc_%s_%d", responseID, i),
-				Type:      "function_call",
-				Status:    "completed",
-				CallID:    tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
-			})
-		}
-	}
 	// The text of a turn that also called a tool is part of the answer, not an
 	// alternative to it (2026-09-27 audit, round 18). A turn with no tool calls
-	// still gets its message item, as it always did.
+	// still gets its message item, as it always did. It is written BEFORE the
+	// calls because that is the order the streaming arm's own output array is
+	// built in — its `buildFinalOutput` states reasoning, then the message, then
+	// the calls, whatever order the events arrived in — so writing the calls
+	// first here answered a model that narrated before it acted with
+	// `[function_call, message]` and the same model streamed with
+	// `[message, function_call]`: one upstream body, two orders, the call in
+	// front of the prose that introduced it. Measured on every other arm of this
+	// leg (native, OpenAI chat, Anthropic) and on this arm's own streamed
+	// sibling, which all say text-then-call (2026-09-29 audit, round 92,
+	// F92-L1-3).
 	if len(chatResponse.Message.ToolCalls) == 0 || chatResponse.Message.Content != "" {
 		output = append(output, ResponsesOutputItem{
 			ID:     itemID,
@@ -806,6 +803,21 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 				},
 			},
 		})
+	}
+
+	// Then the calls, in the order the turn made them.
+	if len(chatResponse.Message.ToolCalls) > 0 {
+		toolCalls := ToToolCalls(chatResponse.Message.ToolCalls)
+		for i, tc := range toolCalls {
+			output = append(output, ResponsesOutputItem{
+				ID:        fmt.Sprintf("fc_%s_%d", responseID, i),
+				Type:      "function_call",
+				Status:    "completed",
+				CallID:    tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
 	}
 
 	var instructions *string
