@@ -193,7 +193,9 @@ func (g *gateway) pullEntry(model string) (gwPullEntry, bool) {
 // "wrong license" (the client renders different advice for each).
 func (g *gateway) licenseLabel(r *http.Request) (label string, presentedKey bool) {
 	auth := r.Header.Get("Authorization")
-	// Case-insensitive scheme (audit L13), matching bearerCredential.
+	// Case-insensitive scheme (audit L13), matching presentedCredential (which
+	// also reads an Anthropic caller's x-api-key; the license path is this
+	// gateway's own client and stays on Authorization).
 	key := strings.TrimSpace(auth)
 	if len(key) >= 7 && strings.EqualFold(key[:7], "Bearer ") {
 		key = strings.TrimSpace(key[7:])

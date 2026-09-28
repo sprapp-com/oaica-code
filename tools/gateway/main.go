@@ -1238,15 +1238,32 @@ func redactCredentialURLs(text string) string {
 	})
 }
 
-// bearerCredential extracts the credential from an Authorization header
-// case-insensitively (audit 2026-09-01 L13): some proxies/lambdas lowercase
-// the scheme, and the old exact "Bearer " prefix rejected them.
-func bearerCredential(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
-		return strings.TrimSpace(auth[7:])
+// presentedCredential is the credential the caller presented, from whichever
+// header the wire they speak puts it in. An Authorization header is read
+// case-insensitively (audit 2026-09-01 L13): some proxies/lambdas lowercase the
+// scheme, and the old exact "Bearer " prefix rejected them.
+//
+// The Anthropic wire is not the Authorization wire. This endpoint answers
+// /v1/messages, and an Anthropic client — the official SDK included — sends its
+// key in `x-api-key` and no Authorization at all, which is exactly the header
+// the strip below exists to keep away from a third-party upstream (audit
+// 2026-09-01 H1). Reading it here and stripping it there are the two halves of
+// serving those callers at all: without this half the SDK's own default gets a
+// 401 from an endpoint built to answer it (2026-09-29 audit, round 89,
+// F89-L3-4). Azure-style callers spell it `api-key`.
+func presentedCredential(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			return strings.TrimSpace(auth[7:])
+		}
+		return strings.TrimSpace(auth)
 	}
-	return strings.TrimSpace(auth)
+	for _, h := range []string{"X-Api-Key", "Api-Key"} {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // lookupKey resolves the presented Bearer key to its whole config entry (not
@@ -1255,7 +1272,7 @@ func bearerCredential(r *http.Request) string {
 // digest as before, and it deliberately does NOT break early on a match so
 // the comparison count stays independent of which key was presented.
 func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
-	key := bearerCredential(r)
+	key := presentedCredential(r)
 	if key == "" {
 		return gwKey{}, false
 	}
@@ -2777,7 +2794,20 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	// charged once for nothing served and again for its retry. Zeroed here, at
 	// the one place the row is built, rather than at each failing arm
 	// (2026-09-27 audit, round 45, B45-14).
+	// And neither may a turn the client was told FAILED carry counts or a claim
+	// that the upstream stated them. A refused turn served the client no answer
+	// and stated no usage to it, so the row that books one is a record of a turn
+	// that did not happen: a stream cut between a usage frame and its terminator
+	// (the gateway asks for stream_options.include_usage, so the usage frame IS
+	// the last frame before the sentinel) reached the client as a 502 and was
+	// booked as the upstream's own 9000/500 with usage_seen=true — the same
+	// refused bytes as a body the buffered arm read as 0/0/false, one upstream
+	// body and two rows. Zeroed at the row for cost's reason: at each failing arm
+	// would be as many arms as there are spellings of a failure (2026-09-29
+	// audit, round 89, F89-L3-1/F89-L3-3).
+	seen := rec.seen
 	if status != http.StatusOK {
+		u, cached, seen = usage{}, 0, false
 		cost, tier = 0, 0
 	}
 	return ledgerEntry{
@@ -2793,7 +2823,7 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 		CompletionTokens: u.CompletionTokens,
 		CachedTokens:     cached,
 		LatencyMS:        time.Since(start).Milliseconds(),
-		UsageSeen:        rec.seen,
+		UsageSeen:        seen,
 		Aborted:          aborted,
 		Backend:          backend,
 		SessionID:        sessionID,
