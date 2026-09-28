@@ -134,6 +134,27 @@ func TestATruncatedCallClosesItsBlock(t *testing.T) {
 				idx = append(idx, i)
 			}
 			sort.Ints(idx)
+			if finish == "length" {
+				// REVERSED 2026-09-28 (round 80, F80-L3-3). B-F2 was written when
+				// this arm had no other answer: the block was opened for a call the
+				// upstream cut off, and leaving it unterminated was the failure it
+				// pinned. Both other arms of the same body DROP that call — the
+				// non-stream path and the adoption arm through callInput, which
+				// refuses an unparseable argument text on a truncated turn — and
+				// answer the same turn with no tool block and a stop_reason of
+				// max_tokens. Opening it here reached the client as half an object
+				// under a stop_reason of tool_use, the very split rounds 55 and 74
+				// closed for every other shape. The block is no longer opened, so
+				// "every block that IS opened is closed" holds vacuously here; the
+				// promise B-F2 makes is kept, by opening nothing.
+				if len(idx) != 0 {
+					t.Fatalf("the truncated call was opened as %d block(s); the document arms of this leg open none:\n%s", len(idx), body)
+				}
+				if !strings.Contains(body, `"stop_reason":"max_tokens"`) {
+					t.Errorf("the truncated turn does not report max_tokens:\n%s", body)
+				}
+				return
+			}
 			if len(idx) == 0 {
 				t.Fatalf("the stream opened no block at all for a call the upstream named:\n%s", body)
 			}

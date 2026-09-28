@@ -3307,7 +3307,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				// arguments (round 56's F1) — is untouched, as is an
 				// argument-only continuation, which names nothing.
 				(name != "" && name == tb.name && (id == "" || !tb.statedID || id == tb.id) &&
-					strings.TrimSpace(tb.args.String()) == "" && strings.TrimSpace(args) != "") ||
+					strings.TrimSpace(tb.args.String()) == "") ||
 				(id != "" && name != "" && strings.TrimSpace(args) == "" && tb.statedID && id == tb.id &&
 					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && argsAreFinished(tb.args.String()))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
@@ -4054,6 +4054,15 @@ func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
 		return false
 	}
 	acc := tb.args.String()
+	// The repeat that names this call again and states NOTHING else — no id, no
+	// arguments — over a call that holds no arguments either is the NEXT call,
+	// and it is the routing clause in routeToolKey that splits it: read as a
+	// restatement, one wire reached the client as one call when the repeat
+	// stated the slot's index and as two when it stated none, where both
+	// document arms of this bridge answer two under every spelling (2026-09-28
+	// audit, round 80, F80-L3-1). No guard is needed HERE: an empty argument
+	// list is not `argsAreFinished`, so the check below already refuses it (a
+	// guard was written, measured not to be load-bearing, and removed).
 	if !argsAreFinished(acc) || !argsAreFinished(args) {
 		return false
 	}
@@ -4206,7 +4215,7 @@ func rawFallbackArgs(s string) string {
 func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 	key := b.toolKey(upIdx, id, name, args)
 	tb, ok := b.toolBlocks[key]
-	if strings.TrimSpace(name) == "" && strings.TrimSpace(args) != "" {
+	if strings.TrimSpace(name) == "" && args != "" {
 		// An entry the upstream never named, on a block that is not a call:
 		// its bytes are the model's prose, and prose is ONE run, in the order
 		// the wire wrote it — the whole-list arms concatenate every nameless
@@ -4215,6 +4224,16 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		// The fragment joins the run currently open wherever the router filed
 		// it; when a call has closed that run it starts one of its own, and it
 		// never reopens the run's block the wire has already left behind.
+		//
+		// The test is that the entry STATES bytes, not that they trim to
+		// something: the document arms group a run by `args == ""` (unnamedRunsOf)
+		// and count whitespace as a member of the run it sits in, so an entry
+		// whose bytes are a space was let past the join here — it was routed to a
+		// block of its own and the run was SPLIT. `[{index 0,"A"},{index 1," "},
+		// {index 0,"B"}]` reached the client as `<text "A"><text " B">` where the
+		// whole-list arm of the same body answers `<text "A B">` — one body, two
+		// answers about where a run the wire never interrupted ends
+		// (2026-09-28 audit, round 80, F80-L3-2).
 		if rb, rok := b.toolBlocks[b.namelessRunKey]; rok && rb != nil && !namesItself(rb) {
 			tb, key, ok = rb, rb.key, true
 		} else if ok && !namesItself(tb) {
@@ -4831,6 +4850,35 @@ func (b *anthropicBridge) finishStream() {
 		if tb.started || tb.merged || !namesItself(tb) {
 			continue
 		}
+		if _, ok := callInput(tb.args.String(), b.sse.stopMsg == "length"); !ok {
+			// A turn the upstream cut at the token limit, carrying a call whose
+			// arguments never became JSON: not a call this client can make. The
+			// non-stream path drops it (finalize) and so does the adoption arm
+			// (callInput), and both of those arms answer the same document with NO
+			// tool block and a stop_reason of max_tokens — while
+			// this arm opened the block under a stop_reason of tool_use and handed
+			// the client half an object (2026-09-28 audit, round 80, F80-L3-3). The
+			// bytes are the model's unfinished output, not arguments, so they are
+			// dropped rather than relayed as prose: no other arm relays a NAMED
+			// call's bytes as text (round 39, B-F8).
+			log.Printf("oaica-gateway: tool call %q dropped: a truncated turn left its arguments unparseable (%d bytes)", tb.name, tb.args.Len())
+			continue
+		}
+		if argsAreMidObject(tb.args.String()) {
+			// The turn is over and the object never closed, so these bytes are
+			// not an object at all: every other arm of this body keeps them as the
+			// single-key _raw object (the client leg at its fragment fold, this
+			// bridge's own non-stream path through callInput, and the adoption arm
+			// by the same callInput), and this arm delivered them as they stood —
+			// one body that reached the client as `{"r":1` when it streamed and as
+			// `{"_raw":"{\"r\":1"}` when it did not, the first of which no client
+			// can parse into an input (2026-09-28 audit, round 80, F80-L3-4). Only
+			// reached with nothing yet delivered — the block is not started, so no
+			// delta has gone out — which is why the bytes can still be re-spelled.
+			wrapped := rawFallbackArgs(strings.TrimSpace(tb.args.String()))
+			tb.args.Reset()
+			tb.args.WriteString(wrapped)
+		}
 		b.closeOpen()
 		b.flushHeldText()
 		b.closeOpen()
@@ -4857,7 +4905,12 @@ func (b *anthropicBridge) finishStream() {
 		// fate of a call that has no name — put the call's own JSON on the wire
 		// as assistant prose, so the client read `{"a":1}` as something the
 		// model said (2026-09-27 audit, round 49, A-F1).
-		if tb.started || tb.merged || tb.args.Len() == 0 {
+		// A block that names itself is a call, and this arm is for the ones that
+		// never could: it used to be unreachable for a named block, because the
+		// loop above opened every one of them, and now a truncated turn leaves one
+		// behind (F80-L3-3) — its bytes are arguments, not prose, and the arms
+		// that dropped the call dropped them with it (2026-09-28 audit, round 80).
+		if tb.started || tb.merged || namesItself(tb) || tb.args.Len() == 0 {
 			continue
 		}
 		log.Printf("oaica-gateway: a tool call the upstream never named (%d bytes of arguments) is relayed as text", tb.args.Len())
