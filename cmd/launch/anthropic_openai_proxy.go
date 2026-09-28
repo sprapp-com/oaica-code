@@ -2638,10 +2638,14 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 		// only a top-level error OBJECT, and openAIResponseToChatResponse
 		// has no else for an empty array. The streaming path already refuses
 		// this same body with 502, and the server-side sibling refuses it
-		// too ("upstream returned no completion choices",
-		// tools/gateway/messages.go) — the verdict must not depend on
-		// `stream: true` (2026-09-26 audit, thirteenth round).
-		writeAnthropicError(w, http.StatusBadGateway, "upstream returned no completion choices")
+		// too (tools/gateway/messages.go) — the verdict must not depend on
+		// `stream: true`, and neither must the SENTENCE: this arm said "no
+		// completion choices" where the streaming arm said "empty
+		// completion" for the same bytes, so the two arms of one leg named
+		// the same upstream answer differently. One sentence for "the body
+		// carries no answer" on all four sites (2026-09-26 audit,
+		// thirteenth round; 2026-09-29 audit, round 88, F88-L2-4).
+		writeAnthropicError(w, http.StatusBadGateway, "upstream returned an empty completion")
 		return false
 	}
 	if onUsage != nil && oaiResp.Usage != nil && oaiResp.Usage.PromptTokens > 0 {
@@ -3413,8 +3417,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reached the client as two executable blocks under two ids, while the same
 	// two statements with the first spelled as a fragment reached it as one
 	// (2026-09-29 audit, round 87, F87-L2-1).
-	heldCall := func(name, args string) bool {
-		return accumHoldsTheCall(toolAccums, name, args) || accumHoldsTheCall(adoptedCallAt, name, args)
+	//
+	// The id the statement wears is part of the question, not decoration. A call
+	// the turn holds under ONE id is not the call a frame states under ANOTHER:
+	// that frame is not a restatement of it but a second statement, and the wire
+	// used two ids to say so. Asking only name and argument bytes folded the
+	// second statement away, so two calls the upstream stated reached the client
+	// as one — where the same two statements written as fragments, and the same
+	// two entries in a whole-list body, reached it as two (2026-09-29 audit,
+	// round 88, F88-L2-2). The two non-empty guards are what keep the
+	// restatement rule this test exists for: an id-less statement is a
+	// restatement of anything it matches (rounds 86 and 87 asked exactly that),
+	// and a holder whose own id was minted rather than stated — a call an adopted
+	// whole completion wrote — is restated by an id-less frame too.
+	heldCall := func(id, name, args string) bool {
+		return accumHoldsTheCall(toolAccums, id, name, args) || accumHoldsTheCall(adoptedCallAt, id, name, args)
 	}
 	// namedBy reports whether a fragment stating this index is naming THIS call:
 	// the index the wire stated for the call, or, for a call whose fragments
@@ -3457,11 +3474,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 			if payload, ok := strings.CutPrefix(line, "data:"); ok {
 				eventBuf.WriteString(strings.TrimSpace(payload))
-			} else {
+			} else if !sseFieldLine(line) {
 				eventBuf.WriteString(line)
 			}
 		}
 		if !strings.HasPrefix(line, "data:") {
+			// A line that names the event's own protocol — `event:`, `id:`,
+			// `retry:`, or a `:` comment — is neither payload nor part of a
+			// document. Keeping it in nonSSE corrupted the whole-body fallback
+			// below into text that cannot parse, so a 200 whose body was a
+			// NAMED event carrying the upstream's error object fell through
+			// every recognition and the client was told a cause that did not
+			// happen (2026-09-29 audit, round 88, F88-L2-1).
+			if sseFieldLine(line) {
+				continue
+			}
 			// Not every failure arrives as an SSE frame: a 200 whose body is
 			// a plain JSON error object has no "data:" prefix at all, and
 			// used to be skipped line by line until the stream "ended"
@@ -3489,7 +3516,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// (handleNonStreamResponse's `len(Choices) == 0`,
 			// adoptNonSSECompletion); the tail below now does too, including
 			// the adoption attempt (2026-09-26 audit, fifteenth round).
-			if started || len(toolAccums) > 0 || finishReason != "" {
+			// Asked the way the guard below asks it. `len(toolAccums) > 0` counts
+			// a fragment that relays no block at all — an opener with neither a
+			// name nor arguments — so this gate called the stream completed
+			// while the guard called it silent, and one empty turn reached the
+			// client as "empty completion" where the same silence ended by
+			// [DONE] alone reached it as "stream ended before the response was
+			// complete" (2026-09-29 audit, round 88, F88-L2-3).
+			if started || relaysSomething(toolAccums) || finishReason != "" {
 				completed = true
 			}
 			break
@@ -3593,7 +3627,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// comparison missed), and a freeform restatement had the two
 					// statements' bytes concatenated into a command the model
 					// never wrote. Both are F86-L2-1 (2026-09-28 audit, round 86).
-					if heldCall(tc.Function.Name, tc.Function.Arguments) {
+					if heldCall(tc.ID, tc.Function.Name, tc.Function.Arguments) {
 						continue
 					}
 					d.ToolCalls = append(d.ToolCalls, openAIStreamToolDelta{
@@ -4579,11 +4613,19 @@ func canonicalCallArgs(raw string) string {
 // entry is not a call on this leg at all — its bytes are prose the model wrote,
 // relayed as text — so it is never held, however exactly its bytes match
 // something the stream relayed (2026-09-28 audit, round 85, R85-L2-4).
-func accumHoldsTheCall(accums map[int]*toolAccum, name, args string) bool {
+func accumHoldsTheCall(accums map[int]*toolAccum, id, name, args string) bool {
 	if strings.TrimSpace(name) == "" {
 		return false
 	}
 	for _, a := range accums {
+		// Both statements must wear the same id for one to be the other restated,
+		// and only a STATEMENT of an id can tell them apart: a statement that
+		// states none is a restatement of what it matches, and so is one matched
+		// against a call whose own id was minted rather than stated
+		// (2026-09-29 audit, round 88, F88-L2-2).
+		if id != "" && a.id != "" && id != a.id {
+			continue
+		}
 		if a.name == name && canonicalCallArgs(a.args.String()) == canonicalCallArgs(args) {
 			return true
 		}
@@ -4608,7 +4650,7 @@ func accumHoldsTheCall(accums map[int]*toolAccum, name, args string) bool {
 // adopted when it carries something of its own; a frame that only restates the
 // calls the stream already holds is still not adopted, which is what that
 // clause was there for (round 56, F2; round 47, C-F3).
-func frameAddsToTheTurn(payload string, held func(name, args string) bool) bool {
+func frameAddsToTheTurn(payload string, held func(id, name, args string) bool) bool {
 	var resp openAIChatResponse
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
 		return false
@@ -4635,7 +4677,7 @@ func frameAddsToTheTurn(payload string, held func(name, args string) bool) bool 
 		if strings.TrimSpace(name) == "" && strings.TrimSpace(args) == "" {
 			continue
 		}
-		if !held(name, args) {
+		if !held(tc.ID, name, args) {
 			return true
 		}
 	}
@@ -4909,6 +4951,34 @@ const upstreamErrorPrefix = "upstream error: "
 // one, resetting the buffer either way. The `"error"` substring guard keeps the
 // parse off the ordinary delta frames an answer is made of (the same guard the
 // per-frame recognition uses).
+// sseFieldLine reports whether a line names the event's own protocol rather than
+// carrying payload: a comment (a leading colon) or a `name: value` field, the
+// `event`, `id` and `retry` the spec defines and any other field name a sender
+// invents. Only `data:` lines are payload — every other field is framing, and
+// the spec says a receiver ignores the ones it does not know. Joining them into
+// the event's payload put the field's own name in front of the object it
+// introduced, so an upstream error that arrived as a NAMED event was not
+// recognised as one and the client was told a cause that did not happen
+// (2026-09-29 audit, round 88, F88-L2-1).
+func sseFieldLine(line string) bool {
+	if strings.HasPrefix(line, ":") {
+		return true
+	}
+	name, _, ok := strings.Cut(line, ":")
+	if !ok || name == "" {
+		return false
+	}
+	for i, r := range name {
+		letter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		other := r == '_' || r == '-' || (r >= '0' && r <= '9')
+		if letter || (other && i > 0) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func eventErrorMessage(buf *strings.Builder, secret string) string {
 	if buf.Len() == 0 {
 		return ""
