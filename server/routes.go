@@ -2640,7 +2640,7 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 				// executable tool_use streamed for one upstream body
 				// (2026-09-28 audit, round 73, F73-L1-1). The gate is kept for
 				// the native wire and lifted where the arms must agree.
-				if len(req.Tools) > 0 || c.GetBool("anthropic_messages") {
+				if len(req.Tools) > 0 || c.GetBool("anthropic_messages") || c.GetBool(middleware.TranslatedSurfaceKey) {
 					toolCalls = append(toolCalls, t.Message.ToolCalls...)
 				}
 				if len(t.Logprobs) > 0 {

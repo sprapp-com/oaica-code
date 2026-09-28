@@ -522,6 +522,15 @@ func ChatMiddleware() gin.HandlerFunc {
 
 		c.Writer = w
 
+		// The surface this request arrived on, for the one rule the native
+		// /api/chat keeps and a translated wire may not: a request that declared
+		// no tools does not surface the model's tool calls. The streaming arm of
+		// this very surface relays them regardless, so applying the gate here
+		// answered one client body two ways — the call missing when the client
+		// asked for no stream and present when it streamed, with the prose that
+		// surrounded it kept either way (2026-09-29 audit, round 92, F92-L1-2).
+		c.Set(TranslatedSurfaceKey, true)
+
 		c.Next()
 	}
 }
@@ -682,9 +691,25 @@ func ResponsesMiddleware() gin.HandlerFunc {
 		}
 
 		c.Writer = w
+
+		// The surface this request arrived on — see ChatMiddleware. This wire's
+		// buffered arm dropped the model's tool call when the client declared
+		// none, while its streaming arm relayed it (2026-09-29 audit, round 92,
+		// F92-L1-2).
+		c.Set(TranslatedSurfaceKey, true)
+
 		c.Next()
 	}
 }
+
+// TranslatedSurfaceKey is the context key a translation middleware sets so the
+// handlers know the request did not arrive on the native Ollama wire. The gate
+// that hides a model's tool calls from a request that declared none belongs to
+// that wire alone: every translated surface relays the call on its streaming arm
+// whatever the client declared, so gating the buffered arm of the same surface
+// makes one client body answer two ways (2026-09-28 audit, round 73, F73-L1-1;
+// 2026-09-29 audit, round 92, F92-L1-2).
+const TranslatedSurfaceKey = "translated_surface"
 
 // TranscriptionWriter collects streamed chat responses and outputs a transcription response.
 type TranscriptionWriter struct {
