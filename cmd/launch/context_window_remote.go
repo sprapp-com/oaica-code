@@ -10,7 +10,9 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -86,6 +88,20 @@ func (n *remoteLen) UnmarshalJSON(b []byte) error {
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return err
+	}
+	// A window is a positive count of tokens, and this is the only place that
+	// can say so: `strconv.ParseFloat` accepts "NaN", "Inf" and "Infinity"
+	// without error, and `int(v)` on a non-finite or out-of-range float is
+	// implementation-defined — on amd64 it is int64's minimum, so a list
+	// stating NaN for the named entry AND its sibling returned
+	// -9223372036854775808 from a probe documented "0 if unknown". An
+	// out-of-range length is the same defect in the other direction: 9e18
+	// survived every `> 0` filter as a window, which is a clamp ceiling no
+	// model has. Both fail the decode, which is this probe's fail-closed
+	// answer, exactly as a length that is not a number at all does
+	// (2026-09-29 audit, round 97, F97-L2-4).
+	if math.IsNaN(v) || math.IsInf(v, 0) || v > float64(math.MaxInt32) {
+		return fmt.Errorf("context length %q is not a window", s)
 	}
 	*n = remoteLen(int(v))
 	return nil
