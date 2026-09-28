@@ -5164,13 +5164,25 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	wroteSlots = map[int]*toolAccum{}
 	{
 		m := oaiResp.Choices[0].Message
-		// The slots these calls occupy in the accumulator's terms. A call of a
-		// whole completion carries no index here (the document's tool_calls
-		// entries have no index field), so the order they are written in is the
-		// only slot they can be said to hold — and it is the slot an index-less
-		// delta stream would have given them, since the accumulator keys those
-		// by the same sequence.
-		slot := 0
+		// The slots these calls occupy in the accumulator's terms — numbered as
+		// every other arm numbers the same wire. An entry that STATES an index
+		// occupies that index; an entry that states none takes the next free
+		// slot, this counter kept above every index the list has stated. It is
+		// parseOpenAIToolCalls' own numbering (the non-stream arm) and the
+		// fragment arm's (an index-stating delta is placed at the index it
+		// states), and a whole completion's entry stating one is as much a
+		// statement of the wire as a delta's — round 73's F73-L2-1 settled that
+		// for the document arm, whose reader had folded `"index":0` and
+		// `"index":1` into one entry. Numbered by list POSITION instead, the
+		// adoption spoke for slot 0 while the wire said 2: the id-less delta that
+		// restated that call at index 2 found no slot claimed, was read as a NEW
+		// call, and the model's one call reached the client twice under two ids —
+		// twice under a stop_reason of tool_use, and run twice. Measured on the
+		// frozen tree, a whole-completion frame stating `"index":2` followed by
+		// the id-less restatement at index 2 answered `[Bash/c1 Bash/call_7ff51383]`
+		// where every document spelling of the same turn answers `[Bash/c1]`
+		// (2026-09-29 audit, round 98, F98-L2-1).
+		nextFreeSlot := 0
 		wroteCall := false
 		// The turn's verdict, read the way the conversion below reads it: a
 		// call the converter DROPS is not a call this adoption wrote, and no
@@ -5205,13 +5217,21 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			// reached the client as 502 while the unframed one was answered with
 			// the turn's own stop_reason (2026-09-28 audit, round 81, L2-3).
 			wroteCall = true
+			slot := nextFreeSlot
+			if tc.Index != nil {
+				slot = *tc.Index
+				if slot >= nextFreeSlot {
+					nextFreeSlot = slot + 1
+				}
+			} else {
+				nextFreeSlot++
+			}
 			if truncated {
 				raw := strings.TrimSpace(tc.Function.Arguments)
 				if raw == "" {
 					raw = "{}"
 				}
 				if err := json.Unmarshal([]byte(raw), &api.ToolCallFunctionArguments{}); err != nil {
-					slot++
 					continue
 				}
 			}
@@ -5220,7 +5240,6 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 				acc.args.WriteString(tc.Function.Arguments)
 			}
 			wroteSlots[slot] = acc
-			slot++
 		}
 		wroteCalls = wroteCall
 		// A call the upstream never named is not a call — but its arguments are
