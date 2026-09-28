@@ -1456,6 +1456,23 @@ func NewStreamConverter(id, model string, estimatedInputTokens int) *StreamConve
 	}
 }
 
+// ReserveToolCallIDs records ids the wire STATED on entries this converter is
+// never handed, so a synthesized id cannot land on one of them (A46-4). The
+// reservation Process makes for itself covers the calls it is given; a caller
+// that drops an entry BEFORE handing it over — an entry the upstream never
+// named, an unfinished fragment the truncation gate refuses — would otherwise
+// leave the id that entry states unclaimed, and a later id-less call whose
+// mint happens to be that string took it: the same upstream body reached the
+// client under two different ids depending on the framing (2026-09-28 audit,
+// round 70).
+func (c *StreamConverter) ReserveToolCallIDs(ids ...string) {
+	for _, id := range ids {
+		if id != "" {
+			c.mintedIDs[id] = true
+		}
+	}
+}
+
 // StreamEvent represents a streaming event to be sent to the client
 type StreamEvent struct {
 	Event string

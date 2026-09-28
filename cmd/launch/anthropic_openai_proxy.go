@@ -3021,9 +3021,21 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		var tcs []api.ToolCall
 		var unnamedText strings.Builder
+		// droppedStatedIDs collects the ids stated by entries this flush does
+		// NOT hand to the converter — the nameless fragment below (its
+		// arguments relay as text) and the truncated fragment after it. The
+		// converter reserves the ids of the calls it is given, but these never
+		// reach it, so the id the wire stated stood unclaimed and a later
+		// id-less call's mint could land on it: the ID-LESS call reached the
+		// client under the id this turn had already stated for another entry,
+		// while this leg's own whole-list arm (which reserves every stated id
+		// before its walk) and the local server's arms bumped it away
+		// (2026-09-28 audit, round 70).
+		var droppedStatedIDs []string
 		for _, i := range indices {
 			a := toolAccums[i]
 			if strings.TrimSpace(a.name) == "" {
+				droppedStatedIDs = append(droppedStatedIDs, a.id)
 				// A call the upstream never named. This path used to emit it
 				// anyway, as a content_block_start with no "name" key at all and
 				// a stop_reason of "tool_use": the client was told to expect a
@@ -3065,6 +3077,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// finish_reason "length", so the truncation was invisible
 					// too (2026-09-26 audit, round 16). Dropped rather than
 					// fabricated; the done event below then reports max_tokens.
+					droppedStatedIDs = append(droppedStatedIDs, a.id)
 					continue
 				}
 				// Not a truncation: a model that emits freeform (non-JSON)
@@ -3078,6 +3091,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				Function: api.ToolCallFunction{Name: a.name, Arguments: args},
 			})
 		}
+		// Reserved even when this flush emits nothing: the ids belong to the
+		// turn, and this converter answers the whole turn.
+		conv.ReserveToolCallIDs(droppedStatedIDs...)
 		if unnamedText.Len() > 0 {
 			// Emitted before the calls that follow it, in the order the
 			// fragments arrived: it is the same turn's output either way.
