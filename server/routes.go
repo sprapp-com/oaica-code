@@ -425,7 +425,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 			var apiError api.StatusError
 			if errors.As(err, &apiError) {
-				c.JSON(apiError.StatusCode, apiError)
+				writeRelayedStatusError(c, apiError)
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -2197,6 +2197,34 @@ func relayEndedWithoutAFinalResponse(c *gin.Context, chunks int) {
 	}
 }
 
+// writeRelayedStatusError answers a relayed refusal the way the runner lane
+// answers the same failure: the peer's own message, and nothing else.
+//
+// The value the relay holds is an api.StatusError built from the peer's
+// response — its ErrorMessage is the `error` field the peer wrote, its Status
+// the peer's HTTP status line (api/client.go:54, :230, :246) — and marshalling
+// THAT struct put the struct's own untagged fields on the wire:
+// `{"StatusCode":429,"Status":"429 Too Many Requests","error":"the runner is
+// busy"}`. The runner lane writes `gin.H{"error": serr.ErrorMessage}`
+// (routes.go:3274, pinned at routes_generate_test.go:1474), and the OpenAI and
+// Responses surfaces READ this body back and encode StatusError.Error(), which
+// JOINS Status and ErrorMessage — so one upstream verdict reached those clients
+// as "429 Too Many Requests: the runner is busy" where the byte-identical
+// direct answer is "the runner is busy", while the native and Anthropic
+// surfaces stayed bare. Two fields no native client has ever been sent, and four
+// surfaces disagreeing about one cause (2026-09-29 audit, round 93, F93-L1-1).
+//
+// A peer that stated no message still stated a status, and its own clients are
+// answered that status: falling back to Error() keeps the cause, where an empty
+// string becomes the middleware's generic "something went wrong" sentence.
+func writeRelayedStatusError(c *gin.Context, apiError api.StatusError) {
+	msg := apiError.ErrorMessage
+	if msg == "" {
+		msg = apiError.Error()
+	}
+	c.JSON(apiError.StatusCode, gin.H{"error": msg})
+}
+
 func streamResponse(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/x-ndjson")
 	// The first chunk is read before the loop because an Anthropic client's
@@ -2897,7 +2925,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 			var apiError api.StatusError
 			if errors.As(err, &apiError) {
-				c.JSON(apiError.StatusCode, apiError)
+				writeRelayedStatusError(c, apiError)
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

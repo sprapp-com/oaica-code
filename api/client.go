@@ -263,6 +263,25 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 		return err
 	}
 
+	// Every status branch above lives INSIDE the scan loop, so a body with no
+	// line in it never ran one and a refusal that stated nothing but its status
+	// was returned as success: the relay answered its client 502 "upstream
+	// returned an empty stream" for a peer that said 429, and a caller that
+	// asked for a turn was told there had been no error at all (2026-09-29
+	// audit, round 93). A status is a cause whether or not a body came with it.
+	switch {
+	case response.StatusCode == http.StatusUnauthorized:
+		return AuthorizationError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+		}
+	case response.StatusCode >= http.StatusBadRequest:
+		return StatusError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+		}
+	}
+
 	return nil
 }
 
