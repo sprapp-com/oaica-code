@@ -85,6 +85,25 @@ func TestTheContinuationStatedAtAnotherIndexStaysTheOpenCallOnThisLeg(t *testing
 		{"the continuation states the name", r59L2Frame(`{"index":0,"function":{"name":"Read","arguments":"{\"p\":1}"}}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "the continuation states the name" {
+				// REVERSED by round 79 (F79-L2-A), for the same reason as the
+				// round-59 row of this wire: a fragment that names the open call
+				// again BESIDE arguments, over a call that has accumulated none,
+				// begins the NEXT call (round 78's F78-L3-2 — an empty argument
+				// list is a complete one). The reference is this leg's own
+				// whole-list arm for the same entries, which answers three calls
+				// here; the hand-written two-call document this row compared
+				// against agreed only while the fragment arm folded them.
+				// Measured 2026-09-28.
+				entries := []string{
+					`{"index":0,"id":"a","type":"function","function":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}`,
+					`{"index":1,"id":"b","type":"function","function":{"name":"Read"}}`,
+					`{"index":0,"type":"function","function":{"name":"Read","arguments":"{\"p\":1}"}}`,
+				}
+				frag, wholeArm, _, _, _, _ := r75Arms(t, entries)
+				r59L2SameAsWhole(t, frag, wholeArm)
+				return
+			}
 			frag, wholeBlocks := r59L2Arms(t, []string{
 				r59L2Frame(`{"index":0,"id":"a","function":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}`),
 				r59L2Frame(`{"index":1,"id":"b","function":{"name":"Read"}}`),

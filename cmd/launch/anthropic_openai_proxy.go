@@ -3166,7 +3166,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// bytes arrived has adopted them as a call's arguments, so they are not
 		// prose and are left out here.
 		recorded := map[int]bool{}
+		// namelessBySlot holds the same bytes grouped by slot, in the order the
+		// wire wrote them: the flush relays them for a slot whose call the
+		// truncation gate drops below, and a call's own bytes are not prose, so
+		// the grouping has to stay a per-slot one (2026-09-28 audit, round 79,
+		// F79-L2-B).
+		namelessBySlot := map[int]string{}
 		for _, f := range namelessFrags {
+			namelessBySlot[f.slot] += f.s
 			if a := toolAccums[f.slot]; a != nil && strings.TrimSpace(a.name) == "" {
 				unnamedText.WriteString(f.s)
 				recorded[f.slot] = true
@@ -3231,6 +3238,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// too (2026-09-26 audit, round 16). Dropped rather than
 					// fabricated; the done event below then reports max_tokens.
 					droppedStatedIDs = append(droppedStatedIDs, a.id)
+					// The bytes the wire stated for this call on entries that
+					// named NOTHING are not its arguments — an entry that names
+					// nothing is not a call (round 77) — and the call they were
+					// folded into is dropped here, so they would vanish with it.
+					// Relayed as the text every other arm of this body makes of
+					// them (2026-09-28 audit, round 79, F79-L2-B).
+					if !recorded[i] {
+						unnamedText.WriteString(namelessBySlot[i])
+						recorded[i] = true
+					}
 					continue
 				}
 				// Not a truncation: a model that emits freeform (non-JSON)
@@ -3694,7 +3711,29 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							(adoptedCallAt[slot] == nil &&
 								(tc.ID != "" || tc.Function.Name != "") &&
 								strings.TrimSpace(tc.Function.Arguments) != "" &&
-								!canExtend(acc.args.String(), tc.Function.Arguments))) {
+								!canExtend(acc.args.String(), tc.Function.Arguments)) ||
+							// The slot's call has accumulated NO arguments and a
+							// fragment names that same call again WITH arguments.
+							// An empty argument list is a COMPLETE one — a call
+							// that takes no arguments has all of them the moment
+							// it is named (round 78's F78-L3-2, the predicate the
+							// index-LESS path of this same wire already asks in
+							// startsANewToolCall) — so this fragment begins the
+							// NEXT call. Asked on the index-stated path because
+							// that is the spelling vendors write, and it was the
+							// one arm still folding them: `[{index 0,id call_1,
+							// name Read},{index 0,id call_1,name Read,arguments
+							// {"a":1}}]` reached the client as ONE call holding
+							// `{"a":1}`, where this leg's whole-list arm answers
+							// the argument-less call AND the completed one, under
+							// a minted id (2026-09-28 audit, round 79, F79-L2-A).
+							// The fragment must name the slot's own call, so an
+							// argument-only continuation (which names nothing) and
+							// a name-only restatement are both untouched.
+							(adoptedCallAt[slot] == nil && acc.name != "" &&
+								tc.Function.Name == acc.name &&
+								strings.TrimSpace(acc.args.String()) == "" &&
+								strings.TrimSpace(tc.Function.Arguments) != "")) {
 						// A call the upstream stated this slot for a SECOND time
 						// begins the next one: a stated id this slot does not
 						// hold (round 43's B43-3) or a name it does not carry
@@ -3976,11 +4015,27 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				}
 				if tc.Function.Arguments != "" {
 					acc.args.WriteString(tc.Function.Arguments)
-					if strings.TrimSpace(acc.name) == "" {
-						// An entry the upstream never named, on an accumulator
-						// that still names nothing: these bytes are the model's
-						// prose, and prose is relayed in the order it was written
-						// (2026-09-28 audit, round 77, F77-L2-2).
+					if strings.TrimSpace(tc.Function.Name) == "" {
+						// An entry the upstream never named: these bytes are the
+						// model's prose, and prose is relayed in the order it was
+						// written (2026-09-28 audit, round 77, F77-L2-2).
+						//
+						// Recorded for EVERY nameless entry, not only those that
+						// land on an accumulator still naming nothing. The bytes
+						// are prose whether or not the slot they were filed under
+						// already carries a call, and the flush is where that is
+						// decided: while the call they were folded into is KEPT
+						// they are its arguments (the freeform trade-off round 77
+						// records), and when the truncation gate DROPS that call
+						// they have nowhere left to go and must reach the client
+						// as the text every document arm makes of them. Recorded
+						// only on a nameless accumulator, the truncated case lost
+						// the model's output entirely — `[{index 0,id c1,name
+						// Bash,args "ls "},{index 0,args "-la"}]` under
+						// finish_reason "length" reached the client as NO content
+						// at all, where this leg's whole-list arm answers the text
+						// `-la` under max_tokens (2026-09-28 audit, round 79,
+						// F79-L2-B).
 						namelessFrags = append(namelessFrags, namelessFrag{slot: slot, s: strings.TrimSpace(tc.Function.Arguments)})
 					}
 				}

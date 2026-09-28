@@ -138,6 +138,30 @@ func TestTheContinuationOfTheSplitCallIsTheSplitCallOnThisLeg(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "the continuation states the index and the name" {
+				// REVERSED by round 79 (F79-L2-A). This row held that the
+				// fragment naming the call again BESIDE its arguments continues
+				// the argument-less call introduced at that slot, and compared
+				// the stream against a hand-written two-call document. It is the
+				// reading round 78 reversed for the index-LESS spelling of the
+				// same wire (F78-L3-2), with the same reason: an empty argument
+				// list is a COMPLETE one, so a call introduced with no arguments
+				// is whole the moment it is named, and a fragment naming it
+				// again WITH arguments is the NEXT call. The document to compare
+				// against is this leg's own whole-list arm for the same entries,
+				// which answers THREE calls here — measured 2026-09-28: the
+				// hand-written two-call document agreed with the fragment arm
+				// only while the fragment arm was folding the two Reads into
+				// one, and the whole-list arm for these entries never did.
+				entries := []string{
+					`{"index":0,"id":"a","type":"function","function":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}`,
+					`{"index":0,"id":"b","type":"function","function":{"name":"Read"}}`,
+					`{"index":0,"type":"function","function":{"name":"Read","arguments":"{\"p\":1}"}}`,
+				}
+				frag, whole, _, _, _, _ := r75Arms(t, entries)
+				r59L2SameAsWhole(t, frag, whole)
+				return
+			}
 			frag, whole := r59L2Arms(t, []string{first, second, tc.third, r59L2Fin, `data: [DONE]`}, r59L2WholeTwoCalls)
 			r59L2SameAsWhole(t, frag, whole)
 		})
