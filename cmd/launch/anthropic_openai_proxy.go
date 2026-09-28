@@ -471,6 +471,23 @@ type openAIStreamChunk struct {
 // same rule to the same wire.
 func startsANewToolCall(accID, accName, accArgs, deltaID, deltaName, deltaArgs string) bool {
 	if accID == "" && accName == "" {
+		// The accumulator holds a fragment the upstream never named, which is
+		// not a call on this path at all: at flush its arguments reach the
+		// client as TEXT (relayUnnamedCallArguments) rather than as a block.
+		// A delta that carries no name is more of the same unnamed fragment —
+		// joining it keeps the text in one piece — but one that NAMES a call
+		// introduces that call, and joining it here made the named call inherit
+		// the unnamed fragment's arguments: on `[{"index":0,name:""},{"id":"c1",
+		// name:"Bash"}]` both entries carry {"a":1} and the client was handed a
+		// single tool_use whose input was {"_raw":"{\"a\":1}{\"a\":1}"} — no
+		// tool can run it — where this leg's own whole-list arm, the local
+		// server's two arms and both gateway arms hand it two entries' meaning
+		// (2026-09-28 audit, round 75, F75-L2-2). A nameless accumulator is
+		// never the call a later fragment names: that fragment is its own entry,
+		// which is what every other arm that reads this wire answers.
+		if deltaName != "" {
+			return true
+		}
 		return false
 	}
 	if deltaID != "" && accID != "" && deltaID != accID {
@@ -864,6 +881,29 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		}
 	}
 	for _, tc := range tcs {
+		// The slot this entry occupies, numbered as the fragment arm numbers it,
+		// and numbered HERE — before the nameless check below — because the
+		// fragment arm advances its counter for every indexed fragment it sees,
+		// including one whose name is missing (the skip further down drops the
+		// entry, not the slot it occupied on the wire). Numbered only for the
+		// entries this walk EMITS, the numbering lagged the wire's slots behind
+		// any nameless entry, and a later id-less entry was then folded onto a
+		// slot the wire never gave the stated call: one body answered 2 calls as
+		// fragments and 1 as one list, legs 1 and 3 answering 2 (2026-09-28
+		// audit, round 75, F75-L2-1). Which slot a twin occupies is asked of
+		// this numbering, one entry at a time, and the answer is a SET of the
+		// slots an identity was stated at — round 73 asked it of the entry's
+		// list position and of the last slot it saw, and each lost a call the
+		// wire had asked for (round 74, F74-1 and F74-3).
+		slot := nextFreeSlot
+		if tc.Index != nil {
+			slot = *tc.Index
+			if slot >= nextFreeSlot {
+				nextFreeSlot = slot + 1
+			}
+		} else {
+			nextFreeSlot++
+		}
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call on this path either:
 			// its arguments reach the client as TEXT (relayUnnamedCallArguments,
@@ -944,21 +984,12 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		// not slots the wire stated.
 		//
 		// Which slot a twin occupies is asked of the numbering the fragment arm
-		// uses, one entry at a time (nextFreeSlot above), and the answer is a SET
-		// of the slots this identity was stated at — round 73 asked both of the
-		// entry's list position and of the last slot it saw, and each of those
-		// lost a call the wire had asked for (2026-09-28 audit, round 74, F74-1
-		// and F74-3).
-		// The slot this entry occupies, numbered as the fragment arm numbers it.
-		slot := nextFreeSlot
-		if tc.Index != nil {
-			slot = *tc.Index
-			if slot >= nextFreeSlot {
-				nextFreeSlot = slot + 1
-			}
-		} else {
-			nextFreeSlot++
-		}
+		// uses, one entry at a time (nextFreeSlot, advanced at the TOP of this
+		// walk), and the answer is a SET of the slots this identity was stated
+		// at — round 73 asked both of the entry's list position and of the last
+		// slot it saw, and each of those lost a call the wire had asked for
+		// (2026-09-28 audit, round 74, F74-1 and F74-3). `slot` here is the one
+		// numbered above, before the nameless skip.
 		if tc.ID == "" {
 			if slots, stated := statedCallSlots[identity]; stated && tc.Index != nil && slots[*tc.Index] {
 				continue
