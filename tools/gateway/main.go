@@ -1815,9 +1815,19 @@ func (u *usageRecorder) Flush() {
 	}
 }
 
-// sseTailLimit bounds the partial-line buffer every SSE scanner keeps between
-// writes (2026-09-01 audit M5).
-const sseTailLimit = 1 << 20
+// docBufferLimit bounds the buffer a whole-completion DOCUMENT may occupy while
+// it arrives. It is the same 8 MiB bound the non-streaming arm already trusts
+// (`bufCapOK`): one turn reaches the client as a document or as frames, and the
+// two spellings of it may not be answered on different sizes (2026-09-28 audit,
+// round 86, F86-L3-1).
+//
+// It is the bound for every buffer that has to hold a whole turn to read it,
+// the meter's included. The meter's partial-line buffer was bounded by a 1 MiB
+// `sseTailLimit`, so a turn whose body passed 1 MiB was metered with
+// usage_seen=false on both streamed spellings and usage_seen=true on the plain
+// one — the same body served, read two ways, billed with two different degrees
+// of confidence (2026-09-28 audit, round 86, F86-L3-1's metering face).
+const docBufferLimit = 8 << 20
 
 // trimOverlongSSETail keeps that buffer bounded WITHOUT going deaf. When the
 // buffer has reached the limit, the bytes up to and including the last
@@ -1839,7 +1849,7 @@ func trimOverlongSSETail(buf *bytes.Buffer, limit int) {
 }
 
 func (u *usageRecorder) scanSSE(p []byte) {
-	trimOverlongSSETail(&u.tail, sseTailLimit)
+	trimOverlongSSETail(&u.tail, docBufferLimit)
 	u.tail.Write(p)
 	for {
 		raw := u.tail.Bytes()
@@ -1856,7 +1866,7 @@ func (u *usageRecorder) scanSSE(p []byte) {
 			// the non-stream path uses) is what lets finish() read that document's
 			// usage instead of booking the served turn as zero tokens
 			// (2026-09-27 audit, round 39, B-F3).
-			if u.body.Len() < 4<<20 {
+			if u.body.Len() < docBufferLimit {
 				u.body.Write(line)
 				u.body.WriteByte('\n')
 			}

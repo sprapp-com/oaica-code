@@ -2854,7 +2854,18 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 	// buffer was over the cap left it over the cap forever, so translation
 	// stalled after the overlong line instead of resuming with the next one
 	// (2026-09-27 audit, round 31).
-	trimOverlongSSETail(&b.sse.tail, sseTailLimit)
+	//
+	// The limit here is the DOCUMENT buffer's, not the usage scanner's 1 MiB:
+	// a whole completion that answers a `stream:true` request arrives as ONE
+	// unterminated line — with or without a `data:` prefix — so a 1 MiB cap
+	// reset it before `bufferedCompletion` could read it and the turn was
+	// refused as `upstream returned an empty stream`, while the same bytes
+	// answered `stream:false` with a 200 and the same turn split into ordinary
+	// small `data:` frames streamed fine. A single large tool call is enough to
+	// cross the old cap (2026-09-28 audit, round 86, F86-L3-1). This is the same
+	// bound `bufCapOK` already trusts on the non-streaming path, so one turn of
+	// one size is served the same way whichever spelling carries it.
+	trimOverlongSSETail(&b.sse.tail, docBufferLimit)
 	b.sse.tail.Write(p)
 	for {
 		raw := b.sse.tail.Bytes()
@@ -2869,7 +2880,7 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			// with a whole completion document sends no "data:" lines at all,
 			// and the adoption below needs the bytes (2026-09-27 audit, round
 			// 38, B-F4). Bounded, and only ever read when nothing was streamed.
-			if b.sse.nonSSE.Len() < 1<<20 {
+			if b.sse.nonSSE.Len() < docBufferLimit {
 				b.sse.nonSSE.WriteString(line)
 				b.sse.nonSSE.WriteByte('\n')
 			}
@@ -2919,10 +2930,23 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 		// its status.
 		if !b.sse.startSent && frameRelaysSomething(chunk) {
 			b.sse.startSent = true
+			// The id the turn wears is the upstream's, when the frame that opened
+			// the turn is a whole completion — the same id the two DOCUMENT arms
+			// state (`finalize`, `adoptWholeStream`). A frame that only carries a
+			// delta has no document to take one from and keeps the minted id; a
+			// frame carrying a `message` is the document spelling of the very
+			// body the client would get `msg_abc` for under `stream:false`, and
+			// answered `msg_<timestamp>` here for a turn whose bytes, model and
+			// usage were otherwise identical (2026-09-28 audit, round 86,
+			// F86-L3-2).
+			startID := ""
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Message != nil {
+				startID = chunk.ID
+			}
 			b.emit("message_start", map[string]any{
 				"type": "message_start",
 				"message": map[string]any{
-					"id": respID(""), "type": "message", "role": "assistant",
+					"id": respID(startID), "type": "message", "role": "assistant",
 					"model": b.model, "content": []any{},
 					"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 				},
@@ -3995,6 +4019,23 @@ func (b *anthropicBridge) blockCarrying(id string, tb *toolBlock) *toolBlock {
 // that merely shares the id and the name. The carried call's own arguments must
 // be far enough along for the comparison to mean anything (settledIdentity), so
 // a block still writing half an object is never read as restated.
+//
+// RECORDED, NOT FIXED (2026-09-28 audit, round 86): the clause reads a
+// FRAGMENT whose bytes are the block's whole accumulated argument text as a
+// restatement of that block, where THE TWO SPELLINGS RULE says a fragment's
+// bytes are more of the call it continues. Measured on both spellings of the
+// fragment wire, one Read call at index 0 whose fragments are `aa`, `aa`:
+// the client was handed `{"_raw":"aa"}` — the upstream's second `aa` dropped,
+// where the model wrote four bytes. `aa`, `aa`, `bb` answered `{"_raw":"aabb"}`,
+// and the client leg answers both rows identically (probed 2026-09-28, HEAD
+// 7adc0b348). No producer is named: the drop needs a fragment equal to the
+// WHOLE argument text accumulated so far, and an upstream that re-sends all of
+// a call's bytes as its next fragment has not been seen — a real continuation
+// grows the buffer and never equals it. Left as written rather than fixed,
+// because the identity clause is what keeps the wires round 56 (F1/F2), 59
+// (F59-L3-3) and 83 (F83-L3-2) describe from reaching the client as
+// concatenated JSON; narrowing it for the fragment spelling alone is a change
+// to that shared rule and belongs to a round that can name the wire it serves.
 func restatesCarriedIdentity(carried *toolBlock, name, args string) bool {
 	mine, ok := settledIdentity(carried)
 	return ok && mine == toolCallIdentity(name, args)
@@ -5429,6 +5470,13 @@ type oaDelta struct {
 // here is translated until a frame is in hand (see writeStream): the frame
 // decides whether the stream is committed at all.
 type oaStreamChunk struct {
+	// ID is the upstream's own id for the turn. A frame that carries a whole
+	// completion carries the id that completion would wear as a document, and
+	// the client is handed it (see writeStream's message_start): the same body
+	// answered `msg_<upstream id>` under `stream:false` and a freshly minted one
+	// here, on a turn whose every other byte agreed (2026-09-28 audit, round 86,
+	// F86-L3-2).
+	ID      string `json:"id"`
 	Choices []struct {
 		Delta        oaDelta  `json:"delta"`
 		Message      *oaDelta `json:"message"`
