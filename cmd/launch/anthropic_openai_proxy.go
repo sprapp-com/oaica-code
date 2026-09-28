@@ -3147,6 +3147,16 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// document does, and is named the same way below (2026-09-29 audit, round
 	// 93, F93-L2-1b).
 	wholeCompletionFrameSeen := false
+	// unreadFramed holds the FIRST frame this stream read and could NOT read as
+	// part of the turn: a `data:` payload that does not decode as a chunk, or a
+	// whole completion whose message is written in a spelling this arm's decoder
+	// rejects. When the stream ends with nothing relayed, those bytes are the
+	// body the buffered arm would have DECODED and declined, and that arm names
+	// the cause ("decode upstream response: <detail>"). Naming a different cause
+	// — "stream ended before the response was complete", or an emptiness
+	// sentence about a frame that did state content — is a sentence about a
+	// thing that did not happen (2026-09-29 audit, round 96, F96-L2-1).
+	var unreadFramed string
 
 	emitErr := func(msg string) {
 		// Mid-stream: the status is already 200 and bytes are already sent,
@@ -3682,6 +3692,11 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// carrying an error object rather than a choice.
 			if m := upstreamErrorMessage(payload, secret); m != "" {
 				upstreamErr = upstreamErrorPrefix + m
+			} else if unreadFramed == "" {
+				// Not an error object: a frame this reader cannot read. The
+				// buffered arm meets the same bytes as a document and names the
+				// decode detail; keep them so the tail below can name it too.
+				unreadFramed = payload
 			}
 			continue
 		}
@@ -3773,6 +3788,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		wholeCompletionFrame := frameCarriesWholeCompletion(payload)
 		if wholeCompletionFrame {
 			wholeCompletionFrameSeen = true
+		}
+		// A frame that IS a whole completion — a choice carrying a message —
+		// written in a spelling this arm's decoder rejects (an array of content
+		// parts is one) is not seen as a whole-completion frame at all: the gate
+		// above asks the same decoder. It is nonetheless the body the buffered
+		// arm declines to DECODE and names by its detail, so it is kept here
+		// whatever that gate said (2026-09-29 audit, round 96, F96-L2-1).
+		if unreadFramed == "" {
+			if p, ok := unreadCompletionFrame(payload); ok {
+				unreadFramed = p
+			}
 		}
 		frameReadAsDelta := false
 
@@ -4641,7 +4667,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// removed) is refused, and recorded the leg healthy so `auto` never moved
 	// the session off it (2026-09-28 audit, round 56, F1).
 	if completed && !started && !relaysSomething(toolAccums) {
-		upstreamErr = "upstream returned an empty completion"
+		// Unless the frame that stated this turn is one this reader could not
+		// READ: the buffered arm meets the same body as a document and answers
+		// with the decode detail, so this arm cannot call it empty when it
+		// never read it (2026-09-29 audit, round 96, F96-L2-1). Measured: a
+		// frame whose message states content as an array of parts answered 502
+		// "upstream returned an empty completion" here where the same body,
+		// buffered, answered "decode upstream response: json: cannot unmarshal
+		// array into Go struct field .choices.message.content of type string".
+		upstreamErr = unreadFrameCause(unreadFramed)
+		if upstreamErr == "" {
+			upstreamErr = "upstream returned an empty completion"
+		}
 	}
 
 	if !completed {
@@ -4687,6 +4724,26 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// whole-bodied and unframed, all answered "upstream returned
 					// an empty completion".
 					msg = "upstream returned an empty completion"
+				}
+				// Last word: the bytes this stream could not READ as part of the
+				// turn name the same cause the buffered arm names for the same
+				// body, when they do not decode as a document either. The
+				// sentences above describe a body that was read and said
+				// nothing; a body that cannot be read is a different cause, and
+				// it is the actionable one — measured 2026-09-29 (round 96,
+				// F96-L2-1): one frame whose `usage.prompt_tokens` is a string
+				// answered 502 "decode upstream response: json: cannot unmarshal
+				// string into Go struct field openAIUsage.usage.prompt_tokens of
+				// type int" buffered and 502 "upstream stream ended before the
+				// response was complete" streamed, and a frame whose message
+				// states content as an array of parts answered the buffered
+				// detail where the streamed arm fabricated an empty completion.
+				// A frame that DOES decode — round 93's empty whole completion —
+				// keeps the sentence its buffered twin gives it.
+				if !started {
+					if c := unreadFrameCause(unreadFramed); c != "" {
+						msg = c
+					}
 				}
 			}
 		}
@@ -4940,6 +4997,35 @@ func frameAddsToTheTurn(payload string, held func(id, name, args string) bool) b
 // matches it, and adopting such a frame emits an empty message, ends the turn,
 // and throws the rest of the stream away, leaving the client with 200 and no
 // answer on a leg recorded healthy (2026-09-26 audit, sixteenth round).
+// unreadFrameCause names the cause the buffered arm names for a body this
+// stream read as a frame and could not read — "decode upstream response:
+// <detail>" — or "" when the bytes decode as a document after all.
+func unreadFrameCause(payload string) string {
+	if strings.TrimSpace(payload) == "" {
+		return ""
+	}
+	var probe openAIChatResponse
+	if derr := json.Unmarshal([]byte(strings.TrimSpace(payload)), &probe); derr != nil {
+		return "decode upstream response: " + redactErr(derr).Error()
+	}
+	return ""
+}
+
+// unreadCompletionFrame reports whether a frame states a whole completion — a
+// choice carrying a message — in a spelling this arm's decoders reject, which
+// is the shape the buffered arm answers with a decode detail rather than an
+// emptiness sentence (2026-09-29 audit, round 96, F96-L2-1).
+func unreadCompletionFrame(payload string) (string, bool) {
+	if !strings.Contains(payload, `"message"`) {
+		return "", false
+	}
+	var resp openAIChatResponse
+	if err := json.Unmarshal([]byte(payload), &resp); err == nil {
+		return "", false
+	}
+	return payload, true
+}
+
 func frameCarriesWholeCompletion(payload string) bool {
 	var resp openAIChatResponse
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {

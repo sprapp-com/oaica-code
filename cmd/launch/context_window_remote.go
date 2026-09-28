@@ -66,14 +66,39 @@ func cachedRemoteContextWindow(route proxyRoute) int {
 	return w
 }
 
+// remoteLen is a length the wire may spell as a JSON number or as the same
+// number in a string, and may spell as a float. A router that answers
+// `"context_length": "262144"` is stating 262144; reading it as 0 lost the
+// window, the CLAUDE_CODE_MAX_CONTEXT_TOKENS hint and the context-fit clamp
+// ceiling for that leg (2026-09-29 audit, round 96, F96-L2-2). Garbage still
+// fails the decode, which is this probe's fail-closed answer.
+type remoteLen int
+
+func (n *remoteLen) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	if s == "" || s == "null" {
+		*n = 0
+		return nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return err
+	}
+	*n = remoteLen(int(v))
+	return nil
+}
+
 type remoteModelMeta struct {
-	ID            string `json:"id"`
-	ContextLength int    `json:"context_length"`
-	MaxModelLen   int    `json:"max_model_len"`
+	ID            string    `json:"id"`
+	ContextLength remoteLen `json:"context_length"`
+	MaxModelLen   remoteLen `json:"max_model_len"`
 }
 
 type remoteModelsResponse struct {
-	Data []remoteModelMeta `json:"data"`
+	Data []json.RawMessage `json:"data"`
 }
 
 // defaultRemoteContextWindow asks the route's model list for the upstream
@@ -147,16 +172,31 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRemoteModelsBytes)).Decode(&parsed); err != nil {
 		return 0
 	}
+	// Each entry is decoded on its own: a list is many statements, and one
+	// entry's spelling is not evidence about the entry the route named. Read as
+	// one struct, a single retyped field ANYWHERE in the list failed the whole
+	// decode, so a well-formed entry lost its window because of an unrelated
+	// sibling (2026-09-29 audit, round 96, F96-L2-2). An entry that does not
+	// decode is simply not a candidate.
+	metas := make([]remoteModelMeta, len(parsed.Data))
+	readable := make([]bool, len(parsed.Data))
+	for i, raw := range parsed.Data {
+		var m remoteModelMeta
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		metas[i], readable[i] = m, true
+	}
 	var meta *remoteModelMeta
-	for i := range parsed.Data {
-		if parsed.Data[i].ID == route.UpstreamModel {
-			meta = &parsed.Data[i]
+	for i := range metas {
+		if readable[i] && metas[i].ID == route.UpstreamModel {
+			meta = &metas[i]
 			break
 		}
 	}
 	if meta == nil {
-		if len(parsed.Data) == 1 {
-			meta = &parsed.Data[0]
+		if len(metas) == 1 && readable[0] {
+			meta = &metas[0]
 		} else {
 			return 0
 		}
@@ -165,9 +205,9 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 	// router in front of vLLM may return both (identical). Prefer the
 	// larger — never advertise less than the upstream says it serves.
 	if meta.ContextLength >= meta.MaxModelLen {
-		return meta.ContextLength
+		return int(meta.ContextLength)
 	}
-	return meta.MaxModelLen
+	return int(meta.MaxModelLen)
 }
 
 // withContextWindows probes each distinct upstream route for its real
