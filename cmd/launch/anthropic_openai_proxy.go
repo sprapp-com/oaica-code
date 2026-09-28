@@ -3114,6 +3114,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// here while the whole-body arm read it fine (2026-09-29 audit, round 87,
 	// F87-L2-2).
 	var eventBuf strings.Builder
+	// spread holds the `data:` lines of the event being read that are not JSON
+	// on their own, so that the text they JOIN to can be read as the payload
+	// the moment it parses. The SSE grammar joins an event's lines with
+	// newlines, so a whole completion may be written across several of them —
+	// an upstream that pretty-prints a long answer does exactly that. Read per
+	// LINE, no line of such a document is a frame: nothing is adopted, nothing
+	// is folded, and a turn the upstream already wrote ended as a 502 whose
+	// cause did not happen (or, when the stream had already relayed text, as a
+	// silently dropped answer). Reading the join makes the three windows one:
+	// whatever rule reads a single-line frame reads a document spelled across
+	// lines (2026-09-29 audit, round 91, F91-L2-1 / F91-L2-2 / F91-L2-3).
+	//
+	// A line that IS JSON is never held, so frames that are each whole objects
+	// of their own are still read as the separate frames they are, and the
+	// buffer is dropped at every event boundary — an event whose text never
+	// parses has already been read by the event's own error arm (F87-L2-2).
+	var spread strings.Builder
 	// choiceslessFrame records whether any frame this stream read PARSED as a
 	// chunk and carried no choice at all — the streamed spelling of the body
 	// the buffered arm reads as "upstream returned an empty completion". The
@@ -3520,8 +3537,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// The blank line ends the event: what it held, joined, is the only
 			// reading of it that can recognise an object that spanned more than
 			// one line (2026-09-29 audit, round 87, F87-L2-2).
-			joined := eventBuf.String()
+				joined := eventBuf.String()
 			eventErr := eventErrorMessage(&eventBuf, secret)
+			// The event is over: text that never parsed is not this event's
+			// payload, and holding it into the next event would join two
+			// events' bytes into one document neither of them wrote.
+			spread.Reset()
 			if upstreamErr == "" && eventErr != "" {
 				upstreamErr = upstreamErrorPrefix + eventErr
 			}
@@ -3606,6 +3627,30 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				completed = true
 			}
 			break
+		}
+
+		// An event's `data:` lines are ONE payload joined by newlines, so a JSON
+		// object may be written across several of them. A line that is not JSON
+		// on its own is held, and the text the lines spell becomes THIS line's
+		// payload the moment it parses — so the document a spread event carries
+		// is read by the same rules the single-line frame goes through, in the
+		// order it arrived, instead of being handed to no rule at all
+		// (2026-09-29 audit, round 91, F91-L2-1 / F91-L2-2 / F91-L2-3).
+		if spread.Len() > 0 {
+			if int64(spread.Len()) < httpbody.DefaultMax {
+				spread.WriteByte('\n')
+				spread.WriteString(payload)
+			}
+			if !json.Valid([]byte(spread.String())) {
+				continue
+			}
+			payload = spread.String()
+			spread.Reset()
+		} else if !json.Valid([]byte(payload)) {
+			if int64(len(payload)) < httpbody.DefaultMax {
+				spread.WriteString(payload)
+			}
+			continue
 		}
 
 		var chunk openAIStreamChunk
