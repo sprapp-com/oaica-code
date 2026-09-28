@@ -826,6 +826,10 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 	// seenInList counts how often each call identity has appeared in this
 	// list, so a repeat takes the streaming converter's "#n" rule (A45-2).
 	seenInList := make(map[string]int, len(tcs))
+	// statedCallIdentities holds the identity of every call this list stated an
+	// id for, so a later id-less entry repeating one of them is read as that
+	// call restated rather than as a second call (see the fold below).
+	statedCallIdentities := make(map[string]bool, len(tcs))
 	for _, tc := range tcs {
 		if tc.ID != "" {
 			usedIDs[tc.ID] = true
@@ -886,6 +890,27 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		// The call's own identity, keyed exactly as the streaming converter
 		// keys it: name plus canonical arguments.
 		identity := "\x00" + tc.Function.Name + "\x00" + key
+		// A restatement of a call this list already STATED is that call, not a
+		// second one. The streaming arm of this leg reads the wire that way —
+		// both entries of one slot, the second with no id, are the call the
+		// first stated (round 56's F1/F2, restatesAccumulatedCall) — and the
+		// gateway leg's document arm folds them too, so only the shape matters
+		// here: an entry that states an id is a call; a LATER entry that states
+		// none and carries the same name and the same finished arguments is
+		// that call listed again. Left in, it minted an id of its own and the
+		// model's one call reached the client as two tool_use blocks with equal
+		// names and inputs — the client runs the tool twice — where the same
+		// body's other arm answers one. Recorded only from entries that STATED
+		// an id, because two identical ID-LESS calls are two calls and not one
+		// stated twice: that is A45-2's rule, and it survives this
+		// (2026-09-28 audit, round 68, F68-L2-3).
+		if tc.ID == "" {
+			if _, stated := statedCallIdentities[identity]; stated {
+				continue
+			}
+		} else {
+			statedCallIdentities[identity] = true
+		}
 		id := tc.ID
 		minted := false
 		if id != "" {
@@ -1002,7 +1027,19 @@ func openAIResponseToChatResponse(resp openAIChatResponse, upstreamModel string)
 		// must not have its unfinished argument fragments dressed up as calls;
 		// see parseOpenAIToolCalls.
 		chatResp.Message.ToolCalls = parseOpenAIToolCalls(c.Message.ToolCalls, c.FinishReason == "length")
-		chatResp.DoneReason = mapFinishReason(c.FinishReason)
+		// The LAST finish_reason any choice stated, which is what this leg's
+		// fragment arm reads off the same field: which of an upstream's choices
+		// carried the reason is not this leg's to decide, and reading
+		// Choices[0] here alone made one body answer max_tokens streamed and
+		// end_turn whole (2026-09-28 audit, round 68, F68-L2-2). The message
+		// stays the first entry's, as this path has always read it.
+		reason := ""
+		for _, ch := range resp.Choices {
+			if ch.FinishReason != "" {
+				reason = ch.FinishReason
+			}
+		}
+		chatResp.DoneReason = mapFinishReason(reason)
 	}
 	if resp.Usage != nil {
 		// The TOTAL prompt, uncached included: Metrics is the shape
@@ -2619,6 +2656,19 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, upstreamMode
 // below renders the upstream's own text to the client, so it is passed to
 // upstreamErrorMessage for the literal redaction (see redactUpstreamDiagnosis).
 
+// toolAccum is one tool call as this leg accumulates it: the identity the
+// stream stated so far, and the argument bytes received so far. It is a
+// package-level type rather than a local of handleStreamResponse because an
+// adopted whole completion hands its calls back as accumulators too — the same
+// shape answers "what call is at this slot" for a call the adoption wrote and
+// for one still arriving as fragments, and every rule that compares a fragment
+// against its slot's occupant has to ask it of both.
+type toolAccum struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
 func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel string, onUsage func(int), estInputTokens int, secret string) bool {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2643,11 +2693,6 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// per-line cap to 8 MiB so we don't bail mid-token on long thinking runs.
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
-	type toolAccum struct {
-		id   string
-		name string
-		args strings.Builder
-	}
 	toolAccums := map[int]*toolAccum{}
 	// toolArrival is the order the stream first wrote each slot — the order the
 	// calls were INTRODUCED, which is the order flushToolCalls hands them to the
@@ -2784,9 +2829,17 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reading that leaves the client a call it can run is that the upstream
 	// listed the same call twice; appended, the client accumulated
 	// `{"a":1}{"a":1}` for a call the model made once (2026-09-28 audit, round
-	// 56, F1 and F2). Both this leg's non-stream list and the gateway leg answer
-	// that wire with ONE call, and the local converter drops a stated id it has
-	// already sent (seenStatedID).
+	// 56, F1 and F2). The gateway leg's document arm and the local converter
+	// (which drops a stated id it has already sent, seenStatedID) each answer
+	// that wire with ONE call.
+	//
+	// This leg's own non-stream list was NOT one of them when round 56 was
+	// written: parseOpenAIToolCalls minted a second id for the id-less
+	// restatement, so the same body reached the client as two equal calls here
+	// and as one everywhere else. It folds that entry now (F68-L2-3,
+	// statedCallIdentities) — the claim is true of all three because it was
+	// made true, not because it was read that way (2026-09-28 audit, round 68,
+	// F68-L2-3).
 	//
 	// A delta that states an id at all must state THIS call's: an id the
 	// accumulator does not hold is a second call the upstream numbered itself,
@@ -3084,14 +3137,25 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// reports a failure instead of a clean turn (2026-09-26 audit).
 	completed := false
 	upstreamErr := ""
-	// adoptedSlots are the call slots an adopted whole completion wrote, so a
-	// fragment later in the stream can be told apart: one at a slot the adoption
-	// wrote continues a call the client already holds (it cannot be delivered);
-	// one at a NEW slot is a call of the model's own (2026-09-27 audit, round
-	// 49, A-F2). Keyed as the accumulator keys its slots: the call's own index,
-	// or — for a completion whose calls carry none — the order they were
-	// written in, which is the slot the index-less accumulator would have used.
-	adoptedSlots := map[int]bool{}
+	// adoptedCallAt is the call each slot an adopted whole completion wrote
+	// already holds, so a fragment later in the stream can be told apart: one
+	// that continues that call cannot be delivered (its block is closed on the
+	// client's side), while one naming a DIFFERENT call is a call of the
+	// model's own and must reach the client. Keyed as the accumulator keys its
+	// slots: the call's own index, or — for a completion whose calls carry none
+	// — the order they were written in, which is the slot the index-less
+	// accumulator would have used (2026-09-27 audit, round 49, A-F2).
+	//
+	// The occupant is a *toolAccum rather than a bool because it is consulted
+	// as an occupant: the split above asks a slot's call for its id, its name
+	// and its argument bytes to decide whether a fragment is more of it or the
+	// next call. With a bool here the split could not ask, so a fragment stating
+	// a different call at an adopted slot was dropped by the guard below instead
+	// of opening a block — the model asked for a tool the client never saw, and
+	// the same two calls reached the client as two blocks when the upstream
+	// stated them inside the frame it adopted and as one when it stated the
+	// second a delta later (2026-09-28 audit, round 68, F68-L2-1).
+	adoptedCallAt := map[int]*toolAccum{}
 	// adoptedCalls is whether the adopted completion wrote any tool call of its
 	// own — the calls whose blocks the client already holds, and the only
 	// fragments a later tool delta can be a continuation of.
@@ -3099,6 +3163,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// adoptedWhole is whether a whole completion that arrived inside a frame
 	// became the turn (see the frameCarriesWholeCompletion branch below).
 	adoptedWhole := false
+	// slotCall returns the call a slot currently holds: one an accumulating
+	// fragment is building, or one an adopted whole completion already wrote.
+	// Those are one question — "what call is at this slot" — and every rule that
+	// compares a fragment against the slot's occupant must ask it of the adopted
+	// call too; that is why the adoption's entries are shaped like accumulators
+	// rather than being a set of slots.
+	slotCall := func(slot int) *toolAccum {
+		if a, ok := toolAccums[slot]; ok {
+			return a
+		}
+		return adoptedCallAt[slot]
+	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -3191,7 +3267,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// asking the same question of the same fragment) (2026-09-28 audit,
 		// round 56, F2).
 		if !started && !relaysSomething(toolAccums) && frameCarriesWholeCompletion(payload) {
-			if adopted, refused, wroteCalls, wroteSlots := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
+			if adopted, refused, wroteCalls, wrote := adoptNonSSECompletion(payload, conv, emit, onUsage, upstreamModel, &finishReason, &finalUsage, &streamedText); adopted {
 				completed = true
 				// The turn's whole completion has been relayed, and the stream
 				// goes on: the upstream stated the message and then kept
@@ -3217,7 +3293,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// and C-F2).
 				adoptedWhole = true
 				adoptedCalls = wroteCalls
-				adoptedSlots = wroteSlots
+				adoptedCallAt = wrote
 			} else if refused {
 				// The frame IS a whole completion and it says nothing. Falling
 				// through to the delta loop let the finish_reason it carried
@@ -3349,11 +3425,12 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							}
 						}
 					}
-					if acc, exists := toolAccums[slot]; exists &&
+					if acc := slotCall(slot); acc != nil &&
 						!restatesAccumulatedCall(acc, tc.ID, tc.Function.Name, tc.Function.Arguments) &&
 						((tc.ID != "" && acc.id != "" && tc.ID != acc.id) ||
 							(tc.Function.Name != "" && acc.name != "" && tc.Function.Name != acc.name) ||
-							((tc.ID != "" || tc.Function.Name != "") &&
+							(adoptedCallAt[slot] == nil &&
+								(tc.ID != "" || tc.Function.Name != "") &&
 								strings.TrimSpace(tc.Function.Arguments) != "" &&
 								!canExtend(acc.args.String(), tc.Function.Arguments))) {
 						// A call the upstream stated this slot for a SECOND time
@@ -3387,6 +3464,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// call, and freeform continuations stay in theirs because
 						// more of a line IS extendable.
 						//
+						// It is asked only of a slot THIS leg opened. A slot the
+						// adoption wrote holds a call whose block the client
+						// already has, closed: bytes that cannot extend it are
+						// dropped below, not split into a second block — and a
+						// fragment stating that call's own id with different
+						// arguments is exactly round 48's adopted tail, which the
+						// split turned into a nameless new call relayed as TEXT
+						// (2026-09-28 audit, round 68, F68-L2-1's fix; the control
+						// is round 48's A-F2/C-F2). A fragment naming a DIFFERENT
+						// call at an adopted slot still splits, above, on the id or
+						// name it states, which is the round-68 finding.
+						//
 						// The call the slot already carries, restated, is asked
 						// first and stays that call: round 56's F1 lists it again
 						// under its own id at its own index.
@@ -3405,7 +3494,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 						// a {"_raw":…} blob no tool accepts, under a stop_reason
 						// of tool_use (2026-09-28 audit, round 59, F59-L2-1).
 						indexSlot[*tc.Index] = slot
-					} else if acc, exists := toolAccums[slot]; exists &&
+					} else if acc := slotCall(slot); acc != nil &&
 						tc.ID == "" && tc.Function.Name == "" &&
 						argsFinished(acc.args.String()) &&
 						!canExtend(acc.args.String(), tc.Function.Arguments) {
@@ -3503,7 +3592,18 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// audit, round 49, A-F2). A fragment carrying no index is
 					// dropped either way: it cannot be told from a continuation
 					// of the calls the adoption wrote.
-					if !indexed || adoptedSlots[slot] {
+					//
+					// Asked of the slot this fragment RESOLVED to, not of the
+					// index it stated: a fragment naming a different call at an
+					// adopted index is split onto a slot of its own above, because
+					// the split compares it against the adopted call (slotCall) —
+					// and that call's block is not the one it would open. Asked of
+					// the stated index instead, it was dropped here, and the same
+					// two calls reached the client as two blocks or as one
+					// depending on whether the upstream stated the second inside
+					// the frame it adopted or a delta later (2026-09-28 audit,
+					// round 68, F68-L2-1).
+					if !indexed || adoptedCallAt[slot] != nil {
 						continue
 					}
 				}
@@ -3824,7 +3924,7 @@ func relayUnnamedCallArguments(msg *api.Message, upstreamCalls []openAIToolCall)
 // content on every retry (the upstream produced and billed a whole answer) and
 // marked the leg failed, so three such turns opened its breaker and moved the
 // session off a leg that was serving it (2026-09-26 audit, fourteenth round).
-func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool, wroteSlots map[int]bool) {
+func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit func([]anthropic.StreamEvent), onUsage func(int), upstreamModel string, finishReason *string, finalUsage **openAIUsage, streamedText *int) (adopted, refused, wroteCalls bool, wroteSlots map[int]*toolAccum) {
 	if strings.TrimSpace(raw) == "" {
 		return false, false, false, nil
 	}
@@ -3851,7 +3951,13 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// that WROTE the turn's tool calls, so a tool fragment later in the stream
 	// continues a call whose block the client already holds under an id it can
 	// answer once (2026-09-27 audit, round 48, A-F2).
-	wroteSlots = map[int]bool{}
+	// Each slot holds the call itself, not merely the fact that one was written
+	// there: a fragment later in the stream is compared against what the
+	// adoption put at that slot to decide whether it continues that call or
+	// names another one (see the caller's slotCall). Only the fields that
+	// comparison reads are filled — the call's own id, name and argument bytes
+	// as the document stated them, which are the bytes the client received.
+	wroteSlots = map[int]*toolAccum{}
 	{
 		m := oaiResp.Choices[0].Message
 		// The slots these calls occupy in the accumulator's terms. A call of a
@@ -3865,7 +3971,11 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 			if strings.TrimSpace(tc.Function.Name) == "" {
 				continue
 			}
-			wroteSlots[slot] = true
+			acc := &toolAccum{id: tc.ID, name: tc.Function.Name}
+			if tc.Function.Arguments != "" {
+				acc.args.WriteString(tc.Function.Arguments)
+			}
+			wroteSlots[slot] = acc
 			slot++
 		}
 		wroteCalls = len(wroteSlots) > 0
@@ -3898,7 +4008,18 @@ func adoptNonSSECompletion(raw string, conv *anthropic.StreamConverter, emit fun
 	// and non-streaming estimates (2026-09-27 audit, round 23).
 	*streamedText = len(chatResp.Message.Content) + len(chatResp.Message.Thinking) +
 		toolCallArgumentsSize(chatResp.Message.ToolCalls)
-	*finishReason = oaiResp.Choices[0].FinishReason
+	// The LAST finish_reason any choice stated, which is what this leg's
+	// fragment arm reads off the same field: which of an upstream's choices
+	// carried the reason is not this leg's to decide, and reading Choices[0]
+	// here alone made one body answer max_tokens streamed and end_turn whole
+	// (2026-09-28 audit, round 68, F68-L2-2). The message stays the first
+	// entry's, as this path has always read it.
+	*finishReason = ""
+	for _, c := range oaiResp.Choices {
+		if c.FinishReason != "" {
+			*finishReason = c.FinishReason
+		}
+	}
 	*finalUsage = oaiResp.Usage
 	return true, false, wroteCalls, wroteSlots
 }

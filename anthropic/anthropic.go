@@ -1183,6 +1183,21 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	// sibling in the stream converter, which always emits a block.
 	content := make([]ContentBlock, 0, 1)
 
+	// thinking, then text, then tool_use — and deliberately NOT the arrival
+	// order the streaming converter preserves. A whole document has no order
+	// left to read: api.ChatResponse carries ONE merged text string and one
+	// tool_calls slice, so a turn the upstream interleaved as
+	// text/call/text arrives here as "texttext" + [call] and the two prose
+	// runs are already one. The streaming arm, which sees each delta as it
+	// comes, opens a block per run and can put a call between them. So the
+	// same upstream turn is [text, tool_use] here and [tool_use, text, text]
+	// — or [text, tool_use, text] — there, and this leg's two arms disagree
+	// about block ORDER (2026-09-28 audit, round 68, F68-L1-1). Reported and
+	// deliberately not changed: no live producer of an interleaved turn was
+	// exhibited (the wire was synthetic), the divergence moves blocks without
+	// losing one, and closing it means carrying a per-block order through
+	// api.ChatResponse — a shape every site in all three legs shares — to fix
+	// a case nothing has been seen to send.
 	if r.Message.Thinking != "" {
 		content = append(content, ContentBlock{
 			Type:     "thinking",
@@ -1457,7 +1472,17 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 		usage := UsageFromMetrics(r.Metrics)
 		c.inputTokens = usage.InputTokens
 		c.cacheReadTokens = usage.CacheReadInputTokens
-		if c.inputTokens == 0 && intValue(c.cacheReadTokens) == 0 && c.estimatedInputTokens > 0 {
+		// SILENT, not zero: a stated 0 is the upstream's reading and outranks
+		// this converter's estimate of the same number. Round 67 settled the
+		// rule for this wire ("a stated zero is a reading") and the terminal
+		// message_delta below already asks it that way, so asking the estimate
+		// here by VALUE made one turn report two different prompt sizes: the
+		// stream seeded message_start with the estimate because the upstream
+		// stated 0, then stated 0 itself in the terminal event, erasing the
+		// count it had just given the client (2026-09-28 audit, round 68,
+		// F68-L1-2). The middleware's whole-document arm asks the nil-ness too
+		// (withInputEstimate), and the three sites must answer one predicate.
+		if c.inputTokens == 0 && c.cacheReadTokens == nil && c.estimatedInputTokens > 0 {
 			c.inputTokens = c.estimatedInputTokens
 		}
 

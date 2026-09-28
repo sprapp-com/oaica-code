@@ -44,9 +44,15 @@ type AnthropicWriter struct {
 // message_start stated the estimate RESETS the client's context accounting for
 // a turn whose size it had already been told (2026-09-27 audit, round 40,
 // C40-6). A stated prompt, or a stated cache read, is the upstream's word and
-// is left alone.
+// is left alone — stated, not merely non-zero: the cache field is tested for
+// PRESENCE, because an upstream that served the whole prompt from cache states
+// input 0 WITH a cache read and one that cached nothing states a real 0, and
+// both are readings the estimate must not overwrite. Asking it by value made
+// one turn answer two prompt sizes: this arm kept the estimate while the
+// streaming arm's message_start stated the upstream's 0 (2026-09-28 audit,
+// round 68, F68-L1-2).
 func withInputEstimate(u anthropic.Usage, estimate int) anthropic.Usage {
-	if estimate > 0 && u.InputTokens == 0 && optionalIntValue(u.CacheReadInputTokens) == 0 {
+	if estimate > 0 && u.InputTokens == 0 && u.CacheReadInputTokens == nil {
 		u.InputTokens = estimate
 	}
 	return u

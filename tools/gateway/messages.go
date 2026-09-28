@@ -2600,7 +2600,10 @@ func (b *anthropicBridge) finalize() {
 	// builds them and the count handed to stopReason must be the same set — and
 	// the set is decided by the rule the client leg applies, not by the
 	// upstream's stated call list.
-	truncated := resp.Choices[0].FinishReason == "length"
+	// The same reading the fragment arm gives the field: the last reason any
+	// choice stated, so the turn this arm refuses or accepts does not depend on
+	// which entry carried it (2026-09-28 audit, round 68, F68-L3-2).
+	truncated := statedFinishReason(resp) == "length"
 	// Every id this list states is reserved before the loop takes a single
 	// mint, so no call in it is numbered with an id another call of the same
 	// list states — whatever order the upstream wrote them in (see
@@ -2795,7 +2798,7 @@ func (b *anthropicBridge) finalize() {
 		"role":          "assistant",
 		"model":         b.model,
 		"content":       respBlocks,
-		"stop_reason":   stopReason(resp.Choices[0].FinishReason, toolBlocks),
+		"stop_reason":   stopReason(statedFinishReason(resp), toolBlocks),
 		"stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":            in,
@@ -3078,11 +3081,26 @@ func (b *anthropicBridge) flushHeldText() {
 func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 	if upIdx != nil {
 		key := "#" + strconv.Itoa(*upIdx)
-		if rekeyed, ok := b.indexKeys[*upIdx]; ok && b.toolBlocks[rekeyed] != nil {
+		if rekeyed, ok := b.indexKeys[*upIdx]; ok {
 			// The block this index opened, under the key it was moved to when
 			// a fragment stated its id (the B45-1 re-key below). The index is
 			// the same slot identity either way.
-			key = rekeyed
+			//
+			// It is that block only when the block IS a call. An entry that
+			// named nothing opens no block of its own and its bytes reach the
+			// client as TEXT (round 39's B-F8, namesItself), so the slot it was
+			// recorded for is free — and asking the record without asking
+			// namesItself made that nameless block the occupant of the slot:
+			// the call which then named itself at this index was read as a
+			// fragment of it, split off into a minted key, and the record was
+			// not replaced (noteIndexKey is first-wins), so the SAME call stated
+			// again at the same index split a second time. One upstream answer
+			// reached the client as two tool_use blocks under one id, where the
+			// document arm answers one call and the nameless entry's bytes as
+			// prose (2026-09-28 audit, round 68, F68-L3-1).
+			if tb := b.toolBlocks[rekeyed]; tb != nil && namesItself(tb) {
+				key = rekeyed
+			}
 		}
 		if id != "" && strings.TrimSpace(args) != "" && !restatesCarriedCall(b.toolBlocks[key], id, name, args) {
 			// A stated id names its call wherever the fragment writes it. The
@@ -3148,12 +3166,24 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			}
 		}
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
-			((id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
+			((!namesItself(tb) && (id != "" || name != "")) ||
+				(id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
 				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args)) ||
 				(id != "" && name != "" && strings.TrimSpace(args) == "" && tb.statedID && id == tb.id &&
 					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && argsAreFinished(tb.args.String()))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
-			// begins the next one. Two things can say so, and only these two: a
+			// begins the next one. The first clause is the occupant's own
+			// answer: a block that never named itself is not a call — its bytes
+			// are delivered as text (round 39's B-F8) — so it fills no slot, and
+			// a fragment that states an id or a name here is a call of its own
+			// rather than more of prose. Without it that nameless block was the
+			// occupant, and the named call was written into it: the client ran
+			// the call with the prose's bytes folded into its input
+			// ("{\"x\":{\"a\":1}"), where the document arm answers the call whole
+			// and relays those bytes as prose (2026-09-28 audit, round 68,
+			// F68-L3-1).
+			//
+			// Two things can say the occupant IS a call and this is another: a
 			// stated id this block does not hold (round 43's B43-3, the shape
 			// an upstream that reuses one id for the turn's second call
 			// produces), or a name the block does not carry — round 40's A40-8,
@@ -3213,6 +3243,19 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 			// F59-L3-1). The index is the wire's own slot identity, and the slot
 			// holds the newest call written into it — there is no other reading
 			// under which the second call's own fragments are reachable.
+			//
+			// The record is REPLACED when the one it holds names no call. A
+			// nameless entry opens no block of its own — its bytes are relayed
+			// as text at the end of the turn (B-F8) — so the index it was
+			// recorded for is free; noteIndexKey is first-wins, so left alone it
+			// went on answering every later fragment at that index with a block
+			// that is not a call, and the call which had just taken the slot was
+			// split off again by its own restatement: one upstream answer reached
+			// the client as two tool_use blocks under one id (2026-09-28 audit,
+			// round 68, F68-L3-1).
+			if tb := b.toolBlocks[b.indexKeys[*upIdx]]; tb == nil || !namesItself(tb) {
+				b.indexKeys[*upIdx] = b.lastToolKey
+			}
 			b.noteIndexKey(*upIdx, b.lastToolKey)
 			return b.lastToolKey
 		}
@@ -5231,6 +5274,26 @@ func gatewayToolCallIDFor(name, argsJSON string) string {
 // not in the message — the stalled turn the stream path has guarded against
 // since round 39 (B-F8), and which this arm answered anyway on the non-stream
 // path (2026-09-27 audit, round 43, C43-3).
+// statedFinishReason returns the turn's finish_reason as the fragment arm of
+// this leg reads it: the last one any choice STATED.
+//
+// The document arm used to read Choices[0] alone, so a completion whose reason
+// sat on a later entry answered end_turn here while the byte-identical body,
+// streamed, answered max_tokens — one body, two stop_reasons, decided by the
+// `stream` flag and by which of an upstream's choices carried the field
+// (2026-09-28 audit, round 68, F68-L3-2). Which choice carried it is not this
+// leg's to decide, which is the rule the fragment arm already follows; the
+// content stays the first entry's, as the whole arm has always read it.
+func statedFinishReason(resp openAICompletion) string {
+	reason := ""
+	for _, c := range resp.Choices {
+		if c.FinishReason != "" {
+			reason = c.FinishReason
+		}
+	}
+	return reason
+}
+
 func stopReason(finishReason string, toolBlocks int) string {
 	if toolBlocks > 0 {
 		return "tool_use"
