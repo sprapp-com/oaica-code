@@ -1537,7 +1537,24 @@ func (w *WebSearchAnthropicWriter) streamResponse(response anthropic.MessagesRes
 }
 
 func (w *WebSearchAnthropicWriter) webSearchErrorResponse(errorCode, query string, usage anthropic.Usage, carried []anthropic.ContentBlock) anthropic.MessagesResponse {
-	toolUseID := serverToolUseID(w.inner.id)
+	// The id this statement wears is the next loop slot the turn has NOT
+	// written, not loop 1's. carried is what the turn has already been given,
+	// and every search it ran left its own pair there under
+	// loopServerToolUseID(id, loop) — so minting the base id named a block the
+	// wire already held: a turn that failed its SECOND search reached the client
+	// as two pairs under one id, the second reporting a query the first one's
+	// result block had already answered, and on the follow-up-failure terminals
+	// the pair collided with the very search it followed. The max-loop terminal
+	// already takes the next free slot (maxWebSearchLoops+1); this is that same
+	// rule, read off what carried actually holds, and it is what keeps one id
+	// naming one call (2026-09-29 audit, round 88, F88-L1-1).
+	pairs := 0
+	for _, b := range carried {
+		if b.Type == "server_tool_use" {
+			pairs++
+		}
+	}
+	toolUseID := loopServerToolUseID(w.inner.id, pairs+1)
 
 	content := append(slices.Clone(carried), anthropic.ContentBlock{
 		Type:  "server_tool_use",
