@@ -1223,6 +1223,21 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	runs := r.Message.ContentRuns
 	runsMode := len(runs) == len(r.Message.ToolCalls)+1 && strings.Join(runs, "") == r.Message.Content
 
+	// addBlock appends one block to the turn, joining it to the text block
+	// before it when both are text: a whole document carries ONE text string,
+	// so the model's prose and the arguments of an entry it never named are one
+	// text block here — which is what the streaming arm's open text block takes
+	// too, and what the client proxy's whole-list arm does when it appends a
+	// nameless entry's arguments to the message content.
+	addBlock := func(b ContentBlock) {
+		if b.Type == "text" && len(content) > 0 && content[len(content)-1].Type == "text" {
+			joined := *content[len(content)-1].Text + *b.Text
+			content[len(content)-1].Text = &joined
+			return
+		}
+		content = append(content, b)
+	}
+
 	if !runsMode && r.Message.Content != "" {
 		content = append(content, ContentBlock{
 			Type: "text",
@@ -1248,13 +1263,24 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call the client can
 			// make: the block carries the name, and a tool_use whose name is
-			// empty is one Claude Code reports as pending and can never run.
-			// The streaming converter holds such a fragment, the proxy's
-			// streaming path relays its arguments as text, and its
-			// non-streaming path drops it, so this path answering with a
-			// nameless block was the one site that told the client to expect a
-			// call nobody could dispatch (2026-09-27 audit, round 45, A45-1).
-			return ContentBlock{}, false
+			// empty is one Claude Code reports as pending and can never run
+			// (2026-09-27 audit, round 45, A45-1). What it is instead is the
+			// model's own output: the arguments the upstream stated are relayed
+			// to the client as TEXT, one text block where the entry stands, the
+			// reading the other two legs take on every arm (the proxy's parser
+			// and its streaming path, and the gateway's three arms). Both arms
+			// of THIS leg dropped them — this one returned no block at all and
+			// the streaming converter `continue`d — so a turn the model wrote
+			// as prose-plus-a-nameless-entry reached the client with the prose
+			// missing, and a turn whose only call was nameless reported
+			// stop_reason end_turn with nothing to show for the bytes
+			// (2026-09-28 audit, round 77, F77-L1-1). An entry with no
+			// arguments at all has nothing to relay and still writes no block.
+			if tc.Function.Arguments.Len() == 0 {
+				return ContentBlock{}, false
+			}
+			argsStated, _ := json.Marshal(tc.Function.Arguments)
+			return ContentBlock{Type: "text", Text: ptr(string(argsStated))}, true
 		}
 		// One body, one answer: this loop now carries the streaming
 		// converter's own key/identity rule, so a list answers the same
@@ -1391,19 +1417,21 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 				ci++
 				if block, ok := blockFor(tc); ok {
 					if pending.Len() > 0 {
-						content = append(content, ContentBlock{
+						addBlock(ContentBlock{
 							Type: "text",
 							Text: ptr(pending.String()),
 						})
 						pending.Reset()
 					}
-					toolBlocks++
-					content = append(content, block)
+					if block.Type == "tool_use" {
+						toolBlocks++
+					}
+					addBlock(block)
 				}
 			}
 		}
 		if pending.Len() > 0 {
-			content = append(content, ContentBlock{
+			addBlock(ContentBlock{
 				Type: "text",
 				Text: ptr(pending.String()),
 			})
@@ -1411,8 +1439,10 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 	} else {
 		for _, tc := range r.Message.ToolCalls {
 			if block, ok := blockFor(tc); ok {
-				toolBlocks++
-				content = append(content, block)
+				if block.Type == "tool_use" {
+					toolBlocks++
+				}
+				addBlock(block)
 			}
 		}
 	}
@@ -1713,11 +1743,42 @@ func (c *StreamConverter) Process(r api.ChatResponse) []StreamEvent {
 			// A call the upstream never named cannot be dispatched: this block
 			// carries the name and there is no second event that does, so the
 			// client was handed a tool_use it can only report as pending
-			// forever. The non-stream converter and the proxy both drop such a
-			// call on the paths that never accumulate, and the proxy's
-			// streaming path relays its arguments as text — this converter was
-			// the site that emitted the nameless block (2026-09-27 audit,
-			// round 45, A45-1).
+			// forever. This converter was the site that emitted the nameless
+			// block (2026-09-27 audit, round 45, A45-1). The arguments the
+			// upstream stated for it are the model's own output and go to the
+			// client as TEXT, into the open text block where one is open and a
+			// new one where it is not — the document arm of this leg joins them
+			// to the one text string it holds, and the other two legs relay
+			// them on every arm. Dropping them here lost the model's output
+			// (2026-09-28 audit, round 77, F77-L1-1). An entry with no
+			// arguments has nothing to relay and still writes no block.
+			if tc.Function.Arguments.Len() > 0 {
+				if !c.textStarted {
+					c.textStarted = true
+					events = append(events, StreamEvent{
+						Event: "content_block_start",
+						Data: ContentBlockStartEvent{
+							Type:  "content_block_start",
+							Index: c.contentIndex,
+							ContentBlock: ContentBlock{
+								Type: "text",
+								Text: ptr(""),
+							},
+						},
+					})
+				}
+				events = append(events, StreamEvent{
+					Event: "content_block_delta",
+					Data: ContentBlockDeltaEvent{
+						Type:  "content_block_delta",
+						Index: c.contentIndex,
+						Delta: Delta{
+							Type: "text_delta",
+							Text: string(argsSeed),
+						},
+					},
+				})
+			}
 			continue
 		}
 

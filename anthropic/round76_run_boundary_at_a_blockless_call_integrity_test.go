@@ -49,6 +49,18 @@ func r76TextBlock(t *testing.T, resp MessagesResponse) []string {
 // TestACallThatWritesNoBlockDoesNotSplitTheText is the F76-L1-1 pin: the turn
 // whose only call is a fragment the upstream never named carries ONE text block,
 // which is what the streaming arm writes for the same chunks.
+//
+// REVISED by round 77 (F77-L1-1). The pin as written asked for the two runs
+// joined with the nameless entry contributing NOTHING — it was written when an
+// entry the upstream never named wrote no block at all on this arm, because the
+// block itself was dropped and with it the arguments. Round 77 relays those
+// arguments to the client as TEXT (that entry is not a call, so its bytes are
+// the model's own output, and both other legs have relayed them on every arm
+// since rounds 55 and 76). The prose is still not SPLIT — the whole turn is
+// still ONE text block, and the arguments sit inside it where the model wrote
+// them, between the runs the call stood between. The expected text below is
+// what the streaming arm writes for the same chunks, measured: run 0's deltas,
+// then the nameless entry's argument delta, then run 1's.
 func TestACallThatWritesNoBlockDoesNotSplitTheText(t *testing.T) {
 	args := api.NewToolCallFunctionArguments()
 	args.Set("cmd", "ls")
@@ -64,8 +76,8 @@ func TestACallThatWritesNoBlockDoesNotSplitTheText(t *testing.T) {
 		},
 	})
 	got := r76TextBlock(t, resp)
-	if len(got) != 1 || got[0] != "Let me check the tree.\n\nNow I wait for the result." {
-		t.Fatalf("a call that writes no block split the turn's prose into %q — the streaming arm writes one block for this turn, because it closes a text block only where it opens a tool_use one (2026-09-28 audit, round 76, F76-L1-1)", got)
+	if len(got) != 1 || got[0] != "Let me check the tree.\n{\"cmd\":\"ls\"}\nNow I wait for the result." {
+		t.Fatalf("a call that writes no block split the turn's prose into %q — the streaming arm writes one block for this turn, because it closes a text block only where it opens a tool_use one, and the entry's arguments are inside it where the model wrote them (2026-09-28 audit, round 76, F76-L1-1; round 77, F77-L1-1)", got)
 	}
 	if len(resp.Content) != 1 {
 		t.Fatalf("the turn wrote %d block(s): %v", len(resp.Content), resp.Content)
