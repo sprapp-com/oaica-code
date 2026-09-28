@@ -12,10 +12,19 @@ package main
 // — under a stop_reason of tool_use. The same body's document arm answers two
 // calls, and the client and gateway legs' own whole-list arms agree with it.
 //
-// Every case below asks the SAME body of both of this bridge's arms — the
-// fragments the upstream streamed, and the whole completion the same upstream
-// writes — and requires the same calls with the same ids and inputs. Each is
-// fail-first: RED against the tree before this round's fix.
+// The first two cases below ask the SAME body of both of this bridge's arms —
+// the fragments the upstream streamed, and the whole completion the same
+// upstream writes — and require the same calls with the same ids and inputs.
+// Each is fail-first: RED against the tree before this round's fix.
+//
+// The third does NOT, and could not: the two spellings of a CONTINUATION are
+// not the same wire. A list states calls, so an entry that continues an earlier
+// entry's bytes is a second call (round 69 measured the client leg's list arm
+// saying so; round 82 pinned both of this bridge's document arms to it); a run
+// of fragments may be writing one call, so more of the same line is more of
+// that call. This case pins the fragment arm's half of that difference — the
+// list's half is round 82's TestAContinuationIsReadByItsSpelling, and neither
+// reading is a divergence from the other (2026-09-28 audit, round 82).
 
 import (
 	"testing"

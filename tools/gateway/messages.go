@@ -3288,9 +3288,28 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			// "the same call restated" by, so a second call that merely shares
 			// the id and the name does not fold here — its arguments differ
 			// (2026-09-28 audit, round 71, F71-L3-2).
+			// The mid-object clause is the FRAGMENT spelling's reading and is
+			// asked only of a fragment. A whole completion is a LIST, and a
+			// list states calls: each entry of it is a call the upstream
+			// named, in the list's own order (round 74's F74-L3-1, the rule
+			// that gives this arm the entry's POSITION as its slot). An entry
+			// whose bytes happen to continue an earlier entry's half-written
+			// object is a second call here — the client leg's document arm
+			// answers it with two calls, the second re-minted and both `_raw`,
+			// and so does this bridge's own non-stream arm — while the
+			// ADOPTED walk reached the carried block and folded them into one,
+			// so one document reached the client as one call under `stream:
+			// true` and two under `stream:false`, the second under a
+			// different id (2026-09-28 audit, round 82, F82-L3-1; measured on
+			// `[{index 0,id call_1,name Bash,arguments "{\"a\":"},
+			// {index 0,id call_1,name Bash,arguments "1}"}]`).
+			//
+			// The identity clause is not that reading and stays: a restatement
+			// of a call this list already holds is that call, wherever the
+			// list files it (round 71's F71-L3-2 pins the order it keeps).
 			if carried := b.blockCarrying(id, nil); carried != nil && carried.statedID &&
 				(name == "" || carried.name == "" || name == carried.name) &&
-				(argsAreMidObject(carried.args.String()) || restatesCarriedIdentity(carried, name, args)) {
+				((!b.sse.adoptedDoc && argsAreMidObject(carried.args.String())) || restatesCarriedIdentity(carried, name, args)) {
 				b.noteIndexKey(*upIdx, carried.key)
 				b.lastToolKey = carried.key
 				return carried.key
