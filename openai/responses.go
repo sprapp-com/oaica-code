@@ -1414,3 +1414,24 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 
 	return events
 }
+
+// Failure is the terminal event of a turn that did NOT finish, in the shape this
+// wire defines for it: `response.failed`, carrying the response object with
+// status "failed" and the producer's own sentence in `error`, alongside whatever
+// output the converter had already assembled. It is the counterpart of the
+// `response.completed` above, and it exists because a stream that stops without
+// either leaves the client holding a partial answer as if it were the whole one:
+// no terminal event, no cause, and nothing to retry (2026-09-29 audit, round 92,
+// F92-L1-1). The events already written cannot be un-sent, so the failure is
+// stated on the wire rather than the turn being left unfinished in silence.
+func (c *ResponsesStreamConverter) Failure(sentence string, status int) []ResponsesStreamEvent {
+	response := c.buildResponseObject("failed", c.buildFinalOutput(), nil)
+	response["completed_at"] = time.Now().Unix()
+	response["error"] = map[string]any{
+		"code":    ErrorCode(status),
+		"message": sentence,
+	}
+	return []ResponsesStreamEvent{c.newEvent("response.failed", map[string]any{
+		"response": response,
+	})}
+}

@@ -283,18 +283,23 @@ type EmbeddingUsage struct {
 	TotalTokens  int `json:"total_tokens"`
 }
 
-func NewError(code int, message string) ErrorResponse {
-	var etype string
+// ErrorCode is the type this wire gives an HTTP status: the value the
+// `error.type` of an OpenAI error envelope carries, and — on the Responses wire,
+// where the envelope's field is called `code` — the same value in that field, so
+// one cause reached two spellings of the same wire with the same name for it.
+func ErrorCode(code int) string {
 	switch code {
 	case http.StatusBadRequest:
-		etype = "invalid_request_error"
+		return "invalid_request_error"
 	case http.StatusNotFound:
-		etype = "not_found_error"
+		return "not_found_error"
 	default:
-		etype = "api_error"
+		return "api_error"
 	}
+}
 
-	return ErrorResponse{Error{Type: etype, Message: message}}
+func NewError(code int, message string) ErrorResponse {
+	return ErrorResponse{Error{Type: ErrorCode(code), Message: message}}
 }
 
 // ToUsage converts an api.ChatResponse to Usage

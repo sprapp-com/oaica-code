@@ -534,6 +534,13 @@ type ResponsesWriter struct {
 	responseID string
 	itemID     string
 	request    openai.ResponsesRequest
+	// failed is set when an error frame ended this turn — see ChatWriter.failed.
+	// This surface had no reading of the error frame at all until round 92: a
+	// turn that died mid-stream was relayed as its own partial text and then
+	// nothing, 200 and no `response.failed`, so a client that asked for a
+	// completion event never got one and read the truncated answer as the whole
+	// one (2026-09-29 audit, F92-L1-1).
+	failed bool
 }
 
 func (w *ResponsesWriter) writeEvent(eventType string, data any) error {
@@ -577,10 +584,40 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 	return len(data), json.NewEncoder(w.ResponseWriter).Encode(response)
 }
 
+// failTurn states the failure to the client in the shape this wire defines for
+// it: the terminal `response.failed` event on the streaming arm, and the wire's
+// own error envelope, under the producer's status, on the buffered one — the
+// same split the OpenAI and Anthropic writers make (failOpenAITurn,
+// AnthropicWriter.failTurn).
+func (w *ResponsesWriter) failTurn(sentence string, status int) (int, error) {
+	if w.failed {
+		return 0, nil
+	}
+	w.failed = true
+	if w.stream {
+		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range w.converter.Failure(sentence, status) {
+			if err := w.writeEvent(event.Event, event.Data); err != nil {
+				return 0, err
+			}
+		}
+		return 0, nil
+	}
+	w.ResponseWriter.Header().Set("Content-Type", "application/json")
+	w.ResponseWriter.WriteHeader(status)
+	return 0, json.NewEncoder(w.ResponseWriter).Encode(openai.NewError(status, sentence))
+}
+
 func (w *ResponsesWriter) Write(data []byte) (int, error) {
+	if w.failed {
+		return len(data), nil
+	}
 	code := w.ResponseWriter.Status()
 	if code != http.StatusOK {
 		return w.writeError(data)
+	}
+	if sentence, status, ok := upstreamErrorFrame(data); ok {
+		return w.failTurn(sentence, status)
 	}
 	return w.writeResponse(data)
 }
