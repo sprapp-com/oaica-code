@@ -200,11 +200,28 @@ type Message struct {
 	Content string `json:"content"`
 	// Thinking contains the text that was inside thinking tags in the
 	// original model output when ChatRequest.Think is enabled.
-	Thinking   string      `json:"thinking,omitempty"`
-	Images     []ImageData `json:"images,omitempty"`
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolName   string      `json:"tool_name,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Thinking  string      `json:"thinking,omitempty"`
+	Images    []ImageData `json:"images,omitempty"`
+	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+	// ContentRuns, when it is present, is Content split at this message's tool
+	// calls so the order the model's output arrived in survives a BUFFERED
+	// (non-streaming) turn: run i is the text that arrived before ToolCalls[i],
+	// and the last run is the text after the final call — so a message with one
+	// call carries two runs. Content is the runs joined, and a reader that
+	// cannot use them (any other shape than len(ContentRuns) == len(ToolCalls)+1
+	// with the join equal to Content) must fall back to reading Content alone.
+	//
+	// A buffered turn merges the pieces a streaming one delivers one at a time,
+	// and a turn the model interleaved as text/call/text arrives here as one
+	// text string plus the call — the run boundary is gone by the time a
+	// translator sees it, so a client that asked for no stream was told the
+	// prose all preceded a call that came before some of it. Only the buffered
+	// lane on the Anthropic surface fills this in, because only that surface
+	// reads it: the OpenAI wire has one text field by definition (2026-09-28
+	// audit, round 75, F75-L1-1).
+	ContentRuns []string `json:"content_runs,omitempty"`
+	ToolName    string   `json:"tool_name,omitempty"`
+	ToolCallID  string   `json:"tool_call_id,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {

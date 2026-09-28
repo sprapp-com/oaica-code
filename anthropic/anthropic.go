@@ -1205,7 +1205,20 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		})
 	}
 
-	if r.Message.Content != "" {
+	// A buffered turn that still knows where its text arrived relative to its
+	// calls hands the boundaries over in ContentRuns, and then this arm writes
+	// the blocks in the order the model produced them — the same order its
+	// streaming twin writes, block for block. Without them the turn has ONE
+	// text string, the runs are already joined, and the call can only be
+	// written after all of it: `text/call/text` reached a client that asked for
+	// no stream as `texttext` then the call, prose the model wrote after the
+	// call included in the block before it. The run shape is trusted only when
+	// it accounts for the content exactly — one more run than there are calls,
+	// joining to the content (2026-09-28 audit, round 75, F75-L1-1).
+	runs := r.Message.ContentRuns
+	runsMode := len(runs) == len(r.Message.ToolCalls)+1 && strings.Join(runs, "") == r.Message.Content
+
+	if !runsMode && r.Message.Content != "" {
 		content = append(content, ContentBlock{
 			Type: "text",
 			Text: ptr(r.Message.Content),
@@ -1222,7 +1235,11 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			usedIDs[tc.ID] = true
 		}
 	}
-	for _, tc := range r.Message.ToolCalls {
+	// blockFor builds the tool_use block for one call, or reports that this
+	// call has none to build: a call the upstream never named is not one the
+	// client can make, and a restatement of a call already written is the same
+	// block, not a second one.
+	blockFor := func(tc api.ToolCall) (ContentBlock, bool) {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call the client can
 			// make: the block carries the name, and a tool_use whose name is
@@ -1232,7 +1249,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			// non-streaming path drops it, so this path answering with a
 			// nameless block was the one site that told the client to expect a
 			// call nobody could dispatch (2026-09-27 audit, round 45, A45-1).
-			continue
+			return ContentBlock{}, false
 		}
 		// One body, one answer: this loop now carries the streaming
 		// converter's own key/identity rule, so a list answers the same
@@ -1325,7 +1342,7 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 			usedIDs[id] = true
 		}
 		if sentKey[key] {
-			continue
+			return ContentBlock{}, false
 		}
 		sentKey[key] = true
 		// `input` is a required field of a tool_use block, and the zero value
@@ -1339,13 +1356,38 @@ func ToMessagesResponse(id string, r api.ChatResponse) MessagesResponse {
 		if input.Len() == 0 {
 			input = api.NewToolCallFunctionArguments()
 		}
-		toolBlocks++
-		content = append(content, ContentBlock{
+		return ContentBlock{
 			Type:  "tool_use",
 			ID:    id,
 			Name:  tc.Function.Name,
 			Input: input,
-		})
+		}, true
+	}
+
+	if runsMode {
+		// The order the model wrote: run i is the text that arrived before
+		// ToolCalls[i], and the last run follows the final call.
+		for i, run := range runs {
+			if run != "" {
+				content = append(content, ContentBlock{
+					Type: "text",
+					Text: ptr(run),
+				})
+			}
+			if i < len(r.Message.ToolCalls) {
+				if block, ok := blockFor(r.Message.ToolCalls[i]); ok {
+					toolBlocks++
+					content = append(content, block)
+				}
+			}
+		}
+	} else {
+		for _, tc := range r.Message.ToolCalls {
+			if block, ok := blockFor(tc); ok {
+				toolBlocks++
+				content = append(content, block)
+			}
+		}
 	}
 
 	// The blocks this turn actually carries decide its stop_reason, not the

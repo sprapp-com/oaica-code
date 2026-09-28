@@ -2368,6 +2368,37 @@ func toolCallId() string {
 	return "call_" + strings.ToLower(string(b))
 }
 
+// carryToolParserChunk writes what one tools.Parser step released onto the
+// response: the prose it let through and the calls it completed — BOTH when
+// both arrived in the same step. Reports whether the response carries anything
+// at all, which is what the caller needs to decide between sending it and
+// falling through to the buffered/logprob path.
+//
+// Reading the two as alternatives threw a call away: a parser that returns a
+// call in the same Add as the prose before it — one step carrying
+// `Sure, let me look that up.<tool_call>…</tool_call>` — had its content kept
+// and its call dropped, so the turn reached the client as text with a
+// stop_reason of end_turn and no tool_use at all: an agent client ends the turn
+// and never runs the tool. The built-in parser lane above has always written
+// both (round 75, F75-L1-2; latent — both of this leg's runners deliver one
+// token per callback, so the parser releases the prose in an earlier step and
+// the two have not been observed to co-occur on a live wire).
+func carryToolParserChunk(res *api.ChatResponse, content string, toolCalls []api.ToolCall) bool {
+	if len(content) > 0 {
+		res.Message.Content = content
+	}
+	if len(toolCalls) > 0 {
+		for i := range toolCalls {
+			toolCalls[i].ID = toolCallId()
+		}
+		res.Message.ToolCalls = toolCalls
+		if len(content) == 0 {
+			res.Message.Content = ""
+		}
+	}
+	return len(content) > 0 || len(toolCalls) > 0
+}
+
 func preservedTokensForCompletion(builtinParser parsers.Parser) []string {
 	if builtinParser != nil {
 		return builtinParser.PreservedTokens()
@@ -2453,12 +2484,34 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		// this same handler writes nothing for it, and both other translation
 		// legs refuse it with a 502 (2026-09-28 audit, round 73, F73-L1-2).
 		arrived := false
+		// contentRuns rebuilds the arrival order of the text around the turn's
+		// tool calls, which the merge below would otherwise lose (the streaming
+		// arm of this handler delivers the same turn as text/call/text, so one
+		// upstream body answered a client differently depending on `stream` —
+		// 2026-09-28 audit, round 75, F75-L1-1). Filled in only on the Anthropic
+		// surface, which is the only reader of Message.ContentRuns; the OpenAI
+		// wire has one text field by definition. The tool-call gate is the same
+		// one the accumulation below uses, so the runs stay aligned with the
+		// calls actually kept.
+		anthropicSurface := c.GetBool("anthropic_messages")
+		var contentRuns []string
+		var run strings.Builder
 		for rr := range ch {
 			switch t := rr.(type) {
 			case api.ChatResponse:
 				arrived = true
 				sbThinking.WriteString(t.Message.Thinking)
 				sbContent.WriteString(t.Message.Content)
+				if anthropicSurface {
+					run.WriteString(t.Message.Content)
+					if len(t.Message.ToolCalls) > 0 && (len(req.Tools) > 0 || anthropicSurface) {
+						contentRuns = append(contentRuns, run.String())
+						run.Reset()
+						for i := 1; i < len(t.Message.ToolCalls); i++ {
+							contentRuns = append(contentRuns, "")
+						}
+					}
+				}
 				resp = t
 				// Upstream ollama's rule — a request that declared no tools does
 				// not surface the model's tool calls — belongs to the native
@@ -2509,6 +2562,18 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 
 		if len(toolCalls) > 0 {
 			resp.Message.ToolCalls = toolCalls
+			// The runs are handed over only when they account for the text of
+			// this turn exactly: one more run than there are calls, joining to
+			// the content the merge produced. Anything else is a shape the
+			// reader must not trust, and a reader that finds no runs reads the
+			// merged content as it always has (2026-09-28 audit, round 75,
+			// F75-L1-1).
+			if contentRuns != nil {
+				contentRuns = append(contentRuns, run.String())
+				if len(contentRuns) == len(toolCalls)+1 && strings.Join(contentRuns, "") == resp.Message.Content {
+					resp.Message.ContentRuns = contentRuns
+				}
+			}
 		}
 
 		c.JSON(http.StatusOK, resp)
@@ -2960,17 +3025,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 				if len(req.Tools) > 0 {
 					toolCalls, content := toolParser.Add(res.Message.Content)
-					if len(content) > 0 {
-						res.Message.Content = content
-					} else if len(toolCalls) > 0 {
-						for i := range toolCalls {
-							toolCalls[i].ID = toolCallId()
-						}
-						res.Message.ToolCalls = toolCalls
-						res.Message.Content = ""
-					} else if res.Message.Thinking != "" {
-						// don't return, fall through to send
-					} else {
+					if !carryToolParserChunk(&res, content, toolCalls) && res.Message.Thinking == "" {
 						//  Send logprobs while content is being buffered by the parser for tool calls
 						if len(res.Logprobs) > 0 && !r.Done {
 							logprobRes := res
