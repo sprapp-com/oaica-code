@@ -3290,6 +3290,24 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			((!namesItself(tb) && (id != "" || name != "")) ||
 				(id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
 				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args)) ||
+				// The slot carries a call that has accumulated NO arguments, and
+				// a fragment names that same call again WITH arguments. An empty
+				// argument list is a COMPLETE one — a call that takes no
+				// arguments has all of them the moment it is named (round 78's
+				// F78-L3-2) — so this fragment is the NEXT call, not more of a
+				// call that is already whole. Asked here for the same reason the
+				// two index-less arms ask it, and this arm was the one that did
+				// not: `[{index 0,id call_1,name Read},{index 0,id call_1,name
+				// Read,arguments {"a":1}}]` reached the client as ONE call
+				// holding `{"a":1}`, where both document arms of this bridge
+				// answer the argument-less call AND the completed one
+				// (2026-09-28 audit, round 79, F79-L3-A). The name must be the
+				// slot's OWN, and the fragment must state arguments, so the
+				// ordinary wire — a name-only chunk restating the call after its
+				// arguments (round 56's F1) — is untouched, as is an
+				// argument-only continuation, which names nothing.
+				(name != "" && name == tb.name && (id == "" || !tb.statedID || id == tb.id) &&
+					strings.TrimSpace(tb.args.String()) == "" && strings.TrimSpace(args) != "") ||
 				(id != "" && name != "" && strings.TrimSpace(args) == "" && tb.statedID && id == tb.id &&
 					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && argsAreFinished(tb.args.String()))) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
@@ -5123,7 +5141,18 @@ func unnamedRunsOf(calls []oaToolCall) []string {
 		}
 		args := firstNonEmptyStr(tc.Function.Arguments, tc.Arguments)
 		if args == "" {
-			prevNameless = true
+			// An entry that carries no bytes neither starts a run nor ends one:
+			// a run ends where a CALL is NAMED and nowhere else (round 77), and
+			// this entry names nothing. It used to set prevNameless, so an empty
+			// entry ARRIVING AFTER A NAMED CALL re-opened the run that call had
+			// closed and the next nameless entry's bytes were appended to the
+			// run BEFORE it: `[{"arguments":"A"},{name:"Read",arguments:
+			// "{\"r\":1}"},{"arguments":""},{"arguments":"B"}]` reached the
+			// client as ONE text block holding "AB" — the model's prose from
+			// both sides of the call in one block, and the run the frame arm
+			// writes as two (measured on all three arms: the frame arm answers
+			// `<tool_use …><text "A"><text "B">`) (2026-09-28 audit, round 79,
+			// F79-L3-C).
 			continue
 		}
 		if prevNameless && len(runs) > 0 {
