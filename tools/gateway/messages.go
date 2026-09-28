@@ -3739,9 +3739,19 @@ func (b *anthropicBridge) splitFromCurrent(key, name, args string) bool {
 		return false
 	}
 	acc := strings.TrimSpace(cur.args.String())
-	return name != b.lastToolName ||
-		(acc != "" && json.Valid([]byte(acc))) ||
-		(acc == "" && strings.TrimSpace(args) == "")
+	// The accumulated arguments being a COMPLETE argument list ends the call,
+	// and an EMPTY list is complete: a call that takes no arguments has all of
+	// them the moment it is named. Round 39's B-F9 said so for the bare repeat
+	// (the fragment names the call again and states no arguments) and stopped
+	// there, so a fragment naming the same call WITH arguments over a call that
+	// had accumulated none was read as its continuation: `[{name:"Read"},
+	// {name:"Read",arguments:"{\"a\":1}"}]` reached a streaming client as ONE
+	// tool_use where both document arms of this bridge deliver two — the first
+	// call, which the client runs, simply did not exist on this arm
+	// (2026-09-28 audit, round 78, F78-L3-2). The conservative direction B-F9
+	// protects is unchanged: a partial object is not a complete one, so a name
+	// repeated over an accumulator holding `{"a":` still continues the call.
+	return name != b.lastToolName || acc == "" || json.Valid([]byte(acc))
 }
 
 // rekeyToolBlock moves the block accumulated under oldKey to newKey, keeping
@@ -3770,6 +3780,17 @@ func (b *anthropicBridge) rekeyToolBlock(oldKey, newKey string) {
 				b.indexChain[idx][i] = newKey
 			}
 		}
+	}
+	// The run currently taking bytes is a KEY like any other this move
+	// invalidates. Round 77's rule routes a nameless fragment to the run's own
+	// block — `toolBlocks[b.namelessRunKey]` — so a run whose block was re-keyed
+	// mid-run (an entry of the run that STATES AN ID, the B45-1 move this
+	// function exists for) kept the run's name pointing at the vacated key: the
+	// next entry of that same run found no block there, minted one of its own,
+	// and one run reached a streaming client as two text blocks where both
+	// document arms answer one (2026-09-28 audit, round 78, F78-L3-1).
+	if b.namelessRunKey == oldKey {
+		b.namelessRunKey = newKey
 	}
 }
 
