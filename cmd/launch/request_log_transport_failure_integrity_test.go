@@ -14,51 +14,24 @@ package launch
 
 import (
 	"bytes"
-	"net"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
-// deadUpstreamAddress returns a 127.0.0.1 address nothing is listening on: the
-// port was bound and closed, so a connect to it is refused immediately (no
-// timeout to wait out, and no dependence on the machine's firewall).
-//
-// The port is then dialled to confirm it actually refuses before it is handed
-// out, and another one is tried if not. Binding port 0 and closing hands the
-// port straight back to the ephemeral pool, and this package has a dozen tests
-// starting httptest servers at the same time — one of them can be given that
-// exact port in between, and then the "dead" address reaches a LIVE server.
-// That is not a hypothetical: it made TestADeadUpstreamStillFailsTheTranslatedLeg
-// fail once in a full-package run (2026-09-26 audit) with "a refused connection
-// did not count against …", because the request reached somebody else's server,
-// whose 4xx is correctly not a leg failure.
-//
-// The check narrows the window from "the rest of the test run" to the
-// microseconds between the dial and the request. It cannot close it: no
-// ephemeral port is reserved, and a port that is refused now can be taken a
-// moment later.
+// deadUpstreamAddress returns a 127.0.0.1 address nothing is listening on and
+// nothing in this package can be handed: see
+// round89_dead_upstream_determinism_test.go for what the old construction —
+// bind port 0, close it, dial to confirm, hand it out — costs, and for the pin
+// that holds this one's property.
 func deadUpstreamAddress(t *testing.T) string {
 	t.Helper()
-	// A timeout counts as "nothing answers here" too: a filtered loopback port
-	// is as dead to the caller as a refusing one.
-	for attempt := 0; attempt < 20; attempt++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		ln.Close()
-
-		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err != nil {
-			return addr
-		}
-		c.Close()
+	addr := "127.0.0.1:" + strconv.Itoa(deadUpstreamPort)
+	if p := deadUpstreamProblem(addr); p != "" {
+		t.Fatalf("the dead upstream this test needs is not dead: %s", p)
 	}
-	t.Fatal("could not find an address that refuses connections — twenty ports in a row were taken between closing them and dialling them, so this test's premise cannot be established")
-	return ""
+	return addr
 }
 
 func usageRowsByModel(t *testing.T) map[string]UsageStatsRow {

@@ -2819,9 +2819,22 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	conv := anthropic.NewStreamConverter(anthropic.GenerateMessageID(), upstreamModel, estInputTokens)
 
 	scanner := bufio.NewScanner(body)
-	// DeepSeek streams can emit sizeable reasoning_content lines; raise the
-	// per-line cap to 8 MiB so we don't bail mid-token on long thinking runs.
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	// DeepSeek streams can emit sizeable reasoning_content lines, so the
+	// per-line cap is raised well past bufio's default to avoid bailing
+	// mid-token on long thinking runs.
+	//
+	// It is the SAME bound this arm already applies to the buffers it fills
+	// from those lines, and that is the point: eventBuf and nonSSE both accept
+	// httpbody.DefaultMax, so a line could be read into them that this reader
+	// refused to hand over. A whole completion delivered as ONE `data:` frame —
+	// the shape a non-streaming backend behind a streaming shim answers with,
+	// and a tool call's arguments are one line whatever their size — was read
+	// at the document arm's 64 MiB and refused here as a mid-stream failure:
+	// measured 2026-09-29 (round 89, F89-L2-1), a 9,437,384-byte single-line
+	// document answered 502 `upstream stream failed: bufio.Scanner: token too
+	// long` where the same bytes with `stream:false` answered 200 with the
+	// call, whole. One body, two verdicts, decided by a reader's own cap.
+	scanner.Buffer(make([]byte, 0, 64*1024), int(httpbody.DefaultMax))
 
 	toolAccums := map[int]*toolAccum{}
 	// toolArrival is the order the stream first wrote each slot — the order the
