@@ -4,7 +4,7 @@ package launch
 // names from two untrusted sources raw (2026-09-26 audit, tenth round).
 //
 // Neither source is a constant in the binary. The provider catalog merges a
-// SYNCED cache file fetched from the network (providerCatalogCachePath), and
+// SYNCED overlay file fetched from the network (oaicaOverlayCachePath), and
 // the "Stored credentials outside the catalog" section prints the keys of
 // ~/.oaica/auth.json. A name carrying a newline from either one forges a whole
 // extra row — complete with a status and a masked credential — in the command a
@@ -29,10 +29,10 @@ func TestAuthListDoesNotPrintARawCatalogName(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// An added row needs no version bump: additive rows merge whatever the
-	// document's own version says.
+	// An added row needs no version bump: the synced copy is merged per key, so
+	// a row it names that the embedded overlay does not is simply appended.
 	body := `{"version":1,"providers":[{"name":"synced\nacme      ready     env:FAKE_KEY","base_url":"https://synced.example/v1","api_key_env":"FAKE_KEY"}]}`
-	if err := os.WriteFile(filepath.Join(dir, "providers.json"), []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "oaica.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

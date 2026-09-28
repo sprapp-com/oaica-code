@@ -347,12 +347,12 @@ func TestModelInventoryRouterHostChangeVoidsTheCache(t *testing.T) {
 	}
 }
 
-// invSyncedCatalogWithGatedBox writes a provider catalog row gated on
+// invSyncedCatalogWithGatedBox writes a synced overlay row gated on
 // AUDITBOX_KEY via the opencode auth store, pointing at a dead port so its rows
 // come from the declared list with no network sweep.
 func invSyncedCatalogWithGatedBox(t *testing.T) {
 	t.Helper()
-	path, err := providerCatalogCachePath()
+	path, err := oaicaOverlayCachePath()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestModelInventoryFingerprintCoversTheDocumentedInputs(t *testing.T) {
 	localServers, lsErr := oaicaLocalServersRegistryPath()
 	cloudCache, ccErr := ollamaCloudCachePath()
 	manifest, mfErr := modelManifestPath()
-	catalog, catErr := providerCatalogCachePath()
+	catalog, catErr := oaicaOverlayCachePath()
 	license, licErr := licenseFilePath()
 	for _, e := range []error{lsErr, ccErr, mfErr, catErr, licErr} {
 		if e != nil {

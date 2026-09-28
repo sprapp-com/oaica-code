@@ -191,7 +191,7 @@ Everything lives under `~/.oaica/` (created owner-only, mode 0700):
 | `~/.oaica/model_picks.json` | Picker frequency/recency state (which models you actually pick) |
 | `~/.oaica/picker_cache.json` | Cached picker inventory, so a launch doesn't re-probe everything |
 | `~/.oaica/requests.log` | Local launch traffic log — model, backend label, sizes, status, never content (`oaica usage`) |
-| `~/.oaica/cache/` | Cached probe answers: `providers/`, `models/`, `cloud_limits/` |
+| `~/.oaica/cache/` | Cached probe answers: `providers/` (the synced oaica overlay), `catalog/` (the ported models.dev catalog), `models/` |
 | `~/.oaica/models/` | Downloaded GGUF weights (`oaica pull`) |
 | `~/.oaica/update_check.json` | Update-check state |
 

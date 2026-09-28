@@ -1,48 +1,41 @@
 package launch
 
-// provider_catalog.go — the built-in provider directory (endpoint, wire,
-// tool format, plan label) as DATA, not Go code. Adding a provider, a new
+// provider_catalog.go — the provider directory (endpoint, wire, tool format,
+// plan label, credential names) as DATA, not Go code. Adding a provider, a new
 // billing plan for an existing one (e.g. z.ai's Coding Plan alongside its
-// pay-per-token API), or fixing an endpoint URL is a providers.json edit +
-// `oaica remote sync`, never a recompile — same principle as
-// model_sync.go's hosted model catalog, applied to the OTHER thing that
-// used to live only in Go source (catalogProviders used to be a literal
-// slice here; see git history around 2026-09-17 for the before/after).
+// pay-per-token API), or fixing an endpoint URL is an overlay edit (or an
+// upstream models.dev correction), never a recompile — same principle as
+// model_sync.go's hosted model catalog, applied to the OTHER thing that used to
+// live only in Go source (catalogProviders used to be a literal slice here; see
+// git history around 2026-09-17 for the before/after).
 //
 // Two layers, lowest priority first:
-//  1. providersEmbeddedDefault (go:embed providers/providers.json) — ships
-//     inside the binary so a fresh install works fully offline.
-//  2. ~/.oaica/cache/providers/providers.json — pulled by `oaica remote
-//     sync` from the hosted URL, same ETag/offline-fallback shape as
-//     model_sync.go. The embedded list still fills in anything sync hasn't
-//     fetched (or never will, e.g. an air-gapped host).
+//  1. the ported models.dev catalog (catalog_modelsdev.go), cached at
+//     ~/.oaica/cache/catalog/modelsdev.json by `oaica model catalog sync` —
+//     third-party data we never edit;
+//  2. the oaica overlay (providers/oaica.json), embedded and applied at read
+//     time (catalog_overlay.go), which corrects upstream where it is wrong for
+//     us and adds the rows and plans models.dev does not carry.
 //
-// The layers MERGE PER FIELD, and the synced copy is additive: it supplies
-// providers, models and fields the embedded default does not have, and cannot
-// replace a value the embedded row already carries unless the fetched document
-// bumps its own "version" above the embedded one. See providerCatalog for why
-// (the short version: a synced file is of unknown age, and treating it as
-// newer than the binary is how both a dropped field and a stale endpoint
-// reached real hosts, 2026-09-26).
+// This file also used to hold a third mechanism: a synced providers.json whose
+// document could REDEFINE a shipped row if it bumped its own "version" above
+// the embedded one. The overlay's per-key merge replaces that entirely — a
+// correction lands at read time with no bump to make, and a document of unknown
+// age can never blank a field it does not name. See catalog_overlay.go's header
+// for the 2026-09-25 incident that version-bump machinery was built around.
 //
-// A user's own ~/.oaica/remotes.json entry of the same name still wins
-// over BOTH layers (loadUserRemotes' existing dedupe) — the catalog only
-// ever supplies a default, never overrides a user's explicit config.
+// A user's own ~/.oaica/remotes.json entry of the same name still wins over
+// BOTH layers (loadUserRemotes' existing dedupe) — the catalog only ever
+// supplies a default, never overrides a user's explicit config.
 
 import (
-	_ "embed"
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 )
 
-//go:embed providers/providers.json
-var providersEmbeddedDefault []byte
-
 // Named env-var/id constants for the handful of builtins tests and other
 // code reference by identifier. These are NOT the provider table — that's
-// providers.json — just readable aliases for strings that also happen to
+// providers/oaica.json — just readable aliases for strings that also happen to
 // live there; changing a provider's actual endpoint/wire/label never
 // touches this block.
 const (
@@ -54,9 +47,10 @@ const (
 	ollamaCloudEnvKey = "OLLAMA_API_KEY"
 )
 
-// providerCatalogEntry is providers.json's per-row shape — a strict subset
-// of userRemote's fields (only what a provider DEFAULT should carry; things
-// like api_key or weight are a user's own choice, never shipped here).
+// providerCatalogEntry is one provider row — the overlay's own per-row shape,
+// and what a models.dev provider becomes on the way in. A strict subset of
+// userRemote's fields (only what a provider DEFAULT should carry; things like
+// api_key or weight are a user's own choice, never shipped here).
 type providerCatalogEntry struct {
 	Name    string `json:"name"`
 	BaseURL string `json:"base_url"`
@@ -99,6 +93,16 @@ type providerCatalogEntry struct {
 	// and its ids win when both know a model.
 	Models map[string]providerCatalogModelLimit `json:"models,omitempty"`
 	Notes  string                               `json:"notes,omitempty"`
+	// Env is the provider's ordered list of credential environment variables,
+	// ported from models.dev. The gate scans it in order and takes the first
+	// variable that is SET, not the first listed — upstream orders these by
+	// popularity, and taking env[0] would hide any provider whose listed-first
+	// variable is the less common one.
+	Env []string `json:"env,omitempty"`
+	// Hidden marks a provider that cannot work through a plain base URL (the
+	// SDK-signed group: Bedrock, Vertex, Azure, and friends). Listed nowhere in
+	// the picker unless a user's own remotes.json names it, which always wins.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // EndpointBase resolves this row the same way a userRemote's does, so a
@@ -116,163 +120,113 @@ type providerCatalogModelLimit struct {
 	Output  int `json:"output"`
 }
 
-type providerCatalogFile struct {
-	// Version is the document's own revision, and it is load-bearing: a synced
-	// (cached) copy may REDEFINE a shipped row — rather than only add to it —
-	// exactly when its Version is strictly greater than the embedded file's.
-	// Bump it on main when a change must reach binaries that are already
-	// installed (a corrected endpoint, a moved path); new providers, new model
-	// rows and newly added fields need no bump, because those merge additively
-	// whatever this number says. Leaving it alone can never make a host worse
-	// off: the failure mode of a stale cache is under-application, never a
-	// clobbered shipped row.
-	Version   int                    `json:"version"`
-	Providers []providerCatalogEntry `json:"providers"`
-}
-
-func providerCatalogCachePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".oaica", "cache", "providers", "providers.json"), nil
-}
-
-// providerCatalog returns the merged provider directory. The embedded default
-// is the shipped contract; the synced copy (fetched from main by
-// `oaica remote sync`) may ADD to it — new providers, new model rows, fields
-// the embedded row leaves empty — but may not silently REDEFINE it.
+// providerCatalog returns the merged provider directory: the ported models.dev
+// catalog as the base layer, corrected per field by the oaica overlay, with
+// overlay-only rows appended. The overlay is where our own plans live —
+// models.dev does not carry zai-coding-plan or opencode-go — and it is also the
+// only way a row of ours can exist before upstream learns about it.
 //
-// That asymmetry is deliberate, and it is the whole of this function's
-// contract. A synced copy is an untimestamped snapshot: nothing in it says
-// whether it was fetched before or after the binary that is reading it, so a
-// row replaced wholesale by it was a defect in both directions. A copy synced
-// before a field existed blanked that field's value (a synced zhipu row lost
-// its version and resolved to ".../paas/v4/v1/..." — a 404 on every request,
-// with the picker cheerfully listing the models); a copy that predates an
-// endpoint fix kept pointing at the old one. Both are the same bug: a document
-// of unknown age was allowed to overwrite a known one.
+// Order is stable: the catalog's provider ids sorted, then the overlay's rows
+// in file order. The picker, `oaica auth list` and the doctor all paint these
+// rows, and a reshuffle between two runs of the same binary reads as a change.
 //
-// The one way to redefine a shipped row through sync is for the fetched
-// document to declare a strictly greater providerCatalogFile.Version than the
-// embedded one — an explicit "this is newer than any binary" statement, made
-// on purpose by whoever edits providers.json on main. Absent that bump, the
-// safe reading holds: additions land, corrections wait for a release.
-//
-// Errors reading/parsing either source are swallowed — a corrupt cache or a
-// bad embed should degrade to "fewer providers listed", never crash the picker.
+// Errors reading either source are swallowed — a corrupt cache or a bad embed
+// should degrade to "fewer providers listed", never crash the picker.
 func providerCatalog() []providerCatalogEntry {
-	byName := map[string]providerCatalogEntry{}
-	order := []string{}
+	byName := map[string]int{}
+	out := []providerCatalogEntry{}
 
-	add := func(e providerCatalogEntry) bool {
-		e.Name = strings.TrimSpace(e.Name)
-		if e.Name == "" || strings.TrimSpace(e.BaseURL) == "" {
-			return false
+	if f, ok := loadModelsDevCatalog(); ok {
+		ids := make([]string, 0, len(f.Providers))
+		for id := range f.Providers {
+			ids = append(ids, id)
 		}
-		if _, exists := byName[e.Name]; !exists {
-			order = append(order, e.Name)
-		}
-		byName[e.Name] = e
-		return true
-	}
-
-	embedded, embeddedVersion := parseProviderCatalogFileVersioned(providersEmbeddedDefault)
-	for _, e := range embedded {
-		add(e)
-	}
-
-	if path, err := providerCatalogCachePath(); err == nil {
-		if b, err := os.ReadFile(path); err == nil {
-			synced, syncedVersion := parseProviderCatalogFileVersioned(b)
-			redefines := syncedVersion > embeddedVersion
-			for _, e := range synced {
-				prev, exists := byName[strings.TrimSpace(e.Name)]
-				if !exists {
-					add(e)
-					continue
-				}
-				if !redefines {
-					// Additive only: fill the embedded row's gaps.
-					merged := prev
-					fillEmptyProviderFields(&merged, e)
-					// The declared windows come from the synced document where
-					// it states them, in this direction too — a measurement,
-					// not a preference (see mergeDeclaredModelLimits).
-					merged.Models = mergeDeclaredModelLimits(prev.Models, e.Models)
-					byName[merged.Name] = merged
-					continue
-				}
-				// The fetched document declares itself newer than this
-				// binary: its values win, and anything it omits is filled
-				// from the embedded row so a redefinition cannot blank a
-				// field the synced copy simply did not carry.
-				merged := e
-				merged.Name = prev.Name
-				fillEmptyProviderFields(&merged, prev)
-				// …including the declarations: prev supplies the ids the
-				// synced row does not list at all, and nowhere else — the
-				// synced document's own numbers win, which is the whole point
-				// of bumping the version to correct a window.
-				merged.Models = mergeDeclaredModelLimits(prev.Models, e.Models)
-				byName[merged.Name] = merged
+		sort.Strings(ids)
+		for _, id := range ids {
+			e := providerEntryFromModelsDev(id, f.Providers[id])
+			if e.Name == "" {
+				continue
+			}
+			if _, exists := byName[e.Name]; !exists {
+				byName[e.Name] = len(out)
+				out = append(out, e)
 			}
 		}
 	}
 
-	out := make([]providerCatalogEntry, 0, len(order))
-	for _, name := range order {
-		out = append(out, byName[name])
+	for _, p := range oaicaOverlay().Providers {
+		p.Name = strings.TrimSpace(p.Name)
+		if p.Name == "" {
+			continue
+		}
+		if i, ok := byName[p.Name]; ok {
+			// Field-level: the overlay's correction wins where it is set, and
+			// whatever it does not mention keeps the catalog's value.
+			out[i] = mergeProviderEntry(out[i], p)
+			continue
+		}
+		byName[p.Name] = len(out)
+		out = append(out, p)
 	}
-	return out
+
+	// A row with no endpoint at all cannot work, and the picker must not offer
+	// one that fails at launch: drop it silently. Hidden rows are exempt — an
+	// SDK-signed provider has no plain base URL by design — and so are rows
+	// upstream gives credentials for, which are real vendors whose endpoint
+	// models.dev states per model rather than at the provider root
+	// (providerEntryFromModelsDev).
+	kept := out[:0]
+	for _, e := range out {
+		if strings.TrimSpace(e.BaseURL) == "" && !e.Hidden && len(e.Env) == 0 {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
 }
 
-// fillEmptyProviderFields copies only the fields dst is missing. Used in both
-// merge directions for the same reason: a field the incoming row does not
-// carry means "this document has nothing to say", not "unset what you know".
-//
-// "Missing" is judged on the TRIMMED value and the result is trimmed, because
-// a base_url of "   " is a hand-edit that lost its content, not an endpoint:
-// add() refuses such a row outright ("a row that cannot state an endpoint is
-// dropped"), but the redefinition branch never went through add(), so a
-// whitespace endpoint was accepted as a redefinition and every URL built from
-// the row became relative ("/v4/chat/completions") — the provider 404s for
-// every model, with an error that names no host.
-func fillEmptyProviderFields(dst *providerCatalogEntry, src providerCatalogEntry) {
-	if strings.TrimSpace(dst.BaseURL) == "" {
-		dst.BaseURL = src.BaseURL
+// providerEntryFromModelsDev ports one models.dev provider row. The per-model
+// provider.api / provider.npm overrides are not resolved here — they belong to
+// the model, not the provider, and are read where a model is chosen.
+func providerEntryFromModelsDev(id string, p modelsDevProvider) providerCatalogEntry {
+	name := strings.TrimSpace(p.ID)
+	if name == "" {
+		name = strings.TrimSpace(id)
 	}
-	dst.BaseURL = strings.TrimSpace(dst.BaseURL)
-	if dst.Version == "" {
-		dst.Version = src.Version
+	return providerCatalogEntry{
+		Name:    name,
+		BaseURL: strings.TrimSpace(p.API),
+		Wire:    wireFromNPM(p.NPM),
+		Env:     p.Env,
 	}
-	if dst.ModelsPath == "" {
-		dst.ModelsPath = src.ModelsPath
+}
+
+// wireFromNPM maps an AI-SDK package name to the wire oaica speaks. Everything
+// that is not the Anthropic SDK goes over the OpenAI-compatible wire, which is
+// what opencode does too (npm ?? "@ai-sdk/openai-compatible").
+func wireFromNPM(npm string) string {
+	if strings.HasPrefix(npm, "@ai-sdk/anthropic") {
+		return "anthropic"
 	}
-	if dst.Wire == "" {
-		dst.Wire = src.Wire
+	return "openai"
+}
+
+// providerCatalogFromCatalogOnly is the catalog layer without overlay
+// corrections, used to tell "upstream carries this provider" from "our overlay
+// does" — a distinction the drift work (Plan B) needs and tests pin.
+func providerCatalogFromCatalogOnly() map[string]providerCatalogEntry {
+	out := map[string]providerCatalogEntry{}
+	f, ok := loadModelsDevCatalog()
+	if !ok {
+		return out
 	}
-	if dst.ToolFormat == "" {
-		dst.ToolFormat = src.ToolFormat
+	for id, p := range f.Providers {
+		e := providerEntryFromModelsDev(id, p)
+		if e.Name != "" {
+			out[e.Name] = e
+		}
 	}
-	if dst.APIKeyEnv == "" {
-		dst.APIKeyEnv = src.APIKeyEnv
-	}
-	if dst.PlanLabel == "" {
-		dst.PlanLabel = src.PlanLabel
-	}
-	if dst.PlanLabelModelPrefix == "" {
-		dst.PlanLabelModelPrefix = src.PlanLabelModelPrefix
-	}
-	if dst.KeyURL == "" {
-		dst.KeyURL = src.KeyURL
-	}
-	if dst.AuthVia == "" {
-		dst.AuthVia = src.AuthVia
-	}
-	if dst.Notes == "" {
-		dst.Notes = src.Notes
-	}
+	return out
 }
 
 // mergeDeclaredModelLimits merges a provider's declared model windows. kept is
@@ -281,18 +235,19 @@ func fillEmptyProviderFields(dst *providerCatalogEntry, src providerCatalogEntry
 // wherever it states one.
 //
 // The direction is what this function exists to pin down. Callers pass the
-// SYNCED document as `incoming` in both merge directions, because a declared
-// window is a measurement, not a preference, and the fetched copy is the
-// newer one wherever it comes from. The redefinition branch used to call
-// fillEmptyProviderFields(dst, prev) — src = the EMBEDDED row — so the one
-// field a version bump is most often used to correct was exactly the field the
-// shipped row overruled: a vendor that revised a context window down (the
-// honest direction) kept being over-reported by every host, and
+// newer, less-trusted document as `incoming` (the synced copy, or the overlay's
+// correction), because a declared window is a measurement, not a preference,
+// and the fetched copy is the newer one wherever it comes from. The version-bump
+// branch this replaced called fillEmptyProviderFields(dst, prev) — src = the
+// EMBEDDED row — so the one field a correction is most often used to fix was
+// exactly the field the shipped row overruled: a vendor that revised a context
+// window down (the honest direction) kept being over-reported by every host, and
 // CLAUDE_CODE_MAX_CONTEXT_TOKENS / the proxy's context-fit clamp never learned.
 //
-// A zero is treated as "states nothing", not as a value: Context and Output
-// are 0-means-unknown throughout, so a document that lists an id without a
-// window leaves the other side's number standing rather than blanking it.
+// A zero is treated as "states nothing", not as a value: Context and Output are
+// 0-means-unknown throughout, so a document that lists an id without stating a
+// window (or with the field at 0) leaves the other side's number standing rather
+// than blanking it — and a cache correcting one window field keeps the other.
 func mergeDeclaredModelLimits(kept, incoming map[string]providerCatalogModelLimit) map[string]providerCatalogModelLimit {
 	if len(kept) == 0 && len(incoming) == 0 {
 		return nil
@@ -316,22 +271,6 @@ func mergeDeclaredModelLimits(kept, incoming map[string]providerCatalogModelLimi
 		out[id] = limit
 	}
 	return out
-}
-
-func parseProviderCatalogBytes(b []byte) []providerCatalogEntry {
-	entries, _ := parseProviderCatalogFileVersioned(b)
-	return entries
-}
-
-// parseProviderCatalogFileVersioned decodes a catalog document and reports the
-// document's own version, which says whether it is newer than the embedded
-// default (see providerCatalog).
-func parseProviderCatalogFileVersioned(b []byte) ([]providerCatalogEntry, int) {
-	var f providerCatalogFile
-	if json.Unmarshal(b, &f) != nil {
-		return nil, 0
-	}
-	return f.Providers, f.Version
 }
 
 // providerCatalogAsUserRemotes converts the merged catalog to userRemote

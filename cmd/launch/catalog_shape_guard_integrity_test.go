@@ -13,20 +13,21 @@ package launch
 //
 // all decode cleanly into "this catalog has zero entries", are written over the
 // previous cache, and the command prints `synced 0 provider(s) ... (fresh)` and
-// exits 0. The cache wins over the embedded default, so with ACME_API_KEY set a
-// provider that only the synced catalog knows is listed by `oaica remote list`
-// before the clobber and gone after it — and the NEXT run, offline, re-reads
-// the garbage and calls it `(cached/304)` with another exit 0. The same
-// substitution silently resets every cloud alias's context window.
+// exits 0. The synced copy is merged over the embedded overlay, so with
+// ACME_API_KEY set a provider that only the synced document knows is listed by
+// `oaica remote list` before the clobber and gone after it — and the NEXT run,
+// offline, re-reads the garbage and calls it `(cached/304)` with another exit 0.
+// The same substitution silently resets every cloud alias's context window,
+// which now lives in the same file.
 //
 // `parseModelCatalog` (model_sync.go) already refuses exactly this shape, for
 // exactly this reason: a document with no "models" MEMBER is not an empty
-// catalog. Its two siblings never got the rule.
+// catalog. The cloud-limits sync that was its second sibling is gone (the
+// overlay carries the limits now), so one sync is left to guard.
 
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -62,7 +63,7 @@ func TestProviderSyncRefusesABodyThatIsNotAProviderCatalog(t *testing.T) {
 			if _, err := ProviderSync(good); err != nil {
 				t.Fatalf("premise: syncing a valid catalog failed: %v", err)
 			}
-			cache, err := providerCatalogCachePath()
+			cache, err := oaicaOverlayCachePath()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -118,7 +119,7 @@ func TestProviderSyncStillAcceptsRealCatalogs(t *testing.T) {
 func TestProviderSyncRefusesAGarbageCachedCatalogOffline(t *testing.T) {
 	home := t.TempDir()
 	setLaunchTestHome(t, home)
-	cache, err := providerCatalogCachePath()
+	cache, err := oaicaOverlayCachePath()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,36 +133,5 @@ func TestProviderSyncRefusesAGarbageCachedCatalogOffline(t *testing.T) {
 	rep, err := ProviderSync("http://127.0.0.1:1/catalog.json")
 	if err == nil {
 		t.Errorf("an unreachable source plus a cached body that is not a catalog reported `synced %d provider(s)` and exit 0 — the garbage cache keeps the whole catalogue empty for every later run, silently", rep.Count)
-	}
-}
-
-func TestCloudLimitsSyncRefusesABodyThatIsNotALimitsCatalog(t *testing.T) {
-	for _, tc := range notACatalogBodies {
-		// The "providers" member is this catalogue's own key name spelled
-		// differently; what matters is that a document about something else is
-		// not read as "no limits".
-		t.Run(tc.name, func(t *testing.T) {
-			setLaunchTestHome(t, t.TempDir())
-			cache, err := cloudLimitsCatalogCachePath()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			good := `{"version":1,"limits":{"kat-awq":{"context_window":262144}}}`
-			if err := os.WriteFile(cache, []byte(good), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			rep, err := CloudLimitsSync(catalogFileFor(t, "bad.json", tc.body))
-			if err == nil {
-				t.Errorf("%s was accepted as a cloud-limits catalog and synced as %d limit(s) — this cache feeds CLAUDE_CODE_MAX_CONTEXT_TOKENS and codex's context_window, so a silent zero resets every alias to the built-in size", tc.name, rep.Count)
-			}
-			after, _ := os.ReadFile(cache)
-			if !strings.Contains(string(after), "262144") {
-				t.Errorf("the cached limits were replaced by %s:\n%s", tc.name, after)
-			}
-		})
 	}
 }

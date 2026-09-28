@@ -429,8 +429,12 @@ type pickerCacheFile struct {
 // Each was added because a row appeared (or vanished) with no other file
 // changing, so the cache kept painting the old menu for up to pickerCacheTTL:
 //
-//   - authStorePath/userRemotesPath/licenseFilePath/providerCatalogCachePath:
-//     the original four (a login, a remote add, a licence, a catalog sync).
+//   - authStorePath/userRemotesPath/licenseFilePath/oaicaOverlayCachePath:
+//     the original four (a login, a remote add, a licence, a provider sync).
+//     The last was providers.json before the models.dev port; the overlay is
+//     what `oaica remote sync` writes now, and it carries both the provider
+//     rows and the cloud-alias limits a row is sized against, so it is still
+//     one file whose edit changes the answer.
 //   - localServersPath: `oaica serve <model>` writes it, and each live entry
 //     becomes a "<model>:local" row.
 //   - ollamaCloudCachePath: its ids become the "ollama/<id>" rows; the scrape
@@ -459,14 +463,12 @@ func pickerCacheInputPaths() []string {
 	if p, err := licenseFilePath(); err == nil {
 		add(p)
 	}
-	if p, err := providerCatalogCachePath(); err == nil {
-		add(p)
-	}
-	// The synced cloud-limits catalog: its numbers are the window a cloud
-	// row is sized against (and the CLAUDE_CODE_* pair a launch exports), so
-	// `oaica model cloud-limits sync` changes the answer while no other input
-	// moves — the same reason providerCatalogCachePath is here.
-	if p, err := cloudLimitsCatalogCachePath(); err == nil {
+	// The synced oaica overlay: `oaica remote sync` writes it, and it carries
+	// the provider rows a launch resolves against AND the cloud-alias numbers a
+	// cloud row is sized against (the CLAUDE_CODE_* pair a launch exports), so
+	// one sync changes the answer while no other input moves. Two entries used
+	// to sit here for the two files it replaces.
+	if p, err := oaicaOverlayCachePath(); err == nil {
 		add(p)
 	}
 	if p, err := oaicaLocalServersRegistryPath(); err == nil {

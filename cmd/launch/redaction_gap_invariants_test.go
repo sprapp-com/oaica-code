@@ -19,10 +19,11 @@ package launch
 //     redactCredentials alone, which handled neither a query-string key nor a
 //     Basic password containing "/" — the response body carried the key back
 //     to the launched client.
-//   - ProviderSync's and CloudLimitsSync's report values (printed by
-//     cmd/cmd.go) returned the raw --url, so `oaica provider sync --url
-//     https://KEY@mirror/…` echoed the mirror credential, while the sibling
-//     ModelSync returned the redacted display for the identical input.
+//   - ProviderSync's report value (printed by cmd/cmd.go) returned the raw
+//     --url, so `oaica remote sync --url https://KEY@mirror/…` echoed the
+//     mirror credential, while the sibling ModelSync returned the redacted
+//     display for the identical input. (CloudLimitsSync's report had the same
+//     defect and is gone with its command — the overlay carries the limits.)
 //
 // The marker below is embedded in every credential so a leak is greppable.
 
@@ -66,10 +67,10 @@ func invWriteRemotes(t *testing.T, home, body string) {
 	t.Setenv("OAICA_REMOTES_FILE", path)
 }
 
-// The two catalog syncs hand their caller the URL to print. The request keeps
-// a mirror credential in its userinfo — that is how a private mirror
-// authenticates — but the report line must not, which is what the sibling
-// ModelSync report already promised.
+// A catalog sync hands its caller the URL to print. The request keeps a mirror
+// credential in its userinfo — that is how a private mirror authenticates — but
+// the report line must not, which is what the sibling ModelSync report already
+// promised.
 func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 	const key = "sk-live-" + invLeakMarker + "-0123456789"
 
@@ -78,7 +79,10 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		setLaunchTestHome(t, home)
 		// Seed the last good copy so the offline fallback takes the success
 		// path the caller prints, without any network.
-		cache := filepath.Join(home, ".oaica", "cache", "providers", "providers.json")
+		cache, err := oaicaOverlayCachePath()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -88,11 +92,11 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		// The offline fallback serves the cache only for the URL it came from
 		// (catalogCacheSourcePath), so the seed has to name its source too.
 		// The redacted form is what the sync writes.
-		if err := os.WriteFile(catalogCacheSourcePath(cache), []byte(redactBaseURL("https://"+key+"@127.0.0.1:1/providers.json")+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(catalogCacheSourcePath(cache), []byte(redactBaseURL("https://"+key+"@127.0.0.1:1/oaica.json")+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
-		rep, err := ProviderSync("https://" + key + "@127.0.0.1:1/providers.json")
+		rep, err := ProviderSync("https://" + key + "@127.0.0.1:1/oaica.json")
 		if err != nil {
 			t.Fatalf("ProviderSync: %v", err)
 		}
@@ -105,33 +109,6 @@ func TestCatalogSyncReportsRedactAMirrorCredential(t *testing.T) {
 		}
 	})
 
-	t.Run("cloud limits sync", func(t *testing.T) {
-		home := t.TempDir()
-		setLaunchTestHome(t, home)
-		cache := filepath.Join(home, ".oaica", "cache", "cloud_limits", "cloud_limits.json")
-		if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		// The real catalog shape: limits is a MAP keyed by alias, not a list.
-		// The old fixture was an array, which the sync used to cache anyway
-		// because it discarded the parse error (2026-09-26 audit, third round
-		// made the sync refuse an unreadable body, which is what exposed it).
-		if err := os.WriteFile(cache, []byte(`{"version":1,"limits":{"x":{"context":1,"output":1}}}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(catalogCacheSourcePath(cache), []byte(redactBaseURL("https://"+key+"@127.0.0.1:1/cloud_limits.json")+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-
-		rep, err := CloudLimitsSync("https://" + key + "@127.0.0.1:1/cloud_limits.json")
-		if err != nil {
-			t.Fatalf("CloudLimitsSync: %v", err)
-		}
-		printed := fmt.Sprintf("synced %d cloud-alias limit(s) from %s", rep.Count, rep.URL)
-		if strings.Contains(rep.URL, key) {
-			invLeak(t, "CloudLimitsSyncReport.URL (printed by cmd/cmd.go)", printed)
-		}
-	})
 }
 
 // A newline in the userinfo is a shape url.Parse REFUSES, so the leak scan

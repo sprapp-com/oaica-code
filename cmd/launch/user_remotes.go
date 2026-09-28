@@ -365,13 +365,13 @@ func userRemotesPath() string {
 // auth login` entry, or a login this row's auth_via declares that another
 // agent CLI already stores (auth_external.go). No key, nothing to route
 // through, no row.
-// Sourced entirely from providerCatalog() (provider_catalog.go): the
-// embedded default (cmd/launch/providers/providers.json) plus whatever
-// `oaica remote sync` has pulled down. Adding a provider, adding a new
+// Sourced entirely from providerCatalog() (provider_catalog.go): the ported
+// models.dev catalog plus our own overlay (cmd/launch/providers/oaica.json),
+// which is what `oaica remote sync` pulls down. Adding a provider, adding a new
 // billing plan for an existing one (e.g. z.ai's Coding Plan alongside its
-// pay-per-token API), relabeling, or fixing an endpoint is a providers.json
-// change — never a change here. A user-defined remote of the same name in
-// remotes.json still wins (see loadUserRemotes).
+// pay-per-token API), relabeling, or fixing an endpoint is an overlay change —
+// never a change here. A user-defined remote of the same name in remotes.json
+// still wins (see loadUserRemotes).
 func builtinRemotes() []userRemote {
 	var out []userRemote
 	for _, p := range providerCatalogAsUserRemotes() {

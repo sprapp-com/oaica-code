@@ -65,12 +65,35 @@ type cloudModelLimit struct {
 // only consults it for names carrying an explicit cloud source tag, so OAICA
 // router / user-remote model ids never match it.
 //
-// Sourced from cloud_limits_catalog.go's embedded default + `oaica model
-// cloud-limits sync` override (data, not a Go literal — correcting or
-// adding an alias's limits is a cloud_limits.json edit, never a recompile),
-// merged with ollamaCloudAliasCatalog's own entries (the picker's
-// recommendation copy, which also carries limits inline).
+// Sourced from the oaica overlay's limits section (catalog_overlay.go — the
+// rows the retired cloud_limits.json carried, moved there verbatim), merged
+// with ollamaCloudAliasCatalog's own entries (the picker's recommendation
+// copy, which also carries limits inline). Data, not a Go literal: correcting
+// or adding an alias's limits is an overlay edit synced by `oaica remote sync`,
+// never a recompile.
 var cloudModelLimits = mergeCloudModelLimits(cloudModelLimitsFromRecommendations(ollamaCloudAliasCatalog), cloudLimitsFromCatalog())
+
+// cloudLimitsFromCatalog returns the Ollama ":cloud" alias windows the overlay
+// states. It reads the overlay only — the synced copy of the overlay is already
+// merged into it per key, so this is the single place a limit can come from,
+// and a cache can no longer be of unknown age relative to a second file.
+//
+// A row that states no usable window is dropped rather than kept as a
+// zero-valued limit: Context is written verbatim into
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS / AUTO_COMPACT_WINDOW / codex's
+// context_window, where 0 turns auto-compact off instead of on. Zero means
+// "states nothing" throughout these catalogs (mergeDeclaredModelLimits), so a
+// row like that is the absence of a limit, not a limit of zero.
+func cloudLimitsFromCatalog() map[string]cloudModelLimit {
+	out := map[string]cloudModelLimit{}
+	for id, l := range overlayLimits() {
+		if strings.TrimSpace(id) == "" || l.Context <= 0 || l.Output <= 0 {
+			continue
+		}
+		out[id] = cloudModelLimit{Context: l.Context, Output: l.Output}
+	}
+	return out
+}
 
 var (
 	dynamicCloudModelLimitsMu sync.RWMutex

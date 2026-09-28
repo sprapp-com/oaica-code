@@ -23,7 +23,7 @@ func TestAuthLoginKeepsTheRemotesSpellingWhenTheCatalogKnowsTheName(t *testing.T
 	setLaunchTestHome(t, dir)
 	t.Setenv("OAICA_AUTH_FILE", filepath.Join(dir, "auth.json"))
 
-	// "deepseek" IS in the provider catalog (providers/providers.json), so
+	// "deepseek" IS in the provider catalog (providers/oaica.json), so
 	// knownAuthProvider resolves it case-insensitively — which is exactly the
 	// path that used to overwrite the remote's own spelling.
 	if _, known := knownAuthProvider("deepseek"); !known {

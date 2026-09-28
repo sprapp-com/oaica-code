@@ -133,7 +133,8 @@ func TestPickerNoMatchHint_NothingKnown(t *testing.T) {
 }
 
 // The provider catalog is the single source of truth for "what oaica knows":
-// a provider added to providers.json gets a hint with no code change here.
+// a provider the overlay (providers/oaica.json) or the ported models.dev
+// catalog carries gets a hint with no code change here.
 func TestPickerNoMatchHint_FollowsTheCatalog(t *testing.T) {
 	useTempAuthStore(t)
 	clearAllCatalogKeys(t)

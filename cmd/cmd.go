@@ -2544,39 +2544,7 @@ files or fills in a model_path on a pathless entry.`,
 			return nil
 		},
 	}
-	modelCloudLimitsCmd := &cobra.Command{
-		Use:   "cloud-limits",
-		Short: "Manage :cloud alias context/output limits",
-	}
-	modelCloudLimitsSyncCmd := &cobra.Command{
-		Use:   "sync",
-		Short: "Pull the hosted :cloud alias limits catalog",
-		Long: `Fetches context/output token limits for Ollama ":cloud" aliases
-(cmd/launch/cloud_limits/cloud_limits.json — kimi-k2.6, glm-5.1, qwen3.5, ...)
-from the OAICA-hosted URL into ~/.oaica/cache/cloud_limits/cloud_limits.json,
-overriding the copy embedded in this binary. Only affects aliases resolved
-via a user's own local Ollama daemon; OAICA's own self-hosted models specify
-context size via 'oaica model add --context-window' or 'oaica model sync'
-instead (see cmd/launch/model_manifest.go).`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			url, _ := cmd.Flags().GetString("url")
-			rep, err := launch.CloudLimitsSync(url)
-			if err != nil {
-				return err
-			}
-			src := "fresh"
-			if rep.FromCache {
-				src = "cached/304"
-			}
-			fmt.Printf("synced %d cloud-alias limit(s) from %s (%s)\n", rep.Count, rep.URL, src)
-			return nil
-		},
-	}
-	modelCloudLimitsSyncCmd.Flags().String("url", "", "Catalog URL (default: the OAICA-hosted catalog; file:// paths accepted)")
-	modelCloudLimitsCmd.AddCommand(modelCloudLimitsSyncCmd)
-
-	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd, modelSyncCmd, modelScanCmd, modelCloudLimitsCmd)
+	modelCmd.AddCommand(modelAddCmd, modelListCmd, modelShowCmd, modelRemoveCmd, modelRefreshCmd, modelSyncCmd, modelScanCmd)
 
 	// remote — CRUD over ~/.oaica/remotes.json (see cmd/launch/user_remotes.go),
 	// the OpenAI/Anthropic-compatible boxes the launch picker offers alongside
@@ -2666,12 +2634,14 @@ instead (see cmd/launch/model_manifest.go).`,
 	remoteSyncCmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Pull the hosted provider catalog (new providers, plans, endpoint fixes)",
-		Long: `Fetches the built-in provider directory (endpoints, wire, billing labels
-for anthropic/openai/zai/zai-coding-plan/etc — cmd/launch/providers/providers.json)
-from the OAICA-hosted URL into ~/.oaica/cache/providers/providers.json, where
-it overrides the copy embedded in this binary. This is how a new provider, a
-new billing plan for an existing one (e.g. z.ai's Coding Plan), or an
-endpoint fix reaches you without upgrading oaica-code itself.`,
+		Long: `Fetches the oaica overlay (endpoints, wire, billing labels and model
+windows for anthropic/openai/zai/zai-coding-plan/etc — cmd/launch/providers/oaica.json)
+from the OAICA-hosted URL into ~/.oaica/cache/providers/oaica.json, where it
+corrects the copy embedded in this binary per key. Provider rows themselves come
+from the models.dev catalog ('oaica model catalog sync'); the overlay is what we
+edit, and this is how a new provider, a new billing plan for an existing one
+(e.g. z.ai's Coding Plan), or an endpoint fix reaches you without upgrading
+oaica-code itself.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			url, _ := cmd.Flags().GetString("url")

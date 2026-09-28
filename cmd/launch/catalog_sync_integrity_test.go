@@ -5,12 +5,17 @@ package launch
 //
 //   - S6: the response body was cached without ever being parsed. One bad
 //     response (an HTML login page from a captive portal, a truncated
-//     transfer) replaced the last good cache — and the synced cache WINS over
-//     the embedded default, so every alias's limits silently collapsed to the
-//     built-in `262144` → `1` until someone synced again;
+//     transfer) replaced the last good cache — and the synced copy is merged
+//     over the embedded overlay, so this file decides every provider row AND
+//     every cloud-alias window the launch exports, and a garbage body silently
+//     emptied both until someone synced again;
 //   - S5: the ETag lived in an unbound `…json.etag` file, so syncing from a
 //     second URL sent the first URL's validator, and a reply of 304 then
 //     served the OTHER catalog's cached body under the new URL's name.
+//
+// The cloud-limits case that used to sit beside the provider one is gone with
+// CloudLimitsSync: the overlay carries those limits now (catalog_overlay.go),
+// so `oaica remote sync` is the one sync left and this file tests it twice.
 
 import (
 	"encoding/json"
@@ -67,19 +72,10 @@ func (cs *catalogServer) validators() []string {
 	return append([]string(nil), cs.inm...)
 }
 
-// providerCachePath is this HOME's synced provider catalog.
+// providerCachePath is this HOME's synced overlay.
 func providerCachePath(t *testing.T) string {
 	t.Helper()
-	p, err := providerCatalogCachePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func cloudLimitsCachePath(t *testing.T) string {
-	t.Helper()
-	p, err := cloudLimitsCatalogCachePath()
+	p, err := oaicaOverlayCachePath()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,60 +85,31 @@ func cloudLimitsCachePath(t *testing.T) string {
 // S6: a body that is not a catalog is never cached, and the last good copy
 // survives. Asserted on what the NEXT reader sees, not just on the error.
 func TestCatalogSyncRefusesToCacheAnUnparseableBody(t *testing.T) {
-	const good = `{"version":1,"providers":[{"name":"good-provider","base_url":"https://good.example.com"}]}`
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
 
-	for _, tc := range []struct {
-		name  string
-		bad   string
-		sync  func(string) error
-		path  func(*testing.T) string
-		read  func(string) string
-		count int
-	}{
-		{
-			name: "provider catalog", bad: "<html>captive portal</html>",
-			path:  providerCachePath,
-			sync:  func(u string) error { _, err := ProviderSync(u); return err },
-			count: 1,
-		},
-		{
-			name: "cloud limits catalog",
-			bad:  `{"version":1,"limits":[{"model":"x"}]}`, // array where a map belongs
-			path: cloudLimitsCachePath,
-			sync: func(u string) error { _, err := CloudLimitsSync(u); return err },
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			setLaunchTestHome(t, home)
+	const seed = `{"version":1,"providers":[{"name":"good-provider","base_url":"https://good.example.com"}]}`
+	// Seed the last good copy, exactly as a previous successful sync would
+	// have left it.
+	cache := providerCachePath(t)
+	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-			// Seed the last good copy, exactly as a previous successful sync
-			// would have left it.
-			cache := tc.path(t)
-			if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			seed := good
-			if tc.count == 0 {
-				seed = `{"version":1,"limits":{"glm-5":{"context":202752,"output":131072}}}`
-			}
-			if err := os.WriteFile(cache, []byte(seed), 0o600); err != nil {
-				t.Fatal(err)
-			}
+	srv := newCatalogServer(t, "<html>captive portal</html>", "")
+	if _, err := ProviderSync(srv.URL + "/catalog.json"); err == nil {
+		t.Error("sync returned nil for a body that is not a catalog — it cached the garbage and reported success")
+	}
 
-			srv := newCatalogServer(t, tc.bad, "")
-			if err := tc.sync(srv.URL + "/catalog.json"); err == nil {
-				t.Error("sync returned nil for a body that is not a catalog — it cached the garbage and reported success")
-			}
-
-			after, err := os.ReadFile(cache)
-			if err != nil {
-				t.Fatalf("the cache was removed: %v", err)
-			}
-			if string(after) != seed {
-				t.Errorf("the cache now holds %q, want the last good copy %q — an unreadable response must never replace it", after, seed)
-			}
-		})
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatalf("the cache was removed: %v", err)
+	}
+	if string(after) != seed {
+		t.Errorf("the cache now holds %q, want the last good copy %q — an unreadable response must never replace it", after, seed)
 	}
 }
 
@@ -151,7 +118,7 @@ func TestCatalogSyncRefusesToCacheAnUnparseableBody(t *testing.T) {
 // collapses every alias's limits.
 func TestCloudLimitsFromCatalogFallsBackToEmbeddedDefaults(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
-	cache := cloudLimitsCachePath(t)
+	cache := providerCachePath(t)
 	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
 		t.Fatal(err)
 	}

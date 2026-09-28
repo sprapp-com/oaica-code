@@ -4,17 +4,17 @@ package launch
 // served a cache that belonged to a different catalogue URL (2026-09-26 audit,
 // tenth round, auditor B).
 //
-// Sync once from a private mirror, then run `oaica provider sync` (or
-// `model cloud-limits sync`) offline with the default URL: the transport-error
-// branch read the one fixed cache path regardless of the URL asked for, and the
-// report echoed the URL that was ASKED FOR with FromCache set. The user
-// concludes the default catalogue was verified from cache when a private
-// mirror's contents are what is on disk — the transport-error sibling of the
-// third-round 304 fix, which bound the validator to its URL but left the cached
-// BODY claimable by anyone.
+// Sync once from a private mirror, then run `oaica remote sync` offline with
+// the default URL: the transport-error branch read the one fixed cache path
+// regardless of the URL asked for, and the report echoed the URL that was ASKED
+// FOR with FromCache set. The user concludes the default catalogue was verified
+// from cache when a private mirror's contents are what is on disk — the
+// transport-error sibling of the third-round 304 fix, which bound the validator
+// to its URL but left the cached BODY claimable by anyone.
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -25,7 +25,10 @@ func deadCatalogURL(t *testing.T) string {
 	return "http://" + deadUpstreamAddress(t) + "/catalog.json"
 }
 
-// The two catalogue caches, each with its own sync entry point.
+// The catalogue caches, each with its own sync entry point. One entry now: the
+// overlay carries the provider rows, the first-party models and the cloud-alias
+// limits, so `oaica remote sync` is the only sync left (CloudLimitsSync and its
+// cache were retired with the file they synced).
 var catalogSyncCases = []struct {
 	name   string
 	body   string
@@ -34,22 +37,12 @@ var catalogSyncCases = []struct {
 	sync   func(string) (int, bool, error)
 }{
 	{
-		name:   "provider catalog",
+		name:   "oaica overlay",
 		body:   `{"version":1,"providers":[{"name":"from-mirror","base_url":"https://mirror.example.com"}]}`,
 		marker: "from-mirror",
 		path:   providerCachePath,
 		sync: func(u string) (int, bool, error) {
 			r, err := ProviderSync(u)
-			return r.Count, r.FromCache, err
-		},
-	},
-	{
-		name:   "cloud limits catalog",
-		body:   `{"version":1,"limits":{"glm-5":{"context":202752,"output":131072}}}`,
-		marker: "glm-5",
-		path:   cloudLimitsCachePath,
-		sync: func(u string) (int, bool, error) {
-			r, err := CloudLimitsSync(u)
 			return r.Count, r.FromCache, err
 		},
 	},
@@ -121,7 +114,7 @@ func TestALegacyCacheIsClaimableOnlyByTheDefaultCatalog(t *testing.T) {
 	setLaunchTestHome(t, home)
 
 	cache := providerCachePath(t)
-	if err := os.MkdirAll(strings.TrimSuffix(cache, "/providers.json"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(cache, []byte(`{"version":1,"providers":[]}`), 0o600); err != nil {

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 //go:embed providers/oaica.json
@@ -108,14 +109,22 @@ func oaicaOverlay() oaicaOverlayFile {
 		out.Models = append(out.Models, m)
 	}
 
-	if out.Limits == nil {
-		out.Limits = map[string]providerCatalogModelLimit{}
-	}
+	// Limits merge per key and per field, by the same rule the provider rows
+	// follow (mergeDeclaredModelLimits): the sync's stated numbers win, a zero
+	// states nothing, and a sync that corrects one window field keeps the other.
+	// A limit's Context is written verbatim into CLAUDE_CODE_MAX_CONTEXT_TOKENS
+	// and codex's context_window, so a document that lists an alias it has no
+	// window for must leave the embedded number standing rather than blank it.
+	synced := make(map[string]providerCatalogModelLimit, len(cache.Limits))
 	for id, lim := range cache.Limits {
 		if id == "" {
 			continue
 		}
-		out.Limits[id] = lim
+		synced[id] = lim
+	}
+	out.Limits = mergeDeclaredModelLimits(out.Limits, synced)
+	if out.Limits == nil {
+		out.Limits = map[string]providerCatalogModelLimit{}
 	}
 	return out
 }
@@ -128,8 +137,14 @@ func oaicaOverlay() oaicaOverlayFile {
 // is silent — the embedded value just keeps winning. If a field is added to the
 // struct, add it here in the same change.
 func mergeProviderEntry(base, override providerCatalogEntry) providerCatalogEntry {
-	if override.BaseURL != "" {
-		base.BaseURL = override.BaseURL
+	// Judged on the TRIMMED value and assigned trimmed, for the reason the
+	// retired provider catalog documented when a "   " endpoint survived as a
+	// row's base_url: every URL built from the row became relative
+	// ("/v4/chat/completions"), the provider 404s for every model, and the
+	// error names no host. A whitespace endpoint is a hand-edit that lost its
+	// content, not an endpoint.
+	if v := strings.TrimSpace(override.BaseURL); v != "" {
+		base.BaseURL = v
 	}
 	if override.Version != "" {
 		base.Version = override.Version
@@ -161,18 +176,24 @@ func mergeProviderEntry(base, override providerCatalogEntry) providerCatalogEntr
 	if override.Notes != "" {
 		base.Notes = override.Notes
 	}
-	if len(override.Models) > 0 {
-		if base.Models == nil {
-			base.Models = map[string]providerCatalogModelLimit{}
-		}
-		for id, lim := range override.Models {
-			base.Models[id] = lim
-		}
+	if len(override.Env) > 0 {
+		base.Env = override.Env
 	}
-	// NOTE: providerCatalogEntry gains a bool field (Hidden) in the credential
-	// gating change, and the merge rule for it belongs here — a bool cannot be
-	// merged by "override wins where set", because absence and false read the
-	// same. Add it deliberately at that point rather than by pattern.
+	// Delegated rather than open-coded: a document that corrects a model's
+	// context window must not blank the output it does not restate, and a zero
+	// is "states nothing" — the rule mergeDeclaredModelLimits pins (and the
+	// reason this used to be a wholesale per-id assignment that let a cache
+	// stating {"context":0} zero an embedded window).
+	base.Models = mergeDeclaredModelLimits(base.Models, override.Models)
+	// Hidden is a bool, so absence and false read the same: a bool cannot be
+	// merged by "override wins where it is set". The override wins when it says
+	// true, and an embedded true is never cleared by a cache that omits the
+	// field. Hiding is the conservative direction — a hidden row is offered to
+	// nobody, while an unhidden SDK-signed row is offered to everyone and fails
+	// at launch — so this asymmetry is deliberate.
+	if override.Hidden {
+		base.Hidden = true
+	}
 	return base
 }
 

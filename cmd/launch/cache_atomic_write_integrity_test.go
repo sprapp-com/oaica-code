@@ -13,8 +13,8 @@ package launch
 //
 // What the reader does with the prefix is the harm:
 //
-//   - providerCatalog() parses the synced copy and, on a parse error, simply
-//     loses it — the run silently drops every provider and model row the sync
+//   - oaicaOverlay reads the synced copy and, on a parse error, simply loses
+//     it — the run silently drops every provider, model and limit row the sync
 //     added, with no error reported;
 //   - the sync path itself falls back to the cache when the network fails or
 //     answers 304, and hands the prefix to parseProviderCatalogFileChecked,
@@ -42,11 +42,11 @@ import (
 // "<home>|<source>|<iterations>".
 const cacheChildEnv = "LAUNCH_CACHE_TEST_CHILD"
 
-// bigProviderCatalogBody is a valid provider catalog big enough that copying it
+// bigProviderCatalogBody is a valid overlay document big enough that copying it
 // into the destination is not a single syscall — which is the whole window the
 // reader has to observe a prefix.
 func bigProviderCatalogBody(providers int) []byte {
-	f := providerCatalogFile{Version: 1}
+	f := oaicaOverlayFile{Version: 1}
 	for i := 0; i < providers; i++ {
 		f.Providers = append(f.Providers, providerCatalogEntry{
 			Name:    fmt.Sprintf("host-%04d", i),
@@ -95,11 +95,11 @@ func TestCatalogCacheWriterChildHelper(t *testing.T) {
 
 func TestCatalogCacheIsNeverReadTorn(t *testing.T) {
 	home := t.TempDir()
-	source := filepath.Join(t.TempDir(), "providers.json")
+	source := filepath.Join(t.TempDir(), "oaica.json")
 	if err := os.WriteFile(source, bigProviderCatalogBody(4000), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cache := filepath.Join(home, ".oaica", "cache", "providers", "providers.json")
+	cache := filepath.Join(home, ".oaica", "cache", "providers", "oaica.json")
 
 	cmd := exec.Command(os.Args[0], "-test.run=TestCatalogCacheWriterChildHelper")
 	cmd.Env = append(os.Environ(), cacheChildEnv+"="+home+"|"+source+"|300")
