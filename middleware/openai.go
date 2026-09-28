@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/openai"
 )
@@ -30,6 +32,8 @@ type ChatWriter struct {
 	streamOptions *openai.StreamOptions
 	id            string
 	toolCallSent  bool
+	// calls carries the turn's tool-call bookkeeping — see translatedCallState.
+	calls *translatedCallState
 	// failed is set when an error frame ended this turn. Everything after it is
 	// nothing: the client has been told why the turn stopped, and a converter
 	// fed the frames that follow would write chunks for a turn that is over.
@@ -80,12 +84,142 @@ func (w *BaseWriter) writeError(data []byte) (int, error) {
 	return len(data), nil
 }
 
+// translatedCallState is the per-turn bookkeeping the two translated OpenAI
+// surfaces (`/v1/chat/completions`, `/v1/responses`) need to state an upstream
+// turn the way every other arm of this repo states it. It is the same rule the
+// Anthropic converter applies — `anthropic.ToolCallIDFor`'s callers in
+// `anthropic/anthropic.go` (`Process`, `ToMessagesResponse`) and the
+// AnthropicMiddleware arm of this same handler (`contentBlocks`) — and the same
+// rule the other two translation legs apply, because one upstream body must
+// reach a client as the same blocks, under the same ids, whichever surface it
+// arrived on.
+//
+// Two readings it fixes, both measured on the OpenAI chat and Responses
+// surfaces while the Anthropic surface of the same handler already stated them
+// correctly (2026-09-29 audit, round 98):
+//
+// F98-L1-1. An entry whose `function.name` is empty is NOT a call. It has no
+// name to dispatch and no second event that carries one, so a client handed
+// such a call can only report it pending forever. Its argument bytes are the
+// model's own output and reach the client as TEXT — the rule rounds 77/80/81
+// pinned for the Anthropic surface, leg 2 (round 75) and leg 3 (round 76),
+// where the bytes are relayed at the position the entry stood. Measured:
+// `[prose "Let me look.", nameless {"cmd":"ls"}]` reached an Anthropic client
+// as `Let me look.{"cmd":"ls"}` with no tool_use, and an OpenAI chat client as
+// the prose plus a RUNNABLE call under the upstream's id with an empty name.
+//
+// F98-L1-2. A call the upstream stated no id for was handed on with the empty
+// id, so the client could not name it back: `openai.FromChatRequest` pairs a
+// tool result to its call only by `tool_call_id`, and it has nothing to pair
+// with. Measured: the same id-less `Bash {"cmd":"ls"}` reached the Anthropic
+// surface as `call_83cf9330` and the OpenAI chat surface as `"id":""`. The mint
+// is keyed on the call's own identity (name + the argument text the upstream
+// stated), the second and later occurrence of one identity in a turn takes a
+// distinct id, and a minted id never lands on one an upstream stated — the
+// rules rounds 39, 40, 45, 46 pinned for this repo's other arms.
+type translatedCallState struct {
+	// statedIDOwner records, per upstream-stated id, the call identity that id
+	// was first stated for, so a second, DIFFERENT call under the same id is
+	// re-minted rather than delivered under an id that names the first
+	// (round 45, A45-3).
+	statedIDOwner map[string]string
+	// mintedIDs holds every id this turn has stated or minted, so a synthesized
+	// id never lands on one the client has already been given (round 46, A46-4).
+	mintedIDs map[string]bool
+	// seenInCall counts, per id-less call identity, how many times this turn has
+	// carried it: the second occurrence is a second call and takes a distinct id
+	// (round 40, A40-6). The counter is TURN-scoped, not chunk-scoped, so the
+	// answer does not depend on the runner's flush boundary (round 67, F67-L1-1).
+	seenInCall map[string]int
+}
+
+func newTranslatedCallState() *translatedCallState {
+	return &translatedCallState{
+		statedIDOwner: make(map[string]string),
+		mintedIDs:     make(map[string]bool),
+		seenInCall:    make(map[string]int),
+	}
+}
+
+// normalize rewrites one upstream chunk in place into the turn these two
+// surfaces may state. `calls` may be nil (a writer built outside a middleware),
+// in which case the chunk is passed through untouched.
+func (c *translatedCallState) normalize(r *api.ChatResponse) {
+	if c == nil || r == nil || len(r.Message.ToolCalls) == 0 {
+		return
+	}
+
+	// Every id this chunk states is spoken for before anything is minted, so a
+	// synthesized id cannot collide with one the client is being handed in the
+	// same chunk (round 46, A46-4). As on the Anthropic arm this pre-pass sees
+	// only the chunk it is in — the residue round 67's F67-L1-2 records.
+	for _, tc := range r.Message.ToolCalls {
+		if tc.ID != "" {
+			c.mintedIDs[tc.ID] = true
+		}
+	}
+
+	kept := make([]api.ToolCall, 0, len(r.Message.ToolCalls))
+	for _, tc := range r.Message.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			// An entry the upstream never named is not a call (F98-L1-1 above):
+			// its bytes are the model's own output, relayed as prose at the
+			// position the entry stood — which on a wire that carries the text
+			// and the calls as separate fields is the end of this chunk's text,
+			// exactly where the Anthropic arm puts it (reasoning, then prose,
+			// then the calls a chunk carried).
+			if tc.Function.Arguments.Len() > 0 {
+				if args, err := json.Marshal(tc.Function.Arguments); err == nil {
+					r.Message.Content += string(args)
+				}
+			}
+			continue
+		}
+		tc.ID = c.idFor(tc)
+		kept = append(kept, tc)
+	}
+	r.Message.ToolCalls = kept
+}
+
+// idFor answers the id this call reaches the client under: the one the upstream
+// stated, unless that id is already spoken for by a different call, in which
+// case — and for every call the upstream stated no id for — this repo's mint,
+// keyed on the call's own identity.
+func (c *translatedCallState) idFor(tc api.ToolCall) string {
+	argsSeed, err := json.Marshal(tc.Function.Arguments)
+	if err != nil {
+		return tc.ID
+	}
+	base := "\x00" + tc.Function.Name + "\x00" + string(argsSeed)
+	if tc.ID != "" {
+		key := "\x01" + tc.ID
+		if owner, ok := c.statedIDOwner[key]; !ok || owner == base {
+			c.statedIDOwner[key] = base
+			return tc.ID
+		}
+	}
+
+	n := c.seenInCall[base]
+	c.seenInCall[base] = n + 1
+	mintedKey := string(argsSeed)
+	if n > 0 {
+		mintedKey += "#" + strconv.Itoa(n)
+	}
+	id := anthropic.ToolCallIDFor(tc.Function.Name, mintedKey)
+	for k := 0; c.mintedIDs[id]; k++ {
+		id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+	}
+	c.mintedIDs[id] = true
+	return id
+}
+
 func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 	var chatResponse api.ChatResponse
 	err := json.Unmarshal(data, &chatResponse)
 	if err != nil {
 		return 0, err
 	}
+	w.calls.normalize(&chatResponse)
 
 	// chat chunk
 	if w.stream {
@@ -518,6 +652,7 @@ func ChatMiddleware() gin.HandlerFunc {
 			stream:        req.Stream,
 			id:            fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
 			streamOptions: req.StreamOptions,
+			calls:         newTranslatedCallState(),
 		}
 
 		c.Writer = w
@@ -543,6 +678,8 @@ type ResponsesWriter struct {
 	responseID string
 	itemID     string
 	request    openai.ResponsesRequest
+	// calls carries the turn's tool-call bookkeeping — see translatedCallState.
+	calls *translatedCallState
 	// failed is set when an error frame ended this turn — see ChatWriter.failed.
 	// This surface had no reading of the error frame at all until round 92: a
 	// turn that died mid-stream was relayed as its own partial text and then
@@ -572,6 +709,7 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 	if err := json.Unmarshal(data, &chatResponse); err != nil {
 		return 0, err
 	}
+	w.calls.normalize(&chatResponse)
 
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
@@ -681,6 +819,7 @@ func ResponsesMiddleware() gin.HandlerFunc {
 			responseID: responseID,
 			itemID:     itemID,
 			request:    req,
+			calls:      newTranslatedCallState(),
 		}
 
 		// Set headers based on streaming mode

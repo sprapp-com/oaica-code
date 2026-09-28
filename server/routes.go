@@ -2339,8 +2339,18 @@ func streamResponse(c *gin.Context, ch chan any) {
 	// other two translation legs' 502 (2026-09-28 audit, round 73, F73-L1-2). A
 	// turn that ENDS with no content is not this shape: its chunks arrive, so
 	// the peek succeeds and the turn is stated as usual.
+	//
+	// Every TRANSLATED surface refuses this shape, not only the Anthropic one:
+	// round 73 widened the refusal to /v1/messages, and the OpenAI chat and
+	// Responses wires — the other two translated surfaces, both of which reach
+	// this handler — went on answering an empty upstream channel with a 200,
+	// while /v1/messages and both other translation legs answer 502 with this
+	// sentence. A translated client asking for a turn and handed nothing read
+	// the emptiness as the model's answer (2026-09-29 audit, round 98,
+	// F98-L1-4). The native wire and the legacy completions surface set neither
+	// key and keep their own answers.
 	first, havePending := <-ch
-	if !havePending && c.GetBool("anthropic_messages") {
+	if !havePending && (c.GetBool("anthropic_messages") || c.GetBool(middleware.TranslatedSurfaceKey)) {
 		c.Header("Content-Type", "application/json")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "upstream returned an empty stream"})
 		return
@@ -2704,6 +2714,14 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 		// one the accumulation below uses, so the runs stay aligned with the
 		// calls actually kept.
 		anthropicSurface := c.GetBool("anthropic_messages")
+		// runsSurface is every surface that READS the ordered run list below:
+		// the Anthropic surface (whose blocks are written from it) and the
+		// translated surfaces (the Responses wire states its items in the runs'
+		// order — 2026-09-29 audit, round 98, F98-L1-3). Keyed off the marks, not
+		// the surface's name, as the tool-call gate is. The native wire and the
+		// legacy completions surface read neither list and keep their own
+		// answers (round 79, F79-L1-1: the native wire carries no runs).
+		runsSurface := anthropicSurface || c.GetBool(middleware.TranslatedSurfaceKey)
 		var contentRuns []string
 		var run strings.Builder
 		// outputRuns is the same turn as the ordered list of runs the streaming
@@ -2748,6 +2766,8 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 							contentRuns = append(contentRuns, "")
 						}
 					}
+				}
+				if runsSurface {
 					if t.Message.Thinking != "" {
 						appendOutputRun("thinking", t.Message.Thinking)
 					}
@@ -2795,11 +2815,14 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 			}
 		}
 
-		if !arrived && c.GetBool("anthropic_messages") {
-			// The Anthropic surface refuses this shape the way the other two
-			// legs do. The native wire keeps its own answer: this handler is
-			// shared, and upstream ollama's reading of an empty channel is not
-			// this surface's to change (2026-09-28 audit, round 73, F73-L1-2).
+		if !arrived && (c.GetBool("anthropic_messages") || c.GetBool(middleware.TranslatedSurfaceKey)) {
+			// Every translated surface refuses this shape the way the other two
+			// legs do — widened from the Anthropic surface alone in round 98, so
+			// /v1/chat/completions and /v1/responses stop answering an empty
+			// upstream channel with a 200 (F98-L1-4). The native wire keeps its
+			// own answer: this handler is shared, and upstream ollama's reading
+			// of an empty channel is not this surface's to change (2026-09-28
+			// audit, round 73, F73-L1-2).
 			c.JSON(http.StatusBadGateway, gin.H{"error": "upstream returned an empty stream"})
 			return
 		}

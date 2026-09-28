@@ -765,9 +765,9 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 	// first two events (2026-09-29 audit, round 94, F94-L1-2).
 	output := []ResponsesOutputItem{}
 
-	// Add reasoning item if thinking is present
-	if chatResponse.Message.Thinking != "" {
-		output = append(output, ResponsesOutputItem{
+	// reasoningItem is the item that holds this turn's reasoning.
+	reasoningItem := func() ResponsesOutputItem {
+		return ResponsesOutputItem{
 			ID:   fmt.Sprintf("rs_%s", responseID),
 			Type: "reasoning",
 			Summary: []ResponsesReasoningSummary{
@@ -777,7 +777,93 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 				},
 			},
 			EncryptedContent: chatResponse.Message.Thinking, // Plain text for now
-		})
+		}
+	}
+	// callItems is the turn's calls, in the order it made them.
+	callItems := func() []ResponsesOutputItem {
+		toolCalls := ToToolCalls(chatResponse.Message.ToolCalls)
+		items := make([]ResponsesOutputItem, 0, len(toolCalls))
+		for i, tc := range toolCalls {
+			items = append(items, ResponsesOutputItem{
+				ID:        fmt.Sprintf("fc_%s_%d", responseID, i),
+				Type:      "function_call",
+				Status:    "completed",
+				CallID:    tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
+		return items
+	}
+
+	// When the turn's own run list is present and accounts for it, the items are
+	// written in the order the RUNS state, because that is the order the
+	// streaming arm of this leg announces and documents them in — item by item,
+	// as the chunks arrive. Both arms must answer one upstream body with one
+	// item order: this arm used to write a fixed reasoning/message/calls order
+	// whatever the runs said, so a turn that narrated BEFORE it reasoned —
+	// `[text A, thinking T]`, the shape a reasoning model that answers and then
+	// reconsiders produces — reached a streaming client as
+	// `[message, reasoning]` and a non-streaming one as `[reasoning, message]`,
+	// and a turn that reasoned, called and then spoke (`[thinking, call, text]`)
+	// reached them as `[reasoning, function_call, message]` and
+	// `[reasoning, message, function_call]` (2026-09-29 audit, round 98,
+	// F98-L1-3).
+	//
+	// Each item stands where its FIRST run of that kind stands, and the calls
+	// stand one per call run: the text of a turn is one message item on this
+	// wire, so a turn whose prose sits either side of its reasoning states one
+	// message item at its first text run — which is what the streamed arm's own
+	// terminal document states for the same turn (measured: `[text, thinking,
+	// text]` → `[message, reasoning]` on both arms, the two text runs joined in
+	// the one message item exactly as its streamed sibling joins them). The
+	// order is all this arm takes from the runs; the text itself is the merged
+	// Content, which is what the streamed arm's document carries too.
+	runsInOrder := chatResponse.Message.OutputRunsAccountFor()
+	if runsInOrder {
+		textWritten, reasoningWritten := false, false
+		nextCall := 0
+		calls := callItems()
+		for _, run := range chatResponse.Message.OutputRuns {
+			switch run.Kind {
+			case "thinking":
+				if reasoningWritten || chatResponse.Message.Thinking == "" {
+					continue
+				}
+				reasoningWritten = true
+				output = append(output, reasoningItem())
+			case "call":
+				if nextCall < len(calls) {
+					output = append(output, calls[nextCall])
+					nextCall++
+				}
+			case "text":
+				if textWritten || chatResponse.Message.Content == "" {
+					continue
+				}
+				textWritten = true
+				output = append(output, ResponsesOutputItem{
+					ID:     itemID,
+					Type:   "message",
+					Status: "completed",
+					Role:   "assistant",
+					Content: []ResponsesOutputContent{
+						{
+							Type:        "output_text",
+							Text:        chatResponse.Message.Content,
+							Annotations: []any{},
+							Logprobs:    []any{},
+						},
+					},
+				})
+			}
+		}
+		return buildResponsesResponse(model, responseID, itemID, chatResponse, request, output)
+	}
+
+	// Add reasoning item if thinking is present
+	if chatResponse.Message.Thinking != "" {
+		output = append(output, reasoningItem())
 	}
 
 	// The text of a turn that also called a tool is part of the answer, not an
@@ -819,20 +905,14 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 	}
 
 	// Then the calls, in the order the turn made them.
-	if len(chatResponse.Message.ToolCalls) > 0 {
-		toolCalls := ToToolCalls(chatResponse.Message.ToolCalls)
-		for i, tc := range toolCalls {
-			output = append(output, ResponsesOutputItem{
-				ID:        fmt.Sprintf("fc_%s_%d", responseID, i),
-				Type:      "function_call",
-				Status:    "completed",
-				CallID:    tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: tc.Function.Arguments,
-			})
-		}
-	}
+	output = append(output, callItems()...)
 
+	return buildResponsesResponse(model, responseID, itemID, chatResponse, request, output)
+}
+
+// buildResponsesResponse wraps the items an arm assembled into the response
+// document this wire states, echoing back the request parameters it carries.
+func buildResponsesResponse(model, responseID, itemID string, chatResponse api.ChatResponse, request ResponsesRequest, output []ResponsesOutputItem) ResponsesResponse {
 	var instructions *string
 	if request.Instructions != "" {
 		instructions = &request.Instructions
