@@ -1743,7 +1743,18 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		return fmt.Errorf("error reading llama-server response: %v", err)
 	}
 
-	return nil
+	// The body ended at a clean SSE boundary with no reader error and no final
+	// response: the runner stopped mid-turn. This is the same event the abrupt
+	// death above reports — a turn that never said it was over — and reporting
+	// it as a SUCCESS gave one upstream body two readings up the stack: the
+	// buffered arm merged the chunks that had arrived and closed the turn with
+	// `end_turn` and a 200, selling a truncated answer as the model's whole
+	// reply to a caller that never retries, while the streaming arm wrote no
+	// terminal event at all and left a client waiting for a message_stop that
+	// could not come (2026-09-29 audit, round 90, F90-L1-1). The sentence is the
+	// family's: it is the same cause the other two translation legs name in the
+	// same words.
+	return fmt.Errorf("upstream stream ended before the response was complete")
 }
 
 func llamaServerStreamLimitError(label string, err error) error {
@@ -2053,7 +2064,12 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 		return fmt.Errorf("error reading llama-server chat response: %v", err)
 	}
 
-	return nil
+	// The body ended at a clean SSE boundary with no reader error and no final
+	// response: see the completion twin above. Reported as a SUCCESS this turn
+	// reached the buffered arm as `end_turn` and 200 over a truncated answer,
+	// and the streaming arm as no terminal event at all, so a client waited for
+	// a message_stop that could not come (2026-09-29 audit, round 90, F90-L1-1).
+	return fmt.Errorf("upstream stream ended before the response was complete")
 }
 
 type llamaServerToolCallAccumulator struct {
