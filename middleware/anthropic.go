@@ -204,7 +204,14 @@ type WebSearchAnthropicWriter struct {
 	streamMessageStarted bool
 	streamHasOpenBlock   bool
 	streamOpenBlockIndex int
-	streamNextIndex      int
+	// streamOpenBlockKind is the type of the block the passthrough arm left
+	// open, so the terminal can CONTINUE it when the narration it carries is of
+	// the same kind rather than close it and open a second one. One merged
+	// message is one run per kind; the streamed turn was reaching the client as
+	// two blocks wherever the run crossed a chunk boundary the takeover
+	// swallowed (2026-09-28 audit, round 81, F81-L1-2).
+	streamOpenBlockKind string
+	streamNextIndex     int
 
 	// pendingCallChunks holds streaming chunks that carry a tool call but no
 	// web_search call, because this arm cannot yet know what the TURN is. A
@@ -687,7 +694,63 @@ func (w *WebSearchAnthropicWriter) combineServerAndFinalContent(serverContent []
 // reached the client with the model's text on one wire and without it on the
 // other, and the text of every further loop iteration was lost on both
 // (2026-09-28 audit, round 56, F56-2).
+// The order here is the order the turn's output ARRIVED in, which is not the
+// merged message's field order. This arm read the merged message as a fixed
+// [thinking, text] pair and the buffered lane of the server hands one over with
+// its OutputRuns, the ordered run list it built while merging (server/routes.go,
+// writeChatResponse) — so a turn the model wrote as prose-then-reasoning reached
+// a client that streamed it as [text, thinking] and a client that did not as
+// [thinking, text] (2026-09-28 audit, round 81, F81-L1-1). The runs also say
+// where an entry the upstream never named stands: those bytes are the model's
+// own output and reach the client as TEXT on every other arm of this leg
+// (F77-L1-1), and this one dropped them by reading only Content and Thinking
+// (round 81, F81-L1-3).
 func carriedNarrationBlocks(response api.ChatResponse) []anthropic.ContentBlock {
+	if response.Message.OutputRunsAccountFor() {
+		var blocks []anthropic.ContentBlock
+		calls := response.Message.ToolCalls
+		next := 0
+		// addText appends prose, joining it to the text block before it: a
+		// run boundary is where the streaming arm opens a block, and a call it
+		// writes no block for — here, one the loop superseded — does not break
+		// the text around it (round 76, F76-L1-1).
+		addText := func(s string) {
+			if s == "" {
+				return
+			}
+			if n := len(blocks); n > 0 && blocks[n-1].Type == "text" && blocks[n-1].Text != nil {
+				joined := *blocks[n-1].Text + s
+				blocks[n-1].Text = &joined
+				return
+			}
+			t := s
+			blocks = append(blocks, anthropic.ContentBlock{Type: "text", Text: &t})
+		}
+		for _, run := range response.Message.OutputRuns {
+			switch run.Kind {
+			case "thinking":
+				thinking := run.Text
+				blocks = append(blocks, anthropic.ContentBlock{Type: "thinking", Thinking: &thinking})
+			case "text":
+				addText(run.Text)
+			case "call":
+				if next >= len(calls) {
+					break
+				}
+				tc := calls[next]
+				next++
+				if strings.TrimSpace(tc.Function.Name) == "" && tc.Function.Arguments.Len() > 0 {
+					args, err := json.Marshal(tc.Function.Arguments)
+					if err != nil {
+						continue
+					}
+					addText(string(args))
+				}
+			}
+		}
+		return blocks
+	}
+
 	var blocks []anthropic.ContentBlock
 	if response.Message.Thinking != "" {
 		thinking := response.Message.Thinking
@@ -821,11 +884,25 @@ func (w *WebSearchAnthropicWriter) releasePendingCallChunks(keepCalls bool) erro
 	w.pendingCallChunks = nil
 	for _, chunk := range pending {
 		if !keepCalls {
-			chunk.Message.ToolCalls = nil
-			// Nothing left of it: a chunk that carried only the call says
-			// nothing once the call is gone, and writing it would open a block
+			// An entry the upstream never NAMED is not a call: its bytes are
+			// the model's own output, relayed as text on every other arm of
+			// this leg and by the other two legs (round 77, F77-L1-1). The
+			// takeover drops the client's calls — the loop supersedes the turn
+			// — and it dropped the prose that shared a chunk with them, so a
+			// turn whose nameless entry sat before the search reached this
+			// client with those bytes gone while the buffered arm of the same
+			// body relayed them (2026-09-28 audit, round 81, F81-L1-3).
+			var kept []api.ToolCall
+			for _, tc := range chunk.Message.ToolCalls {
+				if strings.TrimSpace(tc.Function.Name) == "" {
+					kept = append(kept, tc)
+				}
+			}
+			chunk.Message.ToolCalls = kept
+			// Nothing left of it: a chunk that carried only the calls says
+			// nothing once they are gone, and writing it would open a block
 			// for an empty message.
-			if chunk.Message.Content == "" && chunk.Message.Thinking == "" {
+			if chunk.Message.Content == "" && chunk.Message.Thinking == "" && len(kept) == 0 {
 				continue
 			}
 		}
@@ -883,12 +960,14 @@ func (w *WebSearchAnthropicWriter) writePassthroughStreamChunk(chatResponse api.
 		case anthropic.ContentBlockStartEvent:
 			w.streamHasOpenBlock = true
 			w.streamOpenBlockIndex = e.Index
+			w.streamOpenBlockKind = e.ContentBlock.Type
 			if e.Index+1 > w.streamNextIndex {
 				w.streamNextIndex = e.Index + 1
 			}
 		case anthropic.ContentBlockStopEvent:
 			if w.streamHasOpenBlock && w.streamOpenBlockIndex == e.Index {
 				w.streamHasOpenBlock = false
+				w.streamOpenBlockKind = ""
 			}
 			if e.Index+1 > w.streamNextIndex {
 				w.streamNextIndex = e.Index + 1
@@ -1094,6 +1173,44 @@ func (w *WebSearchAnthropicWriter) writeStreamContentBlocks(content []anthropic.
 	return nil
 }
 
+// writeStreamNarration writes the terminal's leading narration — the turn's own
+// prose and reasoning, which the passthrough arm may already have begun — and
+// CONTINUES an open block of the same kind rather than closing it and opening a
+// second one. The buffered arm of the same body carries one run per kind, so a
+// run that crossed the chunk boundary the takeover swallowed reached a
+// streaming client as two blocks against the document arm's one, and the two
+// arms of one upstream turn disagreed about the turn's block structure
+// (2026-09-28 audit, round 81, F81-L1-2). A block of another kind is written as
+// its own, which is where the streaming converter closes one too.
+func (w *WebSearchAnthropicWriter) writeStreamNarration(blocks []anthropic.ContentBlock) error {
+	for _, block := range blocks {
+		if w.streamHasOpenBlock && w.streamOpenBlockKind == block.Type {
+			delta := anthropic.Delta{Type: "text_delta"}
+			if block.Text != nil {
+				delta.Text = *block.Text
+			}
+			if block.Type == "thinking" {
+				delta = anthropic.Delta{Type: "thinking_delta"}
+				if block.Thinking != nil {
+					delta.Thinking = *block.Thinking
+				}
+			}
+			if err := writeSSE(w.ResponseWriter, "content_block_delta", anthropic.ContentBlockDeltaEvent{
+				Type:  "content_block_delta",
+				Index: w.streamOpenBlockIndex,
+				Delta: delta,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := w.writeStreamContentBlocks([]anthropic.ContentBlock{block}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.MessagesResponse) error {
 	if w.terminalSent {
 		return nil
@@ -1113,10 +1230,20 @@ func (w *WebSearchAnthropicWriter) writeTerminalResponse(response anthropic.Mess
 	if err := w.ensureStreamMessageStart(response.Usage); err != nil {
 		return err
 	}
+	// The turn's narration leads the terminal, and the passthrough arm may have
+	// an open block of that kind already: those blocks CONTINUE it (see
+	// writeStreamNarration), the rest are written after it is closed.
+	lead := 0
+	for lead < len(response.Content) && (response.Content[lead].Type == "thinking" || response.Content[lead].Type == "text") {
+		lead++
+	}
+	if err := w.writeStreamNarration(response.Content[:lead]); err != nil {
+		return err
+	}
 	if err := w.closeOpenStreamBlock(); err != nil {
 		return err
 	}
-	if err := w.writeStreamContentBlocks(response.Content); err != nil {
+	if err := w.writeStreamContentBlocks(response.Content[lead:]); err != nil {
 		return err
 	}
 
