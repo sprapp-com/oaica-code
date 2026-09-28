@@ -129,8 +129,18 @@ type openAIImageURL struct {
 }
 
 type openAIToolCall struct {
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	// Index is the slot a call occupies, and on a whole completion it is as
+	// much a statement of the wire as it is on a streamed one: an upstream
+	// restating a call it already made with an id names that call's slot with
+	// it, and the frame arms of this leg and of the gateway leg fold a
+	// restatement exactly when it names the slot its twin occupies. Without
+	// the field this leg's document arm read `"index":0` and `"index":1` as
+	// the same entry, folded both, and answered one call where every other arm
+	// answered two (2026-09-28 audit, round 73, F73-L2-1). Omitted when
+	// unset, so a call this proxy builds for an upstream request is unchanged.
+	Index    *int               `json:"index,omitempty"`
 	Function openAIToolFunction `json:"function"`
 }
 
@@ -826,16 +836,19 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 	// seenInList counts how often each call identity has appeared in this
 	// list, so a repeat takes the streaming converter's "#n" rule (A45-2).
 	seenInList := make(map[string]int, len(tcs))
-	// statedCallIdentities holds the identity of every call this list stated an
-	// id for, so a later id-less entry repeating one of them is read as that
-	// call restated rather than as a second call (see the fold below).
-	statedCallIdentities := make(map[string]bool, len(tcs))
+	// statedCallSlots holds, per identity, the SLOT every call this list stated
+	// an id for occupies — the index it names, or, when it names none, the
+	// position it is listed at. A later id-less entry repeating one of them is
+	// that call restated rather than a second call, but only when it NAMES that
+	// slot: the frame arms of both this leg and the gateway leg fold exactly
+	// there and nowhere else (see the fold below).
+	statedCallSlots := make(map[string]int, len(tcs))
 	for _, tc := range tcs {
 		if tc.ID != "" {
 			usedIDs[tc.ID] = true
 		}
 	}
-	for _, tc := range tcs {
+	for i, tc := range tcs {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// A call the upstream never named is not a call on this path either:
 			// its arguments reach the client as TEXT (relayUnnamedCallArguments,
@@ -894,22 +907,36 @@ func parseOpenAIToolCalls(tcs []openAIToolCall, truncated bool) []api.ToolCall {
 		// second one. The streaming arm of this leg reads the wire that way —
 		// both entries of one slot, the second with no id, are the call the
 		// first stated (round 56's F1/F2, restatesAccumulatedCall) — and the
-		// gateway leg's document arm folds them too, so only the shape matters
-		// here: an entry that states an id is a call; a LATER entry that states
-		// none and carries the same name and the same finished arguments is
-		// that call listed again. Left in, it minted an id of its own and the
-		// model's one call reached the client as two tool_use blocks with equal
-		// names and inputs — the client runs the tool twice — where the same
-		// body's other arm answers one. Recorded only from entries that STATED
-		// an id, because two identical ID-LESS calls are two calls and not one
-		// stated twice: that is A45-2's rule, and it survives this
-		// (2026-09-28 audit, round 68, F68-L2-3).
+		// gateway leg's FRAME arm folds them by the same rule: an entry that
+		// states an id is a call, and a LATER id-less entry that carries the
+		// same name, the same finished arguments AND THE SLOT ITS TWIN
+		// OCCUPIES is that call listed again. Left in, it minted an id of its
+		// own and the model's one call reached the client as two tool_use
+		// blocks with equal names and inputs — the client runs the tool twice —
+		// where the same body's other arm answers one. Recorded only from
+		// entries that STATED an id, because two identical ID-LESS calls are
+		// two calls and not one stated twice: that is A45-2's rule, and it
+		// survives this (2026-09-28 audit, round 68, F68-L2-3).
+		//
+		// The slot is the second half of the rule, and it is the half round 68
+		// took from a claim about the gateway leg's DOCUMENT arm that measured
+		// false: that arm answers two calls for this body, and so does the
+		// frame arm the moment the restatement names a slot its twin does not
+		// occupy — a fresh index, or none at all. Folded on identity alone, one
+		// body reached the client as one call here and two on every other arm
+		// that reads it (2026-09-28 audit, round 73, F73-L2-1). An entry that
+		// names no slot names nothing to fold onto: this list's positions are
+		// not slots the wire stated.
 		if tc.ID == "" {
-			if _, stated := statedCallIdentities[identity]; stated {
+			if slot, stated := statedCallSlots[identity]; stated && tc.Index != nil && *tc.Index == slot {
 				continue
 			}
 		} else {
-			statedCallIdentities[identity] = true
+			slot := i
+			if tc.Index != nil {
+				slot = *tc.Index
+			}
+			statedCallSlots[identity] = slot
 		}
 		id := tc.ID
 		minted := false
@@ -2902,9 +2929,24 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	// by the name, its arguments were concatenated onto that call's open
 	// arguments and the call it introduced did not exist, while the whole-list
 	// arm reads the same body as three calls (2026-09-28 audit, round 61,
-	// F61-L2-3). An id is still asked at any index: ids name calls, not slots.
-	openSlotStating := func(id, name string, indexSeen bool) (int, bool) {
-		if id != "" {
+	// F61-L2-3).
+	//
+	// An id is asked at any index this stream has already written for, because
+	// ids name calls, not slots (round 60's F60-L2-2: the vendor that does not
+	// update its index on a continuation writes the call's own id at a stale
+	// one). A FRESH index is the exception, and it is the same signal the name
+	// route honours: a fragment that states an index this stream has never
+	// written, its own id, its own name AND a complete object of its own is not
+	// a continuation of anything — the call holding that id has received none of
+	// its arguments, so there is nothing for it to be more of. Claimed anyway,
+	// the second call's whole object was grafted onto the argument-less call
+	// that stated the same id and the second call did not exist: one executable
+	// call carrying the other call's input, which signals nothing to the client,
+	// where this leg's whole-list arm, both of leg 1's arms and both of the
+	// gateway leg's arms answer two calls for the same body (2026-09-28 audit,
+	// round 73, F73-L2-2).
+	openSlotStating := func(id, name string, indexSeen, freshIndex bool) (int, bool) {
+		if id != "" && !freshIndex {
 			byID, found := -1, false
 			for s, a := range toolAccums {
 				if a.id != id || argsFinished(a.args.String()) {
@@ -3439,7 +3481,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// ordinary wire — where the stated id restates the call the
 					// index names — is untouched, and round 56's F1 restatement,
 					// whose call is finished, keeps its own slot.
-					if stated, ok := openSlotStating(tc.ID, tc.Function.Name, indexSeen); ok {
+					if stated, ok := openSlotStating(tc.ID, tc.Function.Name, indexSeen, indexed && !indexSeen); ok {
 						slot = stated
 					}
 					// A fragment that states NO id and no name is an argument
