@@ -1253,10 +1253,34 @@ func redactCredentialURLs(text string) string {
 // F89-L3-4). Azure-style callers spell it `api-key`.
 func presentedCredential(r *http.Request) string {
 	if auth := r.Header.Get("Authorization"); auth != "" {
-		if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
-			return strings.TrimSpace(auth[7:])
+		cred := strings.TrimSpace(auth)
+		// The scheme word alone is the scheme with an EMPTY token — "Bearer "
+		// reaches a server as "Bearer", because a header value's trailing
+		// whitespace is stripped on the wire before any handler sees it — so it
+		// carries no credential either, and must fall through like the case
+		// below rather than be read as a bare token spelled "Bearer"
+		// (2026-09-29 audit, round 90, F90-L3-3).
+		if strings.EqualFold(cred, "Bearer") {
+			cred = ""
+		} else if len(cred) >= 7 && strings.EqualFold(cred[:7], "Bearer ") {
+			cred = strings.TrimSpace(cred[7:])
+		} else if strings.ContainsAny(cred, " \t") {
+			// An Authorization that names a scheme this gateway does not read
+			// ("Basic …", "Negotiate …", a digest challenge echoed back) is not
+			// the caller's credential here — the two credentials this gateway
+			// takes on that header are a Bearer token and a bare token, and a
+			// token carries no space. Treating it as one made an intermediary's
+			// header SHADOW the key the caller actually sent: an
+			// `Authorization: Bearer ` (an empty token), a `Basic …` injected by
+			// a load balancer or a corporate gateway, or a second Authorization
+			// line whose value the first line's Get returns — each answered 401
+			// for a request carrying a valid X-Api-Key, so the caller's own
+			// credential was unreadable (2026-09-29 audit, round 90, F90-L3-3).
+			cred = ""
 		}
-		return strings.TrimSpace(auth)
+		if cred != "" {
+			return cred
+		}
 	}
 	for _, h := range []string{"X-Api-Key", "Api-Key"} {
 		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
@@ -1898,13 +1922,19 @@ func (u *usageRecorder) scanSSE(p []byte) {
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
 		}
-		var chunk struct {
-			Usage *usage `json:"usage"`
+		// The frame is read with the BRIDGE's own struct, not a private lenient
+		// one that models only `usage`: the meter and the client take one
+		// reading of one body, and a frame the bridge cannot decode is a frame
+		// the client never received, whose usage is not a usage to book. A
+		// private struct that accepted what the bridge refused let one wire be
+		// two turns — the client served 8/1 and the row billed 9000/500 for the
+		// same bytes (2026-09-29 audit, round 90, F90-L3-1).
+		var chunk oaStreamChunk
+		if json.Unmarshal(payload, &chunk) != nil || chunk.Usage == nil {
+			continue
 		}
-		if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
-			u.usage.merge(*chunk.Usage)
-			u.seen = true
-		}
+		u.usage.merge(*chunk.Usage)
+		u.seen = true
 	}
 }
 

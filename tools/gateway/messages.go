@@ -2175,6 +2175,14 @@ type bridgeSSE struct {
 	// documentSaysSomething, booked a metered 200 for it (2026-09-28 audit,
 	// round 55).
 	adoptedDoc bool
+	// sawFrame is whether any frame of this body PARSED as a chunk — the
+	// question noAnswer asks to tell a body of frames that said nothing (this
+	// stream's own reading, "upstream returned an empty stream") from a body
+	// that was never frames at all (which the buffered arm reads as a document
+	// and names cause by cause). Without it one body's refusal sentence
+	// depended on the client's `stream` flag (2026-09-29 audit, round 90,
+	// F90-L3-2).
+	sawFrame bool
 }
 
 func newAnthropicBridge(w http.ResponseWriter, stream bool, model string) *anthropicBridge {
@@ -2399,7 +2407,28 @@ func (b *anthropicBridge) noAnswer() (int, string) {
 		// startSent and the turn was found to hold nothing — was told the turn
 		// failed by round 42's empty-stream arm (2026-09-27 audit, round 43,
 		// B43-1).
-		return http.StatusBadGateway, "upstream returned an empty stream"
+		if b.sse.sawFrame {
+			return http.StatusBadGateway, "upstream returned an empty stream"
+		}
+		// No frame of this body ever parsed, so it is not a stream that said
+		// nothing — it is a body the buffered arm below reads as a document, and
+		// its refusal must be named the way that arm names it. Reading only
+		// whether the body PARSED let the same bytes state a different cause
+		// depending on the client's `stream` flag: a 200 whose body is not JSON
+		// at all was "upstream returned an empty stream" here and "unparseable
+		// upstream response" below, and a body with no choices likewise
+		// (2026-09-29 audit, round 90, F90-L3-2). The bytes are the document
+		// buffer's (nonSSE + tail), exactly what bufferedCompletion reads.
+		var resp openAICompletion
+		if err := json.Unmarshal([]byte(strings.TrimSpace(b.sse.nonSSE.String()+b.sse.tail.String())), &resp); err != nil {
+			return http.StatusBadGateway, "unparseable upstream response"
+		}
+		if len(resp.Choices) == 0 {
+			return http.StatusBadGateway, "upstream returned no completion choices"
+		}
+		// Parsed, holds choices, and still says nothing: the same completion the
+		// buffered arm refuses below with its own sentence.
+		return http.StatusBadGateway, "upstream returned an empty completion"
 	}
 	var resp openAICompletion
 	if err := json.Unmarshal(b.sse.tail.Bytes(), &resp); err != nil {
@@ -2966,6 +2995,12 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
 			continue
 		}
+		// A frame of this body PARSED. It is what tells a body of frames that
+		// said nothing apart from a body that was never frames at all when
+		// noAnswer names the cause of a refusal: the first is this stream's own
+		// reading, the second is the reading the buffered arm takes of the same
+		// bytes (2026-09-29 audit, round 90, F90-L3-2).
+		b.sse.sawFrame = true
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
 			b.sse.upstreamErr = upstreamErrorSentence(payload, errorFrameMessage(chunk.Error))
 			continue
@@ -5541,18 +5576,18 @@ type oaStreamChunk struct {
 		Message      *oaDelta `json:"message"`
 		FinishReason *string  `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		// The same two spellings the ledger's usage type carries; the
-		// cached part is reported to the client as
-		// cache_read_input_tokens rather than folded into input_tokens
-		// (2026-09-27 audit, round 23).
-		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
-		PromptTokensDetails  *struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	// The ledger's own usage type, not a second anonymous struct with the same
+	// fields: the meter reads these frames with THIS struct (see
+	// usageRecorder.scanSSE), and one type is what keeps the two readers from
+	// disagreeing about which frames exist at all. The meter's private copy
+	// modelled only `usage`, so a frame this struct refuses (a `content` parts
+	// array, a numeric `id`, an object `finish_reason` — the decode above drops
+	// it, usage and all) was still booked by the meter, and the row for a turn
+	// the client was served as 8/1 stated 9000/500 (2026-09-29 audit, round 90,
+	// F90-L3-1). The cached part is reported to the client as
+	// cache_read_input_tokens rather than folded into input_tokens
+	// (2026-09-27 audit, round 23).
+	Usage *usage `json:"usage"`
 	// Raw, because a failure stated inside the stream is not always an
 	// object: an upstream may send {"error":"upstream ran out of KV
 	// cache"} as a bare string, and modelling only the object made the

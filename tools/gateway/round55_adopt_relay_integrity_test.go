@@ -74,9 +74,15 @@ func TestAnAdoptedDocumentCutShortIsNotAnEmptyStream(t *testing.T) {
 	// The control: a document that says NOTHING has no finish_reason to close it
 	// and is still refused — adoption must not become "any document is a turn".
 	// This is round 43's B43-1, unchanged by round 55.
+	//
+	// The SENTENCE is round 90's F90-L3-2: this body holds no `data:` frame at
+	// all, so the refusal is the one the document arms state, not the one the
+	// frame arms state — the same bytes answered `stream:false` say "upstream
+	// returned an empty completion", and one body states one cause whichever
+	// spelling the client asked for.
 	empty := `{"id":"c2","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":""}}]}`
 	es, ebody, erow := r55Adopted(t, empty)
-	if !strings.Contains(ebody, "upstream returned an empty stream") {
+	if !strings.Contains(ebody, "upstream returned an empty completion") {
 		t.Errorf("a completion with no content, no reasoning and no call was served as a turn (status %d):\n%s\na client that reads a completed empty turn never retries", es, ebody)
 	}
 	if erow.Status < 500 {
