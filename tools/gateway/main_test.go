@@ -357,9 +357,11 @@ func TestReload_BadConfigKeepsPrevious(t *testing.T) {
 }
 
 func TestHealth_DownWhenUpstreamDead(t *testing.T) {
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
-	g, _ := newTestGateway(t, dead.URL)
-	dead.Close()
+	// A listener stood up and closed is NOT a dead address: the kernel hands
+	// the port it frees to the next :0 bind in this process, so the probe can
+	// be answered by a sibling test's fake upstream (measured 2026-09-29,
+	// round 89 — see round89_dead_upstream_determinism_test.go).
+	g, _ := newTestGateway(t, deadUpstreamURL(t))
 	srv := httptest.NewServer(mux(g))
 	defer srv.Close()
 	resp, _ := http.Get(srv.URL + "/health")
@@ -1758,9 +1760,12 @@ func TestUpstreamErrorLog_CapturesConnectionLevelFailure(t *testing.T) {
 	// ReverseProxy's ErrorHandler instead) was invisible to
 	// UpstreamErrorLogPath, only findable in the raw ledger as a bare
 	// status code with no message. This must now show up in the log too.
-	deadUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL := deadUpstream.URL
-	deadUpstream.Close() // closed immediately -> guaranteed connection refused
+	// Closed immediately, but NOT guaranteed refused: a closed listener frees
+	// its ephemeral port, and the next :0 bind in this process is often given
+	// it — this test failed with "expected 502 from the dead upstream, got
+	// 200" on two of six runs at HEAD ffc099225 (2026-09-29 audit, round 89).
+	// deadUpstreamURL is the address nothing can be listening on.
+	deadURL := deadUpstreamURL(t)
 
 	g, errLogPath := newTestGatewayWithErrorLog(t, deadURL)
 	srv := httptest.NewServer(mux(g))
