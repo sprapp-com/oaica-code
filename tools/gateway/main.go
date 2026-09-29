@@ -505,6 +505,11 @@ type gwConfig struct {
 	// and a chat API key must never double as a weights-download license.
 	PullCatalog     []gwPullEntry `json:"pull_catalog,omitempty"`
 	PullLicenseKeys []gwKey       `json:"pull_license_keys,omitempty"`
+	// PullLicenseValidateURL: the oaica-saas licence API (`https://…/license/validate`). A Bearer key shaped
+	// `oaica-lic-…` that matches no pull_license_keys entry is checked there, so a licence bought through Stripe
+	// also opens licensed weights without anyone editing this file. Empty = static keys only. Unreachable or
+	// refusing = refused (fail closed); answers are cached briefly.
+	PullLicenseValidateURL string `json:"pull_license_validate_url,omitempty"`
 
 	// UpstreamErrorLogPath: every non-2xx response from upstream (excluding
 	// SSE streams, which already 200 by the time an error could occur mid-
@@ -628,6 +633,9 @@ func loadConfig(path string) (gwConfig, error) {
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := validatePullLicenseURL(cfg.PullLicenseValidateURL); err != nil {
+		return cfg, fmt.Errorf("pull_license_validate_url: %w", err)
 	}
 	if cfg.UpstreamAddr == "" {
 		cfg.UpstreamAddr = defaultConfig().UpstreamAddr
@@ -890,9 +898,10 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 }
 
 type gateway struct {
-	mu    sync.RWMutex
-	cfg   gwConfig
-	proxy *httputil.ReverseProxy // the default (top-level upstream_addr) proxy
+	licCache remoteLicenseCache // pull.go: results of pull_license_validate_url
+	mu       sync.RWMutex
+	cfg      gwConfig
+	proxy    *httputil.ReverseProxy // the default (top-level upstream_addr) proxy
 	// proxies holds one reverse proxy per DISTINCT upstream address, so a
 	// model with its own upstream_addr reuses connections/transport state
 	// per backend instead of getting a fresh proxy per request. Always

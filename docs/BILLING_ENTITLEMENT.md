@@ -48,6 +48,15 @@ about the gateway's read path changes when a real processor is wired up:
   See `oaica-saas/docs/stripe-setup.md`. (The old unsigned
   `/subscribers/webhook` route was removed in round 132.)
 
+## Licensed weights and the Stripe licence
+
+`oaica pull` of a `license_required` model sends the buyer's licence as a Bearer. The gateway accepts (a) a key
+whose SHA-256 is in `pull_license_keys` (hand-edited, e.g. an enterprise customer), or (b) when
+`pull_license_validate_url` is set (`https://<saas>/license/validate`, https or loopback only), an
+`oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) is cached 10 min when valid and
+1 min when refused, and fails closed when the licence server is unreachable. Leave it unset until oaica-saas is
+live; a refund revokes the key within the cache window.
+
 ## The second condition: rolling-window caps
 
 Being entitled and being *within plan* are separate questions. An

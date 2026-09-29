@@ -1,0 +1,14 @@
+oaica-code
+Copyright (c) 2026 BizTransit Sdn Bhd (891234-X)
+Level 28, Lingkaran Syed Putra, Mid Valley City, 59200 Kuala Lumpur, Malaysia
+
+This product is a derivative of Ollama (https://github.com/ollama/ollama),
+Copyright (c) Ollama, licensed under the MIT License. The full licence text,
+with both copyright notices, is in the file LICENSE that accompanies every copy.
+
+Third-party Go modules linked into the binary keep their own licences; the
+list of modules and versions is in THIRD_PARTY_MODULES.txt (generated at
+build time from go.mod). Model weights are not part of this software and
+carry their own licences.
+
+How the prebuilt binary is licensed and sold: LICENSING.md.

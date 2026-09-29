@@ -50,6 +50,8 @@ TARGETS=(
   "windows/amd64/zip"
 )
 
+go list -m all > "$WORK/THIRD_PARTY_MODULES.txt"
+
 for t in "${TARGETS[@]}"; do
   IFS=/ read -r goos goarch kind <<<"$t"
   stage="$WORK/$goos-$goarch"
@@ -64,15 +66,20 @@ for t in "${TARGETS[@]}"; do
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
     go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$stage/bin/$bin" .
 
+  # The licence notices travel with every copy (MIT requires it): LICENSE, NOTICE, LICENSING.md and the module
+  # list sit beside bin/. The installers unpack into a temp dir and install bin/oaica only, so they are inert there.
+  cp LICENSE NOTICE docs/LICENSING.md "$stage/"
+  cp "$WORK/THIRD_PARTY_MODULES.txt" "$stage/"
+
   name="oaica-$goos-$goarch"
   case "$kind" in
     tar)
-      tar -C "$stage" -cf - bin | zstd -19 -T0 -q -o "$OUT/$name.tar.zst" -f
-      tar -C "$stage" -czf "$OUT/$name.tgz" bin
+      tar -C "$stage" -cf - bin LICENSE NOTICE LICENSING.md THIRD_PARTY_MODULES.txt | zstd -19 -T0 -q -o "$OUT/$name.tar.zst" -f
+      tar -C "$stage" -czf "$OUT/$name.tgz" bin LICENSE NOTICE LICENSING.md THIRD_PARTY_MODULES.txt
       ;;
     zip)
       rm -f "$OUT/$name.zip"
-      (cd "$stage" && zip -q -r -X "$OLDPWD/$OUT/$name.zip" bin)
+      (cd "$stage" && zip -q -r -X "$OLDPWD/$OUT/$name.zip" bin LICENSE NOTICE LICENSING.md THIRD_PARTY_MODULES.txt)
       ;;
   esac
 done
