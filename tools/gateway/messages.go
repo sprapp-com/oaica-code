@@ -2104,7 +2104,11 @@ type openBlock struct {
 }
 
 type bridgeSSE struct {
-	tail bytes.Buffer
+	// choiceSet and primaryChoice: the choice the turn's FIRST element names, the
+	// one this arm relays as the documents relay Choices[0] (F104-L3-2).
+	choiceSet     bool
+	primaryChoice int
+	tail          bytes.Buffer
 	// stopMsg is the upstream's finish_reason, mapped to Anthropic's
 	// stop_reason for the closing message_delta.
 	stopMsg string
@@ -3080,7 +3084,10 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 			b.stateCacheHit(details, chunk.Usage.PromptCacheHitTokens)
 		}
 		for ci, ch := range chunk.Choices {
-			if ci > 0 {
+			if !b.sse.choiceSet {
+				b.sse.choiceSet, b.sse.primaryChoice = true, ch.Index
+			}
+			if ci > 0 || ch.Index != b.sse.primaryChoice {
 				// One client request produced one message here, and every other
 				// spelling of the same body reads its FIRST choice: the
 				// one-list/whole-message arm takes `resp.Choices[0]`, the
@@ -3095,8 +3102,16 @@ func (b *anthropicBridge) writeStream(p []byte) (int, error) {
 				// a tool_use verdict the other spellings never reached
 				// (2026-09-28 audit, round 73, F73-L3-1).
 				//
-				// Positional, not `ch.Index == 0`: a vendor numbering its choices
-				// from 1 is still relayed the way the whole arm relays it. The
+				// Not `ch.Index == 0` (a vendor numbering its choices from 1 is
+				// still relayed the way the whole arm relays it), and not the
+				// position inside one chunk ALONE: a vendor streaming each choice
+				// in a chunk of its own put the alternative at position 0 of its
+				// chunk and it was relayed anyway — "hiyo" against the documents'
+				// "hi", and a second choice's call handed over under a tool_use
+				// verdict they never reach (2026-09-29 audit, round 104,
+				// F104-L3-2). The turn's choice is the one its FIRST element
+				// names; a chunk stating no index reads as 0 and keeps round 67's
+				// positional reading. The
 				// finish_reason is the exception — it is read on every entry,
 				// because which choice carried it is not this arm's to decide.
 				if ch.FinishReason != nil && *ch.FinishReason != "" {
@@ -3489,7 +3504,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 		// this clause, and green with it). And it is asked only of a fragment
 		// that states NO id: a stated id is the identity clause's question
 		// above, which must answer it.
-		if id == "" && name != "" {
+		if id == "" && name != "" && b.slotHoldsLastCall(upIdx) {
 			if last := b.toolBlocks[b.lastToolKey]; last != nil && namesItself(last) &&
 				last.name == name && argsAreMidObject(last.args.String()) &&
 				strings.TrimSpace(args) != "" &&
@@ -3882,6 +3897,26 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 		b.lastToolName = name
 	}
 	return b.lastToolKey
+}
+
+// slotHoldsLastCall reports whether the slot a fragment states is one the call
+// this bridge last wrote to was written at — or the fragment states none. Round
+// 103's named-continuation clause folds an id-less fragment into the open call
+// of the same name; asked of a fragment at a DIFFERENT slot it folded a second
+// call of the same name into the first, on the framed and the adopted arm, where
+// the plain document lists two (2026-09-29 audit, round 104, F104-L3-1). A
+// `!adoptedDoc` companion was measured NOT load-bearing on either shape and
+// does not ship.
+func (b *anthropicBridge) slotHoldsLastCall(upIdx *int) bool {
+	if upIdx == nil {
+		return true
+	}
+	for _, k := range b.indexChain[*upIdx] {
+		if k == b.lastToolKey {
+			return true
+		}
+	}
+	return false
 }
 
 // splitFromCurrent reports whether a fragment begins the NEXT tool call rather
@@ -5667,6 +5702,7 @@ type oaStreamChunk struct {
 	// F86-L3-2).
 	ID      string `json:"id"`
 	Choices []struct {
+		Index        int      `json:"index"`
 		Delta        oaDelta  `json:"delta"`
 		Message      *oaDelta `json:"message"`
 		FinishReason *string  `json:"finish_reason"`
