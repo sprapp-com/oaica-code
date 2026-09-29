@@ -2527,6 +2527,20 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		limit = apiKey.MaxCompletionTokens
 	}
 	if limit > 0 {
+		// `n` and `best_of` fan out inside ONE request, so a ceiling on max_tokens
+		// is a ceiling per choice: a key configured for 100 output tokens got ~6,400
+		// on the OpenAI doors with n=64 (and more with best_of) while /v1/messages,
+		// which builds its upstream body from scratch, could never carry either, and
+		// MaxConcurrent counted the request once. Refused rather than narrowed to
+		// one, because the client asked for n choices and would be answered with
+		// one (2026-09-29 audit, round 108, F108-L3-2).
+		for _, k := range []string{"n", "best_of"} {
+			if choiceFanOut(req[k]) {
+				writeErr(w, http.StatusBadRequest, "invalid_request_error",
+					fmt.Sprintf("%s greater than 1 is not supported: output is capped per request", k))
+				return
+			}
+		}
 		// A body that does not state a positive numeric cap is held to the
 		// ceiling all the same. The clamp below rewrites a key only when it holds
 		// a positive number, so the field absent (the default shape of most
@@ -3250,4 +3264,20 @@ func main() {
 		// No WriteTimeout: streamed completions run for minutes.
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// choiceFanOut reports whether a request field asks for more than one completion.
+// The number may be spelled as a JSON number or as a numeric string an upstream
+// coerces; anything else is left for the upstream to refuse.
+func choiceFanOut(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n > 1
+	case int:
+		return n > 1
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return err == nil && f > 1
+	}
+	return false
 }

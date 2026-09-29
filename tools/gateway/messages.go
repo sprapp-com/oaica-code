@@ -66,6 +66,18 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
 		return
 	}
+	// The credential is asked BEFORE the body is read. The key check lives in
+	// completionHandler, behind this translation, so an anonymous caller got
+	// body-content feedback (400 for bad JSON, 413 for size) and could make the
+	// gateway buffer and parse 16 MiB per connection outside every per-key limit,
+	// where /v1/chat/completions and /v1/completions answer 401 before reading a
+	// byte (2026-09-29 audit, round 108, F108-L3-1). The refusal is the bytes the
+	// bridge has always given it, so a client sees no change.
+	if k, _ := g.lookupKey(r); k.Label == "" {
+		writeAnthropicErrorVal(w, http.StatusUnauthorized, map[string]any{
+			"code": "invalid_api_key", "message": "missing or invalid API key", "type": "invalid_api_key"})
+		return
+	}
 	body, err := readCappedBody(w, r)
 	if err != nil {
 		return // readCappedBody already wrote the error
