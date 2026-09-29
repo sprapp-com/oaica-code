@@ -60,6 +60,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -396,6 +397,28 @@ func credentialShapedEnvName(name string) bool {
 	return false
 }
 
+var catalogPlaceholderRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandCatalogBaseURL fills ${NAME} placeholders from the environment, only for names that are
+// not secret-shaped (a key is never written into a URL), and reports false when one is left.
+func expandCatalogBaseURL(base string) (string, bool) {
+	ok := true
+	out := catalogPlaceholderRE.ReplaceAllStringFunc(base, func(m string) string {
+		name := catalogPlaceholderRE.FindStringSubmatch(m)[1]
+		if credentialShapedEnvName(name) {
+			ok = false
+			return m
+		}
+		v := strings.TrimSpace(os.Getenv(name))
+		if v == "" {
+			ok = false
+			return m
+		}
+		return v
+	})
+	return out, ok && !strings.Contains(out, "${")
+}
+
 func firstSetEnv(env []string) string {
 	for _, name := range env {
 		name = strings.TrimSpace(name)
@@ -421,6 +444,14 @@ func builtinRemotes() []userRemote {
 			continue
 		}
 		p := userRemoteFromCatalogEntry(e)
+		// A base URL models.dev states as a template (${CLOUDFLARE_ACCOUNT_ID}) is expanded from
+		// the row's non-secret variables; one that cannot be is a row that cannot succeed, and is
+		// not offered (2026-09-29 audit, round 121, F121-L2-4).
+		if expanded, ok := expandCatalogBaseURL(p.BaseURL); ok {
+			p.BaseURL = expanded
+		} else {
+			continue
+		}
 		if remoteKeyEnvSet(p) {
 			out = append(out, p)
 			continue

@@ -1059,13 +1059,16 @@ func scrubCredentialEnv(env []string, names []string) []string {
 	// host without it (2026-09-29 audit, round 119, F119-L2-2).
 	env = append([]string(nil), env...)
 	for i, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "OAICA_HOST="); ok {
-			// Every form the launcher reads a credential from: user, user:pass and ?key=
-			// (F120-L2-3), not only a bare username.
-			if u, err := url.Parse(strings.TrimSpace(v)); err == nil && (u.User != nil || u.RawQuery != "") {
-				u.User = nil
-				u.RawQuery = ""
-				env[i] = "OAICA_HOST=" + u.String()
+		// OAICA_AGENT_HOST is read as a credential-bearing URL in the same shape (F121-L2-2).
+		for _, prefix := range []string{"OAICA_HOST=", "OAICA_AGENT_HOST="} {
+			if v, ok := strings.CutPrefix(kv, prefix); ok {
+				// Every form the launcher reads a credential from: user, user:pass and ?key=
+				// (F120-L2-3), not only a bare username.
+				if u, err := url.Parse(strings.TrimSpace(v)); err == nil && (u.User != nil || u.RawQuery != "") {
+					u.User = nil
+					u.RawQuery = ""
+					env[i] = prefix + u.String()
+				}
 			}
 		}
 	}

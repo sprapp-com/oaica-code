@@ -1545,8 +1545,13 @@ func TestUpstreamErrorLog_CapturesRealErrorMessageAndCorrelationInfo(t *testing.
 	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &got); err != nil {
 		t.Fatalf("bad JSON line: %v (%s)", err, lines[len(lines)-1])
 	}
-	if !strings.Contains(got.Message, "maximum context length is 262144") {
-		t.Errorf("expected the real upstream error message preserved, got %q", got.Message)
+	// The numbers that diagnose an overflow are kept; the upstream's own TEXT is not (it can
+	// echo request content, which the published privacy terms say is never stored — round 121).
+	if !strings.Contains(got.Message, "238000") || !strings.Contains(got.Message, "262144") {
+		t.Errorf("expected the real overflow numbers preserved, got %q", got.Message)
+	}
+	if strings.Contains(got.Message, "However, you requested") {
+		t.Errorf("the upstream's verbatim text reached the error log: %q", got.Message)
 	}
 	if got.SessionID != "sess-overflow-test" {
 		t.Errorf("expected session_id correlation, got %q", got.SessionID)

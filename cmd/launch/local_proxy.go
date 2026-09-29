@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // flushResponse pushes the status line and headers out now rather than when
@@ -235,6 +236,9 @@ func RunLocalNormalizingProxy(listenPort, backendPort int) error {
 // Note the BACKEND stays on 127.0.0.1 regardless: llama-server itself is
 // never exposed, only this proxy is, so the auth check cannot be bypassed
 // by hitting the backend port directly from off-box.
+// normalizingProxyHeaderTimeout is a var so a test does not wait ten seconds.
+var normalizingProxyHeaderTimeout = 10 * time.Second
+
 func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey string) error {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", backendPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -296,7 +300,16 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 	if err != nil {
 		return err
 	}
-	return http.Serve(ln, rebindingGuard(isLoopbackBind(bindHost), handler))
+	// A header timeout: the proxy is meant to face the network behind a bearer check that runs only
+	// once the headers are in, so a half-sent request held a goroutine and a descriptor for ever
+	// and 500 of them took the model offline unauthenticated. No whole-request timeout: streamed
+	// turns run long (2026-09-29 audit, round 121, F121-L2-3).
+	srv := &http.Server{
+		Handler:           rebindingGuard(isLoopbackBind(bindHost), handler),
+		ReadHeaderTimeout: normalizingProxyHeaderTimeout,
+		IdleTimeout:       120 * time.Second,
+	}
+	return srv.Serve(ln)
 }
 
 // isLoopbackBind reports whether bindHost is a loopback-only bind.

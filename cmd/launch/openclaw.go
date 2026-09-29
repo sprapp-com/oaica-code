@@ -500,7 +500,9 @@ func openclawCredentialEnvNames() []string {
 	// The metered gateway's credential is documented as never reaching a child's environment
 	// (README, docs/CATALOG.md) but was named only on a claude launch that routed the gateway
 	// leg (2026-09-29 audit, round 120, F120-L2-2).
-	return append(plan.credentialEnvNames(), oaicaGatewayTokenEnv)
+	// OAICA_ADMIN_KEY is the router's operator key (provider-registry commands), stronger than
+	// either name above, and reached every child (2026-09-29 audit, round 121, F121-L2-1).
+	return append(plan.credentialEnvNames(), oaicaGatewayTokenEnv, "OAICA_ADMIN_KEY")
 }
 
 func openclawInstallEnv() []string {

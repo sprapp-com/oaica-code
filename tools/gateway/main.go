@@ -827,19 +827,25 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 			// its context-recovery path instead of retrying the identical
 			// doomed request -- the 2026-08-29 compaction loop -- and feed K
 			// back into this session's calibration. The error LOG keeps the
-			// verbatim upstream text -- that sink exists for diagnosis, and
-			// the raw numbers are the whole point of it.
+			// numbers, not the text (see loggedMsg below).
 			clientMsg := redactCredentialURLs(msg)
+			// What the log keeps is content-free: vLLM's validation errors echo the offending
+			// part of the REQUEST BODY ('input': {...message content...}), and the published
+			// privacy terms say request content is never stored. The numbers that diagnose an
+			// overflow are kept as numbers; any other text is reduced to its size
+			// (2026-09-29 audit, round 121, F121-L3-1).
+			loggedMsg := fmt.Sprintf("upstream error text not logged (%d bytes; it may echo request content)", len(msg))
 			if resp.StatusCode == http.StatusBadRequest {
 				if promptTokens, maxTokens, ok := parseUpstreamContextOverflow(msg); ok {
 					if info != nil && info.Calibrate != nil {
 						info.Calibrate(promptTokens)
 					}
 					clientMsg = promptTooLongMessage(promptTokens, maxTokens)
+					loggedMsg = clientMsg
 				}
 			}
 			if onUpstreamError != nil {
-				onUpstreamError(info, resp.StatusCode, code, msg)
+				onUpstreamError(info, resp.StatusCode, code, loggedMsg)
 			}
 			b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": clientMsg, "type": code, "code": code}})
 			resp.Body = io.NopCloser(bytes.NewReader(b))
@@ -3190,6 +3196,9 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// upstream's either: it reached a foreign upstream beside that upstream's credential
 	// (F120-L3-2).
 	r.Header.Del("Connection")
+	// A client's request trailers are not the upstream's: the header filters above never looked
+	// at them, so a control header refused as a header arrived as a trailer (F121-L3-2).
+	r.Trailer = nil
 	r.Host = ""
 	// A third-party upstream is sent what it needs and nothing else. Round 109 kept
 	// the gateway's key and the caller's X-Forwarded-For from it and left every other
