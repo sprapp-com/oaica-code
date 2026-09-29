@@ -2527,6 +2527,38 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		limit = apiKey.MaxCompletionTokens
 	}
 	if limit > 0 {
+		// A body that does not state a positive numeric cap is held to the
+		// ceiling all the same. The clamp below rewrites a key only when it holds
+		// a positive number, so the field absent (the default shape of most
+		// OpenAI SDK calls), null, a numeric string an upstream coerces, or a
+		// non-positive number went upstream uncapped: a per-key
+		// MaxCompletionTokens and the model's published limit were escaped by
+		// omitting the field, the non-stream 8k clamp that keeps a reply under
+		// Cloudflare's edge timeout never ran for the same body, and the ledger
+		// row recorded a budget of 0. The Anthropic surface, where max_tokens is
+		// required, could only ask for a huge cap and got the clamp. A field that
+		// is not a positive number is dropped, and when nothing positive is
+		// stated the ceiling is stated in its place; the clamps that follow then
+		// tighten it to what fits (2026-09-29 audit, round 107, F107-L3-1).
+		stated := false
+		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
+			switch v := req[k].(type) {
+			case float64:
+				if v > 0 {
+					stated = true
+					continue
+				}
+			case int:
+				if v > 0 {
+					stated = true
+					continue
+				}
+			}
+			delete(req, k)
+		}
+		if !stated {
+			req["max_tokens"] = limit
+		}
 		for _, k := range []string{"max_tokens", "max_completion_tokens"} {
 			// Compare as float64, never through int(): a client asking for
 			// max_tokens 1e19 wrapped int(v) to a negative, so the comparison
