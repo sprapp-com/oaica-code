@@ -172,6 +172,37 @@ func selectPricingTier(tiers []gwPricingTier, promptTokens int) (gwPricingTier, 
 // size no bracket covers), so it is rejected at load rather than papered
 // over at request time -- consistent with loadConfig refusing any other
 // config that would produce wrong-but-plausible behavior.
+// retireProxies closes the idle upstream connections of proxies a reload has replaced.
+// Every apply builds a fresh transport per upstream and swaps the proxies wholesale,
+// and nothing closed the old transports, whose idle connections lingered for
+// IdleConnTimeout (90 s) each, up to 64 per retired proxy, so a busy gateway reloaded
+// often stacked dead connections on its upstream (2026-09-29 audit, round 112,
+// F112-L3-3). Streams still in flight on a retired proxy finish on it: the immediate
+// close touches only idle connections, and a second, later one collects the
+// connections those streams returned to the pool.
+func retireProxies(retired map[string]*httputil.ReverseProxy, retiredDefault *httputil.ReverseProxy) {
+	var all []*httputil.ReverseProxy
+	for _, p := range retired {
+		all = append(all, p)
+	}
+	if retiredDefault != nil {
+		all = append(all, retiredDefault)
+	}
+	closeIdle := func() {
+		for _, p := range all {
+			if t, ok := p.Transport.(interface{ CloseIdleConnections() }); ok {
+				t.CloseIdleConnections()
+			}
+		}
+	}
+	closeIdle()
+	time.AfterFunc(retiredProxyGrace, closeIdle)
+}
+
+// retiredProxyGrace is how long a retired proxy's in-flight streams are given before
+// their returned connections are closed too.
+var retiredProxyGrace = 5 * time.Minute
+
 // scrubUpstreamHeaders removes from an upstream response's headers (or trailers)
 // what must not reach the public client. The gateway deleted five named headers
 // (its own audit L16) and relayed every other, on both doors; a cookie a model's own
@@ -894,9 +925,12 @@ type gateway struct {
 	calib     *promptCalibrator
 
 	// /health probe cache; see healthCacheTTL.
-	healthMu   sync.Mutex
-	healthAt   time.Time
-	healthLast healthResult
+	healthMu sync.Mutex
+	// healthInflight is closed when the probe now running returns; non-nil means one
+	// is in flight (see healthHandler).
+	healthInflight chan struct{}
+	healthAt       time.Time
+	healthLast     healthResult
 	// lastSuccessAt: last time a real routed completion returned 200 with
 	// usage (set where the calibrator records; see completionHandler). Lets
 	// /health answer "ok (recent traffic)" even when the probe ITSELF
@@ -970,11 +1004,14 @@ func (g *gateway) apply(cfg gwConfig) error {
 		}
 	}
 	g.mu.Lock()
+	retired := g.proxies
+	retiredDefault := g.proxy
 	g.cfg = cfg
 	g.proxy = p
 	g.proxies = proxies
 	g.byID = byID
 	g.mu.Unlock()
+	retireProxies(retired, retiredDefault)
 	g.ledgerMu.Lock()
 	if g.ledger != nil {
 		g.ledger.Close()
@@ -1491,19 +1528,49 @@ func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	g.healthMu.Lock()
 	fresh := !g.healthAt.IsZero() && time.Since(g.healthAt) < healthCacheTTL
-	g.healthMu.Unlock()
+	var wait chan struct{}
+	var mine chan struct{}
 	if !fresh {
+		if g.healthInflight != nil {
+			wait = g.healthInflight
+		} else {
+			mine = make(chan struct{})
+			g.healthInflight = mine
+		}
+	}
+	g.healthMu.Unlock()
+	if mine != nil {
 		// Probe OUTSIDE the lock (2026-09-01 audit L9): the lock used to be
 		// held across the whole <=25s probe, queuing every concurrent /health
 		// GET behind it, and the probe ran on the FIRST requester's context —
 		// that client disconnecting mid-probe cached a failure for everyone.
-		// Concurrent refresher GETs may each probe once; the last write wins
-		// and the cache means at most a handful of 1-token probes per TTL.
-		res := g.probeHealth(r)
-		g.healthMu.Lock()
-		g.healthLast = res
-		g.healthAt = time.Now()
-		g.healthMu.Unlock()
+		//
+		// ONE probe is in flight at a time (2026-09-29 audit, round 112,
+		// F112-L3-2): the cache was only stamped when a probe RETURNED, so every
+		// request that arrived while one was running saw a stale cache and ran
+		// its own, and 200 concurrent anonymous GETs made 200 real completions
+		// with the gateway's own upstream credential, outside MaxConcurrent,
+		// the large-context pool and the ledger — worst when a starved fleet
+		// makes probes slow. The others wait for this one's result.
+		func() {
+			defer func() {
+				g.healthMu.Lock()
+				g.healthInflight = nil
+				g.healthMu.Unlock()
+				close(mine)
+			}()
+			res := g.probeHealth(r)
+			g.healthMu.Lock()
+			g.healthLast = res
+			g.healthAt = time.Now()
+			g.healthMu.Unlock()
+		}()
+	} else if wait != nil {
+		select {
+		case <-wait:
+		case <-r.Context().Done():
+			return
+		}
 	}
 	g.healthMu.Lock()
 	res := g.healthLast
@@ -1660,8 +1727,26 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 	g.ledgerMu.Lock()
 	var writeErr error
 	if g.ledger != nil {
-		if _, err := g.ledger.Write(append(b, '\n')); err != nil {
+		row := append(b, '\n')
+		// A write that put PART of a row on the disk and then failed (a full disk
+		// that later frees up) left a newline-less fragment, and the next row was
+		// appended straight onto it: the failed row was lost, which is accepted,
+		// and the row AFTER it stopped parsing as well, because the fragment and the
+		// row shared a line. Cut the file back to the row boundary. A "start the next
+		// row on a fresh line" fallback for a truncate that itself fails was written
+		// alongside and measured not independently reachable, so it does not ship
+		// (2026-09-29 audit, round 112, F112-L3-1).
+		var size int64 = -1
+		if st, serr := g.ledger.Stat(); serr == nil {
+			size = st.Size()
+		}
+		if _, err := g.ledger.Write(row); err != nil {
 			writeErr = err
+			if size >= 0 {
+				if terr := g.ledger.Truncate(size); terr != nil {
+					writeErr = fmt.Errorf("%w (and cutting the ledger back to the row boundary failed: %v)", err, terr)
+				}
+			}
 		}
 	}
 	g.ledgerMu.Unlock()
