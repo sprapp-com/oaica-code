@@ -2147,6 +2147,29 @@ func Serve(ln net.Listener) error {
 	return nil
 }
 
+// drainProducer lets a producer goroutine finish after its consumer has returned.
+// Each door's producer hands chunks over an unbuffered channel with a plain send, and
+// the consumers return the moment the client is gone or a write fails; nothing read
+// the channel after that, so a producer with a send in flight blocked forever — inside
+// the runner callback, which meant llm.Completion never returned, its deferred
+// sem.Release never ran and one of the model's parallel slots was gone for the life of
+// the process, or on the final error frame, which leaked the goroutine and everything it
+// captured. A client that stalls and disconnects triggers it on every streaming door,
+// and N of them wedge a model with NumParallel N. Draining until the producer closes
+// the channel completes its sends; the request's own context, cancelled by the
+// disconnect, is what stops the runner. When the consumer read the channel to its end
+// the drain finds it closed and exits at once. It sits on streamResponse alone: every
+// streaming door goes through it (writeChatResponse streams via it), and the two other
+// consumers read to the end of the channel or return only after an error frame, when
+// the producer has nothing left to send; a drain there was measured not load-bearing
+// (2026-09-29 audit, round 112, F112-L1-1).
+func drainProducer(ch chan any) {
+	go func() {
+		for range ch {
+		}
+	}()
+}
+
 func waitForStream(c *gin.Context, ch chan any) {
 	c.Header("Content-Type", "application/json")
 	var latest api.ProgressResponse
@@ -2339,6 +2362,7 @@ func (t *relaySurfaceRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 }
 
 func streamResponse(c *gin.Context, ch chan any) {
+	defer drainProducer(ch)
 	c.Header("Content-Type", "application/x-ndjson")
 	// The first chunk is read before the loop because an Anthropic client's
 	// channel that closes without stating a single chunk is refused as a whole
