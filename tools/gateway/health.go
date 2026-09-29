@@ -27,7 +27,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -151,7 +150,10 @@ func (g *gateway) probeUpstreamHealthUncached(addr, upstreamID string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if k := os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY"); k != "" {
+	g.mu.RLock()
+	cfg := g.cfg
+	g.mu.RUnlock()
+	if k := upstreamKeyFor(cfg, addr); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 	resp, err := http.DefaultClient.Do(req)

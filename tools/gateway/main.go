@@ -245,6 +245,12 @@ type gwModel struct {
 	// Empty inherits gwConfig.UpstreamAddr, which is what every existing
 	// config does -- this field is purely additive.
 	UpstreamAddr string `json:"upstream_addr,omitempty"`
+	// UpstreamKeyEnv names the environment variable holding the credential for
+	// THIS model's upstream_addr. OAICA_GATEWAY_UPSTREAM_KEY is the credential for
+	// the gateway-wide default upstream and is never sent to another one, so a
+	// model on a different upstream that needs a key names it here
+	// (2026-09-29 audit, round 109, F109-L3-3).
+	UpstreamKeyEnv string `json:"upstream_key_env,omitempty"`
 }
 
 // distinctUpstreams counts the backends this config actually fans out to --
@@ -265,6 +271,25 @@ func (m gwModel) upstreamAddr(defaultAddr string) string {
 		return m.UpstreamAddr
 	}
 	return defaultAddr
+}
+
+// upstreamKeyFor is the credential to present to the upstream at addr. The
+// gateway-wide OAICA_GATEWAY_UPSTREAM_KEY belongs to the DEFAULT upstream
+// (gatekeeper) and goes nowhere else: it was set on every request and probe
+// whichever upstream a model routed to, and upstream_addr is documented as able
+// to name a third-party endpoint, so the gatekeeper credential went to someone
+// else. A model on another upstream names its own key with upstream_key_env; one
+// that names none is sent none (2026-09-29 audit, round 109, F109-L3-3).
+func upstreamKeyFor(cfg gwConfig, addr string) string {
+	if addr == cfg.UpstreamAddr {
+		return os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY")
+	}
+	for _, m := range cfg.Models {
+		if m.UpstreamAddr == addr && m.UpstreamKeyEnv != "" {
+			return os.Getenv(m.UpstreamKeyEnv)
+		}
+	}
+	return ""
 }
 
 func (m gwModel) acceptsImages() bool {
@@ -644,6 +669,25 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 		resp.Header.Del("X-Gatekeeper-Limit")
 		resp.Header.Del("Via")
 		resp.Header.Del("Server")
+		// The five above were the hops this gateway knew of on the day it was
+		// written; every header an upstream adds afterwards reached callers, on
+		// both doors. A cookie a model's own upstream sets landed on the public
+		// origin, and X-Powered-By, an X-Upstream-* or X-Gatekeeper-* label, an
+		// Alt-Svc, or a redirect to an internal address named the inside
+		// (2026-09-29 audit, round 109, F109-L3-1). A denylist by name and by
+		// prefix rather than an allowlist, because clients read headers this
+		// gateway cannot enumerate (rate-limit families, request ids, content
+		// negotiation) and a dropped one breaks them silently.
+		for _, h := range []string{"Set-Cookie", "X-Powered-By", "Alt-Svc", "Location"} {
+			resp.Header.Del(h)
+		}
+		for k := range resp.Header {
+			for _, prefix := range []string{"X-Gatekeeper-", "X-Katlb-", "X-Upstream-"} {
+				if strings.HasPrefix(http.CanonicalHeaderKey(k), prefix) {
+					resp.Header.Del(k)
+				}
+			}
+		}
 		// gatekeeper (429/401) and katlb (503) answer with text/plain or a
 		// non-OpenAI JSON; normalize so clients see {"error":{...}} and keep
 		// Retry-After. Streaming bodies are never rewritten (status 200).
@@ -1438,6 +1482,7 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	g.mu.RLock()
 	up := g.cfg.UpstreamAddr
 	models := g.cfg.Models
+	cfgSnapshot := g.cfg
 	g.mu.RUnlock()
 	if len(models) == 0 {
 		return healthResult{http.StatusServiceUnavailable, map[string]any{"status": "down", "reason": "no models configured"}}
@@ -1465,7 +1510,7 @@ func (g *gateway) probeHealth(r *http.Request) healthResult {
 	body := `{"model":` + fmt.Sprintf("%q", models[0].upstreamID()) + `,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"temperature":0}`
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(probeUp, "/")+"/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	if k := os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY"); k != "" {
+	if k := upstreamKeyFor(cfgSnapshot, probeUp); k != "" {
 		req.Header.Set("Authorization", "Bearer "+k)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -2445,7 +2490,10 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// upstream may not host that upstream_id at all, and quietly forwarding
 	// hides the skew behind a confusing "model not supported" from the wrong
 	// backend.
-	proxy, proxyOK := g.proxies[m.upstreamAddr(g.cfg.UpstreamAddr)]
+	upstreamAddr := m.upstreamAddr(g.cfg.UpstreamAddr)
+	upstreamKey := upstreamKeyFor(g.cfg, upstreamAddr)
+	foreignUpstream := upstreamAddr != g.cfg.UpstreamAddr
+	proxy, proxyOK := g.proxies[upstreamAddr]
 	if !proxyOK {
 		if m.upstreamAddr(g.cfg.UpstreamAddr) != g.cfg.UpstreamAddr {
 			g.mu.RUnlock()
@@ -2703,8 +2751,8 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// Never forward the caller's public key upstream; gatekeeper (if it is
 	// the upstream) has its own keys. Replace with the gateway's upstream
 	// credential when one is configured via env.
-	if up := os.Getenv("OAICA_GATEWAY_UPSTREAM_KEY"); up != "" {
-		r.Header.Set("Authorization", "Bearer "+up)
+	if upstreamKey != "" {
+		r.Header.Set("Authorization", "Bearer "+upstreamKey)
 	} else {
 		r.Header.Del("Authorization")
 	}
@@ -2797,7 +2845,16 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// through both the gateway and oaicalb's own usage reporter (added
 	// 2026-08-29 to catch traffic that bypasses the gateway entirely)
 	// would be counted twice.
-	r.Header.Set("X-Oaica-Metered", "1")
+	//
+	// Only the gateway's own upstream is downstream of oaicalb: a model on another
+	// upstream is sent neither that marker nor the caller's address, which
+	// ReverseProxy appends to X-Forwarded-For unless the header is present and nil
+	// (2026-09-29 audit, round 109, F109-L3-3).
+	if foreignUpstream {
+		r.Header["X-Forwarded-For"] = nil
+	} else {
+		r.Header.Set("X-Oaica-Metered", "1")
+	}
 	proxy.ServeHTTP(rec, r)
 	rec.finish()
 	// Ground truth for the next request of this session: only a 200 whose
