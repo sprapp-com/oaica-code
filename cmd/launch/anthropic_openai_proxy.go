@@ -3112,6 +3112,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		return 0, false
 	}
 	finishReason := ""
+	// primaryChoice is the choice the turn's first element names: the one this
+	// arm relays, as the document arm relays Choices[0] (F103-L2-1).
+	primaryChoice := -1
 	var finalUsage *openAIUsage
 	// nonSSE collects the lines that carry no "data:" prefix. An upstream that
 	// ignores stream:true answers a stream request with a WHOLE completion as
@@ -3953,8 +3956,11 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			chunk.Choices[0].Delta = openAIStreamDelta{}
 		}
 
-		for ci, choice := range chunk.Choices {
-			if ci > 0 {
+		for _, choice := range chunk.Choices {
+			if primaryChoice < 0 {
+				primaryChoice = choice.Index
+			}
+			if choice.Index != primaryChoice {
 				// One client request produced one message here, and the arm that
 				// read the same turn as a whole document reads its FIRST choice
 				// (openAIResponseToChatResponse reads Choices[0]; this proxy
@@ -3966,9 +3972,15 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 				// text the model never wrote, in the client's conversation
 				// (2026-09-28 audit, round 67, F67-L2-1).
 				//
-				// Positional, not `choice.Index == 0`: a vendor numbering its
-				// choices from 1 is still relayed the way the whole arm relays
-				// it. The finish_reason is the exception — it is scanned on
+				// The turn's choice is the one its FIRST element names, not
+				// `choice.Index == 0` (a vendor numbering from 1 is still
+				// relayed the way the whole arm relays it) and not the position
+				// inside one chunk: a vendor streaming each choice in a chunk of
+				// its own put the alternative at position 0 of its chunk and it
+				// was spliced in anyway — "AB" streamed against "A" whole, a
+				// second choice's tool call handed to the agent as a call to run
+				// (2026-09-29 audit, round 103, F103-L2-1). The finish_reason is
+				// the exception — it is scanned on
 				// every entry, because which choice carried it is not this
 				// arm's to decide.
 				if choice.FinishReason != "" {
