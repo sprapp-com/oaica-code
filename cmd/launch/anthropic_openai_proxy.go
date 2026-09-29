@@ -4407,7 +4407,38 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					// arguments at all and a second, empty one appeared at the
 					// slot that was not the call's (2026-09-28 audit, round 58,
 					// F58-L3-1).
-					if acc, exists := toolAccums[lastToolSlot]; lastToolSlot >= 0 && exists &&
+					// A fragment that states NO id and no name is an argument
+					// continuation, and the call it continues is not the one the
+					// stream wrote to last when the wire introduced its calls
+					// before it fed them: a server that parses a whole tool-call
+					// array and re-emits it — the shape Go's `json:"index,omitempty"`
+					// produces for an index-0 call — states every call's header in
+					// one delta and then their arguments one fragment each, in the
+					// order the calls were introduced. Written into the last named
+					// call, the first fragment landed in the SECOND call: the client
+					// ran a Bash with an empty input and a Read wearing Bash's
+					// arguments, and the second call's own bytes were relayed as
+					// prose, where this leg's whole-list arm answers both calls with
+					// their own arguments. So an argument-only fragment takes the
+					// EARLIEST call this stream has named and not yet fed — the same
+					// answer the indexed path gives through indexChain — and the
+					// rules below still decide every fragment no waiting call can
+					// take (2026-09-29 audit, round 101, F101-L2-1).
+					waiting := -1
+					if tc.ID == "" && tc.Function.Name == "" {
+						for s := 0; s < nextFreeToolSlot; s++ {
+							a, ok := toolAccums[s]
+							if !ok || strings.TrimSpace(a.name) == "" || strings.TrimSpace(a.args.String()) != "" {
+								continue
+							}
+							if waiting < 0 || toolArrival[s] < toolArrival[waiting] {
+								waiting = s
+							}
+						}
+					}
+					if waiting >= 0 {
+						slot = waiting
+					} else if acc, exists := toolAccums[lastToolSlot]; lastToolSlot >= 0 && exists &&
 						(startsANewToolCall(acc.id, acc.name, acc.args.String(), tc.ID, tc.Function.Name, tc.Function.Arguments) ||
 							// An argument-only fragment whose bytes are not more
 							// of the call it would join — the call's own
