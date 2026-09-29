@@ -477,68 +477,6 @@ func TestSubscriberList_RequiresAuth(t *testing.T) {
 	}
 }
 
-func postWebhook(t *testing.T, hub *meterHub, token, body string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/subscribers/webhook", bytes.NewReader([]byte(body)))
-	req.Header.Set("Authorization", "Bearer "+token)
-	w := httptest.NewRecorder()
-	hub.subscriberWebhookHandler(w, req)
-	return w
-}
-
-func TestWebhook_ActiveSubscriptionSetsStatus(t *testing.T) {
-	hub, token := testHub(t)
-	body := `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active",
-		"metadata":{"key_label":"alice"},"items":{"data":[{"price":{"nickname":"pro"}}]}}}}`
-	w := postWebhook(t, hub, token, body)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	_, s := getSubscriber(t, hub, token, "alice")
-	if s.Status != "active" || s.Plan != "pro" || s.Source != "stripe" || s.ExternalID != "sub_1" {
-		t.Errorf("got %+v, want status=active plan=pro source=stripe external_id=sub_1", s)
-	}
-}
-
-func TestWebhook_CanceledSubscriptionBlocksKey(t *testing.T) {
-	hub, token := testHub(t)
-	postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active","metadata":{"key_label":"alice"}}}}`)
-	postWebhook(t, hub, token, `{"type":"customer.subscription.deleted","data":{"object":{"id":"sub_1","status":"canceled","metadata":{"key_label":"alice"}}}}`)
-	_, s := getSubscriber(t, hub, token, "alice")
-	if s.Status != "canceled" {
-		t.Errorf("status = %q, want canceled", s.Status)
-	}
-}
-
-func TestWebhook_MissingKeyLabelIsAcceptedNotRetried(t *testing.T) {
-	hub, token := testHub(t)
-	w := postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"active"}}}`)
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200 (accept-and-ignore, don't trigger Stripe retry)", w.Code)
-	}
-}
-
-func TestWebhook_UnrecognizedStripeStatusIsAcceptedNotRetried(t *testing.T) {
-	hub, token := testHub(t)
-	w := postWebhook(t, hub, token, `{"type":"customer.subscription.updated","data":{"object":{"id":"sub_1","status":"incomplete_expired","metadata":{"key_label":"alice"}}}}`)
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200 (accept-and-ignore unmapped status)", w.Code)
-	}
-	if _, s := getSubscriber(t, hub, token, "alice"); s.Status != "unknown" {
-		t.Errorf("unrecognized status must not write a row, got %+v", s)
-	}
-}
-
-func TestWebhook_RequiresAuth(t *testing.T) {
-	hub, _ := testHub(t)
-	req := httptest.NewRequest(http.MethodPost, "/subscribers/webhook", bytes.NewReader([]byte(`{}`)))
-	w := httptest.NewRecorder()
-	hub.subscriberWebhookHandler(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", w.Code)
-	}
-}
-
 func getSubscriberUsage(t *testing.T, hub *meterHub, token, key string) map[string]any {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/subscribers/usage?key="+key, nil)
@@ -901,5 +839,19 @@ func TestRound132IngestRefusesOutOfRangeCostAndLatency(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("case %d: status %d, want 400", i, w.Code)
 		}
+	}
+}
+
+// The Stripe-shaped webhook is gone from meterhub (oaica-saas is the Stripe endpoint); the route must not answer.
+func TestRound132MeterhubHasNoStripeWebhookRoute(t *testing.T) {
+	hub, token := testHub(t)
+	_ = hub
+	mux := newMux(hub)
+	req := httptest.NewRequest(http.MethodPost, "/subscribers/webhook", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
 	}
 }

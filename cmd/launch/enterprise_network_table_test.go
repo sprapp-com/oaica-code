@@ -271,7 +271,7 @@ func TestNpmInstallIsNotPiOnly(t *testing.T) {
 //
 // The table names `ollama.com` nowhere: row 2 is `oaica.com` (the install
 // script host), row 3 is the GitHub release VERSION.txt, row 7 is
-// api.lemonsqueezy.com. `ollama.com` is a different host from `oaica.com`.
+// the oaica-saas licence API. `ollama.com` is a different host from `oaica.com`.
 //
 // CODE — cmd/launch/ollama_cloud.go:35
 //

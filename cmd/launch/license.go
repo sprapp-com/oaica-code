@@ -5,17 +5,17 @@ package launch
 // which permits anyone to build it from source for free — this gate is NOT
 // DRM and cannot stop a determined source build. Its job is narrower: make
 // the CONVENIENT path (a prebuilt binary someone downloaded) require a
-// $20 one-off Lemon Squeezy purchase, the same way most paid CLI tools
-// built on permissive-licensed code work. See docs/LICENSING.md.
+// $20 one-off purchase (Stripe Checkout, with Stripe Tax), the same way most
+// paid CLI tools built on permissive-licensed code work. See docs/LICENSING.md.
 //
-// Validation is against Lemon Squeezy's public License API
-// (https://docs.lemonsqueezy.com/help/licensing/license-api):
-//   - POST /v1/licenses/activate  — one-time, from `oaica activate <key>`,
+// Validation is against the oaica-saas licence API (oaica-saas/api/src/license.ts),
+// whose request/response shapes follow the Lemon Squeezy License API this file
+// used before the move to Stripe:
+//   - POST /license/activate  — one-time, from `oaica activate <key>`,
 //     binds the key to an "instance" (this machine) and stores the
-//     returned instance_id. Lemon Squeezy enforces the product's
-//     activation limit itself; oaica-code does not re-implement seat
-//     counting.
-//   - POST /v1/licenses/validate  — periodic re-check (every
+//     returned instance_id. The server enforces the key's activation
+//     limit itself; oaica-code does not re-implement seat counting.
+//   - POST /license/validate  — periodic re-check (every
 //     licenseRevalidateTTL) that the key is still valid (not refunded or
 //     manually revoked). Cheap, side-effect-free, safe to call often.
 //
@@ -45,18 +45,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// lemonSqueezyLicenseAPI is the base URL for Lemon Squeezy's License API.
-// Var-indirected so tests can point it at an httptest server.
-var lemonSqueezyLicenseAPI = "https://api.lemonsqueezy.com/v1/licenses"
+// licenseServerAPI is the base URL of the oaica-saas licence API. Var-indirected so tests can point it at an
+// httptest server; a `-tags devtest` build also reads OAICA_LICENSE_API (license_api_dev.go), a release build
+// never does — redirecting the gate to a server of one's own is exactly the bypass the devtest doctrine forbids.
+var licenseServerAPI = "https://oaica-saas-api.okx.workers.dev/license"
 
-// oaicaPurchaseURL is printed in the "not activated" error — the Lemon
-// Squeezy product checkout page. Replace with the real product URL once
-// the Lemon Squeezy product is created; kept as a named const so it is
-// the one place to update.
-const oaicaPurchaseURL = "https://oaica.lemonsqueezy.com/buy/oaica-code"
+// oaicaPurchaseURL is printed in the "not activated" error — the page that starts Stripe Checkout for the
+// licence (oaica-saas web/buy.html). It is the one place to update when the site moves.
+const oaicaPurchaseURL = "https://oaica-saas-api.okx.workers.dev/buy.html"
 
 // devTestLicenseKeys holds keys that activate and revalidate entirely locally,
-// with no Lemon Squeezy network call — for verifying the launch/license flow on
+// with no licence-server network call — for verifying the launch/license flow on
 // a machine without spending a real purchase (e.g. a one-off install test on a
 // public/cybercafe PC).
 //
@@ -190,10 +189,10 @@ func saveLicenseFile(f licenseFile) error {
 	return writeAtomic(path, b)
 }
 
-// lemonSqueezyLicenseResponse covers the fields both /activate and
-// /validate return that this file actually reads. Lemon Squeezy's
-// response carries more (customer/order/product metadata) — ignored.
-type lemonSqueezyLicenseResponse struct {
+// licenseResponse covers the fields both /activate and
+// /validate return that this file actually reads; the server's
+// response may carry more — ignored.
+type licenseResponse struct {
 	Activated bool   `json:"activated"`
 	Valid     bool   `json:"valid"`
 	Error     string `json:"error"`
@@ -204,51 +203,39 @@ type lemonSqueezyLicenseResponse struct {
 	LicenseKey struct {
 		Status string `json:"status"`
 	} `json:"license_key"`
-	// Meta names the store and product the key was issued for. The License API answers for EVERY
-	// store's keys, so accepting activated/valid alone accepted a key from anyone's $0 product.
+	// Meta names the product the key was issued for; a response for any other product is not this gate's
+	// (2026-09-29 audit, round 128, F128-L2-1; the Stripe licence server states `product` explicitly).
 	Meta struct {
-		StoreID   int64 `json:"store_id"`
-		ProductID int64 `json:"product_id"`
+		Product string `json:"product"`
 	} `json:"meta"`
 }
 
-// oaicaLemonStoreID / oaicaLemonProductID are the Lemon Squeezy store and product a key must have been
-// issued for (dashboard: Settings > Stores, the product's id). ZERO means not configured, and then any
-// store's key is accepted as before: set both, alongside oaicaPurchaseURL, when the product is live
-// (2026-09-29 audit, round 128, F128-L2-1).
-var (
-	oaicaLemonStoreID   int64
-	oaicaLemonProductID int64
-)
+// licenseProduct is the product name our licence server states in meta.product.
+const licenseProduct = "oaica-code"
 
-// licenseIssuedForUs reports whether a response is for this product, when this product is configured.
-func licenseIssuedForUs(r lemonSqueezyLicenseResponse) bool {
-	if oaicaLemonStoreID != 0 && r.Meta.StoreID != oaicaLemonStoreID {
-		return false
-	}
-	if oaicaLemonProductID != 0 && r.Meta.ProductID != oaicaLemonProductID {
-		return false
-	}
-	return true
+// licenseIssuedForUs reports whether a response is for this product. A response that states no product is
+// accepted (the host is ours, over TLS, and the shape is the older one); one that states ANOTHER product is not.
+func licenseIssuedForUs(r licenseResponse) bool {
+	return r.Meta.Product == "" || r.Meta.Product == licenseProduct
 }
 
-func callLemonSqueezyLicenseAPI(path string, form url.Values) (lemonSqueezyLicenseResponse, error) {
+func callLicenseAPI(path string, form url.Values) (licenseResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), licenseHTTPTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, lemonSqueezyLicenseAPI+path, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, licenseServerAPI+path, strings.NewReader(form.Encode()))
 	if err != nil {
-		return lemonSqueezyLicenseResponse{}, err
+		return licenseResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return lemonSqueezyLicenseResponse{}, err
+		return licenseResponse{}, err
 	}
 	defer resp.Body.Close()
-	var parsed lemonSqueezyLicenseResponse
+	var parsed licenseResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return lemonSqueezyLicenseResponse{}, fmt.Errorf("bad response from license server: %w", err)
+		return licenseResponse{}, fmt.Errorf("bad response from license server: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK && parsed.Error == "" {
 		return parsed, fmt.Errorf("license server: HTTP %d", resp.StatusCode)
@@ -260,10 +247,10 @@ func callLemonSqueezyLicenseAPI(path string, form url.Values) (lemonSqueezyLicen
 	return parsed, nil
 }
 
-// activateLicenseLive binds key to this machine via Lemon Squeezy's
-// /activate endpoint and persists the returned instance_id. instanceName
-// defaults to the hostname when empty — a human-readable label Lemon
-// Squeezy's dashboard shows per activation, not used for any local logic.
+// activateLicenseLive binds key to this machine via the
+// licence server's /activate endpoint and persists the returned instance_id. instanceName
+// defaults to the hostname when empty — a human-readable label the
+// server's dashboard shows per activation, not used for any local logic.
 func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -280,7 +267,7 @@ func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 		}
 	}
 	form := url.Values{"license_key": {key}, "instance_name": {instanceName}}
-	resp, err := callLemonSqueezyLicenseAPI("/activate", form)
+	resp, err := callLicenseAPI("/activate", form)
 	if err != nil {
 		return licenseFile{}, fmt.Errorf("could not reach license server: %w", err)
 	}
@@ -306,7 +293,7 @@ func validateLicenseLive(key, instanceID string) (bool, error) {
 	if instanceID != "" {
 		form.Set("instance_id", instanceID)
 	}
-	resp, err := callLemonSqueezyLicenseAPI("/validate", form)
+	resp, err := callLicenseAPI("/validate", form)
 	if err != nil {
 		return false, err
 	}
@@ -498,7 +485,7 @@ func sha256Hex(s string) string {
 // anything much shorter it stops being a fingerprint and becomes the secret:
 // a nine-character key came back as eight of its nine characters, printed
 // into an error message that ends up in a log, a screenshot or a support
-// ticket. Real keys (Lemon Squeezy's are 36-character UUIDs) are far above
+// ticket. Real keys (`oaica-lic-` plus 32 hex characters) are far above
 // this; a short one is a mis-paste, and for a mis-paste the length alone is
 // what the user needs.
 const redactMinLen = 20
@@ -528,8 +515,8 @@ func ActivateCmd() *cobra.Command {
 
   %s
 
-Binds the key to this machine (Lemon Squeezy's activation-limit rules
-apply — most keys allow a small number of machines). Run once per
+Binds the key to this machine (the key's activation limit
+applies — most keys allow a small number of machines). Run once per
 machine; after that, 'oaica launch ...' works without any extra step.`, oaicaPurchaseURL),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

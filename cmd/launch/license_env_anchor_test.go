@@ -33,17 +33,17 @@ func licenseStubServer(t *testing.T, valid bool) {
 		_, _ = w.Write([]byte(`{"valid":` + map[bool]string{true: "true", false: "false"}[valid] + `}`))
 	}))
 	t.Cleanup(srv.Close)
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 }
 
 // licenseUnreachableServer points the licence API at a closed port.
 func licenseUnreachableServer(t *testing.T) {
 	t.Helper()
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = "http://127.0.0.1:1"
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = "http://127.0.0.1:1"
+	t.Cleanup(func() { licenseServerAPI = prev })
 }
 
 func writeEnvAnchor(t *testing.T, key string, at time.Time) {
@@ -139,9 +139,9 @@ func TestFreshEnvAnchorSkipsTheNetwork(t *testing.T) {
 		_, _ = w.Write([]byte(`{"valid":true}`))
 	}))
 	defer srv.Close()
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	key := "OAICA-REAL-CACHED"
 	writeEnvAnchor(t, key, time.Now().Add(-time.Hour))

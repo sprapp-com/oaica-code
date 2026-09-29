@@ -868,106 +868,10 @@ func (h *meterHub) subscriberResetHandler(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// stripeWebhookEvent is the minimal shape this endpoint understands from
-// Stripe's event envelope — just enough to map a subscription lifecycle
-// event to a subscriber status write. NOT a full Stripe SDK integration
-// (that needs a real Stripe account, webhook signing secret, and product/
-// price setup this session cannot create) — this is the receiving end,
-// ready to wire up: point a Stripe webhook at POST /subscribers/webhook
-// with events customer.subscription.{created,updated,deleted} and set
-// metadata.key_label on the Stripe subscription to the oaica-gateway key
-// label it corresponds to.
-//
-// SECURITY NOTE for whoever wires up the real Stripe webhook: this
-// handler currently trusts the SAME report-token Bearer auth as every
-// other meterhub endpoint, which is NOT what Stripe sends — Stripe signs
-// webhooks with a per-endpoint signing secret verified via
-// stripe.Webhook.ConstructEvent, a different mechanism entirely. Swap the
-// auth check in this handler for real Stripe signature verification
-// before pointing a live Stripe webhook at it; the report-token check
-// here is only a placeholder so the endpoint isn't wide open in the
-// meantime.
-type stripeWebhookEvent struct {
-	Type string `json:"type"`
-	Data struct {
-		Object struct {
-			ID       string `json:"id"`
-			Status   string `json:"status"` // Stripe's subscription.status: active, past_due, canceled, unpaid, ...
-			Metadata struct {
-				KeyLabel string `json:"key_label"`
-			} `json:"metadata"`
-			Items struct {
-				Data []struct {
-					Price struct {
-						Nickname string `json:"nickname"`
-					} `json:"price"`
-				} `json:"data"`
-			} `json:"items"`
-		} `json:"object"`
-	} `json:"data"`
-}
-
-var stripeToInternalStatus = map[string]string{
-	"active":   "active",
-	"trialing": "active",
-	"past_due": "past_due",
-	"unpaid":   "past_due",
-	"canceled": "canceled",
-	"paused":   "suspended",
-}
-
-func (h *meterHub) subscriberWebhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// See the SECURITY NOTE above the type definition: placeholder auth,
-	// replace with real Stripe signature verification before production use.
-	if _, ok := h.authed(r); !ok {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		return
-	}
-	var ev stripeWebhookEvent
-	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
-		return
-	}
-	keyLabel := ev.Data.Object.Metadata.KeyLabel
-	if keyLabel == "" {
-		// Nothing to map this event to — log and accept (200) rather than
-		// error, so Stripe doesn't retry an event we will never be able
-		// to act on (missing metadata is a config problem on the Stripe
-		// side, not a transient failure worth retrying).
-		log.Printf("meterhub: webhook event %s has no metadata.key_label, ignoring", ev.Type)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	status, ok := stripeToInternalStatus[ev.Data.Object.Status]
-	if !ok {
-		log.Printf("meterhub: webhook event %s: unrecognized Stripe status %q for key %s, ignoring", ev.Type, ev.Data.Object.Status, keyLabel)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	plan := ""
-	if len(ev.Data.Object.Items.Data) > 0 {
-		plan = ev.Data.Object.Items.Data[0].Price.Nickname
-	}
-	_, err := h.db.Exec(`
-		INSERT INTO subscribers (key_label, status, plan, source, external_id, updated_at, note)
-		VALUES (?, ?, ?, 'stripe', ?, ?, ?)
-		ON CONFLICT(key_label) DO UPDATE SET
-			status=excluded.status, plan=excluded.plan, source='stripe',
-			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note`,
-		keyLabel, status, plan, ev.Data.Object.ID, time.Now().UTC().Format(time.RFC3339), "via webhook: "+ev.Type,
-	)
-	if err != nil {
-		log.Printf("meterhub: webhook write failed: %v", err)
-		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
-		return
-	}
-	log.Printf("meterhub: %s -> status=%s (via %s)", keyLabel, status, ev.Type)
-	w.WriteHeader(http.StatusOK)
-}
+// The Stripe-shaped webhook that used to live here (POST /subscribers/webhook) is gone: it trusted the report
+// token instead of Stripe's signature, so it could not face Stripe. Stripe now talks only to oaica-saas
+// (POST /billing/webhook: signature-verified, idempotent, order-aware), which pushes each subscription's state to
+// POST /subscribers/set and answers GET /entitlement/:key_label (2026-09-29, round 132).
 
 func main() {
 	configPath := flag.String("config", "", "path to a JSON config (listen_addr, db_path, report_tokens)")
@@ -983,6 +887,12 @@ func main() {
 	}
 	log.Printf("meterhub: db=%s listen=%s report_tokens=%d", cfg.DBPath, cfg.ListenAddr, len(cfg.ReportTokens))
 
+	mux := newMux(hub)
+	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+}
+
+// newMux registers every route. Split out of main so a test can assert which routes exist.
+func newMux(hub *meterHub) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -997,7 +907,5 @@ func main() {
 	mux.HandleFunc("/subscribers/list", hub.subscriberListHandler)
 	mux.HandleFunc("/subscribers/usage", hub.subscriberUsageHandler)
 	mux.HandleFunc("/subscribers/reset", hub.subscriberResetHandler)
-	mux.HandleFunc("/subscribers/webhook", hub.subscriberWebhookHandler)
-
-	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+	return mux
 }

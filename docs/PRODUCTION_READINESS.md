@@ -61,7 +61,7 @@ shipped, so it's reported in full:
 
 - **tools/meterhub** (new service): central usage ledger aggregation
   (idempotent SQLite ingest, `/usage`, `/usage/summary`) + subscriber
-  entitlement store (`/subscribers/{set,get,list,webhook}`). Pure-Go
+  entitlement store (`/subscribers/{set,get,list,usage,reset}`). Pure-Go
   sqlite (`modernc.org/sqlite`), same cross-compile story as every other
   `tools/` binary. 22/22 tests passing.
 - **tools/gateway**: async fire-and-forget usage reporting to meterhub
@@ -87,15 +87,14 @@ shipped, so it's reported in full:
   oaicalb access to the metered gateway — this closes the original gap
   that started the whole thread ("track and bill users accordingly");
   before this, everyday client traffic bypassed metering entirely.
-- Stripe webhook receiver exists (`/subscribers/webhook`) but is
-  explicitly **not safe to point a real Stripe account at yet** — auth is
-  still the same bearer report-token as every other endpoint, not
-  Stripe's per-endpoint signature verification. Documented inline with a
-  SECURITY NOTE; swap before connecting Stripe.
+- Stripe is handled by oaica-saas (`POST /billing/webhook`, signature-
+  verified, idempotent); meterhub's old unsigned webhook route was removed.
+  Going live needs the Stripe account setup in
+  `oaica-saas/docs/stripe-setup.md`.
 
 ## Explicitly out of scope / deferred
 
-- Real Stripe integration (needs an account this session cannot create).
+- Stripe account, Stripe Tax registrations and live secrets (user-side; code is done in oaica-saas).
 - GPU2 as a 3rd oaica-35b-a3b-vision replica: GPU2 shows ~74GB "used" by
   a dead PID (zombie VRAM leak, same pattern as an earlier GPU7 incident)
   — only ~7.7GB is actually free, not enough even for the downsized

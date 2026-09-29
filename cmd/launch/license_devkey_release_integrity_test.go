@@ -54,7 +54,7 @@ func TestReleaseBuildDoesNotHonourADevTestKey(t *testing.T) {
 
 	// Path 1: `oaica activate <published string>`.
 	called := false
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"activated":false,"error":"license_key not found"}`))
@@ -92,7 +92,7 @@ func TestDevTestKeysAreHonouredWhenRegistered(t *testing.T) {
 	if !isTestLicenseKey(key) {
 		t.Fatalf("isTestLicenseKey(%q) = false after registration — the dev/test flow (`oaica activate` on a machine with no purchase) is what the tag enables", key)
 	}
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("a registered dev/test key must not call the licence server")
 	})
 	f, err := activateLicenseLive(key, "")

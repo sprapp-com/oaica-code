@@ -63,9 +63,9 @@ func TestAFutureValidatedAtDoesNotVouchForAStoredLicense(t *testing.T) {
 		_, _ = w.Write([]byte(`{"valid":false}`))
 	}))
 	t.Cleanup(srv.Close)
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	writeLicenseFile(t, licenseFile{
 		Key:         "NOT-A-REAL-PURCHASED-KEY",
@@ -111,9 +111,9 @@ func TestAFutureEnvAnchorDoesNotVouchForTheInjectedKey(t *testing.T) {
 		_, _ = w.Write([]byte(`{"valid":false}`))
 	}))
 	t.Cleanup(srv.Close)
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	key := "NOT-A-REAL-ENV-KEY"
 	writeEnvAnchor(t, key, futureValidatedAt)
@@ -152,9 +152,9 @@ func TestAPastValidatedAtStillSkipsTheNetwork(t *testing.T) {
 		_, _ = w.Write([]byte(`{"valid":true}`))
 	}))
 	t.Cleanup(srv.Close)
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	writeLicenseFile(t, licenseFile{
 		Key:         "OAICA-REAL-RECENTLY-VALIDATED",

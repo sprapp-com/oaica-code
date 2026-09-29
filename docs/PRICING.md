@@ -592,6 +592,9 @@ repeat-heavy-context workload this product actually serves.
   jurisdictions and want no tax registrations. Our buyers are developers
   and teams (B2B), so direct Stripe (~3–4%; verify the current MY rate
   card) wins until tax admin becomes the bottleneck.
+- **Status (2026-09-29):** Checkout + Stripe Tax, the Customer Portal, the signed webhook, the one-off licence
+  and subscription keys, and the entitlement endpoint are implemented in `oaica-saas` (docs/stripe-setup.md);
+  `oaica launch` validates against its `/license` API. Billing Meters from the ledger remain to build.
 - Build order: Checkout + Customer Portal for plans → Billing Meters fed
   from the ledger (batch per key per hour) → webhooks flip key status in
   meterhub → `entitlement.go` (already scaffolded, off by default) reads

@@ -30,20 +30,20 @@ func withDevTestKey(t *testing.T) string {
 	return devTestKey
 }
 
-// stubLemonSqueezy starts an httptest server implementing just enough of
+// stubLicenseServer starts an httptest server implementing just enough of
 // the /activate and /validate endpoints for these tests, and points
-// lemonSqueezyLicenseAPI at it for the duration of the test.
-func stubLemonSqueezy(t *testing.T, handler http.HandlerFunc) {
+// licenseServerAPI at it for the duration of the test.
+func stubLicenseServer(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = srv.URL
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = srv.URL
+	t.Cleanup(func() { licenseServerAPI = prev })
 }
 
 func TestActivateLicenseLive_Success(t *testing.T) {
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/activate" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
@@ -74,7 +74,7 @@ func TestActivateLicenseLive_Success(t *testing.T) {
 }
 
 func TestActivateLicenseLive_Rejected(t *testing.T) {
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"activated": false,
@@ -100,7 +100,7 @@ func TestActivateLicenseLive_EmptyKey(t *testing.T) {
 
 func TestActivateLicenseLive_TestKeyNeverHitsNetwork(t *testing.T) {
 	key := withDevTestKey(t)
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("a dev/test key must not call the license server")
 	})
 
@@ -116,7 +116,7 @@ func TestActivateLicenseLive_TestKeyNeverHitsNetwork(t *testing.T) {
 func TestRequireLicenseLive_TestKeyNeverRevalidates(t *testing.T) {
 	key := withDevTestKey(t)
 	setLaunchTestHome(t, t.TempDir())
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("a dev/test key must not call the license server, even on a stale cache")
 	})
 
@@ -144,7 +144,7 @@ func TestRequireLicenseLive_NoLicenseFile(t *testing.T) {
 func TestRequireLicenseLive_FreshCacheSkipsNetwork(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 	networkHit := false
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		networkHit = true
 		w.WriteHeader(http.StatusInternalServerError)
 	})
@@ -165,7 +165,7 @@ func TestRequireLicenseLive_FreshCacheSkipsNetwork(t *testing.T) {
 
 func TestRequireLicenseLive_StaleCacheRevalidatesAndPersists(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/validate" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
@@ -193,7 +193,7 @@ func TestRequireLicenseLive_StaleCacheRevalidatesAndPersists(t *testing.T) {
 
 func TestRequireLicenseLive_RevokedBlocks(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
-	stubLemonSqueezy(t, func(w http.ResponseWriter, r *http.Request) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"valid": false})
 	})
@@ -215,9 +215,9 @@ func TestRequireLicenseLive_RevokedBlocks(t *testing.T) {
 func TestRequireLicenseLive_OfflineWithinGraceStillPasses(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
 	// Point at a server that refuses connections outright (nothing listening).
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = "http://127.0.0.1:1"
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = "http://127.0.0.1:1"
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	staleButInGrace := time.Now().Add(-licenseRevalidateTTL - time.Hour)
 	if err := saveLicenseFile(licenseFile{Key: "K", InstanceID: "I", ValidatedAt: staleButInGrace}); err != nil {
@@ -231,9 +231,9 @@ func TestRequireLicenseLive_OfflineWithinGraceStillPasses(t *testing.T) {
 
 func TestRequireLicenseLive_OfflinePastGraceBlocks(t *testing.T) {
 	setLaunchTestHome(t, t.TempDir())
-	prev := lemonSqueezyLicenseAPI
-	lemonSqueezyLicenseAPI = "http://127.0.0.1:1"
-	t.Cleanup(func() { lemonSqueezyLicenseAPI = prev })
+	prev := licenseServerAPI
+	licenseServerAPI = "http://127.0.0.1:1"
+	t.Cleanup(func() { licenseServerAPI = prev })
 
 	pastGrace := time.Now().Add(-licenseOfflineGrace - time.Hour)
 	if err := saveLicenseFile(licenseFile{Key: "K", InstanceID: "I", ValidatedAt: pastGrace}); err != nil {

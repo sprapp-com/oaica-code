@@ -41,8 +41,12 @@ about the gateway's read path changes when a real processor is wired up:
 - `POST /subscribers/set` — the manual control surface. This is what
   "easily block an unsubscribed user" means operationally today: post
   `status=canceled`.
-- `POST /subscribers/webhook` — shaped for Stripe's event envelope, also
-  usable by any processor.
+- Stripe does not talk to meterhub. It talks to **oaica-saas**
+  (`POST /billing/webhook`: signature-verified, idempotent per event id,
+  ignores out-of-order events), which pushes each subscription's state to
+  `POST /subscribers/set` here and answers `GET /entitlement/:key_label`.
+  See `oaica-saas/docs/stripe-setup.md`. (The old unsigned
+  `/subscribers/webhook` route was removed in round 132.)
 
 ## The second condition: rolling-window caps
 
@@ -114,11 +118,12 @@ that already has `EntitlementEnabled` on.
 
 ## What is still missing
 
-- **Stripe webhook signature verification.** `/subscribers/webhook`
-  currently authenticates with the same bearer report-token as every
-  other endpoint, not Stripe's per-endpoint signature. It must not be
-  pointed at a real Stripe account until that is swapped; the code
-  carries a SECURITY NOTE saying so.
+- **Stripe account setup.** The integration is written and tested in
+  oaica-saas (Checkout + Stripe Tax, signed webhook, one-off licence and
+  subscription keys); it needs the Stripe account, tax registrations,
+  products/prices and Worker secrets described in
+  `oaica-saas/docs/stripe-setup.md`, and the public origin serving
+  `web/` plus the `/billing`, `/license`, `/entitlement` routes.
 - **Automation-tier metering.** The caps count requests in a rolling
   window, which a scripted workload can satisfy cheaply — many small
   requests consume the same window budget as one large one. Until there
