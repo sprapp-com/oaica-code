@@ -818,23 +818,79 @@ func (u *usageRecorder) scanSSE(p []byte) {
 			continue
 		}
 		var chunk struct {
-			Usage *struct {
-				PromptTokens        int `json:"prompt_tokens"`
-				CompletionTokens    int `json:"completion_tokens"`
-				PromptTokensDetails *struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"prompt_tokens_details"`
-			} `json:"usage"`
+			Usage    *usageFields `json:"usage"`
+			Response *struct {
+				Usage *usageFields `json:"usage"`
+			} `json:"response"` // Responses API: response.completed carries the usage
+			Message *struct {
+				Usage *usageFields `json:"usage"`
+			} `json:"message"` // Messages API: message_start carries the input side
 		}
-		if json.Unmarshal(payload, &chunk) == nil && chunk.Usage != nil {
-			u.promptTokens = chunk.Usage.PromptTokens
-			u.completionTokens = chunk.Usage.CompletionTokens
-			if chunk.Usage.PromptTokensDetails != nil {
-				u.cachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+		if json.Unmarshal(payload, &chunk) == nil {
+			for _, f := range []*usageFields{chunk.Usage, chunkResponseUsage(chunk.Response), chunkMessageUsage(chunk.Message)} {
+				u.absorb(f)
 			}
-			u.seen = true
 		}
 	}
+}
+
+func chunkResponseUsage(r *struct {
+	Usage *usageFields `json:"usage"`
+}) *usageFields {
+	if r == nil {
+		return nil
+	}
+	return r.Usage
+}
+
+func chunkMessageUsage(m *struct {
+	Usage *usageFields `json:"usage"`
+}) *usageFields {
+	if m == nil {
+		return nil
+	}
+	return m.Usage
+}
+
+// usageFields is a usage object in any of the spellings vLLM serves: chat/completions (prompt_tokens),
+// Responses and Messages (input_tokens / output_tokens).
+type usageFields struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+}
+
+// absorb folds one usage object in. A field a frame does not state (0) never overwrites one an earlier
+// frame did: the Messages stream splits the input and the output sides across two frames.
+func (u *usageRecorder) absorb(f *usageFields) {
+	if f == nil {
+		return
+	}
+	if p := f.PromptTokens + f.InputTokens; p > 0 {
+		u.promptTokens = p
+	}
+	if c := f.CompletionTokens + f.OutputTokens; c > 0 {
+		u.completionTokens = c
+	}
+	cached := f.CacheReadTokens
+	if f.PromptTokensDetails != nil {
+		cached += f.PromptTokensDetails.CachedTokens
+	}
+	if f.InputTokensDetails != nil {
+		cached += f.InputTokensDetails.CachedTokens
+	}
+	if cached > 0 {
+		u.cachedTokens = cached
+	}
+	u.seen = true
 }
 
 func (u *usageRecorder) finish() {
@@ -842,21 +898,10 @@ func (u *usageRecorder) finish() {
 		return
 	}
 	var doc struct {
-		Usage *struct {
-			PromptTokens        int `json:"prompt_tokens"`
-			CompletionTokens    int `json:"completion_tokens"`
-			PromptTokensDetails *struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+		Usage *usageFields `json:"usage"`
 	}
-	if json.Unmarshal(u.body.Bytes(), &doc) == nil && doc.Usage != nil {
-		u.promptTokens = doc.Usage.PromptTokens
-		u.completionTokens = doc.Usage.CompletionTokens
-		if doc.Usage.PromptTokensDetails != nil {
-			u.cachedTokens = doc.Usage.PromptTokensDetails.CachedTokens
-		}
-		u.seen = true
+	if json.Unmarshal(u.body.Bytes(), &doc) == nil {
+		u.absorb(doc.Usage)
 	}
 }
 
@@ -942,6 +987,13 @@ func requestAlreadyMetered(r *http.Request) bool {
 
 // meterableCompletionPath: the same two paths tools/gateway meters.
 func meterableCompletionPath(path string) bool {
+	// The Responses and Messages routes vLLM also serves: a turn on them left no trace in meterhub
+	// (2026-09-29 audit, round 128, F128-L3-2).
+	return path == "/v1/chat/completions" || path == "/v1/completions" || path == "/v1/responses" || path == "/v1/messages"
+}
+
+// forcesStreamUsage: only the chat/completions routes take stream_options; the others state usage anyway.
+func forcesStreamUsage(path string) bool {
 	return path == "/v1/chat/completions" || path == "/v1/completions"
 }
 
@@ -997,7 +1049,7 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		// it; a direct or non-gateway client that never asked (the OpenAI SDKs' default streaming request,
 		// or an explicit include_usage:false) was served and booked 0/0 here (2026-09-29 audit,
 		// round 126, F126-L3-1).
-		if whole && fields != nil && laxTruthy(fields["stream"]) {
+		if whole && fields != nil && forcesStreamUsage(r.URL.Path) && laxTruthy(fields["stream"]) {
 			so := map[string]json.RawMessage{}
 			if raw, ok := fields["stream_options"]; ok {
 				json.Unmarshal(raw, &so)

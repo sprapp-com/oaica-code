@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -147,7 +148,11 @@ type meterHub struct {
 }
 
 func newMeterHub(cfg meterConfig) (*meterHub, error) {
-	db, err := sql.Open("sqlite", cfg.DBPath)
+	// WAL and a busy timeout: on the default rollback journal any reader (the summary scans the whole table)
+	// makes a concurrent report fail at once with SQLITE_BUSY, and a reporter that gives up after three
+	// tries has lost the row for good (oaicalb keeps no ledger) (2026-09-29 audit, round 128, F128-L3-1).
+	dsn := (&url.URL{Scheme: "file", Opaque: cfg.DBPath, RawQuery: "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db %s: %w", cfg.DBPath, err)
 	}

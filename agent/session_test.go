@@ -2187,7 +2187,7 @@ func TestSessionAllowShellApprovalScopesToExactCommand(t *testing.T) {
 	registry.Register(namedApprovalTestTool{name: "bash"})
 	prompter := &recordingApprovalPrompter{
 		results: []Approval{
-			{AllowScopes: []string{toolApprovalScope(namedApprovalTestTool{name: "bash"}, "bash", map[string]any{"command": "pwd"})}},
+			{AllowScopes: []string{toolApprovalScope(namedApprovalTestTool{name: "bash"}, "bash", map[string]any{"command": "pwd"}, "")}},
 			{Allow: true},
 		},
 	}

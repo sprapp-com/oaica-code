@@ -143,7 +143,7 @@ func cloneApprovalScopes(src map[string]bool) map[string]bool {
 }
 
 func (s *Session) needsApproval(tool Tool, name string, args map[string]any) bool {
-	return ToolRequiresApproval(tool, args) && !s.allows(toolApprovalScope(tool, name, args))
+	return ToolRequiresApproval(tool, args) && !s.allows(toolApprovalScope(tool, name, args, s.currentWorkingDir()))
 }
 
 // allows reports whether scope is permitted by the session's accumulated approval state.
@@ -190,9 +190,21 @@ func (s *Session) authorizeToolCalls(ctx context.Context, req ApprovalRequest) (
 // If the tool implements ScopedTool, its ApprovalScope method determines the
 // scope (e.g. shell tools scope to "<tool>\x00<command>"). Otherwise the scope
 // is the trimmed tool name.
-func toolApprovalScope(tool Tool, toolName string, args map[string]any) string {
+func toolApprovalScope(tool Tool, toolName string, args map[string]any, workingDir string) string {
 	if scoped, ok := tool.(ScopedTool); ok {
-		return scoped.ApprovalScope(args)
+		scope := scoped.ApprovalScope(args)
+		// A relative path names a different file once the session has cd'd: "y" to editing A/notes.txt
+		// approved editing B/notes.txt after an approved `cd B` (2026-09-29 audit, round 128, F128-L1-4).
+		if wd, ok := tool.(WorkdirScopedTool); ok && wd.ScopeUsesWorkingDir(args) {
+			scope += "\x00@" + workingDir
+		}
+		return scope
 	}
 	return strings.TrimSpace(toolName)
+}
+
+// WorkdirScopedTool is a ScopedTool whose scope also depends on the session's working directory for
+// some arguments (a relative path).
+type WorkdirScopedTool interface {
+	ScopeUsesWorkingDir(args map[string]any) bool
 }

@@ -302,10 +302,19 @@ func refuseCredentialPath(workingDir, path string) error {
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(workingDir, p)
 	}
-	p = filepath.ToSlash(p)
-	for _, fragment := range credentialPathFragments {
-		if strings.Contains(p, fragment) || strings.HasSuffix(p, strings.TrimSuffix(fragment, "/")) {
-			return fmt.Errorf("refusing to touch %s: credential file reads are not allowed", path)
+	// The path as written AND where it lands: a directory symlink in the tree (`keys -> ~/.ssh`) names a
+	// credential file by an in-tree-looking path, and a case-insensitive filesystem serves `.SSH/ID_RSA`
+	// (bash lowercases the command; this did not) (2026-09-29 audit, round 128, F128-L1-3).
+	candidates := []string{p}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		candidates = append(candidates, resolved)
+	}
+	for _, c := range candidates {
+		c = strings.ToLower(filepath.ToSlash(c))
+		for _, fragment := range credentialPathFragments {
+			if strings.Contains(c, fragment) || strings.HasSuffix(c, strings.TrimSuffix(fragment, "/")) {
+				return fmt.Errorf("refusing to touch %s: credential file reads are not allowed", path)
+			}
 		}
 	}
 	return nil

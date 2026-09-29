@@ -204,6 +204,32 @@ type lemonSqueezyLicenseResponse struct {
 	LicenseKey struct {
 		Status string `json:"status"`
 	} `json:"license_key"`
+	// Meta names the store and product the key was issued for. The License API answers for EVERY
+	// store's keys, so accepting activated/valid alone accepted a key from anyone's $0 product.
+	Meta struct {
+		StoreID   int64 `json:"store_id"`
+		ProductID int64 `json:"product_id"`
+	} `json:"meta"`
+}
+
+// oaicaLemonStoreID / oaicaLemonProductID are the Lemon Squeezy store and product a key must have been
+// issued for (dashboard: Settings > Stores, the product's id). ZERO means not configured, and then any
+// store's key is accepted as before: set both, alongside oaicaPurchaseURL, when the product is live
+// (2026-09-29 audit, round 128, F128-L2-1).
+var (
+	oaicaLemonStoreID   int64
+	oaicaLemonProductID int64
+)
+
+// licenseIssuedForUs reports whether a response is for this product, when this product is configured.
+func licenseIssuedForUs(r lemonSqueezyLicenseResponse) bool {
+	if oaicaLemonStoreID != 0 && r.Meta.StoreID != oaicaLemonStoreID {
+		return false
+	}
+	if oaicaLemonProductID != 0 && r.Meta.ProductID != oaicaLemonProductID {
+		return false
+	}
+	return true
 }
 
 func callLemonSqueezyLicenseAPI(path string, form url.Values) (lemonSqueezyLicenseResponse, error) {
@@ -226,6 +252,10 @@ func callLemonSqueezyLicenseAPI(path string, form url.Values) (lemonSqueezyLicen
 	}
 	if resp.StatusCode != http.StatusOK && parsed.Error == "" {
 		return parsed, fmt.Errorf("license server: HTTP %d", resp.StatusCode)
+	}
+	if (parsed.Activated || parsed.Valid) && !licenseIssuedForUs(parsed) {
+		parsed.Activated, parsed.Valid = false, false
+		parsed.Error = "this key is not an oaica-code license"
 	}
 	return parsed, nil
 }

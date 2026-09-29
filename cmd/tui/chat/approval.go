@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"slices"
 	"strings"
 	"time"
@@ -248,6 +249,10 @@ func approvalRequestDetail(request coreagent.ApprovalRequest, width int) string 
 }
 
 func approvalToolCallDetail(call coreagent.ApprovalToolCall, width int) string {
+	// The approval prompt is the one screen whose text must be exactly what will run: the arguments are the
+	// model's, and a CR + erase-line in a command showed the user a harmless one (2026-09-29 audit,
+	// round 128, F128-L1-1).
+	call.ToolName, call.Args = termsafe.Text(call.ToolName), termsafeArgs(call.Args)
 	if isShellToolName(call.ToolName) {
 		command, ok := rawStringArg(call.Args, "command")
 		if !ok {

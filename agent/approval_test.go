@@ -48,7 +48,7 @@ func TestToolApprovalScopeUsesScopedTool(t *testing.T) {
 		{plainTool, "edit", map[string]any{"path": "README.md"}, "edit"},
 	}
 	for _, tt := range tests {
-		if got := toolApprovalScope(tt.tool, tt.name, tt.args); got != tt.want {
+		if got := toolApprovalScope(tt.tool, tt.name, tt.args, ""); got != tt.want {
 			t.Fatalf("toolApprovalScope(%q) = %q, want %q", tt.name, got, tt.want)
 		}
 	}

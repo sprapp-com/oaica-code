@@ -43,3 +43,25 @@ func TestRound127CredentialReadIsRefusedOnEveryFileTool(t *testing.T) {
 		t.Errorf("the credential file was modified: %q", b)
 	}
 }
+
+// F128-L1-3 (2026-09-29 audit, round 128): the denylist holds through a directory symlink and on letter case.
+func TestRound128CredentialReadThroughSymlinkAndCase(t *testing.T) {
+	home := t.TempDir()
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	key := filepath.Join(home, ".ssh", "id_rsa")
+	os.WriteFile(key, []byte("PRIVATE KEY"), 0o600)
+	cwd := t.TempDir()
+	if err := os.Symlink(filepath.Join(home, ".ssh"), filepath.Join(cwd, "keys")); err != nil {
+		t.Skip(err)
+	}
+	tc := agent.ToolContext{WorkingDir: cwd}
+	for name, path := range map[string]string{
+		"absolute through a directory symlink": filepath.Join(cwd, "keys", "id_rsa"),
+		"upper-case spelling":                  filepath.Join(home, ".SSH", "ID_RSA"),
+	} {
+		res, err := (&agenttools.Read{}).Execute(context.Background(), tc, map[string]any{"path": path})
+		if err == nil || strings.Contains(res.Content, "PRIVATE KEY") {
+			t.Errorf("%s: the credential file was served (err=%v)", name, err)
+		}
+	}
+}

@@ -28,6 +28,10 @@ func (t *Skill) Schema() api.ToolFunction {
 
 func (t *Skill) RequiresApproval(map[string]any) bool { return true }
 
+// ApprovalScope binds a "yes" to the skill named: approving `lint` used to approve loading any other skill,
+// and a project repo supplies skills (2026-09-29 audit, round 128, F128-L1-4).
+func (t *Skill) ApprovalScope(args map[string]any) string { return scopeOn(t.Name(), args, "name") }
+
 func (t *Skill) Execute(_ context.Context, _ agent.ToolContext, args map[string]any) (agent.ToolResult, error) {
 	name, ok := args["name"].(string)
 	if !ok {

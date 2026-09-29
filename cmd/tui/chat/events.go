@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"slices"
 	"strings"
 	"time"
@@ -292,7 +293,36 @@ func (m *chatModel) refreshLiveContextEstimate() {
 	m.contextEstimate = true
 }
 
+// termsafeArgs returns args with every string value made terminal-safe (nested maps and lists included).
+//
 //nolint:containedctx // event sinks need the session context to unblock sends on cancellation.
+func termsafeArgs(args map[string]any) map[string]any {
+	if args == nil {
+		return nil
+	}
+	out := make(map[string]any, len(args))
+	for k, v := range args {
+		out[termsafe.Text(k)] = termsafeValue(v)
+	}
+	return out
+}
+
+func termsafeValue(v any) any {
+	switch t := v.(type) {
+	case string:
+		return termsafe.Text(t)
+	case map[string]any:
+		return termsafeArgs(t)
+	case []any:
+		c := make([]any, len(t))
+		for i := range t {
+			c[i] = termsafeValue(t[i])
+		}
+		return c
+	}
+	return v
+}
+
 type chatEventSink struct {
 	ctx                  context.Context
 	ch                   chan<- tea.Msg
@@ -300,6 +330,13 @@ type chatEventSink struct {
 }
 
 func (s chatEventSink) Emit(event coreagent.Event) error {
+	// What the view renders comes from these events, and it is model-, tool- and vendor-authored: an
+	// escape sequence in it is a command to the user's terminal (clipboard write, screen clear, a forged
+	// prompt). The view's own styling is added after this point, so stripping here leaves it alone
+	// (2026-09-29 audit, round 128, F128-L1-2). Messages are left as they are: they are the history the
+	// model is sent back.
+	event.Content, event.Thinking, event.Error, event.ToolName = termsafe.Text(event.Content), termsafe.Text(event.Thinking), termsafe.Text(event.Error), termsafe.Text(event.ToolName)
+	event.Args = termsafeArgs(event.Args)
 	if s.newMessagesPersisted != nil {
 		*s.newMessagesPersisted = true
 	}

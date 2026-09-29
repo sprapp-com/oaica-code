@@ -503,7 +503,7 @@ func (s *Session) executeToolCalls(ctx context.Context, runID string, opts RunOp
 			workingDir: batchWorkingDir,
 		})
 		if ok && s.needsApproval(tool, toolName, args) {
-			approvalReq.AddToolCall(call.ID, toolName, toolApprovalScope(tool, toolName, args), args)
+			approvalReq.AddToolCall(call.ID, toolName, toolApprovalScope(tool, toolName, args, batchWorkingDir), args)
 		}
 	}
 

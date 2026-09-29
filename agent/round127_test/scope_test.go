@@ -103,3 +103,32 @@ func TestRound127EveryTargetedToolScopesItsApprovalToTheTarget(t *testing.T) {
 		}
 	}
 }
+
+// F128-L1-4 (2026-09-29 audit, round 128): approving an edit of a RELATIVE path does not approve the same
+// relative path after the session has changed directory, and approving one skill does not approve another.
+func TestRound128RelativeScopeFollowsTheWorkingDir(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(a, "notes.txt"), []byte("one"), 0o644)
+	os.WriteFile(filepath.Join(b, "notes.txt"), []byte("one"), 0o644)
+	client := &scripted{turns: [][]api.ToolCall{
+		{call("c1", "edit", "path", "notes.txt", "old_text", "one", "new_text", "two")},
+		{call("c2", "bash", "command", "cd "+b)},
+		{call("c3", "edit", "path", "notes.txt", "old_text", "one", "new_text", "PWNED")},
+	}}
+	reg := &agent.Registry{}
+	reg.Register(&agenttools.Edit{})
+	reg.Register(&agenttools.Bash{})
+	p := &yesOnce{}
+	sess := &agent.Session{Client: client, Tools: reg, ApprovalPrompter: p, WorkingDir: a}
+	sess.Run(context.Background(), agent.RunOptions{Model: "m", Messages: []api.Message{{Role: "user", Content: "hi"}}, MaxToolRounds: -1})
+	if len(p.prompts) != 3 {
+		t.Errorf("an approval of edit %s/notes.txt authorized editing %s/notes.txt without a prompt (prompts %q, want 3)", a, b, p.prompts)
+	}
+}
+
+func TestRound128SkillScopeBindsTheSkillName(t *testing.T) {
+	s := &agenttools.Skill{}
+	if s.ApprovalScope(map[string]any{"name": "lint"}) == s.ApprovalScope(map[string]any{"name": "evil"}) {
+		t.Errorf("two different skills share an approval scope")
+	}
+}

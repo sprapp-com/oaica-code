@@ -94,6 +94,15 @@ release_download_base() {
     printf 'https://github.com/%s/releases/latest/download' "$repo"
 }
 
+# curl options that keep an https download from being taken over a plain-http redirect: TLS to the named
+# host is the only protection on the unpinned path, and SHA256SUMS comes from the same hop as the archive.
+# Prints nothing for a non-https base (a local mirror), which is the operator's own choice.
+redirect_guard() {
+    case "$1" in
+        https://*) printf '%s' '--proto-redir =https' ;;
+    esac
+}
+
 # Print the SHA-256 hex digest of "$1", or nothing when no tool is available.
 sha256_of() {
     if available sha256sum; then
@@ -132,7 +141,7 @@ verify_archive() {
         return 0
     fi
 
-    if ! curl --fail --silent --show-error --location --retry 3 \
+    if ! curl --fail --silent --show-error --location $(redirect_guard "$url_base") --retry 3 \
             -o "$TEMP_DIR/SHA256SUMS" "${url_base}/SHA256SUMS"; then
         warning "Could not download SHA256SUMS; skipping checksum verification of $name"
         return 0
@@ -164,7 +173,7 @@ fetch_archive() {
     while :; do
         rm -f "$dest"
         rc=0
-        curl --fail --show-error --location --progress-bar \
+        curl --fail --show-error --location $(redirect_guard "$url_base") --progress-bar \
             -o "$dest" "${url_base}/${name}" || rc=$?
         if [ "$rc" -eq 0 ] && [ ! -s "$dest" ]; then
             rc=18
@@ -328,7 +337,7 @@ download_and_extract() {
     mkdir -p "$unpack_dir"
 
     # Check if .tar.zst is available
-    if curl --fail --silent --head --location "${url_base}/${filename}.tar.zst" >/dev/null 2>&1; then
+    if curl --fail --silent --head --location $(redirect_guard "$url_base") "${url_base}/${filename}.tar.zst" >/dev/null 2>&1; then
         # zst file exists - check if we have zstd tool
         if ! available zstd; then
             error "This version requires zstd for extraction. Please install zstd and try again:

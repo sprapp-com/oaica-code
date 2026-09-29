@@ -831,3 +831,22 @@ func TestRound122IngestRefusesAnOversizedReport(t *testing.T) {
 		t.Fatalf("a normal report was refused: %d", w.Code)
 	}
 }
+
+// F128-L3-1 (2026-09-29 audit, round 128): a report is not lost because a reader is in flight.
+func TestRound128IngestSucceedsWhileAReaderIsScanning(t *testing.T) {
+	hub, token := testHub(t)
+	for i := 0; i < 50; i++ {
+		if w := postIngest(t, hub, token, usageRecord{RequestID: fmt.Sprintf("seed%d", i), Model: "m"}); w.Code != http.StatusNoContent {
+			t.Fatalf("seed ingest: %d", w.Code)
+		}
+	}
+	rows, err := hub.db.Query(`SELECT request_id FROM usage`) // a reader that stays open across the write
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	rows.Next()
+	if w := postIngest(t, hub, token, usageRecord{RequestID: "during-read", Model: "m"}); w.Code != http.StatusNoContent {
+		t.Errorf("a report during an open read answered %d, want 204", w.Code)
+	}
+}

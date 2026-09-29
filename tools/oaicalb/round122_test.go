@@ -240,3 +240,38 @@ func TestRound127MeterRefusesBodiesItCannotRead(t *testing.T) {
 		t.Errorf("a normal body answered %d", w.Code)
 	}
 }
+
+// F128-L3-2 (2026-09-29 audit, round 128): turns on the Responses and Messages routes are metered, in their own
+// usage spellings, streamed or not.
+func TestRound128MeterCountsResponsesAndMessagesRoutes(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"r1","usage":{"input_tokens":11,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}}`)
+		default: // /v1/messages, streamed: input side in message_start, output side in message_delta
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n")
+			io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n")
+		}
+	}))
+	defer be.Close()
+	h := serveWith(newStaticPool([]*backend{newBackend(be.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`)))
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","stream":true,"messages":[]}`)))
+	waitForRecords(t, records, 2)
+	got := map[string]usageRecord{}
+	for _, rec := range *records {
+		got[rec.Path] = rec
+	}
+	if r := got["/v1/responses"]; r.PromptTokens != 11 || r.CompletionTokens != 5 || r.CachedTokens != 3 || !r.UsageSeen {
+		t.Errorf("/v1/responses booked %+v, want 11/5 cached 3", r)
+	}
+	if m := got["/v1/messages"]; m.PromptTokens != 11 || m.CompletionTokens != 5 || !m.UsageSeen {
+		t.Errorf("/v1/messages booked %+v, want 11/5", m)
+	}
+}

@@ -152,6 +152,16 @@ func (e *Edit) RequiresApproval(map[string]any) bool {
 // ApprovalScope binds a "yes" to the path being edited (F127-L1-3).
 func (e *Edit) ApprovalScope(args map[string]any) string { return scopeOn(e.Name(), args, "path") }
 
+// ScopeUsesWorkingDir: a relative path means a different file after a cd (F128-L1-4).
+func (r *Read) ScopeUsesWorkingDir(args map[string]any) bool { return relativePathArg(args) }
+func (e *Edit) ScopeUsesWorkingDir(args map[string]any) bool { return relativePathArg(args) }
+
+func relativePathArg(args map[string]any) bool {
+	p, _ := args["path"].(string)
+	p = strings.TrimSpace(p)
+	return p != "" && !filepath.IsAbs(p)
+}
+
 // scopeOn is "<tool>\x00<argument>" for the named argument, or the bare tool name when it is absent.
 func scopeOn(tool string, args map[string]any, key string) string {
 	if v, ok := args[key].(string); ok {

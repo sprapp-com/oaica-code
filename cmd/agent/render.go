@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"io"
 	"os"
 	"strings"
@@ -29,6 +30,8 @@ func newStdoutSink() *stdoutSink {
 }
 
 func (s *stdoutSink) Emit(ev agent.Event) error {
+	// Model, tool and vendor text never reaches the terminal raw.
+	ev.Content, ev.Thinking, ev.Error, ev.ToolName = termsafe.Text(ev.Content), termsafe.Text(ev.Thinking), termsafe.Text(ev.Error), termsafe.Text(ev.ToolName)
 	switch ev.Type {
 	case agent.EventMessageDelta:
 		fmt.Fprint(s.out, ev.Content)
@@ -38,7 +41,7 @@ func (s *stdoutSink) Emit(ev agent.Event) error {
 
 	case agent.EventToolCallDetected:
 		for _, tc := range ev.ToolCalls {
-			fmt.Fprintf(s.out, "\n  ◆ %s%s%s %s\n", readline.ColorBold, tc.Function.Name, readline.ColorDefault, compactToolArgs(tc))
+			fmt.Fprintf(s.out, "\n  ◆ %s%s%s %s\n", readline.ColorBold, termsafe.Text(tc.Function.Name), readline.ColorDefault, termsafe.Text(compactToolArgs(tc)))
 		}
 
 	case agent.EventToolStarted:
