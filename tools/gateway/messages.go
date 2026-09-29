@@ -54,6 +54,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // messagesHandler accepts an Anthropic /v1/messages request, translates it
@@ -6476,9 +6478,26 @@ func (tb *toolBlock) advanceScan() {
 	if len(s) < sc.n {
 		*sc = argScan{}
 	}
-	for i := sc.n; i < len(s); i++ {
+	i := sc.n
+	for i < len(s) {
 		c := s[i]
-		space := c == ' ' || c == '\t' || c == '\n' || c == '\r'
+		// Whitespace is what strings.TrimSpace calls whitespace — the predicate this replaces trimmed
+		// with it — so a NBSP, \v, \f, U+0085 or U+2028 outside a string is a space here too, not
+		// a stray byte (2026-09-29 audit, round 124, F124-L3-1). A rune split across two fragments
+		// waits for the rest of it.
+		size := 1
+		var space bool
+		if c < 0x80 {
+			space = unicode.IsSpace(rune(c))
+		} else {
+			if !utf8.FullRuneInString(s[i:]) {
+				break
+			}
+			var r rune
+			r, size = utf8.DecodeRuneInString(s[i:])
+			space = unicode.IsSpace(r)
+		}
+		i += size
 		if !sc.started {
 			if space {
 				continue
@@ -6486,7 +6505,7 @@ func (tb *toolBlock) advanceScan() {
 			sc.started, sc.first = true, c
 		}
 		if sc.first != '{' {
-			break // not an object: nothing further matters
+			continue // not an object: nothing further matters
 		}
 		if sc.closed {
 			if !space {
@@ -6517,16 +6536,32 @@ func (tb *toolBlock) advanceScan() {
 			}
 		}
 	}
-	sc.n = len(s)
+	sc.n = i
+}
+
+// scanView is the scan's state with any bytes it is still waiting on (the front of a rune a fragment
+// cut in two) read the way strings.TrimSpace reads them: as non-space bytes.
+func (tb *toolBlock) scanView() (started bool, first byte, closed, trail bool) {
+	tb.advanceScan()
+	sc := &tb.scan
+	started, first, closed, trail = sc.started, sc.first, sc.closed, sc.trail
+	if s := tb.args.String(); sc.n < len(s) {
+		if !started {
+			started, first = true, s[sc.n]
+		} else if first == '{' && closed {
+			trail = true
+		}
+	}
+	return
 }
 
 // finishedObject is finishedObjectArgs(tb.args.String()), incrementally.
 func (tb *toolBlock) finishedObject() bool {
-	tb.advanceScan()
-	sc := &tb.scan
-	if !sc.started || sc.first != '{' || !sc.closed || sc.trail {
+	started, first, closed, trail := tb.scanView()
+	if !started || first != '{' || !closed || trail {
 		return false
 	}
+	sc := &tb.scan
 	if !sc.validKnown {
 		sc.valid = json.Valid([]byte(strings.TrimSpace(tb.args.String())))
 		sc.validKnown = true
@@ -6536,11 +6571,11 @@ func (tb *toolBlock) finishedObject() bool {
 
 // argsFinished is argsAreFinished(tb.args.String()), incrementally.
 func (tb *toolBlock) argsFinished() bool {
-	tb.advanceScan()
-	if !tb.scan.started {
+	started, first, _, _ := tb.scanView()
+	if !started {
 		return false
 	}
-	if tb.scan.first != '{' {
+	if first != '{' {
 		return true
 	}
 	return tb.finishedObject()

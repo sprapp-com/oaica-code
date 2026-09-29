@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -118,9 +119,23 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 func truncateForError(b []byte) string {
 	s := strings.TrimSpace(string(b))
 	if len(s) > 300 {
-		return s[:300] + "…"
+		// On a rune boundary: a split character renders as garbage or drops the line
+		// (2026-09-29 audit, round 124, F124-L1-4).
+		cut := 300
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		return s[:cut] + "…"
 	}
 	return s
+}
+
+// oaicaRouterMessage is a message the ROUTER wrote, made safe to print: redacted of the credentials
+// this process sent, bounded, and quoted if it carries control characters (an escape sequence in a
+// vendor's error text reaches the terminal otherwise). `oaica run`, `lora` and `auth login` printed it
+// whole, up to the 64 MiB a body may be (2026-09-29 audit, round 124, F124-L1-2).
+func oaicaRouterMessage(msg string) string {
+	return launch.PrintableCell(truncateForError([]byte(oaicaDiagnosis(msg))))
 }
 
 // siteLLMForModel validates the model against the router's live list so a

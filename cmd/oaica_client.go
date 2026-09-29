@@ -466,7 +466,7 @@ func oaicaChatComplete(model string, messages []oaicaChatMessage) (string, oaica
 		return "", oaicaChatUsage{}, fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return "", oaicaChatUsage{}, oaicaWrapAuthError(resp.StatusCode, oaicaDiagnosis(out.Error.Message))
+		return "", oaicaChatUsage{}, oaicaWrapAuthError(resp.StatusCode, oaicaRouterMessage(out.Error.Message))
 	}
 	if len(out.Choices) == 0 {
 		return "", oaicaChatUsage{}, fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
@@ -590,7 +590,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 		return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return "", oaicaWrapAuthError(resp.StatusCode, oaicaDiagnosis(out.Error.Message))
+		return "", oaicaWrapAuthError(resp.StatusCode, oaicaRouterMessage(out.Error.Message))
 	}
 	return out.Model, nil
 }
@@ -728,7 +728,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 		return fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))
 	}
 	if out.Error != nil {
-		return fmt.Errorf("%s", oaicaDiagnosis(out.Error.Message))
+		return fmt.Errorf("%s", oaicaRouterMessage(out.Error.Message))
 	}
 	if !out.OK {
 		return fmt.Errorf("registration failed (HTTP %d): %s", resp.StatusCode, oaicaDiagnosisBody(body))

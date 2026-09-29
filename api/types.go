@@ -697,8 +697,12 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	// square of the nesting: a 148 KB schema nested 4000 deep took 8 s, four such tools 33 s, and
 	// the launch proxy converts each request twice. No real schema is near this deep; Go's own
 	// decoder allows 10000 (2026-09-29 audit, round 123, F123-L1-4).
-	if jsonDepthExceeds(data, maxToolSchemaDepth) {
+	if depth := jsonMaxDepth(data); depth > maxToolSchemaDepth {
 		return fmt.Errorf("tool schema is nested deeper than %d levels", maxToolSchemaDepth)
+	} else if int64(depth)*int64(len(data)) > maxToolSchemaWork {
+		// The cost is bytes x depth, not depth alone: a 244-level schema with one 4 MiB description
+		// took 11 s and kept ~1 GB (2026-09-29 audit, round 124, F124-L1-1).
+		return fmt.Errorf("tool schema is too large for its nesting (%d bytes, %d levels)", len(data), depth)
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -725,9 +729,13 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 // maxToolSchemaDepth is the deepest JSON nesting a tool's parameter schema may have.
 const maxToolSchemaDepth = 256
 
-// jsonDepthExceeds reports, in one pass, whether data nests objects and arrays deeper than max.
-func jsonDepthExceeds(data []byte, max int) bool {
-	depth, inStr, esc := 0, false, false
+// maxToolSchemaWork bounds bytes x nesting depth of one tool schema (~0.6 s and ~50 MB to decode).
+const maxToolSchemaWork = 48 << 20
+
+// jsonMaxDepth is the deepest nesting of objects and arrays in data, in one pass; it stops counting
+// once it passes maxToolSchemaDepth.
+func jsonMaxDepth(data []byte) int {
+	depth, deepest, inStr, esc := 0, 0, false, false
 	for _, c := range data {
 		if inStr {
 			switch {
@@ -745,14 +753,17 @@ func jsonDepthExceeds(data []byte, max int) bool {
 			inStr = true
 		case '{', '[':
 			depth++
-			if depth > max {
-				return true
+			if depth > deepest {
+				deepest = depth
+				if deepest > maxToolSchemaDepth {
+					return deepest
+				}
 			}
 		case '}', ']':
 			depth--
 		}
 	}
-	return false
+	return deepest
 }
 
 // isJSONNull reports whether the bytes are the JSON literal null, which every

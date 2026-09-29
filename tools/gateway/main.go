@@ -3149,11 +3149,17 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		so["include_usage"] = true
 		req["stream_options"] = so
 	}
-	nb, err := json.Marshal(req)
-	if err != nil {
+	// Not HTML-escaped: encoding/json writes < > & as six-byte escapes, so a 16 MiB body of markup
+	// reached the upstream as ~96 MiB, held in memory per request (2026-09-29 audit, round 124,
+	// F124-L3-4; the bridge's own encode stopped doing this in round 119).
+	var encoded bytes.Buffer
+	enc := json.NewEncoder(&encoded)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", "could not re-encode request")
 		return
 	}
+	nb := bytes.TrimRight(encoded.Bytes(), "\n")
 	r.Body = io.NopCloser(bytes.NewReader(nb))
 	r.ContentLength = int64(len(nb))
 	r.Header.Set("Content-Length", fmt.Sprint(len(nb)))

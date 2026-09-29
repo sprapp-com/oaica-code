@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/anthropic"
 	"github.com/ollama/ollama/api"
@@ -218,7 +219,11 @@ func (s *shimClient) safeErr(err error) error {
 		msg = launch.RedactDiagnosis(msg, s.token)
 	}
 	if len(msg) > 300 {
-		msg = msg[:300] + "…"
+		cut := 300
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + "…"
 	}
 	return errors.New(msg)
 }

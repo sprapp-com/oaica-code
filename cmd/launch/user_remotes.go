@@ -453,7 +453,9 @@ func expandCatalogBaseURL(base string, allowed []string) (string, bool) {
 	return out.String(), ok && !strings.Contains(out.String(), "${")
 }
 
-var catalogBareHostRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
+// An underscore is allowed: Snowflake account names may carry one, and it cannot restructure a URL
+// (2026-09-29 audit, round 124, F124-L2-2).
+var catalogBareHostRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 
 func firstSetEnv(env []string) string {
 	for _, name := range env {

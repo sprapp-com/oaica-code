@@ -502,7 +502,42 @@ func openclawCredentialEnvNames() []string {
 	// leg (2026-09-29 audit, round 120, F120-L2-2).
 	// OAICA_ADMIN_KEY is the router's operator key (provider-registry commands), stronger than
 	// either name above, and reached every child (2026-09-29 audit, round 121, F121-L2-1).
-	return append(plan.credentialEnvNames(), oaicaGatewayTokenEnv, "OAICA_ADMIN_KEY")
+	names := plan.credentialEnvNames()
+	// General-purpose platform tokens are the user's own tooling credentials before they are an
+	// inference key: `gh`, `git`, `huggingface-cli`, `wandb`, `doctl`, `databricks` and `wrangler` read
+	// them inside the agent. models.dev lists them as some row's key, so a synced catalogue scrubbed
+	// them from every child (and an unsynced one did not): the scrub turned on a third party's file.
+	// They are scrubbed only when the user's own remotes.json names them (2026-09-29 audit, round
+	// 124, F124-L2-1).
+	explicit := map[string]bool{}
+	for _, r := range remotes {
+		if r.CatalogOrigin {
+			continue
+		}
+		for _, n := range strings.Split(r.APIKeyEnv, ",") {
+			explicit[strings.TrimSpace(n)] = true
+		}
+	}
+	kept := names[:0:0]
+	for _, n := range names {
+		if dualUseCredentialEnvNames[n] && !explicit[n] {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	// OAICA_SERVE_API_KEY guards a network-exposed inference server (round 123 introduced it as the
+	// non-argv input for `oaica serve`) and is scrubbed like the other operator keys (F124-L1-3).
+	return append(kept, oaicaGatewayTokenEnv, "OAICA_ADMIN_KEY", "OAICA_SERVE_API_KEY")
+}
+
+// dualUseCredentialEnvNames are variables that hold a platform credential the user's own tools read,
+// and that models.dev also lists as an inference key for one provider row.
+var dualUseCredentialEnvNames = map[string]bool{
+	"GITHUB_TOKEN": true, "GH_TOKEN": true, "COPILOT_GITHUB_TOKEN": true,
+	"HF_TOKEN": true, "HUGGING_FACE_HUB_TOKEN": true, "HUGGINGFACE_API_KEY": true,
+	"WANDB_API_KEY": true, "DIGITALOCEAN_ACCESS_TOKEN": true,
+	"DATABRICKS_TOKEN": true, "CLOUDFLARE_API_KEY": true, "CLOUDFLARE_API_TOKEN": true,
+	"REPLICATE_API_TOKEN": true, "VERCEL_TOKEN": true, "NETLIFY_AUTH_TOKEN": true,
 }
 
 func openclawInstallEnv() []string {

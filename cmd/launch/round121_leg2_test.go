@@ -116,6 +116,7 @@ func TestRound123TemplateValuesAreWrittenForTheirPosition(t *testing.T) {
 		{"whole URL opens the template", "${NEON_URL}/v1", "NEON_URL", "https://ep-cool-1234.aigw.neon.tech/", "https://ep-cool-1234.aigw.neon.tech/v1"},
 		{"host with its scheme", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "https://adb-1.azuredatabricks.net", "https://adb-1.azuredatabricks.net/ai/v1"},
 		{"bare host", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "adb-1.azuredatabricks.net", "https://adb-1.azuredatabricks.net/ai/v1"},
+		{"host with an underscore (snowflake)", "https://${SNOW_ACCT}.snowflakecomputing.com/v1", "SNOW_ACCT", "myorg-my_account", "https://myorg-my_account.snowflakecomputing.com/v1"},
 		{"path segment", "https://api.x.example/acct/${ACCT}/v1", "ACCT", "a/b?c", "https://api.x.example/acct/a%2Fb%3Fc/v1"},
 		{"host that smuggles a path", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "evil.example/@x", ""},
 		{"opening value with user-info", "${NEON_URL}/v1", "NEON_URL", "https://u:p@evil.example", ""},
@@ -132,5 +133,44 @@ func TestRound123TemplateValuesAreWrittenForTheirPosition(t *testing.T) {
 		if !ok || got != c.want {
 			t.Errorf("%s: got %q ok=%v, want %q", c.name, got, ok, c.want)
 		}
+	}
+}
+
+// F124-L2-1 (2026-09-29 audit, round 124): a platform token models.dev happens to list as an inference
+// key is the user's own tooling credential; it reaches the child unless the user's remotes.json names it.
+func TestRound124PlatformTokensSurviveTheScrubUnlessConfigured(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	dir := filepath.Join(home, ".oaica", "cache", "catalog")
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "modelsdev.json"), []byte(`{
+ "huggingface":{"id":"huggingface","name":"HF","api":"https://router.huggingface.co/v1","npm":"@ai-sdk/openai-compatible","env":["HF_TOKEN"],"models":{}},
+ "other":{"id":"other","name":"Other","api":"https://api.other.example/v1","npm":"@ai-sdk/openai-compatible","env":["OTHER_API_KEY"],"models":{}}
+}`), 0o600)
+	t.Setenv("HF_TOKEN", "hf-tool-token")
+	t.Setenv("GITHUB_TOKEN", "gh-tool-token")
+	t.Setenv("OTHER_API_KEY", "other-inference-key")
+	env := strings.Join(directLaunchEnv(), "\n")
+	for _, keep := range []string{"HF_TOKEN=hf-tool-token", "GITHUB_TOKEN=gh-tool-token"} {
+		if !strings.Contains(env, keep) {
+			t.Errorf("the child lost %s: a platform token the user's own tools read", keep)
+		}
+	}
+	if strings.Contains(env, "OTHER_API_KEY=") {
+		t.Errorf("an inference key reached the child")
+	}
+	// The user's own remote naming it makes it an inference credential again.
+	os.WriteFile(userRemotesPath(), []byte(`{"remotes":[{"name":"mine","base_url":"https://x.example/v1","api_key_env":"HF_TOKEN"}]}`), 0o600)
+	if strings.Contains(strings.Join(directLaunchEnv(), "\n"), "HF_TOKEN=") {
+		t.Errorf("HF_TOKEN reached the child although the user's remote uses it as a key")
+	}
+}
+
+// F124-L1-3 (2026-09-29 audit, round 124): the serve key is an operator credential like the admin key.
+func TestRound124ServeKeyIsScrubbedFromChildren(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("OAICA_SERVE_API_KEY", "serve-key-abcdef123456")
+	if strings.Contains(strings.Join(directLaunchEnv(), "\n"), "serve-key-abcdef123456") {
+		t.Errorf("OAICA_SERVE_API_KEY reached a child")
 	}
 }

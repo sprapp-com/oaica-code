@@ -5,9 +5,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -70,4 +72,56 @@ func TestRound122OversizeBodyIsForwardedWholeAndUnmetered(t *testing.T) {
 		t.Errorf("status %d, backend received %d of %d bytes: an oversize body was cut", w.Code, got.Load(), len(body))
 	}
 	_ = records
+}
+
+// F124-L3-2 (2026-09-29 audit, round 124): SSE or document is decided by the response, and an
+// oversize request is still metered.
+func TestRound124MeterFramingComesFromTheResponse(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	sse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n")
+	}))
+	defer sse.Close()
+	h := serveWith(newStaticPool([]*backend{newBackend(sse.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+	for _, stream := range []string{`1`, `"true"`} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":`+stream+`}`))
+		h(httptest.NewRecorder(), req)
+	}
+	// and a body too large to read is metered from its response
+	pad := `{"model":"m","stream":true,"pad":"` + strings.Repeat("x", meterBodyLimit+1024) + `"}`
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(pad)))
+	waitForRecords(t, records, 3)
+	for i, rec := range (*records)[:3] {
+		if rec.PromptTokens != 11 || rec.CompletionTokens != 5 || !rec.UsageSeen {
+			t.Errorf("row %d booked %+v, want 11/5", i, rec)
+		}
+	}
+	if m := (*records)[2].Model; m != "(request too large to read)" {
+		t.Errorf("the oversize request's row names model %q", m)
+	}
+}
+
+// F124-L3-3: every listen address in the in-tree oaicalb configs is loopback, as the deploy README
+// says and as every consumer (gatekeeper, gateway, the watchdogs) reaches them.
+func TestRound124InTreeConfigsBindLoopback(t *testing.T) {
+	for _, f := range []string{"oaicalb.json", "nemotron-oaicalb.json"} {
+		b, err := os.ReadFile("../a100b/" + f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range []string{"leastconn_addr", "session_hash_addr", "status_addr"} {
+			addr, _ := cfg[k].(string)
+			if addr != "" && !strings.HasPrefix(addr, "127.0.0.1:") && !strings.HasPrefix(addr, "localhost:") {
+				t.Errorf("%s %s = %q binds every interface", f, k, addr)
+			}
+		}
+	}
 }

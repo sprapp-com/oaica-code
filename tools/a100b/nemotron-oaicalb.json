@@ -3,9 +3,9 @@
     "http://127.0.0.1:30107"
   ],
   "health_path": "/v1/models",
-  "leastconn_addr": ":30120",
-  "session_hash_addr": ":8191",
-  "status_addr": ":8192",
+  "leastconn_addr": "127.0.0.1:30120",
+  "session_hash_addr": "127.0.0.1:8191",
+  "status_addr": "127.0.0.1:8192",
   "probe_model": "oaica-nemotron-30b-a3b",
   "probe_timeout_sec": 25,
   "stall_sec": 300,

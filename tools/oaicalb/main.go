@@ -761,6 +761,7 @@ type usageRecorder struct {
 	completionTokens int
 	cachedTokens     int
 	seen             bool
+	decided          bool // the framing has been read from the response's Content-Type
 	tail             bytes.Buffer
 	body             bytes.Buffer
 }
@@ -771,6 +772,15 @@ func (u *usageRecorder) WriteHeader(code int) {
 }
 
 func (u *usageRecorder) Write(p []byte) (int, error) {
+	// SSE or one JSON document is what the RESPONSE says it is. The request's `stream` field is read
+	// by the backend as a pydantic lax bool (1, "true"), which Go's bool decode is not, so a served
+	// stream was parsed as a document and booked 0/0 (2026-09-29 audit, round 124, F124-L3-2).
+	if !u.decided {
+		u.decided = true
+		if ct := u.Header().Get("Content-Type"); ct != "" {
+			u.stream = strings.HasPrefix(ct, "text/event-stream")
+		}
+	}
 	n, err := u.ResponseWriter.Write(p)
 	if u.stream {
 		u.scanSSE(p)
@@ -919,14 +929,10 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		}
 		start := time.Now()
 		rawBody, whole := peekBody(r, meterBodyLimit)
-		if !whole {
-			// Too big to read here: the body goes on unchanged and unmetered. It used to be
-			// replaced by its first 8 MiB with the Content-Length left alone, so the same body was
-			// served when metered-upstream and refused 502 otherwise (2026-09-29 audit, round 122,
-			// F122-L3-4).
-			next(w, r)
-			return
-		}
+		// A body too big to read here goes on unchanged (it used to be replaced by its first 8 MiB
+		// with the Content-Length left alone, so the same body was served metered-upstream and
+		// refused 502 otherwise, F122-L3-4) and is still METERED, from its response: padding a
+		// request with 20 MiB of whitespace booked nothing (F124-L3-2).
 		// Exact key names, as the backend reads them: encoding/json matches "STREAM" to a `stream`
 		// field, vLLM does not, so a client could make this meter parse a JSON reply as SSE and
 		// book a served turn 0/0 (F122-L3-3).
@@ -938,6 +944,9 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		}
 		json.Unmarshal(fields["model"], &reqDoc.Model)
 		json.Unmarshal(fields["stream"], &reqDoc.Stream)
+		if !whole {
+			reqDoc.Model = "(request too large to read)"
+		}
 
 		rec := &usageRecorder{ResponseWriter: w, stream: reqDoc.Stream}
 		next(rec, r)
@@ -956,7 +965,7 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 			RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
 			Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: boundedText(r.Header.Get("X-Session-Id"), 128),
 			Model: boundedText(reqDoc.Model, 256), UpstreamModel: boundedText(reqDoc.Model, 256), Path: r.URL.Path,
-			Stream: reqDoc.Stream, Status: rec.status,
+			Stream: rec.stream, Status: rec.status,
 			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,
 			LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen,
 		})
