@@ -123,6 +123,16 @@ func oaicaLicenseKey() string {
 	}
 	// What `oaica activate` saved: ~/.oaica/license.json. Nothing writes license_key, so a buyer who followed the
 	// README and then pulled a licensed model sent no licence at all (2026-09-29 audit, round 133, F133-L1-3).
+	// It is sent only to an https router or a loopback one: a plain-http OAICA_HOST would put a paid key on the wire
+	// with every pull, free models included (2026-09-30 audit, round 134, F134-L1-3).
+	if oaicaHostIsSecure(oaicaHost()) {
+		return oaicaActivatedLicenseKey()
+	}
+	return ""
+}
+
+// oaicaActivatedLicenseKey is the key `oaica activate` saved, whatever the host (used to redact it from errors).
+func oaicaActivatedLicenseKey() string {
 	if dir, err := oaicaConfigDir(); err == nil {
 		if b, err := os.ReadFile(filepath.Join(dir, "license.json")); err == nil {
 			var f struct {
@@ -134,6 +144,18 @@ func oaicaLicenseKey() string {
 		}
 	}
 	return ""
+}
+
+func oaicaHostIsSecure(host string) bool {
+	u, err := url.Parse(host)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	h := u.Hostname()
+	return u.Scheme == "http" && (h == "localhost" || net.ParseIP(h).IsLoopback())
 }
 
 // oaicaModelsDir defaults to ~/.oaica/models but honors OAICA_MODELS_DIR —

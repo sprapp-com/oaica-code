@@ -183,7 +183,7 @@ Everything lives under `~/.oaica/` (created owner-only, mode 0700):
 | `~/.oaica/aliases.json` | User-defined model-name shortcuts (`oaica model alias`) |
 | `~/.oaica/config.json` | Standing launch tiers — `sonnet_model`, `haiku_model` (`oaica config`) |
 | `~/.oaica/license_key` | Saved license key |
-| `~/.oaica/license.json` | Activation state for a purchased license (`oaica activate`); distinct from `license_key` |
+| `~/.oaica/license.json` | Activation state for a purchased license (`oaica activate`); `oaica pull` also sends its key (to an https or loopback router only) when neither `OAICA_LICENSE_KEY` nor `license_key` is set |
 | `~/.oaica/local_servers.json` | Runtime state of running `oaica serve` instances (rewritten on every start/stop) |
 | `~/.oaica/models.json` | Local model manifest (`oaica model`) |
 | `~/.oaica/plans.json` | Named tier plans (`oaica plan`) |

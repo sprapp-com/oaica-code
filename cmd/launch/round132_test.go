@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,5 +100,45 @@ func TestRound133LicenceClientDoesNotFollowRedirects(t *testing.T) {
 	}
 	if leaked.Load() {
 		t.Error("the licence key was re-sent to the redirect target")
+	}
+}
+
+// F134-L1-1: re-running `oaica activate` on an already activated machine does not spend another seat.
+func TestRound134ReactivatingTheSameMachineSpendsNoSeat(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	var activations atomic.Int32
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/activate":
+			activations.Add(1)
+			w.Write([]byte(`{"activated":true,"valid":true,"instance":{"id":"inst-1","name":"host"},"meta":{"product":"oaica-code"}}`))
+		case "/validate":
+			w.Write([]byte(`{"valid":true,"activated":false,"meta":{"product":"oaica-code"}}`))
+		}
+	})
+	key := "oaica-lic-" + strings.Repeat("a", 32)
+	for i := 0; i < 4; i++ {
+		cmd := ActivateCmd()
+		cmd.SetArgs([]string{key})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	if n := activations.Load(); n != 1 {
+		t.Errorf("4 runs of `oaica activate` on one machine spent %d seats, want 1", n)
+	}
+}
+
+// F134-L1-2: a rate-limited activation says so, instead of claiming the server is unreachable.
+func TestRound134ActivationRefusalKeepsTheServersWords(t *testing.T) {
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":"too many requests"}`))
+	})
+	_, err := activateLicenseLive("oaica-lic-"+strings.Repeat("b", 32), "")
+	if err == nil || !strings.Contains(err.Error(), "too many requests") || strings.Contains(err.Error(), "could not reach") {
+		t.Errorf("err = %v; want the server's own words, not 'could not reach'", err)
 	}
 }

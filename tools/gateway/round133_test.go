@@ -291,3 +291,84 @@ func TestRound133RemoteCallFollowsTheRequestContext(t *testing.T) {
 		t.Errorf("the call outlived its request by %v", d)
 	}
 }
+
+// F134-L3-1: junk keys cannot lock a paying subscriber out — a lookup waits for a slot instead of being refused.
+func TestRound134JunkKeysCannotStarveASubscriber(t *testing.T) {
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		time.Sleep(150 * time.Millisecond)
+		if r.FormValue("api_key") == goodSK {
+			w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+			return
+		}
+		w.Write([]byte(`{"valid":false}`))
+	}))
+	defer saas.Close()
+	g, _ := bridgeGateway(t, saas.URL)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 12; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				r := httptest.NewRequest("GET", "/v1/models", nil)
+				r.Header.Set("Authorization", fmt.Sprintf("Bearer oaica-sk-%048x", w*1000000+i))
+				g.lookupKey(r)
+			}
+		}(w)
+	}
+	time.Sleep(300 * time.Millisecond)
+	refused := 0
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer "+goodSK)
+		if _, ok := g.lookupKey(r); !ok {
+			refused++
+		}
+		g.remote.mu.Lock()
+		g.remote.m = map[string]remoteEntry{} // force a fresh call each time
+		g.remote.mu.Unlock()
+	}
+	close(stop)
+	wg.Wait()
+	if refused > 0 {
+		t.Errorf("a paying subscriber was refused %d/5 times while junk keys ran", refused)
+	}
+}
+
+// F134-L3-2: one caller hanging up does not fail the others waiting on the same lookup.
+func TestRound134OneCallerHangingUpDoesNotFailTheOthers(t *testing.T) {
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(400 * time.Millisecond)
+		w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+	}))
+	defer saas.Close()
+	var c remoteCache
+	fn := func(ctx context.Context) (remoteResult, bool) { return callAPIKeyValidate(ctx, saas.URL, "t", goodSK) }
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	go c.check(leaderCtx, "k", fn)
+	time.Sleep(50 * time.Millisecond)
+	var wg sync.WaitGroup
+	var refused atomic.Int32
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !c.check(context.Background(), "k", fn).ok {
+				refused.Add(1)
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancelLeader()
+	wg.Wait()
+	if refused.Load() != 0 {
+		t.Errorf("%d/3 waiters with live contexts were refused after the first caller hung up", refused.Load())
+	}
+}

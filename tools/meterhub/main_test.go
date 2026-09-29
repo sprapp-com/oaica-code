@@ -894,3 +894,25 @@ func TestRound133SubscriberPushOrderingAndManualSuspension(t *testing.T) {
 		t.Errorf("a manual write was refused: %s", got)
 	}
 }
+
+// F134-L3-3: a manual write must not reset the stamp that orders Stripe pushes.
+func TestRound134ManualWriteKeepsTheEventStamp(t *testing.T) {
+	hub, token := testHub(t)
+	set := func(body string) {
+		req := httptest.NewRequest(http.MethodPost, "/subscribers/set", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		hub.subscriberSetHandler(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("set -> %d", w.Code)
+		}
+	}
+	set(`{"key_label":"a","status":"canceled","source":"stripe","event_created":200}`)
+	set(`{"key_label":"a","status":"canceled","source":"manual","note":"checked"}`)
+	set(`{"key_label":"a","status":"active","source":"stripe","event_created":100}`) // older than the cancellation
+	var s string
+	hub.db.QueryRow(`SELECT status FROM subscribers WHERE key_label = 'a'`).Scan(&s)
+	if s != "canceled" {
+		t.Errorf("a manual write let an older Stripe push undo the cancellation: %s", s)
+	}
+}

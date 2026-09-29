@@ -630,7 +630,7 @@ func (h *meterHub) subscriberSetHandler(w http.ResponseWriter, r *http.Request) 
 		ON CONFLICT(key_label) DO UPDATE SET
 			status=excluded.status, plan=excluded.plan, source=excluded.source,
 			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note,
-			event_created=excluded.event_created
+			event_created=MAX(subscribers.event_created, excluded.event_created)
 		WHERE (excluded.source = 'manual' OR excluded.event_created = 0
 		       OR (excluded.event_created >= subscribers.event_created
 		           AND NOT (subscribers.source = 'manual' AND subscribers.status = 'suspended')))`,

@@ -101,6 +101,9 @@ func oaicaDiagnosis(text string) string {
 	if license := oaicaLicenseKey(); license != "" {
 		secrets = append(secrets, license)
 	}
+	if activated := oaicaActivatedLicenseKey(); activated != "" {
+		secrets = append(secrets, activated)
+	}
 	// The agent sidecar is reached at its own address, which may carry its own
 	// credential in the userinfo — separate from the router key above.
 	if _, tok := launch.SplitUserinfoCredential(oaicaAgentHostRaw()); tok != "" {

@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"io"
 	"net/http"
 	"net/url"
@@ -220,6 +221,19 @@ func licenseIssuedForUs(r licenseResponse) bool {
 	return r.Meta.Product == "" || r.Meta.Product == licenseProduct
 }
 
+// licenseHTTPError: the licence server answered, but not with a verdict (429, 5xx, ...).
+type licenseHTTPError struct {
+	Status int
+	Msg    string
+}
+
+func (e *licenseHTTPError) Error() string {
+	if e.Msg != "" {
+		return fmt.Sprintf("license server: HTTP %d: %s", e.Status, e.Msg)
+	}
+	return fmt.Sprintf("license server: HTTP %d", e.Status)
+}
+
 // licenseHTTPClient never follows a redirect: see callLicenseAPI.
 var licenseHTTPClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
@@ -243,8 +257,17 @@ func callLicenseAPI(path string, form url.Values) (licenseResponse, error) {
 	// the key: returning it as an error routes the caller to the offline grace instead of a lockout that claims
 	// the licence was "refunded or revoked" (F133-L1-1).
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return licenseResponse{}, fmt.Errorf("license server: HTTP %d", resp.StatusCode)
+		// Keep the server's own words (its rate limiter says "too many requests"): an activation that failed for
+		// that reason must not read as "could not reach the server" (round 134, F134-L1-2). Still an error, so the
+		// validate path takes the offline grace.
+		var body struct {
+			Error string `json:"error"`
+		}
+		json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body)
+		if msg := strings.TrimSpace(body.Error); msg != "" && len(msg) <= 200 {
+			return licenseResponse{}, &licenseHTTPError{Status: resp.StatusCode, Msg: termsafe.Text(msg)}
+		}
+		return licenseResponse{}, &licenseHTTPError{Status: resp.StatusCode}
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
@@ -288,6 +311,10 @@ func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 	form := url.Values{"license_key": {key}, "instance_name": {instanceName}}
 	resp, err := callLicenseAPI("/activate", form)
 	if err != nil {
+		var he *licenseHTTPError
+		if errors.As(err, &he) {
+			return licenseFile{}, fmt.Errorf("license activation failed: %w (try again in a minute)", he)
+		}
 		return licenseFile{}, fmt.Errorf("could not reach license server: %w", err)
 	}
 	if !resp.Activated {
@@ -540,6 +567,17 @@ machine; after that, 'oaica launch ...' works without any extra step.`, oaicaPur
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			key := strings.TrimSpace(args[0])
+			// Already activated HERE with this key: check it, do not spend another seat. Every run of /activate
+			// takes one of the key's (three) seats and nothing gives one back, so re-running the README step burned
+			// the buyer's second and third machine (2026-09-30 audit, round 134, F134-L1-1).
+			if cur, lerr := loadLicenseFile(); lerr == nil && cur.Key == key && cur.InstanceID != "" && !isTestLicenseKey(key) {
+				if ok, verr := validateLicenseLive(key, cur.InstanceID); verr == nil && ok {
+					cur.ValidatedAt = time.Now()
+					_ = saveLicenseFile(cur)
+					fmt.Printf("This machine (%q) is already activated with that key.\n", cur.InstanceName)
+					return nil
+				}
+			}
 			f, err := activateLicenseLive(key, "")
 			if err != nil {
 				return err

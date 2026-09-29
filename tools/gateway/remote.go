@@ -58,6 +58,9 @@ const (
 
 var remoteTimeout = 4 * time.Second
 
+// remoteSlotWait: how long a lookup waits for one of the remoteMaxCalls slots before it is refused (not cached).
+var remoteSlotWait = 3 * time.Second
+
 func (c *remoteCache) init() {
 	if c.m == nil {
 		c.m = make(map[string]remoteEntry)
@@ -91,33 +94,49 @@ func (c *remoteCache) check(ctx context.Context, idSource string, fn func(contex
 	c.inflight[id] = f
 	c.mu.Unlock()
 
-	var res remoteResult
-	definite := false
-	select {
-	case c.sem <- struct{}{}: // at most remoteMaxCalls in flight; beyond that, refuse without remembering
-		callCtx, cancel := context.WithTimeout(ctx, remoteTimeout)
-		res, definite = fn(callCtx)
-		cancel()
-		<-c.sem
-	default:
-	}
+	// The lookup runs on its own goroutine and its own clock: it is SHARED by every waiter of this key, so no one
+	// caller's context may end it. Each caller — the first included — stops WAITING on its own context, and the
+	// lookup finishes for the others (2026-09-30 audit, round 134, F134-L3-2; the request-bound rule of round 133
+	// still holds for every caller's wait).
+	go func() {
+		var res remoteResult
+		definite := false
+		// At most remoteMaxCalls in flight. The lookup WAITS for a slot (bounded by remoteSlotWait) instead of being
+		// refused at once: refusing let four unauthenticated junk keys lock every paying subscriber out, and five
+		// subscribers re-validating together refused the fifth (F134-L3-1).
+		slot := time.NewTimer(remoteSlotWait)
+		select {
+		case c.sem <- struct{}{}:
+			slot.Stop()
+			callCtx, cancel := context.WithTimeout(context.Background(), remoteTimeout)
+			res, definite = fn(callCtx)
+			cancel()
+			<-c.sem
+		case <-slot.C:
+		}
+		c.mu.Lock()
+		if definite {
+			if len(c.m) >= remoteMaxEntries {
+				c.evictLocked(now)
+			}
+			ttl := remoteInvalidTTL
+			if res.ok {
+				ttl = remoteValidTTL
+			}
+			c.m[id] = remoteEntry{res: res, expires: time.Now().Add(ttl)}
+		}
+		delete(c.inflight, id)
+		f.res = res
+		close(f.done)
+		c.mu.Unlock()
+	}()
 
-	c.mu.Lock()
-	if definite {
-		if len(c.m) >= remoteMaxEntries {
-			c.evictLocked(now)
-		}
-		ttl := remoteInvalidTTL
-		if res.ok {
-			ttl = remoteValidTTL
-		}
-		c.m[id] = remoteEntry{res: res, expires: now.Add(ttl)}
+	select {
+	case <-f.done:
+		return f.res
+	case <-ctx.Done():
+		return remoteResult{}
 	}
-	delete(c.inflight, id)
-	f.res = res
-	close(f.done)
-	c.mu.Unlock()
-	return res
 }
 
 // evictLocked frees room one entry at a time: expired first, then refused answers, then any — a flood of junk

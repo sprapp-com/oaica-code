@@ -86,3 +86,24 @@ func TestRound133PullSendsTheActivatedLicence(t *testing.T) {
 		t.Errorf("license_key file must win over license.json: %q", got)
 	}
 }
+
+// F134-L1-3: the activated licence is sent only to an https (or loopback) router, and is always redacted.
+func TestRound134ActivatedLicenceIsNotSentOverPlainHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("OAICA_LICENSE_KEY", "")
+	key := "oaica-lic-" + strings.Repeat("c", 32)
+	os.MkdirAll(filepath.Join(home, ".oaica"), 0o700)
+	os.WriteFile(filepath.Join(home, ".oaica", "license.json"), []byte(`{"key":"`+key+`","instance_id":"i"}`), 0o600)
+	for host, want := range map[string]string{"https://router.example": key, "http://127.0.0.1:8080": key, "http://router.example": ""} {
+		t.Setenv("OAICA_HOST", host)
+		if got := oaicaLicenseKey(); got != want {
+			t.Errorf("OAICA_HOST=%s: key sent = %q, want %q", host, got, want)
+		}
+	}
+	t.Setenv("OAICA_HOST", "http://router.example")
+	if out := oaicaDiagnosis("echoed " + key); strings.Contains(out, key) {
+		t.Errorf("the activated key is not redacted from a diagnosis: %q", out)
+	}
+}
