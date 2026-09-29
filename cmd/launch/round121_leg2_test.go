@@ -109,3 +109,28 @@ func TestRound122TemplateOnlyExpandsTheRowsOwnVariablesEscaped(t *testing.T) {
 		}
 	}
 }
+
+// F123-L2-2 (2026-09-29 audit, round 123): a value is written for where its placeholder sits.
+func TestRound123TemplateValuesAreWrittenForTheirPosition(t *testing.T) {
+	cases := []struct{ name, base, env, val, want string }{
+		{"whole URL opens the template", "${NEON_URL}/v1", "NEON_URL", "https://ep-cool-1234.aigw.neon.tech/", "https://ep-cool-1234.aigw.neon.tech/v1"},
+		{"host with its scheme", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "https://adb-1.azuredatabricks.net", "https://adb-1.azuredatabricks.net/ai/v1"},
+		{"bare host", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "adb-1.azuredatabricks.net", "https://adb-1.azuredatabricks.net/ai/v1"},
+		{"path segment", "https://api.x.example/acct/${ACCT}/v1", "ACCT", "a/b?c", "https://api.x.example/acct/a%2Fb%3Fc/v1"},
+		{"host that smuggles a path", "https://${DBX_HOST}/ai/v1", "DBX_HOST", "evil.example/@x", ""},
+		{"opening value with user-info", "${NEON_URL}/v1", "NEON_URL", "https://u:p@evil.example", ""},
+	}
+	for _, c := range cases {
+		t.Setenv(c.env, c.val)
+		got, ok := expandCatalogBaseURL(c.base, []string{c.env})
+		if c.want == "" {
+			if ok {
+				t.Errorf("%s: %q was expanded to %q", c.name, c.val, got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("%s: got %q ok=%v, want %q", c.name, got, ok, c.want)
+		}
+	}
+}

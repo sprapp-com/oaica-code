@@ -403,31 +403,57 @@ var catalogPlaceholderRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 // not secret-shaped (a key is never written into a URL), and reports false when one is left.
 func expandCatalogBaseURL(base string, allowed []string) (string, bool) {
 	ok := true
-	out := catalogPlaceholderRE.ReplaceAllStringFunc(base, func(m string) string {
-		name := catalogPlaceholderRE.FindStringSubmatch(m)[1]
+	var out strings.Builder
+	last := 0
+	for _, loc := range catalogPlaceholderRE.FindAllStringSubmatchIndex(base, -1) {
+		out.WriteString(base[last:loc[0]])
+		last = loc[1]
+		name := base[loc[2]:loc[3]]
 		// Only the row's OWN variables, and never a secret-shaped one: the catalog is a third
 		// party's file, and any other name (DATABASE_URL, a proxy URL with user-info) put its value
-		// into a URL called with the row's key. The value is path-escaped so it cannot restructure
-		// the URL (2026-09-29 audit, round 122, F122-L2-2).
+		// into a URL called with the row's key (2026-09-29 audit, round 122, F122-L2-2).
 		listed := false
 		for _, a := range allowed {
 			if strings.TrimSpace(a) == name {
 				listed = true
 			}
 		}
-		if !listed || credentialShapedEnvName(name) {
-			ok = false
-			return m
-		}
 		v := strings.TrimSpace(os.Getenv(name))
-		if v == "" {
+		if !listed || credentialShapedEnvName(name) || v == "" {
 			ok = false
-			return m
+			out.WriteString(base[loc[0]:loc[1]])
+			continue
 		}
-		return url.PathEscape(v)
-	})
-	return out, ok && !strings.Contains(out, "${")
+		// The value is written for where the placeholder SITS: a whole URL when it opens the
+		// template (NEON_AI_GATEWAY_BASE_URL), a bare host after `scheme://` (DATABRICKS_HOST is
+		// often set with its scheme), a path segment anywhere else. Escaping all three as a segment
+		// broke the live neon row (2026-09-29 audit, round 123, F123-L2-2).
+		switch {
+		case loc[0] == 0:
+			u, err := url.Parse(v)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+				ok = false
+				out.WriteString(base[loc[0]:loc[1]])
+				continue
+			}
+			out.WriteString(strings.TrimRight(v, "/"))
+		case strings.HasSuffix(base[:loc[0]], "://"):
+			host := strings.TrimRight(strings.TrimPrefix(strings.TrimPrefix(v, "https://"), "http://"), "/")
+			if !catalogBareHostRE.MatchString(host) {
+				ok = false
+				out.WriteString(base[loc[0]:loc[1]])
+				continue
+			}
+			out.WriteString(host)
+		default:
+			out.WriteString(url.PathEscape(v))
+		}
+	}
+	out.WriteString(base[last:])
+	return out.String(), ok && !strings.Contains(out.String(), "${")
 }
+
+var catalogBareHostRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$`)
 
 func firstSetEnv(env []string) string {
 	for _, name := range env {

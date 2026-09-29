@@ -693,6 +693,13 @@ func (t ToolFunctionParameters) SchemaJSON() json.RawMessage { return t.raw }
 // and both put the zero value's `{"type":"","properties":null}` on the wire
 // (2026-09-27 audit, round 51).
 func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
+	// The typed decode below re-reads every subtree at every level, so its cost grows with the
+	// square of the nesting: a 148 KB schema nested 4000 deep took 8 s, four such tools 33 s, and
+	// the launch proxy converts each request twice. No real schema is near this deep; Go's own
+	// decoder allows 10000 (2026-09-29 audit, round 123, F123-L1-4).
+	if jsonDepthExceeds(data, maxToolSchemaDepth) {
+		return fmt.Errorf("tool schema is nested deeper than %d levels", maxToolSchemaDepth)
+	}
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -713,6 +720,39 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 	}
 	t.raw = append(json.RawMessage(nil), data...)
 	return nil
+}
+
+// maxToolSchemaDepth is the deepest JSON nesting a tool's parameter schema may have.
+const maxToolSchemaDepth = 256
+
+// jsonDepthExceeds reports, in one pass, whether data nests objects and arrays deeper than max.
+func jsonDepthExceeds(data []byte, max int) bool {
+	depth, inStr, esc := 0, false, false
+	for _, c := range data {
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{', '[':
+			depth++
+			if depth > max {
+				return true
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return false
 }
 
 // isJSONNull reports whether the bytes are the JSON literal null, which every

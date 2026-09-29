@@ -61,6 +61,7 @@
       "upstream_id": "oaica-nemotron-30b-a3b",
       "owned_by": "oaica",
       "upstream_addr": "http://127.0.0.1:30120",
+      "metered_downstream": true,
       "context_length": 262144,
       "max_completion_tokens": 32768,
       "pricing": {

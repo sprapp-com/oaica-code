@@ -74,3 +74,30 @@ func TestRound122ClientCannotStateTheMeteredMarkerUnlessTrusted(t *testing.T) {
 		t.Errorf("the trusted tier's marker should pass and nothing else: %q", got)
 	}
 }
+
+// F123-L3-1 (2026-09-29 audit, round 123): the in-tree deploy config keeps the gateway's own marker
+// — its key is on the "openrouter" tier — so oaicalb does not meter every gateway turn again.
+func TestRound123InTreeConfigTrustsTheGatewaysTier(t *testing.T) {
+	for name, cfg := range map[string]gkConfig{"default": defaultConfig()} {
+		found := false
+		for _, tier := range cfg.TrustedMeteredTiers {
+			if tier == "openrouter" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s config does not trust the openrouter tier: %v", name, cfg.TrustedMeteredTiers)
+		}
+	}
+	cfg, err := parseConfig("../a100b/gatekeeper.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := map[string]bool{}
+	for _, tier := range cfg.TrustedMeteredTiers {
+		trusted[tier] = true
+	}
+	if !trusted["openrouter"] {
+		t.Errorf("tools/a100b/gatekeeper.json does not trust the gateway's tier: %v", cfg.TrustedMeteredTiers)
+	}
+}

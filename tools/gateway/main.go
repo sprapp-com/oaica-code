@@ -345,6 +345,12 @@ type gwModel struct {
 	// model on a different upstream that needs a key names it here
 	// (2026-09-29 audit, round 109, F109-L3-3).
 	UpstreamKeyEnv string `json:"upstream_key_env,omitempty"`
+	// MeteredDownstream marks a per-model upstream_addr that is OUR OWN hop with its own usage
+	// reporter (an oaicalb with meterhub_addr set, as the Nemotron pool is): the marker that
+	// stops it reporting a turn this gateway already billed is sent to it. Without it every
+	// per-model upstream was treated as third-party and got no marker, so that pool was
+	// metered twice (2026-09-29 audit, round 123, F123-L3-2).
+	MeteredDownstream bool `json:"metered_downstream,omitempty"`
 }
 
 // distinctUpstreams counts the backends this config actually fans out to --
@@ -3303,7 +3309,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// upstream is sent neither that marker nor the caller's address, which
 	// ReverseProxy appends to X-Forwarded-For unless the header is present and nil
 	// (2026-09-29 audit, round 109, F109-L3-3).
-	if foreignUpstream {
+	if foreignUpstream && !m.MeteredDownstream {
 		r.Header["X-Forwarded-For"] = nil
 	} else {
 		r.Header.Set("X-Oaica-Metered", "1")

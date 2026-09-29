@@ -144,6 +144,10 @@ oaica serve kat-coder-i-compact --ncmoe 34 --threads 6 \
   --api-key "$(openssl rand -hex 24)"
 ```
 
+Prefer the environment for the key: `OAICA_SERVE_API_KEY="$(openssl rand -hex 24)" oaica serve … --host 0.0.0.0`.
+A `--api-key` on the command line sits in `/proc/<pid>/cmdline`, readable by every local user, for as
+long as the server runs; the environment is readable only by its owner.
+
 Any OpenAI client then works against it:
 
 ```bash
@@ -163,7 +167,7 @@ Endpoints: `/v1/chat/completions`, `/v1/messages` (Anthropic shape, so
 Claude Code works too), `/v1/models`, `/health` (unauthenticated, for
 health checks).
 
-**`--api-key` is mandatory off loopback.** `oaica serve` refuses a
+**A key (`OAICA_SERVE_API_KEY` or `--api-key`) is mandatory off loopback.** `oaica serve` refuses a
 non-loopback `--host` without one, because that would publish an
 unauthenticated inference server — anyone who can reach the port could use
 your GPU. `--insecure` overrides this, and should only be used on a

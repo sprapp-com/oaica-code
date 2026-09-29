@@ -995,13 +995,19 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		bindHost = "127.0.0.1"
 	}
 	apiKey, _ := cmd.Flags().GetString("api-key")
+	// The key can come from the environment: on the command line it sits in /proc/<pid>/cmdline,
+	// readable by every local user, for the server's whole life (2026-09-29 audit, round 123,
+	// F123-L1-5).
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("OAICA_SERVE_API_KEY"))
+	}
 	insecure, _ := cmd.Flags().GetBool("insecure")
 	// Binding off-loopback publishes an inference server. Without a key
 	// anyone who can reach the port can use (and bill) your GPU, so this
 	// is a hard stop rather than a warning — --insecure is the explicit
 	// opt-out for trusted private networks.
 	if bindHost != "127.0.0.1" && bindHost != "localhost" && apiKey == "" && !insecure {
-		return fmt.Errorf("refusing to bind %s without --api-key: that exposes an unauthenticated inference server to the network.\n\nEither set one:\n  oaica serve %s --host %s --api-key \"$(openssl rand -hex 24)\"\n\nor, only on a network you fully trust, pass --insecure", bindHost, model, bindHost)
+		return fmt.Errorf("refusing to bind %s without --api-key: that exposes an unauthenticated inference server to the network.\n\nEither set one (the environment keeps it out of the process list):\n  OAICA_SERVE_API_KEY=\"$(openssl rand -hex 24)\" oaica serve %s --host %s\n\nor, only on a network you fully trust, pass --insecure", bindHost, model, bindHost)
 	}
 
 	modelPath, err := oaicaModelPath(model)

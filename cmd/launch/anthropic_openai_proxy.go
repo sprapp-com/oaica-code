@@ -2852,6 +2852,25 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	scanner.Buffer(make([]byte, 0, 64*1024), int(httpbody.DefaultMax))
 
 	toolAccums := map[int]*toolAccum{}
+	// slotsByID / slotsByName index the accumulators by the id and name they carry, so the slot
+	// lookup below asks the few that match instead of walking every call in the turn on every
+	// fragment (quadratic in the number of calls: 20000 calls, 3 s; 250k, minutes) (2026-09-29 audit,
+	// round 123, F123-L2-1 measurement of the round-122 record).
+	slotsByID := map[string]map[int]struct{}{}
+	slotsByName := map[string]map[int]struct{}{}
+	reindex := func(idx map[string]map[int]struct{}, key string, slot int, add bool) {
+		if key == "" {
+			return
+		}
+		if add {
+			if idx[key] == nil {
+				idx[key] = map[int]struct{}{}
+			}
+			idx[key][slot] = struct{}{}
+			return
+		}
+		delete(idx[key], slot)
+	}
 	// toolArrival is the order the stream first wrote each slot — the order the
 	// calls were INTRODUCED, which is the order flushToolCalls hands them to the
 	// client. The slot is the upstream's own index whenever it states one, so
@@ -2921,6 +2940,13 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		if !strings.HasPrefix(s, "{") {
 			return true
+		}
+		// A JSON object can only be complete if it ends in a closing brace: asked of every
+		// fragment, json.Valid re-read everything received so far, and one call streamed a token
+		// at a time cost 28 s for 195 KB of arguments against 0.2 s with this test (2026-09-29
+		// audit, round 123, F123-L2-1).
+		if !strings.HasSuffix(s, "}") {
+			return false
 		}
 		return json.Valid([]byte(s))
 	}
@@ -3083,8 +3109,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 	openSlotStating := func(id, name string, indexSeen, freshIndex bool) (int, bool) {
 		if id != "" && !freshIndex {
 			byID, found := -1, false
-			for s, a := range toolAccums {
-				if a.id != id || argsFinished(a.args.String()) {
+			for s := range slotsByID[id] {
+				a := toolAccums[s]
+				if a == nil || a.id != id || argsFinished(a.args.String()) {
 					continue
 				}
 				if !found || s < byID {
@@ -3097,8 +3124,9 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		}
 		if name != "" && indexSeen {
 			byName, count := -1, 0
-			for s, a := range toolAccums {
-				if a.name != name || argsFinished(a.args.String()) {
+			for s := range slotsByName[name] {
+				a := toolAccums[s]
+				if a == nil || a.name != name || argsFinished(a.args.String()) {
 					continue
 				}
 				if count == 0 || s < byName {
@@ -3406,6 +3434,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 		// adopt paths, so the two agree (round 23).
 		streamedText += toolCallArgumentsSize(tcs)
 		toolAccums = map[int]*toolAccum{}
+		slotsByID, slotsByName = map[string]map[int]struct{}{}, map[string]map[int]struct{}{}
 		// The arrival order is the map's own lifetime: a slot written again
 		// after this flush is a call of the next turn's output, not one of these.
 		toolArrival = map[int]int{}
@@ -4627,10 +4656,14 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 					acc.statedSlots[*tc.Index] = true
 				}
 				if tc.ID != "" {
+					reindex(slotsByID, acc.id, slot, false)
 					acc.id = tc.ID
+					reindex(slotsByID, acc.id, slot, true)
 				}
 				if tc.Function.Name != "" {
+					reindex(slotsByName, acc.name, slot, false)
 					acc.name = tc.Function.Name
+					reindex(slotsByName, acc.name, slot, true)
 				}
 				if tc.Function.Arguments != "" {
 					acc.args.WriteString(tc.Function.Arguments)

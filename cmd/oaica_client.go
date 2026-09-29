@@ -118,7 +118,10 @@ func oaicaDiagnosis(text string) string {
 // (httpbody.DefaultMax is 64 MiB), and this is the string a user pastes into a
 // support ticket.
 func oaicaDiagnosisBody(body []byte) string {
-	return oaicaDiagnosis(truncateForError(body))
+	// Redacted BEFORE it is cut: cut first, a key that crosses the boundary is left as a fragment the
+	// exact-match redaction cannot see, and 21 of its 40 characters printed (2026-09-29 audit,
+	// round 123, F123-L1-1).
+	return truncateForError([]byte(oaicaDiagnosis(string(body))))
 }
 
 // oaicaPrintableCells renders each of a router-supplied list's entries for a

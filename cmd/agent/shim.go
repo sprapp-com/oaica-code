@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -201,8 +202,25 @@ func newShimClient(baseURL, token, model string, meta launch.AgentModelMeta) *sh
 		token:      token,
 		model:      model,
 		meta:       meta,
-		httpClient: &http.Client{Timeout: shimTimeout},
+		httpClient: &http.Client{Timeout: shimTimeout, CheckRedirect: launch.CredentialSafeRedirect},
 	}
+}
+
+// safeErr redacts the bearer this client sent from an upstream error and bounds its length: a
+// vendor's refusal routinely echoes the key it rejected, and the message came through whole, up to a
+// mebibyte (2026-09-29 audit, round 123, F123-L1-2).
+func (s *shimClient) safeErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if s.token != "" {
+		msg = launch.RedactDiagnosis(msg, s.token)
+	}
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	return errors.New(msg)
 }
 
 func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.ChatResponseFunc) error {
@@ -229,7 +247,7 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp)
+		return s.safeErr(parseAPIError(resp))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -271,7 +289,7 @@ func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.Chat
 		}
 		deltas, done, err := acc.Feed(envelope.Type, []byte(data))
 		if err != nil {
-			return err
+			return s.safeErr(err)
 		}
 		for _, d := range deltas {
 			if err := fn(d); err != nil {

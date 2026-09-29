@@ -47,7 +47,7 @@ Relevant when assessing an issue, and when deciding what to report:
   configured). There is no telemetry, no crash reporting, and no analytics.
   Two requests happen without you asking, and neither carries a payload: an
   update check — a plain GET of the release's `VERSION.txt`, at most once per
-  20 hours, with no body and no identifiers, which tells that host your IP and
+  20 hours after a successful check (a failed attempt is retried after 30 minutes), with no body and no identifiers, which tells that host your IP and
   that oaica is installed (`OAICA_NO_UPDATE_CHECK=1` turns it off) — and, on an
   install that has been activated, a revalidation of that licence at most once
   every 7 days, sending only the key and activation id already stored. Beyond

@@ -55,7 +55,10 @@ func defaultConfig() gkConfig {
 		UpstreamAddr: "http://127.0.0.1:30099",
 		ListenAddr:   ":30098",
 
-		TrustedMeteredTiers: []string{"internal"},
+		// The gateway's own upstream credential is a gatekeeper key on the "openrouter" tier
+		// (tools/a100b/README.md, stack_watchdog.sh); trusting only "internal" stripped its marker and
+		// made oaicalb meter every gateway turn a second time (2026-09-29 audit, round 123, F123-L3-1).
+		TrustedMeteredTiers: []string{"internal", "openrouter"},
 	}
 }
 
@@ -228,8 +231,8 @@ func main() {
 	flag.Parse()
 
 	g := &gate{cfg: loadConfig(*configPath)}
-	log.Printf("gatekeeper: %d keys, tiers=%v, upstream=%s, listen=%s",
-		len(g.cfg.Keys), g.cfg.Tiers, g.cfg.UpstreamAddr, g.cfg.ListenAddr)
+	log.Printf("gatekeeper: trusted_metered_tiers=%v; %d keys, tiers=%v, upstream=%s, listen=%s",
+		g.cfg.TrustedMeteredTiers, len(g.cfg.Keys), g.cfg.Tiers, g.cfg.UpstreamAddr, g.cfg.ListenAddr)
 
 	// SIGHUP reload: rotate/add/revoke keys without dropping in-flight
 	// requests or bouncing the process.

@@ -2102,6 +2102,8 @@ type anthropicBridge struct {
 // through a bare arguments fragment and through a held block swept at end of
 // stream (2026-09-27 audit, round 39, B-F8).
 type toolBlock struct {
+	// scan is the incremental reading of args (see argScan); reset wherever args is.
+	scan argScan
 	// index is the block's index on the wire, assigned when it opens; -1 until
 	// then, because a block that opens later takes a later index (see nextIdx).
 	index int
@@ -3369,7 +3371,7 @@ func (b *anthropicBridge) toolKey(upIdx *int, id, name, args string) string {
 		return key
 	}
 	cur := b.toolBlocks[key]
-	if cur == nil || !namesItself(cur) || (callArgsExtend(cur.args.String(), args) && !cur.closed) {
+	if cur == nil || !namesItself(cur) || (cur.argsExtend(args) && !cur.closed) {
 		return key
 	}
 	b.synthSeq++
@@ -3564,7 +3566,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			if last := b.toolBlocks[b.lastToolKey]; last != nil && namesItself(last) &&
 				last.name == name && argsAreMidObject(last.args.String()) &&
 				strings.TrimSpace(args) != "" &&
-				callArgsExtend(last.args.String(), args) {
+				last.argsExtend(args) {
 				b.lastToolName = name
 				b.noteIndexKey(*upIdx, b.lastToolKey)
 				return b.lastToolKey
@@ -3574,7 +3576,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
 			((!namesItself(tb) && (id != "" || name != "")) ||
 				(id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
-				((id != "" || name != "") && strings.TrimSpace(args) != "" && !callArgsExtend(tb.args.String(), args)) ||
+				((id != "" || name != "") && strings.TrimSpace(args) != "" && !tb.argsExtend(args)) ||
 				// The slot carries a call that has accumulated NO arguments, and
 				// a fragment names that same call again WITH arguments. An empty
 				// argument list is a COMPLETE one — a call that takes no
@@ -3594,7 +3596,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				(name != "" && name == tb.name && (id == "" || !tb.statedID || id == tb.id) &&
 					strings.TrimSpace(tb.args.String()) == "") ||
 				(id != "" && name != "" && strings.TrimSpace(args) == "" && tb.statedID && id == tb.id &&
-					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && argsAreFinished(tb.args.String()))) {
+					name == tb.name && strings.TrimSpace(tb.args.String()) != "" && tb.argsFinished())) {
 			// A fragment at an OCCUPIED slot that introduces a distinct call
 			// begins the next one. The first clause is the occupant's own
 			// answer: a block that never named itself is not a call — its bytes
@@ -3684,7 +3686,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			return b.lastToolKey
 		}
 		if tb := b.toolBlocks[key]; tb != nil && id == "" && name == "" &&
-			argsAreFinished(tb.args.String()) {
+			tb.argsFinished() {
 			// An argument-only fragment whose block already holds a FINISHED
 			// argument list is not more of that call: two finished objects do
 			// not concatenate into JSON, and the document arm reads them as two
@@ -3695,7 +3697,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			// interleaved-parallel order (2026-09-28 audit, round 59,
 			// F59-L3-1's second shape).
 			if last := b.toolBlocks[b.lastToolKey]; b.lastToolKey != "" && b.lastToolKey != key && last != nil &&
-				!argsAreFinished(last.args.String()) {
+				!last.argsFinished() {
 				return b.lastToolKey
 			}
 			// Nothing goes to a block that carries no call here: the fragment
@@ -3729,7 +3731,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				newest = key
 			}
 			if tb := b.toolBlocks[key]; tb == nil || strings.TrimSpace(tb.args.String()) == "" ||
-				argsAreFinished(tb.args.String()) {
+				tb.argsFinished() {
 				if len(b.indexChain[*upIdx]) == 0 {
 					// The index has named no call at all, so there is no chain to
 					// walk: the vendor numbered its own fragments and closed the
@@ -3765,7 +3767,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				}
 				for _, k := range b.indexChain[*upIdx] {
 					held := b.toolBlocks[k]
-					if k == newest || held == nil || argsAreFinished(held.args.String()) {
+					if k == newest || held == nil || held.argsFinished() {
 						continue
 					}
 					key = k
@@ -3851,7 +3853,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 		// new call outright, which is why this asks only about a key already
 		// accumulated.
 		if tb := b.toolBlocks[key]; tb != nil && !namesItself(tb) && name != "" && strings.TrimSpace(args) != "" &&
-			!callArgsExtend(tb.args.String(), args) {
+			!tb.argsExtend(args) {
 			// A fragment that NAMES itself over a block that has never named
 			// itself, whose bytes the block's arguments cannot take, is the next
 			// call — this arm's reading of the clause the index arm already
@@ -3901,7 +3903,7 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 			// already holds the minted id and it is kept (2026-09-27 audit,
 			// round 45, B45-1).
 			if cur := b.toolBlocks[b.lastToolKey]; cur != nil &&
-				(!cur.statedID || (cur.id == id && callArgsExtend(cur.args.String(), args))) {
+				(!cur.statedID || (cur.id == id && cur.argsExtend(args))) {
 				if !cur.started {
 					cur.id = ""
 				}
@@ -4410,7 +4412,7 @@ func restatesCarriedCall(tb *toolBlock, id, name, args string) bool {
 	// audit, round 80, F80-L3-1). No guard is needed HERE: an empty argument
 	// list is not `argsAreFinished`, so the check below already refuses it (a
 	// guard was written, measured not to be load-bearing, and removed).
-	if !argsAreFinished(acc) || !argsAreFinished(args) {
+	if !tb.argsFinished() || !argsAreFinished(args) {
 		return false
 	}
 	return canonicalCallArgs(acc) == canonicalCallArgs(args)
@@ -4675,7 +4677,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 		b.namelessRunKey = ""
 	}
 	if args != "" {
-		if namesItself(tb) && !callArgsExtend(tb.args.String(), args) {
+		if namesItself(tb) && !tb.argsExtend(args) {
 			// Bytes this call's arguments cannot take: a whole object after a
 			// finished one or after a freeform line, or a whole object onto an
 			// object the model was still writing. No block of this bridge can
@@ -4792,7 +4794,7 @@ func (b *anthropicBridge) toolDelta(upIdx *int, id, name, args string) {
 			// (finishStream), which opens it with its empty input.
 			return
 		}
-		if !finishedObjectArgs(tb.args.String()) {
+		if !tb.finishedObject() {
 			// The arguments stated so far are an object the upstream has not
 			// finished writing, so opening now would hand the client the half an
 			// object — and the object it opens with is the input the client RUNS.
@@ -5054,7 +5056,7 @@ func (b *anthropicBridge) openBlockStillWriting(tb *toolBlock) bool {
 	if b.cur == nil || b.cur.tool == nil || b.cur.tool == tb {
 		return false
 	}
-	return !argsAreFinished(b.cur.tool.args.String())
+	return !b.cur.tool.argsFinished()
 }
 
 // startToolBlock emits the content_block_start for one tool call, once, and
@@ -5291,6 +5293,7 @@ func (b *anthropicBridge) finishStream() {
 			// delta has gone out — which is why the bytes can still be re-spelled.
 			wrapped := rawFallbackArgs(strings.TrimSpace(tb.args.String()))
 			tb.args.Reset()
+			tb.scan = argScan{}
 			tb.args.WriteString(wrapped)
 		}
 		b.closeOpen()
@@ -6447,3 +6450,114 @@ func readCappedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 
 // readCloserBytes wraps bytes in a fresh NopCloser reader (replacement body).
 func readCloserBytes(b []byte) io.ReadCloser { return io.NopCloser(bytes.NewReader(b)) }
+
+// argScan reads a tool call's argument text once, as it arrives. argsAreFinished and
+// finishedObjectArgs re-ran json.Valid over ALL the text received so far on every fragment: one
+// 32k-token call streamed a token at a time cost 31 s of CPU on /v1/messages while the chat door
+// relayed the same body in 30 ms (2026-09-29 audit, round 123, F123-L3-3). The scan tracks depth
+// and string state over only the new bytes, and json.Valid runs when the top-level object has
+// just closed — once per closure, not once per fragment.
+type argScan struct {
+	n          int  // bytes of args already read
+	started    bool // a non-space byte has been seen
+	first      byte
+	depth      int
+	inStr      bool
+	esc        bool
+	closed     bool // the top-level object closed
+	trail      bool // a non-space byte followed the close
+	validKnown bool
+	valid      bool
+}
+
+func (tb *toolBlock) advanceScan() {
+	s := tb.args.String()
+	sc := &tb.scan
+	if len(s) < sc.n {
+		*sc = argScan{}
+	}
+	for i := sc.n; i < len(s); i++ {
+		c := s[i]
+		space := c == ' ' || c == '\t' || c == '\n' || c == '\r'
+		if !sc.started {
+			if space {
+				continue
+			}
+			sc.started, sc.first = true, c
+		}
+		if sc.first != '{' {
+			break // not an object: nothing further matters
+		}
+		if sc.closed {
+			if !space {
+				sc.trail = true
+			}
+			continue
+		}
+		if sc.inStr {
+			if sc.esc {
+				sc.esc = false
+			} else if c == '\\' {
+				sc.esc = true
+			} else if c == '"' {
+				sc.inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			sc.inStr = true
+		case '{', '[':
+			sc.depth++
+		case '}', ']':
+			sc.depth--
+			if sc.depth <= 0 {
+				sc.closed = true
+				sc.validKnown = false
+			}
+		}
+	}
+	sc.n = len(s)
+}
+
+// finishedObject is finishedObjectArgs(tb.args.String()), incrementally.
+func (tb *toolBlock) finishedObject() bool {
+	tb.advanceScan()
+	sc := &tb.scan
+	if !sc.started || sc.first != '{' || !sc.closed || sc.trail {
+		return false
+	}
+	if !sc.validKnown {
+		sc.valid = json.Valid([]byte(strings.TrimSpace(tb.args.String())))
+		sc.validKnown = true
+	}
+	return sc.valid
+}
+
+// argsFinished is argsAreFinished(tb.args.String()), incrementally.
+func (tb *toolBlock) argsFinished() bool {
+	tb.advanceScan()
+	if !tb.scan.started {
+		return false
+	}
+	if tb.scan.first != '{' {
+		return true
+	}
+	return tb.finishedObject()
+}
+
+// argsExtend is callArgsExtend(tb.args.String(), args), incrementally.
+func (tb *toolBlock) argsExtend(args string) bool {
+	a := strings.TrimSpace(tb.args.String())
+	d := strings.TrimSpace(args)
+	if d == "" || a == "" {
+		return true
+	}
+	if tb.finishedObject() {
+		return false
+	}
+	if strings.HasPrefix(a, "{") {
+		return true
+	}
+	return !strings.HasPrefix(d, "{")
+}
