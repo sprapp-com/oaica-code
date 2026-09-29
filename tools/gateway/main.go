@@ -3642,7 +3642,59 @@ func main() {
 		MaxHeaderBytes:    64 << 10,
 		// No WriteTimeout: streamed completions run for minutes.
 	}
-	log.Fatal(srv.ListenAndServe())
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("oaica-gateway: %v", err)
+	}
+	stop, cancelStop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancelStop()
+	if err := serveUntilDone(stop, srv, ln, shutdownGrace); err != nil {
+		log.Fatalf("oaica-gateway: %v", err)
+	}
+	log.Printf("oaica-gateway: shut down cleanly")
+}
+
+// shutdownGrace is how long in-flight streams get to finish after SIGTERM or SIGINT before they
+// are cut. Kept under systemd's default 90 s stop timeout.
+const shutdownGrace = 60 * time.Second
+
+// serveUntilDone serves srv on ln until ctx is done, then drains: it stops accepting, lets the
+// requests in flight finish for grace, then cancels their context so the remainder take the
+// existing aborted-row path, and returns once the handlers are done. main() ended with
+// log.Fatal(srv.ListenAndServe()) and trapped only SIGHUP, so a SIGTERM (a restart, a deploy,
+// `docker stop`) ended the process at once: every in-flight stream was cut mid-frame with no
+// terminal event, and none got a ledger row, because the row is written after ServeHTTP returns
+// and a signal death runs nothing — a turn the upstream generated and billed left no trace, and the
+// overage accounting never saw it (2026-09-29 audit, round 114, F114-L3-1).
+func serveUntilDone(ctx context.Context, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	base, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	srv.BaseContext = func(net.Listener) context.Context { return base }
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	log.Printf("oaica-gateway: shutting down: no new connections; in-flight requests get %s to finish", grace)
+	gctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := srv.Shutdown(gctx); err != nil {
+		// The grace period is over. Cancelling the requests' context makes the streams still
+		// running return through the aborted-row path; the second Shutdown waits for them.
+		log.Printf("oaica-gateway: grace period over (%v): aborting the remaining streams", err)
+		cancelBase()
+		wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wcancel()
+		if err := srv.Shutdown(wctx); err != nil {
+			_ = srv.Close()
+		}
+	}
+	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // choiceFanOut reports whether a request field asks for more than one completion.
