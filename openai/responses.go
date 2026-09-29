@@ -394,9 +394,10 @@ type ResponsesRequest struct {
 
 	Tools []ResponsesTool `json:"tools,omitempty"`
 
-	// TODO(drifkin): tool_choice is not supported. We could support "none" by not
-	// passing tools, but the other controls like `"required"` cannot be generally
-	// supported.
+	// optional `string | object`. Only the string "none" is honoured, by not
+	// passing tools (the way FromChatRequest and the Anthropic converter honour
+	// it); the other controls like `"required"` cannot be generally supported.
+	ToolChoice any `json:"tool_choice,omitempty"`
 
 	// optional, default is false
 	Stream *bool `json:"stream,omitempty"`
@@ -557,6 +558,14 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 				format = r.Text.Format.Schema
 			}
 		}
+	}
+
+	// "none" means the model must not call a tool, and the only way to honour
+	// that on this wire is to send no tools: chat and Anthropic already do, and
+	// Responses sent them all, so one agent got a forbidden call on one surface
+	// only (2026-09-29 audit, round 105, F105-L1-2).
+	if tc, ok := r.ToolChoice.(string); ok && strings.EqualFold(strings.TrimSpace(tc), "none") {
+		tools = nil
 	}
 
 	return &api.ChatRequest{

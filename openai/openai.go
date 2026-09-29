@@ -566,12 +566,12 @@ func ToModel(r api.ShowResponse, m string) Model {
 // FromChatRequest converts a ChatCompletionRequest to api.ChatRequest
 func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	var messages []api.Message
-	for _, msg := range r.Messages {
+	for mi, msg := range r.Messages {
 		toolName := ""
 		if strings.ToLower(msg.Role) == "tool" {
 			toolName = msg.Name
 			if toolName == "" && msg.ToolCallID != "" {
-				toolName = nameFromToolCallID(r.Messages, msg.ToolCallID)
+				toolName = nameFromToolCallID(r.Messages, mi, msg.ToolCallID)
 			}
 		}
 		switch content := msg.Content.(type) {
@@ -658,6 +658,15 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 			// same result unpaired with its call while the string spelling kept
 			// both — the upstream body differed by `tool_call_id`, and the model
 			// saw an answer to nothing (2026-09-29 audit, round 104, F104-L1-1).
+			// An array that held no part and carried no calls is still a TURN:
+			// `content: ""` keeps it as an empty message, Anthropic keeps it and
+			// Responses keeps it, and the chat array spelling deleted it — the
+			// user's turn vanished, and a body whose only turn was `content: []`
+			// reached the handler as no messages and was answered with a
+			// synthetic 200 (2026-09-29 audit, round 105, F105-L1-1).
+			if len(messages) == first {
+				messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning})
+			}
 			if msg.ToolCallID != "" {
 				for i := first; i < len(messages); i++ {
 					messages[i].ToolCallID = msg.ToolCallID
@@ -806,15 +815,30 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 	}, nil
 }
 
-func nameFromToolCallID(messages []Message, toolCallID string) string {
-	// iterate backwards to be more resilient to duplicate tool call IDs (this
-	// follows "last one wins")
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		for _, tc := range msg.ToolCalls {
+func nameFromToolCallID(messages []Message, at int, toolCallID string) string {
+	// A result answers the call BEFORE it, so the search starts at the message
+	// ahead of the result and walks backwards: nearest first. Clients and local
+	// proxies commonly repeat ids like `call_0` every turn, and "last one wins"
+	// over the whole request named an earlier result after a LATER call that
+	// happened to reuse its id (2026-09-29 audit, round 105, F105-L1-3). Calls
+	// after the result are the fallback, so a request that lists the result
+	// first still finds its call.
+	find := func(i int) string {
+		for _, tc := range messages[i].ToolCalls {
 			if tc.ID == toolCallID {
 				return tc.Function.Name
 			}
+		}
+		return ""
+	}
+	for i := at - 1; i >= 0; i-- {
+		if name := find(i); name != "" {
+			return name
+		}
+	}
+	for i := at + 1; i < len(messages); i++ {
+		if name := find(i); name != "" {
+			return name
 		}
 	}
 	return ""
