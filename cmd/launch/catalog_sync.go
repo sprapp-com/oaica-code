@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
 
 const defaultCatalogSyncURL = "https://models.dev/api.json"
@@ -71,6 +73,20 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 	if err != nil {
 		return CatalogSyncReport{URL: url}, err
 	}
+	// A cache that will not parse, with the ETag of the whole body beside it (an
+	// interrupted write left it), answers 304 for ever, and the byte-identical early
+	// return below reported "unchanged, 0 providers" with exit 0 until the upstream's
+	// ETag happened to change. Fetch it again without the ETag; the fresh body and its
+	// new ETag replace both (2026-09-29 audit, round 112, F112-L2-2). Removing the old
+	// ETag first, and writing the ETag atomically, were measured not load-bearing.
+	if fromCache && etag != "" {
+		if _, perr := parseModelsDevCatalog(body); perr != nil {
+			body, newEtag, fromCache, err = fetchCatalogBody(url, "", cachePath)
+			if err != nil {
+				return CatalogSyncReport{URL: url}, err
+			}
+		}
+	}
 
 	// Byte-identical to what we already hold: nothing to validate, nothing to
 	// write. (The ETag path usually catches this; file:// has no ETag.)
@@ -112,7 +128,12 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 			return CatalogSyncReport{URL: url}, err
 		}
-		if err := os.WriteFile(cachePath, body, 0o600); err != nil {
+		// Atomic, as ProviderSync's cache is: os.WriteFile truncates the live path
+		// first, so a write that failed part-way (a full disk, Ctrl-C, SIGKILL during
+		// `oaica model catalog sync`) destroyed the last good catalog and left the
+		// picker with none (2026-09-29 audit, round 112, F112-L2-2). The body goes
+		// first and the ETag after it, so an ETag never names a body that is not there.
+		if err := fileutil.WriteFileAtomic(cachePath, body, 0o600); err != nil {
 			return CatalogSyncReport{URL: url}, err
 		}
 		if newEtag != "" {

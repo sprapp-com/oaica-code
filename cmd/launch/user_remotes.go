@@ -1058,7 +1058,12 @@ func fetchRemoteModelsCached(r userRemote) ([]string, error) {
 			if ttl <= 0 {
 				ttl = remoteModelsCacheTTL.Seconds()
 			}
-			if time.Since(f.SavedAt) < time.Duration(ttl*float64(time.Second)) {
+			// A negative age is a cache written while the clock was ahead (a wrong
+			// RTC, a restored VM snapshot) and since corrected: `age < ttl` then
+			// held until the clock caught up, and a remembered failure or a stale
+			// list was served for days with no upstream request. It is not a cache
+			// (2026-09-29 audit, round 112, F112-L2-1).
+			if age := time.Since(f.SavedAt); age >= 0 && age < time.Duration(ttl*float64(time.Second)) {
 				if f.Error != "" {
 					return nil, errors.New(f.Error)
 				}

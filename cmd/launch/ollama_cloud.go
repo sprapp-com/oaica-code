@@ -74,16 +74,23 @@ func ollamaCloudModelIDsErr() ([]string, error) {
 			var c ollamaCloudCache
 			if json.Unmarshal(b, &c) == nil {
 				age := time.Since(c.SavedAt)
-				if c.Error != "" && age < ollamaCloudErrorTTL {
-					return nil, fmt.Errorf("%s", c.Error)
-				}
-				if c.Error == "" && age < ollamaCloudCacheTTL && len(c.IDs) > 0 {
-					return c.IDs, nil
-				}
-				// Stale-but-within-grace copies still serve — a menu hours
-				// old beats no menu; refresh happens next launch.
-				if c.Error == "" && age < 6*ollamaCloudCacheTTL && len(c.IDs) > 0 {
-					return c.IDs, nil
+				// A cache dated in the future is not a cache, in any of the three
+				// readings below: it was written while the clock was ahead and the
+				// clock has since been corrected, so `age < ttl` held until it caught
+				// up and a remembered failure or a stale list was served for days
+				// (2026-09-29 audit, round 112, F112-L2-1).
+				if age >= 0 {
+					if c.Error != "" && age < ollamaCloudErrorTTL {
+						return nil, fmt.Errorf("%s", c.Error)
+					}
+					if c.Error == "" && age < ollamaCloudCacheTTL && len(c.IDs) > 0 {
+						return c.IDs, nil
+					}
+					// Stale-but-within-grace copies still serve — a menu hours
+					// old beats no menu; refresh happens next launch.
+					if c.Error == "" && age < 6*ollamaCloudCacheTTL && len(c.IDs) > 0 {
+						return c.IDs, nil
+					}
 				}
 			}
 		}
