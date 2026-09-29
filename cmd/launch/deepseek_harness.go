@@ -56,7 +56,7 @@ func (d *DeepSeekHarness) Run(_ string, _ []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = deepSeekHarnessLaunchEnv(os.Environ())
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func deepSeekHarnessLaunchArgs(patchPath string, args []string) []string {

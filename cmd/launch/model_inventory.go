@@ -467,6 +467,12 @@ func pickerCacheInputPaths() []string {
 	}
 	add(userRemotesPath())
 	add(authStorePath())
+	// The synced models.dev catalogue sizes every catalogue-origin row (window, output,
+	// fallback rows): `oaica model catalog sync` moved them while the cached menu kept the
+	// old numbers for up to an hour (2026-09-29 audit, round 117, F117-L2-3).
+	if p, err := catalogCachePath(); err == nil {
+		add(p)
+	}
 	if p, err := licenseFilePath(); err == nil {
 		add(p)
 	}

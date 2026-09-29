@@ -341,8 +341,11 @@ func buildDoctorReport() (string, bool) {
 		// layout check this list exists to answer is decided HERE and the
 		// report was silent on it (2026-09-26 audit).
 		describeFile(&b, filepath.Join(home, ".oaica"), true)
-		describeFile(&b, filepath.Join(home, ".oaica", "auth.json"), true)
-		describeFile(&b, filepath.Join(home, ".oaica", "remotes.json"), true)
+		// The stores IN USE: OAICA_AUTH_FILE / OAICA_REMOTES_FILE move them, and checking
+		// the default paths reported "absent" for two 0644 credential files the client
+		// was reading (2026-09-29 audit, round 117, F117-L2-2).
+		describeFile(&b, authStorePath(), true)
+		describeFile(&b, userRemotesPath(), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "api_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license_key"), true)
 		describeFile(&b, filepath.Join(home, ".oaica", "license.json"), true)

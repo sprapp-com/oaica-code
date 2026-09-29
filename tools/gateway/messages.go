@@ -101,6 +101,21 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// And a key that is no longer entitled (canceled, suspended, over its window cap) is
+	// refused before the body too: the OpenAI doors answer that first, and here it cost a full
+	// 16 MiB buffer-parse-convert per connection plus body-content feedback. check() is cached,
+	// so completionHandler's own call — still the authority for isOverage — is free
+	// (2026-09-29 audit, round 117, F117-L3-1).
+	if ent := g.entitlementSnapshot(); ent != nil {
+		if allowed, reason, _ := ent.check(key.Label); !allowed {
+			status, code := http.StatusForbidden, "subscription_required"
+			if strings.HasPrefix(reason, "rate limit:") {
+				status, code = http.StatusTooManyRequests, "rate_limited"
+			}
+			writeAnthropicErrorVal(w, status, map[string]any{"code": code, "type": code, "message": reason})
+			return
+		}
+	}
 	body, err := readCappedBody(w, r)
 	if err != nil {
 		return // readCappedBody already wrote the error

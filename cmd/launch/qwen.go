@@ -322,7 +322,7 @@ func (q *Qwen) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = qwenLaunchEnv(model)
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func (q *Qwen) Paths() []string {

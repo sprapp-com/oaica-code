@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/ollama/ollama/types/model"
@@ -227,7 +228,20 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	// The destination directory can be pruned away between the caller's MkdirAll and this
+	// rename (a delete of a sibling model empties and removes it), and the temp file was
+	// written elsewhere, so nothing kept it alive: made again a few times, as the temp
+	// directory is (2026-09-29 audit, round 117, F117-L1-1).
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = os.Rename(tmpName, path); err == nil || !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		if merr := os.MkdirAll(filepath.Dir(path), 0o755); merr != nil {
+			err = merr
+			break
+		}
+	}
+	if err != nil {
 		os.Remove(tmpName)
 		// A host or namespace directory symlinked onto another filesystem cannot be renamed
 		// into from .tmp. Write beside the target instead: the window in which a listing can
@@ -280,7 +294,17 @@ func Manifests(continueOnError bool) (map[model.Name]*Manifest, error) {
 
 	ms := make(map[model.Name]*Manifest)
 	for _, match := range matches {
+		// A manifest deleted between the glob and here is not corruption: the listing is of
+		// the models that are present. It failed /api/tags with a 500 while /api/show
+		// served the rest, whatever continueOnError said. The fallback writer's own temp
+		// name is never a model (2026-09-29 audit, round 117, F117-L1-2).
+		if strings.HasPrefix(filepath.Base(match), ".manifest-") {
+			continue
+		}
 		fi, err := os.Stat(match)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

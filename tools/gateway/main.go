@@ -999,6 +999,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 	if err != nil {
 		return fmt.Errorf("open ledger %s: %w", cfg.LedgerPath, err)
 	}
+	closeOffPartialRow(f, cfg.LedgerPath)
 	var ef *os.File
 	if cfg.UpstreamErrorLogPath != "" {
 		ef, err = os.OpenFile(cfg.UpstreamErrorLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -1006,6 +1007,7 @@ func (g *gateway) apply(cfg gwConfig) error {
 			f.Close() // don't leak the already-opened ledger (audit L15)
 			return fmt.Errorf("open upstream error log %s: %w", cfg.UpstreamErrorLogPath, err)
 		}
+		closeOffPartialRow(ef, cfg.UpstreamErrorLogPath)
 	}
 	g.mu.Lock()
 	retired := g.proxies
@@ -1253,6 +1255,31 @@ func deliverMeterReport(client *http.Client, done <-chan struct{}, addr, token s
 // returns them. Called while apply() holds the write lock, so no sender is
 // between its read of g.meterCh and its send: the reports it returns are the
 // whole of what the retired reporter had left.
+// closeOffPartialRow ends a JSONL file that a previous process left mid-row. appendRow repairs a
+// failed write inside the running process, but a fragment from an earlier one (a full disk, a
+// kill -9, the pre-round-112 binary) took the first row billed after startup or a reload onto its
+// own line: one unparseable line, no log, and the meterhub total ahead of the ledger. A newline is
+// appended rather than the file cut back, so the fragment stays for forensics (2026-09-29 audit,
+// round 117, F117-L3-2).
+func closeOffPartialRow(f *os.File, path string) {
+	rf, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer rf.Close()
+	st, err := rf.Stat()
+	if err != nil || st.Size() == 0 {
+		return
+	}
+	var last [1]byte
+	if _, err := rf.ReadAt(last[:], st.Size()-1); err != nil || last[0] == '\n' {
+		return
+	}
+	if _, err := f.Write([]byte("\n")); err == nil {
+		log.Printf("oaica-gateway: %s ended mid-row (a previous run was cut short); closed the partial row off so the next row is its own line", path)
+	}
+}
+
 func drainMeterChannel(ch chan usageReport) []usageReport {
 	if ch == nil {
 		return nil
@@ -1278,14 +1305,25 @@ func requeueMeterReports(ch chan usageReport, reports []usageReport) int {
 	}
 	dropped := 0
 	for _, rep := range reports {
+		// A shutdown-flush sentinel is not a billing report: one that cannot ride onto the
+		// new reporter is released (its flush has nothing left to wait for) and never counted
+		// as a dropped record (2026-09-29 audit, round 117, F117-L3-3).
 		if ch == nil {
-			dropped++
+			if rep.flush != nil {
+				close(rep.flush)
+			} else {
+				dropped++
+			}
 			continue
 		}
 		select {
 		case ch <- rep:
 		default:
-			dropped++
+			if rep.flush != nil {
+				close(rep.flush)
+			} else {
+				dropped++
+			}
 		}
 	}
 	return dropped

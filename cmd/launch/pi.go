@@ -55,7 +55,7 @@ func (p *Pi) Run(_ string, _ []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func ensureNpmInstalled() error {

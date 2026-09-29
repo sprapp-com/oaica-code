@@ -113,6 +113,13 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 	if prev, rerr := os.ReadFile(cachePath); rerr == nil && sameBytes(prev, body) {
 		f, _ := parseModelsDevCatalog(body)
 		pn, mn := f.counts()
+		// The bytes are proven to be THIS source's, so the source and validator are
+		// recorded as ProviderSync always does: left as they were, a cache confirmed
+		// against D stayed bound to the mirror it was first fetched from, D was refetched in
+		// full on every sync, and D unreachable was refused for holding "a different
+		// source's" cache (2026-09-29 audit, round 117, F117-L2-1).
+		saveCatalogETag(cachePath+".etag", display, newEtag)
+		saveCatalogCacheSource(cachePath, display)
 		return CatalogSyncReport{URL: display, Providers: pn, Models: mn, Unchanged: true}, nil
 	}
 

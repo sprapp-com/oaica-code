@@ -164,7 +164,7 @@ func (o *OMP) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func ensureOMPWebSearchPlugin(bin string) {

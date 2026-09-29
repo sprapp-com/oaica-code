@@ -72,7 +72,7 @@ func (o *OpenCode) Run(model string, models []LaunchModel, args []string) error 
 	if content := o.resolveContent(model, models); content != "" {
 		cmd.Env = append(cmd.Env, "OPENCODE_CONFIG_CONTENT="+content)
 	}
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func ensureOpenCodeInstalled() (string, error) {

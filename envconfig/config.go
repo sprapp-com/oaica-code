@@ -132,7 +132,7 @@ func KeepAlive() (keepAlive time.Duration) {
 		if d, err := time.ParseDuration(s); err == nil {
 			keepAlive = d
 		} else if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			keepAlive = time.Duration(n) * time.Second
+			keepAlive = secondsToDuration(n)
 		}
 	}
 
@@ -141,6 +141,20 @@ func KeepAlive() (keepAlive time.Duration) {
 	}
 
 	return keepAlive
+}
+
+// secondsToDuration reads n seconds, saturating instead of wrapping: a number too large for a
+// Duration used to wrap to a fraction of a second while the same number as a request's keep_alive
+// meant "forever" (2026-09-29 audit, round 117, F117-L1-3).
+func secondsToDuration(n int64) time.Duration {
+	const max = int64(math.MaxInt64) / int64(time.Second)
+	if n > max {
+		return time.Duration(math.MaxInt64)
+	}
+	if n < -max {
+		return time.Duration(math.MinInt64)
+	}
+	return time.Duration(n) * time.Second
 }
 
 // LoadTimeout returns the duration for stall detection during model loads. LoadTimeout can be configured via the OLLAMA_LOAD_TIMEOUT environment variable.
@@ -152,7 +166,7 @@ func LoadTimeout() (loadTimeout time.Duration) {
 		if d, err := time.ParseDuration(s); err == nil {
 			loadTimeout = d
 		} else if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-			loadTimeout = time.Duration(n) * time.Second
+			loadTimeout = secondsToDuration(n)
 		}
 	}
 

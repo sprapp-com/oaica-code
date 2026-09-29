@@ -123,7 +123,9 @@ func TestDoctorReport_ShortValuesAreNotTreatedAsSecrets(t *testing.T) {
 func TestDoctorReport_FlagsWorldReadableCredentials(t *testing.T) {
 	home := t.TempDir()
 	setLaunchTestHome(t, home)
-	authPath := filepath.Join(home, ".oaica", "auth.json")
+	// The store IN USE: the test home isolates it through OAICA_AUTH_FILE, and the report
+	// checks that file, not the default path (2026-09-29 audit, round 117, F117-L2-2).
+	authPath := authStorePath()
 	if err := os.MkdirAll(filepath.Dir(authPath), 0o700); err != nil {
 		t.Fatal(err)
 	}

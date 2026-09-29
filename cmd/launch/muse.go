@@ -155,7 +155,7 @@ func (m *Muse) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome)
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func (m *Muse) Edit(models []LaunchModel) error {

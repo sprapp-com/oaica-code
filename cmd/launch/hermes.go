@@ -85,7 +85,7 @@ func (h *Hermes) Run(_ string, _ []LaunchModel, args []string) error {
 	}); err != nil {
 		return err
 	}
-	return hermesAttachedCommand(bin, args...).Run()
+	return runChild(hermesAttachedCommand(bin, args...))
 }
 
 type HermesDesktop struct {
@@ -102,7 +102,7 @@ func (h *HermesDesktop) Run(_ string, _ []LaunchModel, args []string) error {
 	if err := h.ensureHermesDesktopMinVersion(bin); err != nil {
 		return err
 	}
-	return hermesAttachedCommand(bin, h.launchArgs(args)...).Run()
+	return runChild(hermesAttachedCommand(bin, h.launchArgs(args)...))
 }
 
 func (h *HermesDesktop) ensureHermesDesktopMinVersion(bin string) error {

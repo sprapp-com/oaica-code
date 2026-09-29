@@ -80,5 +80,5 @@ func (p *Poolside) Run(model string, _ []LaunchModel, args []string) error {
 		"POOLSIDE_STANDALONE_BASE_URL="+poolsideBaseURLFor(model),
 		"POOLSIDE_API_KEY="+poolsideKeyFor(model),
 	)
-	return cmd.Run()
+	return runChild(cmd)
 }

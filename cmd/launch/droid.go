@@ -56,7 +56,7 @@ func (d *Droid) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func (d *Droid) Paths() []string {
