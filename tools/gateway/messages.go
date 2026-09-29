@@ -5719,6 +5719,105 @@ type oaToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
+// UnmarshalJSON reads one tool call of this wire. `arguments` is spelled as a
+// STRING holding the argument object's text, which is what every arm of this leg
+// relays — but a server that hands its own parse of the model's object rather
+// than the text of it states the same arguments as a JSON VALUE, and the plain
+// string fields below refused the whole frame, and the whole document, for it:
+// the fragment arm dropped the frame silently and the turn still reached the
+// client as one that ended normally with no call at all, while the two document
+// arms answered 502 "unparseable upstream response" — three readings of one
+// upstream body, none of them the call (2026-09-29 audit, round 100, F100-L3-1).
+// A value is read as its own compact JSON, which is the text the string spelling
+// would have carried; an absent, empty or null field states nothing.
+func (tc *oaToolCall) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Index    json.RawMessage `json:"index"`
+		ID       string          `json:"id"`
+		Type     string          `json:"type"`
+		Function *struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"function"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	idx, err := oaIndexValue(raw.Index)
+	if err != nil {
+		return err
+	}
+	tc.Index, tc.ID, tc.Type, tc.Name = idx, raw.ID, raw.Type, raw.Name
+	if raw.Function != nil {
+		tc.Function.Name = raw.Function.Name
+		a, err := oaArgumentText(raw.Function.Arguments)
+		if err != nil {
+			return err
+		}
+		tc.Function.Arguments = a
+	}
+	a, err := oaArgumentText(raw.Arguments)
+	if err != nil {
+		return err
+	}
+	tc.Arguments = a
+	return nil
+}
+
+// oaIndexValue answers the slot one call states: a number as itself, and a
+// numeric string as the number it spells. A server that stringifies its integers
+// states the same slot that way, and the typed pointer refused the whole frame
+// for it — the same three readings the argument value above gets, and the same
+// fix's second half: the fragment arm dropped the frame and reported the turn
+// ended with no call, the document arms answered 502 (2026-09-29 audit, round
+// 100, F100-L3-1). An absent, empty or null index states none.
+func oaIndexValue(raw json.RawMessage) (*int, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(s) == "" {
+			return nil, nil
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil {
+			return nil, err
+		}
+		return &n, nil
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+// oaArgumentText answers the argument text one `arguments` field states: a string
+// as itself, any other JSON value as its own compact JSON.
+func oaArgumentText(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
 // relayDelta writes one turn's content into the bridge: reasoning, then text,
 // then its tool calls. Both wire shapes go through it.
 func (b *anthropicBridge) relayDelta(d oaDelta) {
