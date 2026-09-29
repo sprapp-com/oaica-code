@@ -332,7 +332,7 @@ func fetchModelCatalog(url, display string) (modelManifest, bool, error) {
 		return modelManifest{}, false, fmt.Errorf("%s returned 304 but no cached copy from that URL is on disk", display)
 	case resp.StatusCode != http.StatusOK:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return modelManifest{}, false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, strings.TrimSpace(string(body)))
+		return modelManifest{}, false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, PrintableCell(redactCredentials(strings.TrimSpace(string(body)))))
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))

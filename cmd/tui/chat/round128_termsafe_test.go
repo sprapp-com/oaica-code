@@ -56,3 +56,11 @@ func TestRound129ResumedAndSlashEntriesCarryNoControlSequences(t *testing.T) {
 		t.Errorf("a slash entry carries a control sequence: %q", e.content)
 	}
 }
+
+// F130-L1-3: tool-call arguments on rebuilt and approval entries are terminal-safe.
+func TestRound130EntryArgsCarryNoControlSequences(t *testing.T) {
+	e := newChatEntry(chatEntry{role: "tool", args: map[string]any{"command": hostileText}})
+	if v, _ := e.args["command"].(string); strings.ContainsAny(v, "\x1b\a\r") {
+		t.Errorf("entry args carry a control sequence: %q", v)
+	}
+}

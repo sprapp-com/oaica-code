@@ -1001,6 +1001,15 @@ func meterableCompletionPath(path string) bool {
 	return path == "/v1/chat/completions" || path == "/v1/completions" || path == "/v1/responses" || path == "/v1/messages"
 }
 
+// unmeteredGenerationPath: routes that generate but are not read by the meter.
+func unmeteredGenerationPath(path string) bool {
+	switch path {
+	case "/invocations", "/generative_scoring":
+		return true
+	}
+	return strings.HasPrefix(path, "/inference/") || strings.HasPrefix(path, "/v1/chat/completions/") || strings.HasPrefix(path, "/v1/completions/")
+}
+
 // forcesStreamUsage: only the chat/completions routes take stream_options; the others state usage anyway.
 func forcesStreamUsage(path string) bool {
 	return path == "/v1/chat/completions" || path == "/v1/completions"
@@ -1024,6 +1033,13 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && unmeteredGenerationPath(r.URL.Path) && !requestAlreadyMetered(r) {
+			// vLLM serves chat completions on more routes than the four this meter reads
+			// (`/invocations` picks the API by the shape of the body); a turn served there left no row
+			// (2026-09-29 audit, round 130, F130-L3-2).
+			writeMeterRefusal(w, http.StatusNotFound, "this route is not served here")
+			return
+		}
 		if r.Method != http.MethodPost || !meterableCompletionPath(r.URL.Path) || requestAlreadyMetered(r) {
 			next(w, r)
 			return
@@ -1082,26 +1098,34 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		rec := &usageRecorder{ResponseWriter: w, stream: reqDoc.Stream}
+		// The report is deferred: a client that hangs up mid-stream makes httputil.ReverseProxy panic with
+		// http.ErrAbortHandler, and a report written after next() was skipped with it, so a turn whose prefill
+		// and partial decode were served left no meter row (2026-09-29 audit, round 130, F130-L3-1).
+		defer func() {
+			p := recover()
+			rec.finish()
+			// serveWith sets X-Katlb-Backend on rec (the ResponseWriter it was
+			// handed) before proxying -- read it back here rather than
+			// threading the picked *backend through meterAndServe's signature.
+			// Unlike the gateway (which strips this header from what the
+			// public client sees), oaicalb leaves it on the response as-is
+			// today for anyone hitting it directly -- an existing, separate,
+			// lower-priority concern not addressed by this change.
+			backend := rec.Header().Get("X-Katlb-Backend")
+
+			metered.report(usageRecord{
+				RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
+				Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: boundedText(r.Header.Get("X-Session-Id"), 128),
+				Model: boundedText(reqDoc.Model, 256), UpstreamModel: boundedText(reqDoc.Model, 256), Path: r.URL.Path,
+				Stream: rec.stream, Status: rec.status,
+				PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,
+				LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen, Aborted: p != nil,
+			})
+			if p != nil {
+				panic(p)
+			}
+		}()
 		next(rec, r)
-		rec.finish()
-
-		// serveWith sets X-Katlb-Backend on rec (the ResponseWriter it was
-		// handed) before proxying -- read it back here rather than
-		// threading the picked *backend through meterAndServe's signature.
-		// Unlike the gateway (which strips this header from what the
-		// public client sees), oaicalb leaves it on the response as-is
-		// today for anyone hitting it directly -- an existing, separate,
-		// lower-priority concern not addressed by this change.
-		backend := rec.Header().Get("X-Katlb-Backend")
-
-		metered.report(usageRecord{
-			RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
-			Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: boundedText(r.Header.Get("X-Session-Id"), 128),
-			Model: boundedText(reqDoc.Model, 256), UpstreamModel: boundedText(reqDoc.Model, 256), Path: r.URL.Path,
-			Stream: rec.stream, Status: rec.status,
-			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,
-			LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen,
-		})
 	}
 }
 

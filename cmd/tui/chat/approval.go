@@ -111,7 +111,7 @@ func (m *chatModel) upsertApprovalToolEntries(request coreagent.ApprovalRequest)
 		m.entries[idx].label = toolInvocationLabel(call.ToolName, call.Args)
 		m.entries[idx].status = "approval"
 		m.entries[idx].toolID = call.ToolCallID
-		m.entries[idx].args = call.Args
+		m.entries[idx].args = termsafeArgs(call.Args)
 		m.entries[idx].startedAt = time.Now()
 		m.applyToolOutputModeTo(idx)
 		m.markEntryDirty(idx)

@@ -877,6 +877,12 @@ func resolvedMaxToolRounds(model string, value int) int {
 // the ceiling. If the message already fits, it is returned with only the
 // small-context rune cap applied.
 func (s *Session) toolMessageWithBudget(toolName, toolCallID, content string, opts RunOptions, baseTokens, budgetTokens int) api.Message {
+	// toolOutputFullyOmitted reads the marker back out of the content, so genuine output that begins with the
+	// marker's words (a file, a page, an echo) must not be able to pass for it and force a full compaction
+	// (2026-09-29 audit, round 130, F130-L1-5).
+	if strings.HasPrefix(content, toolOutputFullOmissionPrefix) {
+		content = "(output) " + content
+	}
 	maxRunes := maxToolResultRunes
 	if limit := smallContextToolResultLimitRunes(s.contextWindowTokens(opts)); limit > 0 {
 		maxRunes = min(maxRunes, limit)

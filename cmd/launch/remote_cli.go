@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/ollama/ollama/cmd/internal/fileutil"
 )
@@ -511,7 +512,7 @@ func isControlRune(r rune) bool {
 	switch {
 	case r < 0x20, r == 0x7f:
 		return true
-	case r == 0x85: // NEL
+	case r >= 0x80 && r <= 0x9f: // C1: U+009B is CSI and U+009D is OSC to a terminal that honours 8-bit controls
 		return true
 	case r >= 0x2028 && r <= 0x2029: // LINE / PARAGRAPH SEPARATOR
 		return true
@@ -534,7 +535,7 @@ func isControlRune(r rune) bool {
 // `oaica remote list` or a second field line in `remote show` (2026-09-26
 // audit, ninth round).
 func printableName(name string) string {
-	if strings.ContainsFunc(name, isControlRune) {
+	if !utf8.ValidString(name) || strings.ContainsFunc(name, isControlRune) {
 		return strconv.Quote(name)
 	}
 	return name

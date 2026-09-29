@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ollama/ollama/agent"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 )
 
 // terminalApprovalPrompter asks for tool approval on the terminal, one
@@ -89,7 +90,12 @@ func compactMap(m map[string]any) string {
 		// %q: the values are written by the MODEL, and a raw CR or escape sequence in one redraws the
 		// question line, so the user approves a command other than the one shown (2026-09-29 audit,
 		// round 127, F127-L1-5).
-		parts = append(parts, fmt.Sprintf("%s=%s", k, quoteArg(m[k])))
+		// The KEY is the model's too: the registry does not reject unknown keys (round 130, F130-L1-4).
+		name := k
+		if termsafe.Text(k) != k {
+			name = strconv.Quote(k)
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", name, quoteArg(m[k])))
 	}
 	return strings.Join(parts, " ")
 }

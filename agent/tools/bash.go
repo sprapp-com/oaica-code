@@ -186,7 +186,7 @@ func hasUnsafeRecursiveDelete(command string) bool {
 	// target") as an rm argument. Splitting on separators first restores
 	// command boundaries while still catching multi-target single commands
 	// like "rm -rf build /etc".
-	var earlier []string // words of the segments before this one, for `echo ~ | xargs rm -rf`
+	var piped []string // the literal words `echo`/`printf` in the segment just before hand to `xargs rm -rf`
 	for _, segment := range shellSegments(command) {
 		// `r\m` is rm to the shell; the backslash-to-slash rewrite turned it into `r/m`, while a Windows path needs
 		// that rewrite: scan both spellings.
@@ -195,15 +195,30 @@ func hasUnsafeRecursiveDelete(command string) bool {
 				if isRMCommand(field) && rmCommandDeletesUnsafeTarget(fields[i+1:]) {
 					return true
 				}
-				if field == "xargs" && i+1 < len(fields) && isRMCommand(fields[i+1]) && rmCommandDeletesUnsafeTarget(append(append([]string{}, fields[i+2:]...), earlier...)) {
-					return true
+				if field == "xargs" {
+					// Flags and wrappers (`-0`, `-I{} `, `sudo`) sit between xargs and the rm it runs.
+					for j := i + 1; j < len(fields); j++ {
+						if isRMCommand(fields[j]) {
+							if rmCommandDeletesUnsafeTarget(append(append([]string{}, fields[j+1:]...), piped...)) {
+								return true
+							}
+							break
+						}
+					}
 				}
 				if isPowerShellDeleteCommand(field) && powerShellDeleteCommandDeletesUnsafeTarget(fields[i+1:]) {
 					return true
 				}
 			}
 		}
-		earlier = append(earlier, shellSafetyFields(segment)...)
+		piped = nil
+		if f := shellSafetyFields(segment); len(f) > 1 && (f[0] == "echo" || f[0] == "printf") {
+			for _, w := range f[1:] {
+				if !strings.HasPrefix(w, "-") {
+					piped = append(piped, w)
+				}
+			}
+		}
 	}
 	return false
 }
@@ -277,8 +292,7 @@ func powerShellDeleteCommandDeletesUnsafeTarget(fields []string) bool {
 }
 
 func readsCredentialPath(command string) bool {
-	fields := shellSafetyFields(command)
-	if !hasCredentialReadVerb(fields) {
+	if !commandHasCredentialReadVerb(command) {
 		return false
 	}
 	normalized := shellSafetyText(command)
@@ -292,12 +306,24 @@ func readsCredentialPath(command string) bool {
 			return true
 		}
 	}
-	for _, field := range strings.Fields(normalized) {
-		if globNamesCredential(field) {
-			return true
+	// A glob only matters in the segment that reads, and a quoted word is not expanded by the shell.
+	for _, segment := range shellSegments(command) {
+		if !commandHasCredentialReadVerb(segment) {
+			continue
+		}
+		for _, word := range strings.Fields(strings.NewReplacer("(", " ", ")", " ", "<", " ", ">", " ").Replace(segment)) {
+			if !strings.ContainsAny(word, "'\"`") && globNamesCredential(word) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// commandHasCredentialReadVerb asks both spellings: `ca\t` is cat to the shell, while the backslash-to-slash
+// rewrite reads it as a path (2026-09-29 audit, round 130, F130-L1-7).
+func commandHasCredentialReadVerb(command string) bool {
+	return hasCredentialReadVerb(shellSafetyFields(command)) || hasCredentialReadVerb(shellSafetyFields(strings.ReplaceAll(command, "\\", "")))
 }
 
 // globNamesCredential reports whether a shell glob word (`~/.ssh/id_rs?`, `~/.ssh/id_*`) can expand to a
@@ -315,6 +341,11 @@ func globNamesCredential(word string) bool {
 		tail := segs[len(segs)-len(want):]
 		ok := true
 		for i := range want {
+			// A shell glob never matches a dot-name unless its own pattern starts with a literal dot.
+			if strings.HasPrefix(want[i], ".") && !strings.HasPrefix(tail[i], ".") {
+				ok = false
+				break
+			}
 			if m, err := path.Match(tail[i], want[i]); err != nil || !m {
 				ok = false
 				break
@@ -331,7 +362,7 @@ func globNamesCredential(word string) bool {
 // once relative paths and directory symlinks are resolved (`keys/id_rsa` with `keys -> ~/.ssh`) is refused,
 // as the Read tool refuses it (2026-09-29 audit, round 129, F129-L1-3).
 func refuseCredentialWords(workingDir, command string) error {
-	if !hasCredentialReadVerb(shellSafetyFields(command)) {
+	if !commandHasCredentialReadVerb(command) {
 		return nil
 	}
 	for _, word := range strings.Fields(strings.NewReplacer(";", " ", "&", " ", "|", " ", "(", " ", ")", " ", "\"", "", "'", "", "<", " ", ">", " ").Replace(command)) {

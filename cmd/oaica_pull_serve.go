@@ -622,11 +622,14 @@ func oaicaPullModel(model string) (string, error) {
 		return "", fmt.Errorf("pull failed: HTTP %d: %s", resp.StatusCode, readPullErrorBody(resp.Body))
 	}
 
-	tmpPath := destPath + ".partial"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// One temp file per pull: two concurrent pulls of a model shared `<dest>.partial`, each truncating the other's
+	// bytes, and the winner installed a file whose hash it had checked on the wire, not on disk (2026-09-29 audit,
+	// round 130, F130-L2-1).
+	f, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+".partial-*")
 	if err != nil {
 		return "", err
 	}
+	tmpPath := f.Name()
 	defer f.Close()
 
 	fmt.Fprintf(os.Stderr, "pulling %s (%s)...\n", model, humanBytes(manifest.SizeBytes))
@@ -720,11 +723,14 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 		return "", fmt.Errorf("HF download failed: HTTP %d: %s", resp.StatusCode, readPullErrorBody(resp.Body))
 	}
 
-	tmpPath := destPath + ".partial"
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// One temp file per pull: two concurrent pulls of a model shared `<dest>.partial`, each truncating the other's
+	// bytes, and the winner installed a file whose hash it had checked on the wire, not on disk (2026-09-29 audit,
+	// round 130, F130-L2-1).
+	f, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+".partial-*")
 	if err != nil {
 		return "", err
 	}
+	tmpPath := f.Name()
 	defer f.Close()
 
 	body := io.Reader(newStallGuard(resp.Body, pullStallTimeout))

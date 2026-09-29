@@ -52,7 +52,7 @@ func Preview(ctx context.Context, dir string, port int) (string, error) {
 		fmt.Fprint(w, previewPage(filepath.Base(dir)))
 	})
 
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: previewHostGuard(mux)}
 	go func() { _ = srv.Serve(ln) }()
 	go func() {
 		<-ctx.Done()
@@ -77,6 +77,13 @@ func Preview(ctx context.Context, dir string, port int) (string, error) {
 // file, per request — buys nothing an ordinary copy would not also defeat).
 func servableUnder(root, urlPath string) bool {
 	rel := strings.TrimPrefix(urlPath, "/site/")
+	// Export refuses to publish dotfiles (.env, .git, .dev.vars) and secret-shaped names; the preview must not
+	// hand them to a browser either (2026-09-29 audit, round 130, F130-L2-3).
+	for _, part := range strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if isPrivateName(part) || part == "node_modules" {
+			return false
+		}
+	}
 	full := filepath.Join(root, filepath.FromSlash(rel))
 
 	realRoot, err := filepath.EvalSymlinks(root)
@@ -119,4 +126,22 @@ iframe{border:0;width:100%%;height:calc(100%% - 42px);background:#fff;display:bl
 <span class="w"><button onclick="f.style.width='100%%'">desktop</button><button onclick="f.style.width='820px'">tablet</button><button onclick="f.style.width='390px'">phone</button></span></div>
 <iframe id="f" sandbox="" src="/site/" title="site preview"></iframe>
 </body></html>`, html.EscapeString(name))
+}
+
+// previewHostGuard answers only requests addressed to this machine: a page on another origin whose DNS name was
+// rebound to 127.0.0.1 sends its own name as Host, and the preview would otherwise serve the site to it
+// (2026-09-29 audit, round 130, F130-L2-3).
+func previewHostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.ToLower(strings.Trim(host, "[]"))
+		if ip := net.ParseIP(host); host != "localhost" && !strings.HasSuffix(host, ".localhost") && (ip == nil || !ip.IsLoopback()) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

@@ -1828,6 +1828,9 @@ func newChatEntry(entry chatEntry) chatEntry {
 	// live events, and all of that is model-, tool- or repository-authored: the live path was made
 	// terminal-safe in round 128 and this one was not (2026-09-29 audit, round 129, F129-L1-2).
 	entry.content, entry.label, entry.detail = termsafe.Text(entry.content), termsafe.Text(entry.label), termsafe.Text(entry.detail)
+	// The arguments too: an expanded tool entry prints `$ <command>` from them, on resume, after /compact and
+	// on the approval entry (2026-09-29 audit, round 130, F130-L1-3).
+	entry.args = termsafeArgs(entry.args)
 	return entry
 }
 
