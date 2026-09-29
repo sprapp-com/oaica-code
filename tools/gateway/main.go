@@ -172,6 +172,65 @@ func selectPricingTier(tiers []gwPricingTier, promptTokens int) (gwPricingTier, 
 // size no bracket covers), so it is rejected at load rather than papered
 // over at request time -- consistent with loadConfig refusing any other
 // config that would produce wrong-but-plausible behavior.
+// scrubUpstreamHeaders removes from an upstream response's headers (or trailers)
+// what must not reach the public client. The gateway deleted five named headers
+// (its own audit L16) and relayed every other, on both doors; a cookie a model's own
+// upstream set landed on the public origin, and X-Powered-By, an X-Upstream-* or
+// X-Gatekeeper-* label, an Alt-Svc, or a redirect to an internal address named the
+// inside (2026-09-29 audit, round 109, F109-L3-1). A denylist by name and by prefix
+// rather than an allowlist, because clients read headers this gateway cannot
+// enumerate (rate-limit families, request ids, content negotiation) and a dropped one
+// breaks them silently.
+func scrubUpstreamHeaders(h http.Header) {
+	for _, name := range []string{"X-Katlb-Backend", "X-Gatekeeper-Tier", "X-Gatekeeper-Limit", "Via", "Server",
+		"Set-Cookie", "X-Powered-By", "Alt-Svc", "Location"} {
+		h.Del(name)
+	}
+	for k := range h {
+		for _, prefix := range []string{"X-Gatekeeper-", "X-Katlb-", "X-Upstream-"} {
+			if strings.HasPrefix(http.CanonicalHeaderKey(k), prefix) {
+				h.Del(k)
+			}
+		}
+	}
+}
+
+// trailerScrubBody scrubs resp.Trailer once the body has been read to its end, which
+// is when the transport fills it in.
+type trailerScrubBody struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (b *trailerScrubBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		scrubUpstreamHeaders(b.resp.Trailer)
+	}
+	return n, err
+}
+
+// validateFlatPricing checks the flat per-token prices the way validatePricingTiers
+// checks the tiers: a stated price is a finite, non-negative decimal. Empty stays
+// allowed (it bills as zero, today's behaviour). NaN made a served turn's ledger row
+// fail to encode and vanish, and a negative price booked a negative cost; neither was
+// caught on load (2026-09-29 audit, round 111, F111-L3-3).
+func validateFlatPricing(p gwPricing) error {
+	for name, s := range map[string]string{"prompt": p.Prompt, "completion": p.Completion, "cached_prompt": p.CachedPrompt} {
+		if s == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("pricing.%s %q is not a finite decimal number", name, s)
+		}
+		if v < 0 {
+			return fmt.Errorf("pricing.%s %q must not be negative", name, s)
+		}
+	}
+	return nil
+}
+
 func validatePricingTiers(tiers []gwPricingTier) error {
 	if len(tiers) == 0 {
 		return nil
@@ -570,6 +629,11 @@ func loadConfig(path string) (gwConfig, error) {
 		}
 	}
 	for i, m := range cfg.Models {
+		if err := validateFlatPricing(m.Pricing); err != nil {
+			return cfg, fmt.Errorf("models[%d] (%s): %w", i, m.ID, err)
+		}
+	}
+	for i, m := range cfg.Models {
 		if err := validatePricingTiers(m.PricingTiers); err != nil {
 			return cfg, fmt.Errorf("models[%d] (%s): %w", i, m.ID, err)
 		}
@@ -663,30 +727,22 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 			*b = resp.Header.Get("X-Katlb-Backend")
 		}
 		// Internal topology must not leak to the public (audit L16: Via and
-		// Server name internal hops too).
-		resp.Header.Del("X-Katlb-Backend")
-		resp.Header.Del("X-Gatekeeper-Tier")
-		resp.Header.Del("X-Gatekeeper-Limit")
-		resp.Header.Del("Via")
-		resp.Header.Del("Server")
-		// The five above were the hops this gateway knew of on the day it was
-		// written; every header an upstream adds afterwards reached callers, on
-		// both doors. A cookie a model's own upstream sets landed on the public
-		// origin, and X-Powered-By, an X-Upstream-* or X-Gatekeeper-* label, an
-		// Alt-Svc, or a redirect to an internal address named the inside
-		// (2026-09-29 audit, round 109, F109-L3-1). A denylist by name and by
-		// prefix rather than an allowlist, because clients read headers this
-		// gateway cannot enumerate (rate-limit families, request ids, content
-		// negotiation) and a dropped one breaks them silently.
-		for _, h := range []string{"Set-Cookie", "X-Powered-By", "Alt-Svc", "Location"} {
-			resp.Header.Del(h)
-		}
-		for k := range resp.Header {
-			for _, prefix := range []string{"X-Gatekeeper-", "X-Katlb-", "X-Upstream-"} {
-				if strings.HasPrefix(http.CanonicalHeaderKey(k), prefix) {
-					resp.Header.Del(k)
-				}
-			}
+		// Server name internal hops too), and neither may an upstream cookie: see
+		// scrubUpstreamHeaders. The same scrub applies to TRAILERS, which the
+		// header pass never reached: a cookie or an internal name an upstream sent
+		// as a trailer reached the public client, and on /v1/messages as an
+		// ordinary header, because the bridge writes its own headers after the
+		// proxy has stored the trailers under a Trailer: prefix (2026-09-29 audit,
+		// round 111, F111-L3-2).
+		scrubUpstreamHeaders(resp.Header)
+		if resp.Trailer != nil {
+			scrubUpstreamHeaders(resp.Trailer)
+			// ReverseProxy re-announces the trailer names from resp.Trailer itself, so
+			// the upstream's own Trailer header is dropped rather than rewritten.
+			resp.Header.Del("Trailer")
+			// The values arrive when the body is read to its end, into the same
+			// map; scrub again at that moment.
+			resp.Body = &trailerScrubBody{ReadCloser: resp.Body, resp: resp}
 		}
 		// gatekeeper (429/401) and katlb (503) answer with text/plain or a
 		// non-OpenAI JSON; normalize so clients see {"error":{...}} and keep
@@ -2450,7 +2506,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		inflight = v.(*atomic.Int32)
 		for {
 			cur := inflight.Load()
-			if cur >= int32(apiKey.MaxConcurrent) {
+			if int64(cur) >= int64(apiKey.MaxConcurrent) {
 				w.Header().Set("Retry-After", "1")
 				w.Header().Set("x-ratelimit-limit-requests", strconv.Itoa(apiKey.MaxConcurrent))
 				w.Header().Set("x-ratelimit-remaining-requests", "0")
@@ -2783,6 +2839,34 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// caller's key there would leak it into someone else's logs.
 	for _, h := range []string{"X-Api-Key", "Api-Key", "Cookie"} {
 		r.Header.Del(h)
+	}
+	// Control headers a CLIENT must never set, on either upstream: the gateway's own
+	// marker and the internal hops' names. A client's X-Gatekeeper-Tier: internal or
+	// X-Oaica-Metered reached the default upstream as its own, and the marker is set
+	// again below where it is the gateway's to set (2026-09-29 audit, round 111,
+	// F111-L3-1).
+	for k := range r.Header {
+		ck := http.CanonicalHeaderKey(k)
+		if strings.HasPrefix(ck, "X-Gatekeeper-") || strings.HasPrefix(ck, "X-Katlb-") || strings.HasPrefix(ck, "X-Oaica-") {
+			r.Header.Del(k)
+		}
+	}
+	// A third-party upstream is sent what it needs and nothing else. Round 109 kept
+	// the gateway's key and the caller's X-Forwarded-For from it and left every other
+	// header through: Cloudflare's Cf-Connecting-Ip and True-Client-Ip, Forwarded,
+	// X-Real-Ip and X-Forwarded-Host named the end caller, and the credential-shaped
+	// headers of other vendors (X-Goog-Api-Key, X-Auth-Token, X-Amz-Security-Token,
+	// Openai-Organization) went with them. An allowlist, because for a foreign host
+	// the failure of an unlisted header is a missing optional hint, and the failure of
+	// a listed-by-omission one is a leak.
+	if foreignUpstream {
+		for k := range r.Header {
+			switch http.CanonicalHeaderKey(k) {
+			case "Content-Type", "Content-Length", "Accept", "Accept-Encoding", "User-Agent", "X-Session-Id", "Authorization":
+			default:
+				r.Header.Del(k)
+			}
+		}
 	}
 
 	rid := newRequestID()

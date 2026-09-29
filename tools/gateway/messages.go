@@ -90,7 +90,7 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	// round 110, F110-L3-2).
 	if key.MaxConcurrent > 0 {
 		if v, ok := g.keyInflight.Load(key.Label); ok {
-			if cur := v.(*atomic.Int32).Load(); cur >= int32(key.MaxConcurrent) {
+			if cur := v.(*atomic.Int32).Load(); int64(cur) >= int64(key.MaxConcurrent) {
 				w.Header().Set("Retry-After", "1")
 				w.Header().Set("x-ratelimit-limit-requests", strconv.Itoa(key.MaxConcurrent))
 				w.Header().Set("x-ratelimit-remaining-requests", "0")
