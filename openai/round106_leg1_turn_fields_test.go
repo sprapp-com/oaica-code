@@ -75,3 +75,19 @@ func TestMine106ResponsesJSONObjectIsJSONMode(t *testing.T) {
 		t.Errorf("format = %q, want \"json\" — chat's json_object sends it (2026-09-29 audit, round 106, F106-L1-4)", out.Format)
 	}
 }
+
+// TestMine107ResponsesReadsTheFormatTypeLikeChat is F107-L1-3's pin: chat folds
+// case and space on response_format.type, and Responses compared it exactly.
+func TestMine107ResponsesReadsTheFormatTypeLikeChat(t *testing.T) {
+	var req ResponsesRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","input":"hi","text":{"format":{"type":" JSON_OBJECT "}}}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	out, err := FromResponsesRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out.Format) != `"json"` {
+		t.Errorf("format = %q, want \"json\" (2026-09-29 audit, round 107, F107-L1-3)", out.Format)
+	}
+}

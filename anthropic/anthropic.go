@@ -90,6 +90,18 @@ type MessagesRequest struct {
 
 type OutputConfig struct {
 	Effort string `json:"effort,omitempty"`
+
+	// Format is Anthropic's structured-output request: {"type":"json_schema",
+	// "schema":{...}}. Chat's response_format and Responses' text.format state the
+	// same intent and both reach the runner as ChatRequest.Format; this surface
+	// decoded only Effort, so the schema was discarded and the turn answered free
+	// text with a 200 (2026-09-29 audit, round 107, F107-L1-1).
+	Format *OutputFormat `json:"format,omitempty"`
+}
+
+type OutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema,omitempty"`
 }
 
 // StopSequences is the client's list of strings that end a turn. It is a named
@@ -644,7 +656,13 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		}
 	}
 
-	nameToolResults(messages)
+	api.NameToolResults(messages)
+
+	var format json.RawMessage
+	if r.OutputConfig != nil && r.OutputConfig.Format != nil &&
+		strings.EqualFold(strings.TrimSpace(r.OutputConfig.Format.Type), "json_schema") && len(r.OutputConfig.Format.Schema) > 0 {
+		format = r.OutputConfig.Format.Schema
+	}
 
 	stream := r.Stream
 	convertedRequest := &api.ChatRequest{
@@ -654,6 +672,7 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		Stream:   &stream,
 		Tools:    tools,
 		Think:    think,
+		Format:   format,
 	}
 	logutil.Trace("anthropic: converted request", "req", TraceChatRequest(convertedRequest))
 
@@ -4681,27 +4700,4 @@ func ConvertOllamaToAnthropicResults(ollamaResults *OllamaWebSearchResponse) []W
 		})
 	}
 	return results
-}
-
-// nameToolResults states, on every tool result that carries only the id of the
-// call it answers, the name of that call — the nearest call BEFORE it that
-// carries the id. The chat converter has always derived it, so the same history
-// reached the renderers (which read ToolName) named on chat and unnamed on the
-// other two surfaces (2026-09-29 audit, round 106, F106-L1-3).
-func nameToolResults(messages []api.Message) {
-	for i := range messages {
-		m := &messages[i]
-		if m.Role != "tool" || m.ToolName != "" || m.ToolCallID == "" {
-			continue
-		}
-	find:
-		for j := i - 1; j >= 0; j-- {
-			for _, tc := range messages[j].ToolCalls {
-				if tc.ID == m.ToolCallID {
-					m.ToolName = tc.Function.Name
-					break find
-				}
-			}
-		}
-	}
 }

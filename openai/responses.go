@@ -552,7 +552,7 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 	// Handle text format (e.g. json_schema)
 	var format json.RawMessage
 	if r.Text != nil && r.Text.Format != nil {
-		switch r.Text.Format.Type {
+		switch strings.ToLower(strings.TrimSpace(r.Text.Format.Type)) {
 		case "json_object":
 			// JSON mode: chat's response_format json_object sends Format "json";
 			// Responses ignored it and answered free text with a 200
@@ -565,7 +565,7 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		}
 	}
 
-	nameToolResults(messages)
+	api.NameToolResults(messages)
 
 	// "none" means the model must not call a tool, and the only way to honour
 	// that on this wire is to send no tools: chat and Anthropic already do, and
@@ -1710,27 +1710,4 @@ func (c *ResponsesStreamConverter) Failure(sentence string, status int) []Respon
 	return []ResponsesStreamEvent{c.newEvent("response.failed", map[string]any{
 		"response": response,
 	})}
-}
-
-// nameToolResults states, on every tool result that carries only the id of the
-// call it answers, the name of that call — the nearest call BEFORE it that
-// carries the id. The chat converter has always derived it, so the same history
-// reached the renderers (which read ToolName) named on chat and unnamed on the
-// other two surfaces (2026-09-29 audit, round 106, F106-L1-3).
-func nameToolResults(messages []api.Message) {
-	for i := range messages {
-		m := &messages[i]
-		if m.Role != "tool" || m.ToolName != "" || m.ToolCallID == "" {
-			continue
-		}
-	find:
-		for j := i - 1; j >= 0; j-- {
-			for _, tc := range messages[j].ToolCalls {
-				if tc.ID == m.ToolCallID {
-					m.ToolName = tc.Function.Name
-					break find
-				}
-			}
-		}
-	}
 }
