@@ -3454,6 +3454,52 @@ func (b *anthropicBridge) routeToolKey(upIdx *int, id, name, args string) string
 				return carried.key
 			}
 		}
+		// A named continuation that extends a call this bridge has already
+		// opened MID-OBJECT is more of THAT call, not the next one — whatever
+		// slot the vendor states for it.
+		//
+		// The wire is the vendor that writes ONE index for every call of its
+		// turn (round 58's F58-L3-2, round 62's F62-L3-3) and restates the
+		// call's name on the chunk that continues it (the habit round 62's
+		// F62-L3-2 attests, there stated with the id). The slot the fragment
+		// names is still the turn's FIRST call — the index record is first-wins
+		// and its block names itself, so the split below never re-points it —
+		// and the continuation therefore meets a block carrying a DIFFERENT
+		// name, which the occupant clause reads as the next call by round 40's
+		// A40-8. Measured: one body spelling one turn as two calls, `Read` with
+		// no arguments and `Grep` with `{"cmd":"ls"}` written as `{"cmd":` then
+		// `"ls"}`:
+		//
+		//	plain    200 [text:hi call:call_1|Read|{} call:call_2|Grep|{"cmd":"ls"}]
+		//	adopted  200 [text:hi call:call_1|Read|{} call:call_2|Grep|{"cmd":"ls"}]
+		//	framed   200 [text:hi call:call_1|Read|{} call:call_2|Grep|{"_raw":"{\"cmd\":"}
+		//	                 call:call_82073e46|Grep|{"_raw":"\"ls\"}"}]
+		//
+		// The framed arm handed its client THREE tool_use blocks for a two-call
+		// turn: the call the wire named left holding half an object it cannot
+		// run, and a call the model never wrote minted beside it — three
+		// tool_results owed for a turn that asked for two (2026-09-29 audit,
+		// round 103, F103-L3-1).
+		//
+		// Two things keep this from swallowing the wires A40-8 protects. The
+		// block must be MID-OBJECT: a call holding the empty (complete) list or
+		// a finished object cannot take more of itself, so round 78's F78-L3-2
+		// — a call that takes no arguments, then the same name with arguments —
+		// and round 38's B-F3 stay the next call (both measured RED without
+		// this clause, and green with it). And it is asked only of a fragment
+		// that states NO id: a stated id is the identity clause's question
+		// above, which must answer it.
+		if id == "" && name != "" {
+			if last := b.toolBlocks[b.lastToolKey]; last != nil && namesItself(last) &&
+				last.name == name && argsAreMidObject(last.args.String()) &&
+				strings.TrimSpace(args) != "" &&
+				callArgsExtend(last.args.String(), args) {
+				b.lastToolName = name
+				b.noteIndexKey(*upIdx, b.lastToolKey)
+				return b.lastToolKey
+			}
+		}
+
 		if tb := b.toolBlocks[key]; tb != nil && !restatesCarriedCall(tb, id, name, args) &&
 			((!namesItself(tb) && (id != "" || name != "")) ||
 				(id != "" && tb.statedID && id != tb.id) || (name != "" && tb.name != "" && name != tb.name) ||
