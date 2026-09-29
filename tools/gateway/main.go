@@ -3183,6 +3183,14 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// the Transport, the upstream may still compress and the meter and the bridge read
 	// plaintext, which is what the client is then sent (2026-09-29 audit, round 118, F118-L3-1).
 	r.Header.Del("Accept-Encoding")
+	// Connection names headers of the client-to-gateway hop, and ReverseProxy deletes every
+	// header a request lists in it AFTER this handler has set its own: a key holder sending
+	// `Connection: X-Oaica-Metered` switched off the marker that stops oaicalb metering a billed
+	// turn a second time (2026-09-29 audit, round 120, F120-L3-1). The client's Host is not the
+	// upstream's either: it reached a foreign upstream beside that upstream's credential
+	// (F120-L3-2).
+	r.Header.Del("Connection")
+	r.Host = ""
 	// A third-party upstream is sent what it needs and nothing else. Round 109 kept
 	// the gateway's key and the caller's X-Forwarded-For from it and left every other
 	// header through: Cloudflare's Cf-Connecting-Ip and True-Client-Ip, Forwarded,

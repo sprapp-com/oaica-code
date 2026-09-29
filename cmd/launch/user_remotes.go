@@ -381,10 +381,25 @@ func userRemotesPath() string {
 // envs[item]).find(Boolean)). It is the fallback for a catalog row that
 // declares no api_key_env of its own: our overlay's spec is more specific, so
 // it is asked first.
+// credentialShapedEnvName reports whether a variable a catalog row lists in env[] can hold a
+// SECRET. models.dev's env[] also lists the account id, host, endpoint and product id a provider
+// needs beside its key (CLOUDFLARE_ACCOUNT_ID, DATABRICKS_HOST, PRIVATEMODE_ENDPOINT ...): taken
+// as the row's key they authenticated with a non-secret, and scrubbed from a child they broke
+// tools that read them (2026-09-29 audit, round 120, F120-L2-1).
+func credentialShapedEnvName(name string) bool {
+	u := strings.ToUpper(name)
+	for _, part := range []string{"KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "_PAT"} {
+		if strings.Contains(u, part) {
+			return true
+		}
+	}
+	return false
+}
+
 func firstSetEnv(env []string) string {
 	for _, name := range env {
 		name = strings.TrimSpace(name)
-		if name == "" {
+		if name == "" || !credentialShapedEnvName(name) {
 			continue
 		}
 		if os.Getenv(name) != "" {

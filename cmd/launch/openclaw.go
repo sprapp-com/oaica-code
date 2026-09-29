@@ -483,12 +483,24 @@ func openclawCredentialEnvNames() []string {
 		if e.Hidden || strings.TrimSpace(e.BaseURL) == "" || len(e.Env) == 0 {
 			continue
 		}
+		var secrets []string
+		for _, n := range e.Env {
+			if credentialShapedEnvName(strings.TrimSpace(n)) {
+				secrets = append(secrets, n)
+			}
+		}
+		if len(secrets) == 0 {
+			continue
+		}
 		plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, routeFor(launchEndpoint{
 			Source:         sourceUserRemote,
-			RemoteEndpoint: RemoteEndpoint{Name: e.Name, APIKeyEnv: strings.Join(e.Env, ",")},
+			RemoteEndpoint: RemoteEndpoint{Name: e.Name, APIKeyEnv: strings.Join(secrets, ",")},
 		}))
 	}
-	return plan.credentialEnvNames()
+	// The metered gateway's credential is documented as never reaching a child's environment
+	// (README, docs/CATALOG.md) but was named only on a claude launch that routed the gateway
+	// leg (2026-09-29 audit, round 120, F120-L2-2).
+	return append(plan.credentialEnvNames(), oaicaGatewayTokenEnv)
 }
 
 func openclawInstallEnv() []string {

@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -1059,8 +1060,12 @@ func scrubCredentialEnv(env []string, names []string) []string {
 	env = append([]string(nil), env...)
 	for i, kv := range env {
 		if v, ok := strings.CutPrefix(kv, "OAICA_HOST="); ok {
-			if clean, token := splitRemoteUserinfo(v); token != "" {
-				env[i] = "OAICA_HOST=" + clean
+			// Every form the launcher reads a credential from: user, user:pass and ?key=
+			// (F120-L2-3), not only a bare username.
+			if u, err := url.Parse(strings.TrimSpace(v)); err == nil && (u.User != nil || u.RawQuery != "") {
+				u.User = nil
+				u.RawQuery = ""
+				env[i] = "OAICA_HOST=" + u.String()
 			}
 		}
 	}
