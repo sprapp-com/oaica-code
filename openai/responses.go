@@ -910,6 +910,26 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 	return buildResponsesResponse(model, responseID, itemID, chatResponse, request, output)
 }
 
+// doneReasonLength is the runner's own word for a turn the model stopped at its
+// generation cap, and capReason is this wire's word for the same thing. Both
+// are stated below and in processCompletion.
+const (
+	doneReasonLength = "length"
+	capReason        = "max_output_tokens"
+)
+
+// cappedByGenerationLimit reports whether this turn's stop is the cap, under the
+// same priority the sibling translated surfaces use: a turn that delivered calls
+// is stated by the CALLS, whatever the runner's done_reason said (openai's
+// finishReason, anthropic's mapStopReason). A capped turn with no call is the
+// only one that carries a truncation verdict on this leg. `hasCalls` is the
+// caller's own count — the whole response on the buffered arm, the calls the
+// converter has already written on the streamed one, since the terminal chunk of
+// a streamed turn carries none of them.
+func cappedByGenerationLimit(doneReason string, hasCalls bool) bool {
+	return doneReason == doneReasonLength && !hasCalls
+}
+
 // buildResponsesResponse wraps the items an arm assembled into the response
 // document this wire states, echoing back the request parameters it carries.
 func buildResponsesResponse(model, responseID, itemID string, chatResponse api.ChatResponse, request ResponsesRequest, output []ResponsesOutputItem) ResponsesResponse {
@@ -948,13 +968,30 @@ func buildResponsesResponse(model, responseID, itemID string, chatResponse api.C
 		}
 	}
 
+	// The verdict word. Every other surface of this leg states a turn the model
+	// stopped at its cap — the native wire `"done_reason":"length"`, chat
+	// `"finish_reason":"length"`, Anthropic `"stop_reason":"max_tokens"` — and
+	// this one said `"status":"completed"` with `"incomplete_details":null`, on
+	// both of its arms, so a client reading the truncation the way this wire
+	// defines it (`status == "incomplete"`, `incomplete_details.reason ==
+	// "max_output_tokens"`, both typed by openai-python) was told a capped answer
+	// was the whole one (2026-09-29 audit, round 101, F101-L1-1). `max_output_tokens`
+	// is forwarded as `num_predict` and the runner's cap path sets
+	// `done_reason:"length"`, so this is reachable with an ordinary body.
+	status := "completed"
+	var incomplete *ResponsesIncompleteDetails
+	if cappedByGenerationLimit(chatResponse.DoneReason, len(chatResponse.Message.ToolCalls) > 0) {
+		status = "incomplete"
+		incomplete = &ResponsesIncompleteDetails{Reason: capReason}
+	}
+
 	return ResponsesResponse{
 		ID:                 responseID,
 		Object:             "response",
 		CreatedAt:          chatResponse.CreatedAt.Unix(),
 		CompletedAt:        nil, // Set by middleware when writing final response
-		Status:             "completed",
-		IncompleteDetails:  nil, // Only populated if response incomplete
+		Status:             status,
+		IncompleteDetails:  incomplete,
 		Model:              model,
 		PreviousResponseID: nil, // Not supported
 		Instructions:       instructions,
@@ -1604,9 +1641,22 @@ func (c *ResponsesStreamConverter) processCompletion(r api.ChatResponse) []Respo
 			"reasoning_tokens": 0,
 		},
 	}
-	response := c.buildResponseObject("completed", c.buildFinalOutput(), usage)
+	// The terminal event states this wire's verdict for the turn, the same one
+	// the buffered arm states in its document: `response.incomplete` with status
+	// "incomplete" and the reason the model stopped, where a capped turn used to
+	// be announced as `response.completed` — a client of the streaming arm had no
+	// truncation signal anywhere on this surface (2026-09-29 audit, round 101,
+	// F101-L1-1). Same priority as the buffered builder: the calls win.
+	status, event := "completed", "response.completed"
+	if cappedByGenerationLimit(r.DoneReason, len(c.toolCallItems) > 0) {
+		status, event = "incomplete", "response.incomplete"
+	}
+	response := c.buildResponseObject(status, c.buildFinalOutput(), usage)
+	if status == "incomplete" {
+		response["incomplete_details"] = map[string]any{"reason": capReason}
+	}
 	response["completed_at"] = time.Now().Unix()
-	events = append(events, c.newEvent("response.completed", map[string]any{
+	events = append(events, c.newEvent(event, map[string]any{
 		"response": response,
 	}))
 
