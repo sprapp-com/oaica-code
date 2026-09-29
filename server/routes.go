@@ -243,6 +243,10 @@ func (s *Server) scheduleRunner(ctx context.Context, model *Model, caps []model.
 	case runner = <-runnerCh:
 	case err = <-errCh:
 		return nil, nil, nil, err
+	case <-ctx.Done():
+		// The request's own context ends the wait, whatever the scheduler does with
+		// it (2026-09-29 audit, round 113, F113-L1-2).
+		return nil, nil, nil, ctx.Err()
 	}
 
 	return runner.llama, model, &opts, nil

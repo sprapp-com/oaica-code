@@ -164,6 +164,14 @@ func (s *Server) CreateHandler(c *gin.Context) {
 				baseLayers, err = parseFromModel(ctx, fromName, fn)
 				if err != nil {
 					ch <- gin.H{"error": err.Error()}
+					// The create has failed and is over. It ran on into createModel
+					// with no base layers: with stream:false the consumer had already
+					// returned on this error frame, so the producer blocked for ever in
+					// createModel (one leaked goroutine per failed request), and in the
+					// default stream it wrote a manifest for a model with zero layers
+					// after the client had been told the create failed (2026-09-29
+					// audit, round 113, F113-L1-1).
+					return
 				}
 
 				if err == nil && !remote {

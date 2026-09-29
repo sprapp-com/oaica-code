@@ -236,6 +236,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 			if pending.ctx.Err() != nil {
 				slog.Debug("pending request cancelled or timed out, skipping scheduling")
+				// Answer it. The request was dropped without a word, and its caller
+				// waits on the success and error channels only, so the handler
+				// goroutine (with its request body and gin context) blocked for the
+				// life of the process: one per impatient client queued behind a slow
+				// model load. errCh has capacity 1, so this never blocks
+				// (2026-09-29 audit, round 113, F113-L1-2).
+				select {
+				case pending.errCh <- pending.ctx.Err():
+				default:
+				}
 				continue
 			}
 			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
