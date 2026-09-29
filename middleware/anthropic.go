@@ -502,7 +502,24 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 
 	var serverContent []anthropic.ContentBlock
 
-	for loop := 1; loop <= maxWebSearchLoops; loop++ {
+	// The tool states its own limits. max_uses is the most searches this request
+	// may run and only ever LOWERS the loop's own bound; the domain lists filter
+	// what each search hands the model and the client. The loop ran a fixed three
+	// searches whatever the tool said and decoded neither list (2026-09-29 audit,
+	// round 108, F108-L1-3).
+	maxLoops := maxWebSearchLoops
+	var allowedDomains, blockedDomains []string
+	for _, t := range w.req.Tools {
+		if strings.HasPrefix(t.Type, "web_search") {
+			if t.MaxUses > 0 && t.MaxUses < maxLoops {
+				maxLoops = t.MaxUses
+			}
+			allowedDomains, blockedDomains = t.AllowedDomains, t.BlockedDomains
+			break
+		}
+	}
+
+	for loop := 1; loop <= maxLoops; loop++ {
 		query := extractQueryFromToolCall(&currentToolCall)
 		logutil.TraceContext(ctx, "anthropic middleware: web_search loop iteration",
 			"loop", loop,
@@ -540,6 +557,7 @@ func (w *WebSearchAnthropicWriter) runWebSearchLoop(ctx context.Context, initial
 		)
 
 		toolUseID := loopServerToolUseID(w.inner.id, loop)
+		searchResp.Results = anthropic.FilterWebSearchResults(searchResp.Results, allowedDomains, blockedDomains)
 		searchResults := anthropic.ConvertOllamaToAnthropicResults(searchResp)
 		// The turn that asked for this search leads with what it said before
 		// asking; it is prepended here rather than at the terminal response so

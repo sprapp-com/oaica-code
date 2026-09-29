@@ -299,7 +299,9 @@ type Tool struct {
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 
 	// Web search specific fields
-	MaxUses int `json:"max_uses,omitempty"`
+	MaxUses        int      `json:"max_uses,omitempty"`
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
 }
 
 // UnmarshalJSON refuses a tool stated as JSON null.
@@ -4700,4 +4702,39 @@ func ConvertOllamaToAnthropicResults(ollamaResults *OllamaWebSearchResponse) []W
 		})
 	}
 	return results
+}
+
+// FilterWebSearchResults keeps the results the tool's own domain lists allow: a
+// result is dropped when its host is, or is a subdomain of, a blocked domain, or
+// when an allow-list is stated and its host is on neither side of it. The lists
+// are the client's (web_search_20250305's allowed_domains / blocked_domains); the
+// :cloud loop decoded neither and let a blocked site reach the model and the
+// client (2026-09-29 audit, round 108, F108-L1-3).
+func FilterWebSearchResults(results []OllamaWebSearchResult, allowed, blocked []string) []OllamaWebSearchResult {
+	if len(allowed) == 0 && len(blocked) == 0 {
+		return results
+	}
+	under := func(host string, domains []string) bool {
+		for _, d := range domains {
+			d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(d, "https://"), "http://")))
+			d = strings.TrimSuffix(strings.SplitN(d, "/", 2)[0], ".")
+			if d != "" && (host == d || strings.HasSuffix(host, "."+d)) {
+				return true
+			}
+		}
+		return false
+	}
+	var kept []OllamaWebSearchResult
+	for _, r := range results {
+		u, err := url.Parse(r.URL)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		host := strings.ToLower(u.Hostname())
+		if under(host, blocked) || (len(allowed) > 0 && !under(host, allowed)) {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept
 }
