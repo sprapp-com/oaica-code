@@ -862,9 +862,7 @@ func signinOpencode(provider string) error {
 		provider = p
 	}
 
-	fmt.Printf("Enter API key for opencode/%s: ", provider)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := readSecretLine(fmt.Sprintf("Enter API key for opencode/%s: ", provider))
 	if err != nil {
 		return err
 	}
@@ -878,6 +876,19 @@ func signinOpencode(provider string) error {
 	}
 	fmt.Printf("Saved API key for opencode provider %q.\n", provider)
 	return nil
+}
+
+// readSecretLine prompts for a secret and reads it without echo when stdin is a terminal (a pasted
+// key stays out of scrollback, screen shares and tmux logs, as in every sibling prompt); a pipe is
+// read as a plain line (2026-09-29 audit, round 122, F122-L1-3).
+func readSecretLine(prompt string) (string, error) {
+	fmt.Print(prompt)
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Println()
+		return string(b), err
+	}
+	return bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
 func promptProviderName() (string, error) {
@@ -904,9 +915,7 @@ func oaicaInteractiveSignin() (bool, error) {
 		return false, nil
 	}
 
-	fmt.Print("Enter your OAICA API key (from api.oaica.com): ")
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := readSecretLine("Enter your OAICA API key (from api.oaica.com): ")
 	if err != nil {
 		return false, err
 	}

@@ -40,6 +40,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // oaicalb is not model-specific -- it's a plain reverse proxy over any set of
@@ -845,6 +846,42 @@ func (u *usageRecorder) finish() {
 	}
 }
 
+// meterBodyLimit is how much of a request body this file reads to meter or size it: above the
+// 16 MiB the gateway itself accepts.
+const meterBodyLimit = 20 << 20
+
+// peekBody reads r's body for inspection and puts it back whole. When the body is longer than
+// limit it is NOT read out: what was read is stitched back in front of the rest, so the request
+// continues byte for byte, and whole is false.
+func peekBody(r *http.Request, limit int64) (body []byte, whole bool) {
+	orig := r.Body
+	head, err := io.ReadAll(io.LimitReader(orig, limit+1))
+	if err != nil || int64(len(head)) > limit {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), orig), orig}
+		return nil, false
+	}
+	orig.Close()
+	r.Body = io.NopCloser(bytes.NewReader(head))
+	return head, true
+}
+
+// boundedText cuts a client-supplied string to n bytes on a rune boundary, marking the cut. The
+// model and session id come from the CLIENT and went into the billing row whole: a 7 MB model
+// name wrote a 15 MB row (2026-09-29 audit, round 122, F122-L3-2).
+func boundedText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "…"
+}
+
 // requestAlreadyMetered reports whether the gateway already billed this
 // request before forwarding it through gatekeeper to here -- see
 // lbConfig.MeterHubAddr's doc for why this header, not the request's
@@ -881,18 +918,26 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		start := time.Now()
-		rawBody, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-		r.Body.Close()
-		if err != nil {
+		rawBody, whole := peekBody(r, meterBodyLimit)
+		if !whole {
+			// Too big to read here: the body goes on unchanged and unmetered. It used to be
+			// replaced by its first 8 MiB with the Content-Length left alone, so the same body was
+			// served when metered-upstream and refused 502 otherwise (2026-09-29 audit, round 122,
+			// F122-L3-4).
 			next(w, r)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(rawBody))
+		// Exact key names, as the backend reads them: encoding/json matches "STREAM" to a `stream`
+		// field, vLLM does not, so a client could make this meter parse a JSON reply as SSE and
+		// book a served turn 0/0 (F122-L3-3).
+		var fields map[string]json.RawMessage
+		json.Unmarshal(rawBody, &fields)
 		var reqDoc struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
+			Model  string
+			Stream bool
 		}
-		json.Unmarshal(rawBody, &reqDoc)
+		json.Unmarshal(fields["model"], &reqDoc.Model)
+		json.Unmarshal(fields["stream"], &reqDoc.Stream)
 
 		rec := &usageRecorder{ResponseWriter: w, stream: reqDoc.Stream}
 		next(rec, r)
@@ -909,8 +954,8 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 
 		metered.report(usageRecord{
 			RequestID: newRequestID(), TS: time.Now().UTC().Format(time.RFC3339Nano),
-			Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: r.Header.Get("X-Session-Id"),
-			Model: reqDoc.Model, UpstreamModel: reqDoc.Model, Path: r.URL.Path,
+			Region: metered.region, KeyLabel: keyLabelFor(r), Backend: backend, SessionID: boundedText(r.Header.Get("X-Session-Id"), 128),
+			Model: boundedText(reqDoc.Model, 256), UpstreamModel: boundedText(reqDoc.Model, 256), Path: r.URL.Path,
 			Stream: reqDoc.Stream, Status: rec.status,
 			PromptTokens: rec.promptTokens, CompletionTokens: rec.completionTokens, CachedTokens: rec.cachedTokens,
 			LatencyMS: time.Since(start).Milliseconds(), UsageSeen: rec.seen,
@@ -933,9 +978,7 @@ func serveWith(pool *backendPool, pick func([]*backend, int) *backend) http.Hand
 		bs := snap.bs
 		estTokens := 0
 		if snap.hasContextLimits && r.Method == http.MethodPost {
-			if body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20)); err == nil {
-				r.Body.Close()
-				r.Body = io.NopCloser(bytes.NewReader(body))
+			if body, whole := peekBody(r, meterBodyLimit); whole {
 				estTokens = estimateRequestTokens(body)
 			}
 		}

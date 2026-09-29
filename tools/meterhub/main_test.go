@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -816,5 +817,17 @@ func TestSubscriberUsage_UnknownPlanOmitsCap(t *testing.T) {
 	}
 	if over, _ := w5h["over"].(bool); over {
 		t.Error("window_5h.over = true with no cap set, want false")
+	}
+}
+
+// F122-L3-2 (2026-09-29 audit, round 122): an oversized report is refused, not stored.
+func TestRound122IngestRefusesAnOversizedReport(t *testing.T) {
+	hub, token := testHub(t)
+	w := postIngest(t, hub, token, usageRecord{RequestID: "req_big", Model: strings.Repeat("m", 1<<20)})
+	if w.Code == http.StatusNoContent {
+		t.Fatalf("a 1 MiB report was stored (status %d)", w.Code)
+	}
+	if w = postIngest(t, hub, token, usageRecord{RequestID: "req_ok", Model: "kat-awq"}); w.Code != http.StatusNoContent {
+		t.Fatalf("a normal report was refused: %d", w.Code)
 	}
 }

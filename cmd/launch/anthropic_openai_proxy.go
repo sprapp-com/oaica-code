@@ -47,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3261,14 +3262,10 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			}
 			return nextToolArrival
 		}
-		// Simple sort.
-		for i := 0; i < len(indices); i++ {
-			for j := i + 1; j < len(indices); j++ {
-				if arrival(indices[j]) < arrival(indices[i]) {
-					indices[i], indices[j] = indices[j], indices[i]
-				}
-			}
-		}
+		// Ordered by arrival. The exchange sort this replaces was quadratic, with two map lookups per
+		// comparison: one streamed turn of 64000 tool calls (a 9 MB body) held a core for a minute
+		// where the same turn as a document took 0.3 s (2026-09-29 audit, round 122, F122-L2-1).
+		sort.SliceStable(indices, func(a, b int) bool { return arrival(indices[a]) < arrival(indices[b]) })
 		var tcs []api.ToolCall
 		var unnamedText strings.Builder
 		// The nameless entries' bytes, in the order the WIRE wrote them, which

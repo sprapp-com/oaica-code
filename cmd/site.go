@@ -72,7 +72,7 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		oaicaAuthorize(httpReq)
-		resp, err := (&http.Client{Timeout: 180 * time.Second}).Do(httpReq)
+		resp, err := (&http.Client{Timeout: 180 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}).Do(httpReq)
 		if err != nil {
 			lastErr = launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 			if ctx.Err() != nil {
@@ -92,7 +92,7 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 		}
 		var out oaicaChatResponse
 		if err := json.Unmarshal(raw, &out); err != nil {
-			return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, truncateForError(raw))
+			return "", fmt.Errorf("bad response (HTTP %d): %s", resp.StatusCode, truncateForError([]byte(oaicaDiagnosisBody(raw))))
 		}
 		if out.Error != nil {
 			// Bounded and redacted like the two sibling branches above: the
@@ -104,7 +104,7 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 			return "", fmt.Errorf("%s (HTTP %d)", truncateForError([]byte(oaicaDiagnosis(out.Error.Message))), resp.StatusCode)
 		}
 		if len(out.Choices) == 0 {
-			return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, truncateForError(raw))
+			return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, truncateForError([]byte(oaicaDiagnosisBody(raw))))
 		}
 		msg := out.Choices[0].Message
 		if msg.Content == "" && msg.ReasoningContent != "" {

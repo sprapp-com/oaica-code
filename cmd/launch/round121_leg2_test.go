@@ -82,3 +82,30 @@ func TestRound121TemplatedCatalogBaseURL(t *testing.T) {
 		t.Errorf("a secret-shaped name was substituted into a URL: %q", r.BaseURL)
 	}
 }
+
+// F122-L2-2 (2026-09-29 audit, round 122): only the row's own variables are expanded, escaped.
+func TestRound122TemplateOnlyExpandsTheRowsOwnVariablesEscaped(t *testing.T) {
+	home := t.TempDir()
+	setLaunchTestHome(t, home)
+	dir := filepath.Join(home, ".oaica", "cache", "catalog")
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "modelsdev.json"), []byte(`{
+ "tpl":{"id":"tpl","name":"Tpl","api":"https://api.tpl.example/acct/${DATABASE_URL}/${TPL_ACCOUNT_ID}/v1","npm":"@ai-sdk/openai-compatible","env":["TPL_ACCOUNT_ID","TPL_API_KEY"],"models":{}}
+}`), 0o600)
+	t.Setenv("TPL_API_KEY", "k")
+	t.Setenv("TPL_ACCOUNT_ID", "a/b?c#d@e")
+	t.Setenv("DATABASE_URL", "postgres://app:db-password-123@db.internal/prod")
+	for _, r := range builtinRemotes() {
+		if r.Name == "tpl" {
+			t.Errorf("a row naming a variable outside its own env[] was offered: %q", r.BaseURL)
+		}
+	}
+	os.WriteFile(filepath.Join(dir, "modelsdev.json"), []byte(`{
+ "tpl":{"id":"tpl","name":"Tpl","api":"https://api.tpl.example/acct/${TPL_ACCOUNT_ID}/v1","npm":"@ai-sdk/openai-compatible","env":["TPL_ACCOUNT_ID","TPL_API_KEY"],"models":{}}
+}`), 0o600)
+	for _, r := range builtinRemotes() {
+		if r.Name == "tpl" && (strings.Count(r.BaseURL, "/") != 5 || strings.ContainsAny(r.BaseURL, "?#")) {
+			t.Errorf("a substituted value restructured the URL: %q", r.BaseURL)
+		}
+	}
+}

@@ -814,7 +814,7 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 		text      strings.Builder
 		images    []api.ImageData
 		toolCalls []api.ToolCall
-		thinking  string
+		thinking  strings.Builder // a Builder: += on a string was quadratic in the number of thinking blocks (2026-09-29 audit, round 122, F122-L1-5)
 	}
 	var parts []any // *ownRun, or an api.Message for a tool result
 	var cur *ownRun
@@ -918,10 +918,10 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				// back. The text blocks beside it are joined for the same
 				// reason (2026-09-26 audit, sixteenth round).
 				r := own()
-				if r.thinking != "" {
-					r.thinking += "\n\n"
+				if r.thinking.Len() > 0 {
+					r.thinking.WriteString("\n\n")
 				}
-				r.thinking += *block.Thinking
+				r.thinking.WriteString(*block.Thinking)
 			}
 
 		case "redacted_thinking":
@@ -1068,7 +1068,7 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 	for _, part := range parts {
 		switch p := part.(type) {
 		case *ownRun:
-			if p.text.Len() == 0 && len(p.images) == 0 && len(p.toolCalls) == 0 && p.thinking == "" {
+			if p.text.Len() == 0 && len(p.images) == 0 && len(p.toolCalls) == 0 && p.thinking.Len() == 0 {
 				continue // a run that states nothing is not a message
 			}
 			messages = append(messages, api.Message{
@@ -1076,7 +1076,7 @@ func convertMessage(msg MessageParam) ([]api.Message, error) {
 				Content:   p.text.String(),
 				Images:    p.images,
 				ToolCalls: p.toolCalls,
-				Thinking:  p.thinking,
+				Thinking:  p.thinking.String(),
 			})
 		case api.Message:
 			messages = append(messages, p)

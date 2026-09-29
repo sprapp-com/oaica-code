@@ -41,6 +41,11 @@ type gkConfig struct {
 	Keys         map[string]string `json:"keys"`          // key -> tier name
 	UpstreamAddr string            `json:"upstream_addr"` // default "http://127.0.0.1:30099"
 	ListenAddr   string            `json:"listen_addr"`   // default ":30098"
+	// TrustedMeteredTiers are the tiers whose requests may carry X-Oaica-Metered upstream: the
+	// marker means "the gateway already billed this turn", so oaicalb skips its own report. It
+	// used to be forwarded from any key, and a free-tier key holder sending it erased the only
+	// record of its own served turns (2026-09-29 audit, round 122, F122-L3-1). Default: internal.
+	TrustedMeteredTiers []string `json:"trusted_metered_tiers"`
 }
 
 func defaultConfig() gkConfig {
@@ -49,6 +54,8 @@ func defaultConfig() gkConfig {
 		Keys:         map[string]string{},
 		UpstreamAddr: "http://127.0.0.1:30099",
 		ListenAddr:   ":30098",
+
+		TrustedMeteredTiers: []string{"internal"},
 	}
 }
 
@@ -59,18 +66,19 @@ type gate struct {
 	inuseM sync.Mutex
 }
 
-func loadConfig(path string) gkConfig {
+// parseConfig reads a config file. A missing path is the empty-key defaults (startup only); an
+// unreadable or unparseable file is an error, never a fatal exit and never an empty config.
+func parseConfig(path string) (gkConfig, error) {
 	cfg := defaultConfig()
 	if path == "" {
-		return cfg
+		return cfg, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("gatekeeper: no config at %s (%v), using empty-key defaults (everything 401s until keys are added)", path, err)
-		return cfg
+		return cfg, err
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		log.Fatalf("gatekeeper: bad config %s: %v", path, err)
+		return cfg, err
 	}
 	if cfg.UpstreamAddr == "" {
 		cfg.UpstreamAddr = defaultConfig().UpstreamAddr
@@ -78,15 +86,58 @@ func loadConfig(path string) gkConfig {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = defaultConfig().ListenAddr
 	}
+	return cfg, nil
+}
+
+func loadConfig(path string) gkConfig {
+	cfg, err := parseConfig(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("gatekeeper: no config at %s (%v), using empty-key defaults (everything 401s until keys are added)", path, err)
+			return defaultConfig()
+		}
+		log.Fatalf("gatekeeper: bad config %s: %v", path, err)
+	}
 	return cfg
 }
 
+// reload applies a new config on SIGHUP. A file that is missing (an editor's rename) or does not
+// parse (mid-edit) keeps the config in force: it used to exit the process on bad JSON and to
+// replace the key set with none on a missing file, taking every in-flight stream and the whole
+// default upstream down during the documented key-add procedure (2026-09-29 audit, round 122,
+// F122-L3-5).
 func (g *gate) reload(path string) {
-	cfg := loadConfig(path)
+	cfg, err := parseConfig(path)
+	if err != nil {
+		log.Printf("gatekeeper: SIGHUP: config rejected, keeping the current one: %v", err)
+		return
+	}
 	g.mu.Lock()
 	g.cfg = cfg
 	g.mu.Unlock()
 	log.Printf("gatekeeper: config reloaded, %d keys, tiers=%v", len(cfg.Keys), cfg.Tiers)
+}
+
+// stripClientControlHeaders removes the request headers a client must never set on the hops
+// behind this gate; the marker is kept only for a trusted tier.
+func (g *gate) stripClientControlHeaders(h http.Header, tier string) {
+	g.mu.RLock()
+	trusted := false
+	for _, t := range g.cfg.TrustedMeteredTiers {
+		if t == tier {
+			trusted = true
+		}
+	}
+	g.mu.RUnlock()
+	for k := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if strings.HasPrefix(ck, "X-Gatekeeper-") || strings.HasPrefix(ck, "X-Katlb-") || strings.HasPrefix(ck, "X-Oaica-") {
+			if ck == "X-Oaica-Metered" && trusted {
+				continue
+			}
+			h.Del(k)
+		}
+	}
 }
 
 // acquire returns (allowed, tierName, limit). Never blocks -- an over-limit
@@ -119,30 +170,8 @@ func (g *gate) release(key string) {
 	}
 }
 
-func main() {
-	configPath := flag.String("config", "", "path to gatekeeper JSON config (tiers, keys, upstream_addr, listen_addr)")
-	flag.Parse()
-
-	g := &gate{cfg: loadConfig(*configPath)}
-	log.Printf("gatekeeper: %d keys, tiers=%v, upstream=%s, listen=%s",
-		len(g.cfg.Keys), g.cfg.Tiers, g.cfg.UpstreamAddr, g.cfg.ListenAddr)
-
-	// SIGHUP reload: rotate/add/revoke keys without dropping in-flight
-	// requests or bouncing the process.
-	sighup := make(chan os.Signal, 1)
-	signal.Notify(sighup, syscall.SIGHUP)
-	go func() {
-		for range sighup {
-			g.reload(*configPath)
-		}
-	}()
-
-	// Fail fast on a bad initial upstream_addr. The parsed value itself is not
-	// kept: the Director below re-parses the address on every request so that
-	// a SIGHUP reload takes effect, so this is a startup check only.
-	if _, err := url.Parse(g.cfg.UpstreamAddr); err != nil {
-		log.Fatalf("gatekeeper: bad upstream_addr %q: %v", g.cfg.UpstreamAddr, err)
-	}
+// handler is the gate's HTTP handler; main serves it and the tests drive it.
+func (g *gate) handler() http.Handler {
 	// Resolve the upstream for every request so a SIGHUP config reload changes
 	// the live routing target as documented. NewSingleHostReverseProxy captures
 	// its target at construction time, which previously made a reloaded
@@ -188,9 +217,37 @@ func main() {
 		defer g.release(key)
 
 		w.Header().Set("X-Gatekeeper-Tier", tier)
+		g.stripClientControlHeaders(r.Header, tier)
 		proxy.ServeHTTP(w, r)
 	})
+	return mux
+}
 
+func main() {
+	configPath := flag.String("config", "", "path to gatekeeper JSON config (tiers, keys, upstream_addr, listen_addr)")
+	flag.Parse()
+
+	g := &gate{cfg: loadConfig(*configPath)}
+	log.Printf("gatekeeper: %d keys, tiers=%v, upstream=%s, listen=%s",
+		len(g.cfg.Keys), g.cfg.Tiers, g.cfg.UpstreamAddr, g.cfg.ListenAddr)
+
+	// SIGHUP reload: rotate/add/revoke keys without dropping in-flight
+	// requests or bouncing the process.
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	go func() {
+		for range sighup {
+			g.reload(*configPath)
+		}
+	}()
+
+	// Fail fast on a bad initial upstream_addr. The parsed value itself is not
+	// kept: the Director below re-parses the address on every request so that
+	// a SIGHUP reload takes effect, so this is a startup check only.
+	if _, err := url.Parse(g.cfg.UpstreamAddr); err != nil {
+		log.Fatalf("gatekeeper: bad upstream_addr %q: %v", g.cfg.UpstreamAddr, err)
+	}
+	mux := g.handler()
 	log.Fatal(http.ListenAndServe(g.cfg.ListenAddr, mux))
 }
 

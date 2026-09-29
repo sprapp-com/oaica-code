@@ -266,6 +266,9 @@ func (h *meterHub) authed(r *http.Request) (label string, ok bool) {
 	return "", false
 }
 
+// maxIngestBytes bounds one /ingest body.
+const maxIngestBytes = 64 << 10
+
 func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -275,8 +278,10 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	// A report is a few hundred bytes; a row the reporter wrote from a client's model name or session
+	// id was 15 MB (2026-09-29 audit, round 122, F122-L3-2).
 	var rec usageRecord
-	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxIngestBytes)).Decode(&rec); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}

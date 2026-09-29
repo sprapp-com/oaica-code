@@ -89,6 +89,11 @@ func oaicaSentAPIKey() string {
 // (2026-09-26 audit, tenth round).
 func oaicaDiagnosis(text string) string {
 	secrets := []string{oaicaSentAPIKey()}
+	// The router admin key rides as the bearer of `oaica router list/login/logout`, whose error bodies
+	// come through here (2026-09-29 audit, round 122, F122-L1-4).
+	if admin := strings.TrimSpace(os.Getenv("OAICA_ADMIN_KEY")); admin != "" {
+		secrets = append(secrets, admin)
+	}
 	// The weights-distribution licence is a credential too, and it travels as
 	// a bearer on the manifest request — the one request that carries it — so
 	// an error body echoing the Authorization header would print it in full
