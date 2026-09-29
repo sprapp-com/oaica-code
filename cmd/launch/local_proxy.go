@@ -361,11 +361,25 @@ func RunNormalizingProxyOnKeyed(bindHost string, listenPort, backendPort int, ap
 	// and 500 of them took the model offline unauthenticated. No whole-request timeout: streamed
 	// turns run long (2026-09-29 audit, round 121, F121-L2-3).
 	srv := &http.Server{
-		Handler:           rebindingGuard(isLoopbackBind(bindHost), handler),
+		Handler:           bodyReadDeadline(rebindingGuard(isLoopbackBind(bindHost), handler)),
 		ReadHeaderTimeout: normalizingProxyHeaderTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
 	return srv.Serve(ln)
+}
+
+// normalizingProxyBodyTimeout bounds how long a request body may take to arrive once its headers are in.
+var normalizingProxyBodyTimeout = 2 * time.Minute
+
+// bodyReadDeadline gives every request a read deadline. A refusal (401, Host, Origin) answers without reading
+// the body, and Go then drains the unread body before it writes the response headers; with no read timeout a peer
+// that sent `Content-Length: 1` and nothing more held that goroutine for ever, before any credential was checked
+// (2026-09-29 audit, round 132, F132-L2-3).
+func bodyReadDeadline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(normalizingProxyBodyTimeout))
+		next.ServeHTTP(w, r)
+	})
 }
 
 // isLoopbackBind reports whether bindHost is a loopback-only bind.

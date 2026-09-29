@@ -885,3 +885,21 @@ func TestRound131IngestRefusesOutOfRangeCounts(t *testing.T) {
 		}
 	}
 }
+
+// F132-L3-1 (2026-09-29 audit, round 132): a cost or latency outside any real turn's range is refused at ingest.
+func TestRound132IngestRefusesOutOfRangeCostAndLatency(t *testing.T) {
+	hub, token := testHub(t)
+	for i, raw := range []string{
+		`{"request_id":"c1","ts":"t","key_label":"k","cost_usd":1e308}`,
+		`{"request_id":"c2","ts":"t","key_label":"k","cost_usd":-5}`,
+		`{"request_id":"c3","ts":"t","key_label":"k","latency_ms":-1}`,
+	} {
+		req := httptest.NewRequest("POST", "/ingest", strings.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		hub.ingestHandler(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("case %d: status %d, want 400", i, w.Code)
+		}
+	}
+}

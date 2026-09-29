@@ -41,3 +41,31 @@ func TestRound131PullErrorBodyIsQuotedAndRedacted(t *testing.T) {
 		t.Errorf("pull error body leaks: %q", got)
 	}
 }
+
+// F132-L2-1: pulling model `m` must not delete the installed file of model `m.gguf.partial-v2`.
+func TestRound132SweepLeavesOtherModelsAlone(t *testing.T) {
+	dir := t.TempDir()
+	other := filepath.Join(dir, "m.gguf.partial-v2.gguf")
+	os.WriteFile(other, []byte("x"), 0o600)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(other, old, old)
+	f, stop, err := createPullTemp(filepath.Join(dir, "m.gguf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	defer f.Close()
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("an installed model of another name was swept: %v", err)
+	}
+}
+
+// F132-L2-4: a body that echoes the licence key across the cap does not print the part before the cut.
+func TestRound132PullErrorBodyRedactsAcrossTheCap(t *testing.T) {
+	t.Setenv("OAICA_LICENSE_KEY", "sk-license-abcdefghijklmnop")
+	body := strings.Repeat("x", int(maxPullErrorBodyBytes)-7-16) + "Bearer sk-license-abcdefghijklmnop tail"
+	got := readPullErrorBody(strings.NewReader(body))
+	if strings.Contains(got, "sk-license-abc") {
+		t.Errorf("part of the licence key survived the cut: %q", got[len(got)-60:])
+	}
+}

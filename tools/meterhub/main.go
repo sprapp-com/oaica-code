@@ -42,6 +42,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -309,6 +310,12 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"token count out of range"}`, http.StatusBadRequest)
 			return
 		}
+	}
+	// cost_usd and latency_ms feed the same aggregates: 1e308 twice sums to +Inf, the summary fails to encode and
+	// answers an empty 200 for every key (2026-09-29 audit, round 132, F132-L3-1).
+	if math.IsNaN(rec.CostUSD) || math.IsInf(rec.CostUSD, 0) || rec.CostUSD < 0 || rec.CostUSD > 1e9 || rec.LatencyMS < 0 {
+		http.Error(w, `{"error":"cost or latency out of range"}`, http.StatusBadRequest)
+		return
 	}
 	// INSERT OR IGNORE: request_id is the idempotency key. A gateway
 	// retrying a report after a timeout must not double-count usage — the

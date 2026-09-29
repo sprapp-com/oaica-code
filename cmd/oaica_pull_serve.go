@@ -1226,10 +1226,17 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 // audit, round 131, F131-L2-1).
 func createPullTemp(destPath string) (*os.File, func(), error) {
 	dir, base := filepath.Dir(destPath), filepath.Base(destPath)
-	if old, _ := filepath.Glob(filepath.Join(dir, base+".partial*")); len(old) > 0 {
-		for _, p := range old {
-			if fi, err := os.Stat(p); err == nil && !fi.IsDir() && time.Since(fi.ModTime()) > pullStaleTempAge {
-				os.Remove(p)
+	// Only the names CreateTemp writes (`<base>.partial-<digits>`): a model called `m.gguf.partial-v2` installs as
+	// `m.gguf.partial-v2.gguf`, which a `.partial*` glob swept as a stale temp of model `m` (2026-09-29 audit,
+	// round 132, F132-L2-1).
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			digits, ok := strings.CutPrefix(e.Name(), base+".partial-")
+			if !ok || digits == "" || strings.Trim(digits, "0123456789") != "" {
+				continue
+			}
+			if fi, err := e.Info(); err == nil && !fi.IsDir() && time.Since(fi.ModTime()) > pullStaleTempAge {
+				os.Remove(filepath.Join(dir, e.Name()))
 			}
 		}
 	}
@@ -1238,6 +1245,9 @@ func createPullTemp(destPath string) (*os.File, func(), error) {
 		return nil, func() {}, err
 	}
 	name := f.Name()
+	// A live pull keeps its file fresh, so the sweep never mistakes a slow one (an encrypted pull writes once per
+	// 8 MiB chunk) or a skewed NFS clock for an abandoned one (round 132, F132-L2-2).
+	touch := time.NewTicker(time.Minute)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	done := make(chan struct{})
@@ -1250,7 +1260,18 @@ func createPullTemp(destPath string) (*os.File, func(), error) {
 		case <-done:
 		}
 	}()
-	return f, func() { signal.Stop(sigCh); close(done) }, nil
+	go func() {
+		for {
+			select {
+			case <-touch.C:
+				now := time.Now()
+				_ = os.Chtimes(name, now, now)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return f, func() { touch.Stop(); signal.Stop(sigCh); close(done) }, nil
 }
 
 // pullStaleTempAge: a temp file untouched this long belongs to a pull that is gone.

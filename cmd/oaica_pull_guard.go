@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var (
@@ -250,14 +251,22 @@ func (s *stallGuard) Close() error {
 // readPullErrorBody reads a failing response's body for the message, capped
 // and with a note when it was cut.
 func readPullErrorBody(body io.Reader) string {
-	b, err := io.ReadAll(io.LimitReader(body, maxPullErrorBodyBytes))
-	msg := strings.TrimSpace(string(b))
-	if err == nil && int64(len(b)) == maxPullErrorBodyBytes {
+	// Redact BEFORE cutting: a body that echoes the licence key across the cap would otherwise print the part of
+	// it that fell before the cut (round 132, F132-L2-4). Read a margin past the cap for the redactor to see.
+	b, err := io.ReadAll(io.LimitReader(body, maxPullErrorBodyBytes+512))
+	msg := oaicaDiagnosis(strings.TrimSpace(string(b)))
+	if len(msg) > int(maxPullErrorBodyBytes) {
+		cut := int(maxPullErrorBodyBytes)
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + "… (truncated)"
+	} else if err == nil && int64(len(b)) > maxPullErrorBodyBytes {
 		msg += "… (truncated)"
 	}
 	// The body is the server's: it can echo the licence bearer this request carried and it can carry terminal
 	// escapes (2026-09-29 audit, round 131, F131-L2-3).
-	return launch.PrintableCell(oaicaDiagnosis(msg))
+	return launch.PrintableCell(msg)
 }
 
 // validateModelName refuses a model name that would address anything other

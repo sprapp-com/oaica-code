@@ -3,6 +3,7 @@ package chat
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"os"
 	"path/filepath"
 	"slices"
@@ -279,7 +280,7 @@ func (m *chatModel) promptDebugLines(width int) []string {
 
 func promptDebugFieldLine(label, value string, width int) string {
 	labelText := label + ":"
-	value = strings.TrimSpace(value)
+	value = strings.TrimSpace(termsafe.Text(value)) // the /prompt view shows the raw history; display must be safe (round 132, F132-L1-5)
 	if value == "" {
 		value = "_empty_"
 	}
@@ -305,10 +306,10 @@ func promptDebugMessageLines(index int, msg api.Message, width int) []string {
 	}
 	if msg.Role == "tool" {
 		if msg.ToolName != "" {
-			lines = append(lines, "  "+chatHistoryLabelStyle.Render("tool_name:")+" "+chatHistoryTextStyle.Render(msg.ToolName))
+			lines = append(lines, "  "+chatHistoryLabelStyle.Render("tool_name:")+" "+chatHistoryTextStyle.Render(termsafe.Text(msg.ToolName)))
 		}
 		if msg.ToolCallID != "" {
-			lines = append(lines, "  "+chatHistoryLabelStyle.Render("tool_call_id:")+" "+chatHistoryTextStyle.Render(msg.ToolCallID))
+			lines = append(lines, "  "+chatHistoryLabelStyle.Render("tool_call_id:")+" "+chatHistoryTextStyle.Render(termsafe.Text(msg.ToolCallID)))
 		}
 		lines = append(lines, promptDebugBlockLines("tool result", promptDebugToolResult(msg.Content), width, chatHistoryTextStyle)...)
 	}
@@ -343,7 +344,7 @@ func promptDebugMapLines(label string, values map[string]any, width int) []strin
 }
 
 func promptDebugToolLines(index int, tool api.Tool, width int) []string {
-	name := strings.TrimSpace(tool.Function.Name)
+	name := strings.TrimSpace(termsafe.Text(tool.Function.Name))
 	if name == "" {
 		name = "_unnamed_"
 	}
@@ -390,7 +391,7 @@ func promptDebugToolLines(index int, tool api.Tool, width int) []string {
 }
 
 func promptDebugToolCallLines(index int, call api.ToolCall, width int) []string {
-	name := strings.TrimSpace(call.Function.Name)
+	name := strings.TrimSpace(termsafe.Text(call.Function.Name))
 	if name == "" {
 		name = "_unnamed_"
 	}
@@ -441,7 +442,7 @@ func promptDebugValueLine(indent int, label string, value any, width int) []stri
 
 func promptDebugTextLine(indent int, label, value string, width int) []string {
 	prefix := strings.Repeat(" ", indent) + chatHistoryLabelStyle.Render(label+":")
-	value = strings.TrimSpace(value)
+	value = strings.TrimSpace(termsafe.Text(value))
 	if value == "" {
 		value = "_empty_"
 	}
@@ -489,6 +490,7 @@ func promptDebugValueText(value any) string {
 
 func promptDebugBlockLines(label, value string, width int, style lipgloss.Style) []string {
 	lines := []string{"  " + chatHistoryLabelStyle.Render(label+":")}
+	value = termsafe.Text(value)
 	if value == "" {
 		return append(lines, "    "+chatMetaStyle.Render("_empty_"))
 	}
@@ -529,7 +531,7 @@ func formatPromptTokenCount(count int) string {
 
 func promptMessageLabel(msg api.Message) string {
 	if msg.Role == "tool" && msg.ToolName != "" {
-		return msg.Role + ":" + msg.ToolName
+		return msg.Role + ":" + termsafe.Text(msg.ToolName)
 	}
 	return msg.Role
 }

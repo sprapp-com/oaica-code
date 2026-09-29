@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -57,5 +59,44 @@ func TestRound131PublicKeysAreReadable(t *testing.T) {
 	}
 	if err := refuseCredentialPath("/tmp", "/home/u/.ssh/id_rsa.pub.bak"); err == nil {
 		t.Error("a .pub.bak is not the public key")
+	}
+}
+
+// F132-L1-1..4 (2026-09-29 audit, round 132).
+func TestRound132ProjectFilesNamedLikeProductStoresPass(t *testing.T) {
+	for _, c := range []string{
+		"cat src/.oaica/api_key_docs.md", "cat project/.oaica/api_key.txt", "sed -n 1,5p .oaica/remotes.json.example",
+		"cat ./.oaica/remotes.json", "cat src/api_key.go", "cat ~/.oaica/api_key_docs.md",
+	} {
+		if err := rejectUnsafeShellCommand(c); err != nil {
+			t.Errorf("%q must pass: %v", c, err)
+		}
+	}
+	for _, c := range []string{"cat ~/.oaica/api_key", "cat ~/.oaica/remotes.json.bak.1", "cat $HOME/.oaica/local_servers.json", "cat ${HOME}/.oaica/api_key"} {
+		if rejectUnsafeShellCommand(c) == nil {
+			t.Errorf("%q must be refused", c)
+		}
+	}
+}
+
+func TestRound132QuotingFormsAndCdCannotHideTheKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	os.WriteFile(filepath.Join(home, ".ssh", "id_rsa"), []byte("k"), 0o600)
+	for _, c := range []string{
+		`cat ~/.ssh/$'id_rsa'`, `cat ~/.ssh/id_$'rsa'`, `cat ~/.ssh/$"id_rsa"`, `cat ~/.ssh/$'\x69d_rsa'`, `cat ~/.ss${x}h/id_rsa`,
+	} {
+		if rejectUnsafeShellCommand(c) == nil {
+			t.Errorf("%q must be refused", c)
+		}
+	}
+	for _, c := range []string{"cd ~/.ssh && cat id_rsa", "cd ~/.ssh; cat id_*", "cd " + filepath.Join(home, ".ssh") + " && cat id_rsa"} {
+		if refuseCredentialWords(t.TempDir(), c) == nil {
+			t.Errorf("%q must be refused after the cd", c)
+		}
+	}
+	if err := refuseCredentialWords(t.TempDir(), "cd src && cat main.go"); err != nil {
+		t.Errorf("ordinary cd refused: %v", err)
 	}
 }

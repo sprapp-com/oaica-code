@@ -5,6 +5,7 @@ package chat
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -73,5 +74,29 @@ func TestRound131ApprovalLabelsAreTerminalSafe(t *testing.T) {
 	}
 	if got := toolInvocationLabel("bash", termsafeArgs(args)); strings.ContainsAny(got, "\x1b\a") {
 		t.Errorf("label: %q", got)
+	}
+}
+
+// F132-L1-5/6/7: the /prompt view and the completion menu show repository- and model-authored text safely.
+var sgrRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func TestRound132PromptViewAndCompletionsCarryNoControlSequences(t *testing.T) {
+	msg := api.Message{Role: "tool", ToolName: hostileText, ToolCallID: hostileText, Content: hostileText,
+		ToolCalls: []api.ToolCall{{ID: hostileText, Function: api.ToolCallFunction{Name: hostileText, Arguments: api.ToolCallFunctionArguments{}}}}}
+	for _, l := range promptDebugMessageLines(1, msg, 100) {
+		if strings.ContainsAny(sgrRe.ReplaceAllString(l, ""), "\x1b\a\r") {
+			t.Errorf("prompt view line carries a raw control sequence: %q", l)
+		}
+	}
+	for _, l := range append(promptDebugTextLine(2, "id", hostileText, 100), promptDebugFieldLine("model", hostileText, 100)) {
+		if strings.ContainsAny(sgrRe.ReplaceAllString(l, ""), "\x1b\a\r") {
+			t.Errorf("prompt view helper carries a raw control sequence: %q", l)
+		}
+	}
+	m := chatModel{}
+	for _, l := range m.renderCompletions([]chatCompletion{{value: "x", label: "@" + hostileText, description: hostileText}}, 120) {
+		if strings.ContainsAny(sgrRe.ReplaceAllString(l, ""), "\x1b\a\r") {
+			t.Errorf("completion menu carries a raw control sequence: %q", l)
+		}
 	}
 }

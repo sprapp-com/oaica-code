@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1195,9 +1196,11 @@ func (m chatModel) renderCompletions(completions []chatCompletion, width int) []
 		if start+i == selected {
 			marker = "› "
 		}
-		name := chatCommandNameStyle.Render(completion.label)
-		padding := strings.Repeat(" ", max(1, nameWidth-lipgloss.Width(completion.label)+2))
-		line := marker + name + padding + chatMetaStyle.Render(completion.description)
+		// File names and skill descriptions come from the repository (round 132, F132-L1-6/7).
+		label, description := termsafe.Text(completion.label), termsafe.Text(completion.description)
+		name := chatCommandNameStyle.Render(label)
+		padding := strings.Repeat(" ", max(1, nameWidth-lipgloss.Width(label)+2))
+		line := marker + name + padding + chatMetaStyle.Render(description)
 		lines = append(lines, truncateRenderedLine(line, width))
 	}
 	return lines

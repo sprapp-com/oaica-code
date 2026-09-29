@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"slices"
 	"sort"
 	"strings"
@@ -637,18 +638,18 @@ func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) 
 	}
 
 	if idx == m.cursor {
-		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + termsafe.Text(item.Name)))
 		if meta != "" {
 			s.WriteString(selectorMetaStyle.Render(meta))
 		}
 		s.WriteString("\n")
 		if item.Description != "" {
-			s.WriteString(selectorDescLineStyle.Render(item.Description))
+			s.WriteString(selectorDescLineStyle.Render(termsafe.Text(item.Description)))
 			s.WriteString("\n")
 		}
 		return
 	}
-	s.WriteString(selectorItemStyle.Render(item.Name))
+	s.WriteString(selectorItemStyle.Render(termsafe.Text(item.Name)))
 	if meta != "" {
 		s.WriteString(selectorMetaStyle.Render(meta))
 	}
@@ -657,10 +658,10 @@ func (m selectorModel) renderItem(s *strings.Builder, item SelectItem, idx int) 
 
 func (m selectorModel) renderCompactItem(s *strings.Builder, item SelectItem, idx int) {
 	if idx == m.cursor {
-		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + termsafe.Text(item.Name)))
 		s.WriteString(cursorItemSuffix(item))
 	} else {
-		s.WriteString(selectorItemStyle.Render(item.Name))
+		s.WriteString(selectorItemStyle.Render(termsafe.Text(item.Name)))
 	}
 	s.WriteString("\n")
 }
@@ -1293,16 +1294,16 @@ func (m multiSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m multiSelectorModel) renderSingleItem(s *strings.Builder, item SelectItem, idx int) {
 	if idx == m.cursor {
-		s.WriteString(selectorSelectedItemStyle.Render("▸ " + item.Name))
+		s.WriteString(selectorSelectedItemStyle.Render("▸ " + termsafe.Text(item.Name)))
 		s.WriteString(cursorItemSuffix(item))
 		s.WriteString("\n")
 		if item.Description != "" {
-			s.WriteString(selectorDescLineStyle.Render(item.Description))
+			s.WriteString(selectorDescLineStyle.Render(termsafe.Text(item.Description)))
 			s.WriteString("\n")
 		}
 		return
 	}
-	s.WriteString(selectorItemStyle.Render(item.Name))
+	s.WriteString(selectorItemStyle.Render(termsafe.Text(item.Name)))
 	s.WriteString("\n")
 }
 
@@ -1330,7 +1331,7 @@ func (m multiSelectorModel) renderMultiItem(s *strings.Builder, item SelectItem,
 	s.WriteString(suffix)
 	s.WriteString("\n")
 	if item.Description != "" {
-		s.WriteString(selectorDescLineStyle.Render(item.Description))
+		s.WriteString(selectorDescLineStyle.Render(termsafe.Text(item.Description)))
 		s.WriteString("\n")
 	}
 }

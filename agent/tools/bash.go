@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -301,7 +303,7 @@ func readsCredentialPath(command string) bool {
 		normalized = strings.ReplaceAll(normalized, "//", "/")
 	}
 	normalized = strings.ReplaceAll(normalized, "/./", "/")
-	for _, text := range []string{normalized, shellSafetyText(strings.ReplaceAll(command, "\\", ""))} {
+	for _, text := range []string{normalized, shellSafetyText(strings.ReplaceAll(command, "\\", "")), shellDecodedText(command)} {
 		for _, fragment := range credentialPathFragments {
 			if containsCredentialFragment(text, fragment) {
 				return true
@@ -425,17 +427,48 @@ func refuseCredentialWords(workingDir, command string) error {
 	if !commandHasCredentialReadVerb(command) {
 		return nil
 	}
-	for _, word := range strings.Fields(strings.NewReplacer(";", " ", "&", " ", "|", " ", "(", " ", ")", " ", "\"", "", "'", "", "<", " ", ">", " ").Replace(command)) {
-		if strings.HasPrefix(word, "-") || strings.ContainsAny(word, "*?[$`") || !strings.Contains(word, "/") {
+	// A `cd` earlier in the same command moves where later relative words point (`cd ~/.ssh && cat id_rsa`);
+	// the next tool call would be caught, this one was not (round 132, F132-L1-4).
+	cwd := workingDir
+	for _, segment := range strings.FieldsFunc(command, func(r rune) bool { return r == ';' || r == '&' || r == '|' || r == '\n' || r == '\r' }) {
+		words := shellWords(strings.NewReplacer("(", " ", ")", " ", "<", " ", ">", " ").Replace(segment))
+		if len(words) >= 2 && words[0] == "cd" {
+			dir := strings.Trim(words[1], `"'`)
+			if strings.HasPrefix(dir, "~") {
+				if home, err := os.UserHomeDir(); err == nil {
+					dir = filepath.Join(home, dir[1:])
+				}
+			}
+			if filepath.IsAbs(dir) {
+				cwd = dir
+			} else if dir != "" && !strings.Contains(dir, "$") {
+				cwd = filepath.Join(cwd, dir)
+			}
 			continue
 		}
-		if strings.HasPrefix(word, "~/") {
-			if home, err := os.UserHomeDir(); err == nil {
-				word = filepath.Join(home, word[2:])
+		for _, word := range words {
+			word = strings.Trim(word, `"'`)
+			if strings.HasPrefix(word, "-") || strings.ContainsAny(word, "$`") || word == "" {
+				continue
 			}
-		}
-		if err := refuseCredentialPath(workingDir, word); err != nil {
-			return fmt.Errorf("refusing to run unsafe command: credential file reads are not allowed")
+			if strings.ContainsAny(word, "*?[") {
+				// A glob is judged where it lands: relative to the directory a `cd` moved to.
+				if cwd != workingDir && globNamesCredential(filepath.ToSlash(filepath.Join(cwd, unquotedGlobPattern(word)))) {
+					return fmt.Errorf("refusing to run unsafe command: credential file reads are not allowed")
+				}
+				continue
+			}
+			if !strings.Contains(word, "/") && cwd == workingDir {
+				continue
+			}
+			if strings.HasPrefix(word, "~/") {
+				if home, err := os.UserHomeDir(); err == nil {
+					word = filepath.Join(home, word[2:])
+				}
+			}
+			if err := refuseCredentialPath(cwd, word); err != nil {
+				return fmt.Errorf("refusing to run unsafe command: credential file reads are not allowed")
+			}
 		}
 	}
 	return nil
@@ -452,8 +485,19 @@ func containsCredentialFragment(text, fragment string) bool {
 		if i < 0 {
 			return false
 		}
-		end := from + i + len(fragment)
+		i += from
+		end := i + len(fragment)
 		after := text[end:]
+		// The product's own stores live in the HOME directory: a project's own `.oaica/api_key_docs.md` or
+		// `.oaica/remotes.json.example` is a project file, not this user's key (round 132, F132-L1-1).
+		if homeScopedFragment(fragment) {
+			if !homeAnchored(text[:i]) || (!strings.HasPrefix(fragment, "/.oaica/remotes.json") && len(after) > 0 && isNameByte(after[0])) {
+				from = end
+				continue
+			}
+			return true
+		}
+		from = i
 		if !strings.HasSuffix(fragment, "/") && strings.HasPrefix(after, ".pub") {
 			if rest := after[len(".pub"):]; rest == "" || !isNameByte(rest[0]) {
 				from = end
@@ -464,11 +508,69 @@ func containsCredentialFragment(text, fragment string) bool {
 	}
 }
 
+var (
+	ansiCQuoteRe = regexp.MustCompile(`\$'([^']*)'`)
+	braceVarRe   = regexp.MustCompile(`\$\{[a-z_][a-z0-9_]*\}`)
+	ansiEscapeRe = regexp.MustCompile(`\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)`)
+)
+
+// shellDecodedText is the third spelling the shell reads: `$'id_\x72sa'` and `$"id_rsa"` are id_rsa, and an unset
+// `${x}` is nothing (round 132, F132-L1-3).
+func shellDecodedText(command string) string {
+	c := strings.ToLower(command)
+	c = ansiCQuoteRe.ReplaceAllStringFunc(c, func(m string) string {
+		inner := m[2 : len(m)-1]
+		return ansiEscapeRe.ReplaceAllStringFunc(inner, func(e string) string {
+			switch {
+			case e[1] == 'x' && len(e) > 2:
+				if n, err := strconv.ParseUint(e[2:], 16, 8); err == nil {
+					return string(rune(n))
+				}
+			case e[1] >= '0' && e[1] <= '7':
+				if n, err := strconv.ParseUint(e[1:], 8, 16); err == nil {
+					return string(rune(n))
+				}
+			}
+			return e[1:]
+		})
+	})
+	c = strings.ReplaceAll(c, `$"`, `"`)
+	c = braceVarRe.ReplaceAllStringFunc(c, func(m string) string {
+		if m == "${home}" {
+			return m
+		}
+		return ""
+	})
+	return shellSafetyText(c)
+}
+
+func homeScopedFragment(fragment string) bool {
+	return strings.HasPrefix(fragment, "/.oaica/") || strings.HasPrefix(fragment, "/.ollama/")
+}
+
+// homeAnchored: the text in front of a home-scoped fragment names the user's home (`~`, `$HOME`, the resolved
+// directory), not a project directory.
+func homeAnchored(before string) bool {
+	if i := strings.LastIndexAny(before, " \t\n"); i >= 0 {
+		before = before[i+1:]
+	}
+	switch before {
+	case "~", "$home", "${home}", "$env:userprofile", "%userprofile%":
+		return true
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		h := strings.ToLower(filepath.ToSlash(home))
+		return h != "" && strings.HasSuffix(before, h)
+	}
+	return false
+}
+
 func isNameByte(b byte) bool {
 	return b == '.' || b == '_' || b == '-' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
 }
 
 var credentialPathFragments = []string{
+	"/.oaica/local_servers.json",
 	"/.ollama/id_ed25519",
 	"/.oaica/api_key",
 	"/.oaica/license_key",

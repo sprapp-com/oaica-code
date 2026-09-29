@@ -157,9 +157,6 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 	}
 
 	p := filepath.Join(manifests, name.Filepath())
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
 
 	m := Manifest{
 		SchemaVersion: 2,
@@ -172,7 +169,19 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 	if err := json.NewEncoder(&buf).Encode(m); err != nil {
 		return err
 	}
-	return WriteFileAtomic(p, buf.Bytes(), 0o644)
+	// A concurrent delete of a sibling prunes the empty directory this write just made, between the MkdirAll and
+	// the rename: the write then fails with ENOENT though nothing is wrong. Make the directory again and retry
+	// (2026-09-29, round 132: TestRound117RealDeleteNew failed 1 run in 6 under load).
+	var werr error
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+		if werr = WriteFileAtomic(p, buf.Bytes(), 0o644); werr == nil || !errors.Is(werr, fs.ErrNotExist) {
+			return werr
+		}
+	}
+	return werr
 }
 
 // WriteFileAtomic writes data to path through a temporary file in the same directory and a
