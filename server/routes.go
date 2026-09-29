@@ -2265,7 +2265,7 @@ func writeRelayedStatusError(c *gin.Context, apiError api.StatusError) {
 // make a merged turn carry the run order its own streamed arm keeps, live in the
 // gin context of the process that saw that client — and a peer that merges a
 // relayed request has neither (2026-09-29 audit, round 96, F96-L1-1).
-const relayedSurfaceHeader = "X-Oaica-Surface"
+const relayedSurfaceHeader = api.RelayedSurfaceHeader
 
 // applyRelayedSurfaceMark gives a request that arrived from a relay the marks
 // the client on the far side of it earns locally, so one client body reads the

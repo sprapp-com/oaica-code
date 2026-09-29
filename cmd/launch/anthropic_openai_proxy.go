@@ -2412,6 +2412,20 @@ func RunAnthropicOpenAIProxyRoutes(ln net.Listener, table proxyRouteTable) error
 			return
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
+		// The surface the client on THIS side arrived on is stated to the peer,
+		// because a peer that is this tree's own server decides the turn by it:
+		// the marks that lift its tool-call gate, keep a merged turn's run
+		// order, and let an Anthropic client ask for thinking against a model
+		// that cannot think live in the gin context of the process that saw the
+		// client, and a relayed request arrives with none of them (round 96,
+		// F96-L1-1; round 97, F97-L1-1). This lane translates only the Anthropic
+		// wire (/v1/messages to /chat/completions), so its client is always the
+		// Anthropic surface. Measured without it: one Anthropic body carrying
+		// thinking against a model with no thinking capability was answered 200
+		// on the runner lane and 400 through this relay (2026-09-29 audit,
+		// round 99, F99-L2-1), the very split round 97 closed for the local
+		// server's own relay. A vendor upstream ignores the header.
+		upstreamReq.Header.Set(api.RelayedSurfaceHeader, "anthropic")
 		if resolvedKey := route.resolveKey(); resolvedKey != "" {
 			upstreamReq.Header.Set("Authorization", "Bearer "+resolvedKey)
 		}

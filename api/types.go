@@ -20,6 +20,18 @@ import (
 	"github.com/ollama/ollama/types/model"
 )
 
+// RelayedSurfaceHeader names the surface the client on the far side of a relay
+// arrived on, so the peer that serves that client applies the marks the surface
+// sets locally — the tool-call gate it lifts, the run order it keeps, and, for
+// the Anthropic surface, its own rule that lets a client ask for thinking
+// against a model that cannot think (server's applyRelayedSurfaceMark, rounds
+// 96 and 97). It is a contract between a relay and its peer, so both sides name
+// it from here: the local server's relay states it, and every lane that relays a
+// translated client to a peer must state it too — the client proxy's translated
+// path did not, and one Anthropic body then read 200 direct and 400 through the
+// relay for the same model (2026-09-29 audit, round 99, F99-L2-1).
+const RelayedSurfaceHeader = "X-Oaica-Surface"
+
 // StatusError is an error with an HTTP status code and message.
 type StatusError struct {
 	StatusCode   int
