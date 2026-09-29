@@ -115,7 +115,14 @@ func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType st
 	}
 
 	url := fmt.Sprintf("%s://%s%s", scheme, host, route)
-	curl := fmt.Sprintf("#!/bin/sh\nSCRIPT_DIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\ncurl --request %s --url %q --header %q --data-binary @\"${SCRIPT_DIR}/%s\"\n", method, url, "Content-Type: "+contentType, bodyFilename)
+	// Every field the CLIENT chose (the method, the Host it named, its Content-Type)
+	// is single-quoted, not %q: %q escapes a quote and a backslash and leaves
+	// `$(...)` and a backtick live inside the double quotes of a /bin/sh script, and
+	// the method, a valid HTTP token, may itself contain a backtick or `$`. Replaying
+	// the script ran whatever a client that could reach the port had put there
+	// (2026-09-29 audit, round 109, F109-L1-2).
+	curl := fmt.Sprintf("#!/bin/sh\nSCRIPT_DIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\ncurl --request %s --url %s --header %s --data-binary @\"${SCRIPT_DIR}/%s\"\n",
+		shellSingleQuote(method), shellSingleQuote(url), shellSingleQuote("Content-Type: "+contentType), bodyFilename)
 	if err := os.WriteFile(curlPath, []byte(curl), 0o600); err != nil {
 		slog.Warn("failed to write debug request replay command", "route", route, "error", err)
 		return
@@ -141,4 +148,11 @@ func sanitizeRouteForFilename(route string) string {
 	}
 
 	return b.String()
+}
+
+// shellSingleQuote quotes s for /bin/sh: nothing inside single quotes is expanded,
+// and an embedded single quote is written as close-quote, backslash-quote,
+// open-quote.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

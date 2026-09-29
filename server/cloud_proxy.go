@@ -445,10 +445,27 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// proxyIdentityRequestHeaders are the headers that say WHO the client is or where
+// it is, and that the cloud proxy must not forward: the proxied request is the
+// operator's own signed request. The Anthropic SDK always sends x-api-key, so a
+// client holding a real Anthropic key and pointed at the local server had it
+// delivered to ollama.com on every :cloud request, and its cookies and address went
+// with it (2026-09-29 audit, round 109, F109-L1-1). Authorization is not here: it is
+// the operator's signature on the signing host, and a custom cloud base URL may
+// legitimately expect the caller's.
+var proxyIdentityRequestHeaders = map[string]bool{
+	"X-Api-Key": true, "Api-Key": true, "Cookie": true, "Proxy-Authorization": true,
+	"Forwarded": true, "X-Forwarded-For": true, "X-Forwarded-Host": true,
+	"X-Forwarded-Proto": true, "X-Forwarded-Port": true, "X-Real-Ip": true,
+}
+
 func copyProxyRequestHeaders(dst, src http.Header) {
 	connectionTokens := connectionHeaderTokens(src)
 	for key, values := range src {
 		if isHopByHopHeader(key) || isConnectionTokenHeader(key, connectionTokens) {
+			continue
+		}
+		if proxyIdentityRequestHeaders[http.CanonicalHeaderKey(key)] {
 			continue
 		}
 
@@ -463,6 +480,11 @@ func copyProxyResponseHeaders(dst, src http.Header) {
 	connectionTokens := connectionHeaderTokens(src)
 	for key, values := range src {
 		if isHopByHopHeader(key) || isConnectionTokenHeader(key, connectionTokens) {
+			continue
+		}
+		// An upstream cookie set on the local origin is not the client's to hold
+		// (2026-09-29 audit, round 109, F109-L1-1).
+		if http.CanonicalHeaderKey(key) == "Set-Cookie" {
 			continue
 		}
 
