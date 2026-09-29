@@ -275,3 +275,42 @@ func TestRound128MeterCountsResponsesAndMessagesRoutes(t *testing.T) {
 		t.Errorf("/v1/messages booked %+v, want 11/5", m)
 	}
 }
+
+// F129-L3-1 / F129-L3-2 (2026-09-29 audit, round 129).
+func TestRound129MessagesPromptIncludesCacheTokens(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if r.URL.Query().Get("stream") == "1" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":400,\"cache_read_input_tokens\":600,\"output_tokens\":1}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"usage":{"input_tokens":400,"cache_read_input_tokens":600,"cache_creation_input_tokens":0,"output_tokens":20}}`)
+	}))
+	defer be.Close()
+	h := serveWith(newStaticPool([]*backend{newBackend(be.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m"}`)))
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages?stream=1", strings.NewReader(`{"model":"m","stream":true}`)))
+	waitForRecords(t, records, 2)
+	for i, rec := range (*records)[:2] {
+		if rec.PromptTokens != 1000 || rec.CachedTokens != 600 || rec.CompletionTokens != 20 {
+			t.Errorf("row %d booked prompt=%d cached=%d completion=%d, want 1000/600/20", i, rec.PromptTokens, rec.CachedTokens, rec.CompletionTokens)
+		}
+	}
+}
+
+func TestRound129SessionHashDoorWithNoBackendIsA503NotAPanic(t *testing.T) {
+	if hashPick(nil, "session", 1.5, 0) != nil {
+		t.Fatal("an empty pool picked a backend")
+	}
+	h := sessionHandler(newStaticPool(nil), 1.5)
+	w := httptest.NewRecorder()
+	h(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`)))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status %d, want 503", w.Code)
+	}
+}

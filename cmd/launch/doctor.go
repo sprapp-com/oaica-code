@@ -112,7 +112,7 @@ func doctorChecks(w io.Writer) bool {
 		// thing this line is for.
 		// Credential-embedded URLs (https://key@host/...) print
 		// redacted — doctor output lands in terminals and CI logs.
-		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", printableName(r.Name), redactBaseURL(r.openAIBase()), r.Wire, status, suffix)
+		fmt.Fprintf(w, "  %-16s %-40s wire=%-8s %s%s\n", printableName(r.Name), printableName(redactBaseURL(r.openAIBase())), printableName(r.Wire), status, suffix)
 	}
 	if len(remotes) == 0 {
 		fmt.Fprintln(w, "  (none configured)")

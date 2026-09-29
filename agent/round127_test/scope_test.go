@@ -132,3 +132,24 @@ func TestRound128SkillScopeBindsTheSkillName(t *testing.T) {
 		t.Errorf("two different skills share an approval scope")
 	}
 }
+
+// F129-L1-1 (2026-09-29 audit, round 129): a bash approval is bound to the directory it was given in.
+func TestRound129BashApprovalFollowsTheWorkingDir(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	os.MkdirAll(filepath.Join(a, "src"), 0o755)
+	os.MkdirAll(filepath.Join(b, "src"), 0o755)
+	os.WriteFile(filepath.Join(b, "src", "main.go"), []byte("x"), 0o644)
+	client := &scripted{turns: [][]api.ToolCall{
+		{call("c1", "bash", "command", "ls src")},
+		{call("c2", "bash", "command", "cd "+b)},
+		{call("c3", "bash", "command", "ls src")},
+	}}
+	reg := &agent.Registry{}
+	reg.Register(&agenttools.Bash{})
+	p := &yesOnce{}
+	sess := &agent.Session{Client: client, Tools: reg, ApprovalPrompter: p, WorkingDir: a}
+	sess.Run(context.Background(), agent.RunOptions{Model: "m", Messages: []api.Message{{Role: "user", Content: "hi"}}, MaxToolRounds: -1})
+	if len(p.prompts) != 3 {
+		t.Errorf("%d prompts, want 3: an approval of `ls src` in %s carried over to %s (%q)", len(p.prompts), a, b, p.prompts)
+	}
+}

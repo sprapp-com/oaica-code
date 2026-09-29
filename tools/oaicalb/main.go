@@ -617,6 +617,11 @@ func averageHealthyLoad(bs []*backend) float64 {
 // not chasing every request to the cheapest backend that could serve it,
 // and a real conversation's context only grows.
 func hashPick(bs []*backend, key string, overflowFactor float64, estTokens int) *backend {
+	// An empty pool (a reload down to no replicas) is "no backend", as the leastconn door answers it: the
+	// modulo below divided by zero and the client got a bare EOF (2026-09-29 audit, round 129, F129-L3-2).
+	if len(bs) == 0 {
+		return nil
+	}
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	idx := int(h.Sum32()) % len(bs)
@@ -860,6 +865,7 @@ type usageFields struct {
 	InputTokens         int `json:"input_tokens"`
 	OutputTokens        int `json:"output_tokens"`
 	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	CacheCreateTokens   int `json:"cache_creation_input_tokens"`
 	PromptTokensDetails *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
@@ -874,7 +880,10 @@ func (u *usageRecorder) absorb(f *usageFields) {
 	if f == nil {
 		return
 	}
-	if p := f.PromptTokens + f.InputTokens; p > 0 {
+	// The Messages spelling follows Anthropic: input_tokens EXCLUDES the cache read and cache creation
+	// tokens, which are stated beside it. The prompt is all three (a served 1000-token prompt with 600 cache
+	// hits was booked prompt=400 cached=600) (2026-09-29 audit, round 129, F129-L3-1).
+	if p := f.PromptTokens + f.InputTokens + f.CacheReadTokens + f.CacheCreateTokens; p > 0 {
 		u.promptTokens = p
 	}
 	if c := f.CompletionTokens + f.OutputTokens; c > 0 {

@@ -5,7 +5,10 @@
 // with an erase-line redraws a line already printed (2026-09-29 audit, round 128, F128-L1-1/2).
 package termsafe
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // Text keeps newlines, tabs and ordinary text and neutralises every other control character: ESC becomes
 // the visible symbol U+241B (so an ANSI sequence shows as "␛[31m" instead of running), a lone CR is
@@ -16,8 +19,10 @@ func Text(s string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(s))
-	for _, r := range s {
+	for i, r := range s {
 		switch {
+		case r == utf8.RuneError && !validAt(s, i):
+			b.WriteRune('�') // a raw invalid byte, e.g. an 8-bit C1 control (0x9b CSI, 0x9d OSC)
 		case r == '\n' || r == '\t':
 			b.WriteRune(r)
 		case r == '\r':
@@ -37,7 +42,15 @@ func isBidi(r rune) bool {
 	return (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) || r == 0x200e || r == 0x200f || r == 0x061c
 }
 
+func validAt(s string, i int) bool {
+	r, size := utf8.DecodeRuneInString(s[i:])
+	return !(r == utf8.RuneError && size <= 1)
+}
+
 func needsWork(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
 	for _, r := range s {
 		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f) || isBidi(r) {
 			return true

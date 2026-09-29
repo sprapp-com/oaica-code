@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/ollama/ollama/cmd/internal/termsafe"
 	"regexp"
 	"slices"
 	"sort"
@@ -1823,6 +1824,10 @@ func newChatEntry(entry chatEntry) chatEntry {
 	if entry.version <= 0 {
 		entry.version = 1
 	}
+	// Entries are built from stored messages (resume, /compact, skill runs) and from skill files as well as from
+	// live events, and all of that is model-, tool- or repository-authored: the live path was made
+	// terminal-safe in round 128 and this one was not (2026-09-29 audit, round 129, F129-L1-2).
+	entry.content, entry.label, entry.detail = termsafe.Text(entry.content), termsafe.Text(entry.label), termsafe.Text(entry.detail)
 	return entry
 }
 

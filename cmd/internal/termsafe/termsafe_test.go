@@ -3,6 +3,7 @@ package termsafe
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestTextNeutralisesTerminalControls(t *testing.T) {
@@ -21,5 +22,18 @@ func TestTextNeutralisesTerminalControls(t *testing.T) {
 	}
 	if Text("模型 ünï") != "模型 ünï" {
 		t.Errorf("non-ASCII text was altered")
+	}
+}
+
+// F129-L1-5: raw 8-bit C1 bytes (invalid UTF-8) are neutralised like their U+009x spellings.
+func TestTextNeutralisesRawC1Bytes(t *testing.T) {
+	for _, in := range []string{"\x9b2J", "ok \x9d52;c;cHduZWQ=\x9c", "a\xffb"} {
+		out := Text(in)
+		if out == in || !utf8.ValidString(out) {
+			t.Errorf("%q passed through as %q", in, out)
+		}
+	}
+	if Text("模型") != "模型" {
+		t.Errorf("valid multi-byte text was altered")
 	}
 }

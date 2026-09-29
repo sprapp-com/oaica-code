@@ -22,6 +22,7 @@ package launch
 import (
 	"encoding/json"
 	"fmt"
+	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"io"
 	"net/http"
 	"os"
@@ -145,7 +146,7 @@ func ollamaCloudModelIDsUncached() ([]string, error) {
 var ollamaCloudEntriesFn = ollamaCloudEntries
 
 func ollamaCloudEntries() []oaicaModelEntry {
-	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" {
+	if strings.TrimSpace(os.Getenv("OAICA_HOST")) != "" || internalcloud.Disabled() {
 		return nil
 	}
 	ids := ollamaCloudModelIDs()

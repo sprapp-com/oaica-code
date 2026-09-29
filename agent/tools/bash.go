@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -58,6 +59,11 @@ func (b *Bash) RequiresApproval(map[string]any) bool {
 // matches ONLY that precise string — any whitespace, quoting, or casing
 // variant re-prompts. The NUL separator is safe because a shell command
 // string cannot contain a literal NUL.
+// ScopeUsesWorkingDir: a command's effect depends on the directory it runs in exactly as a relative path
+// does, so "y" to `rm -rf src` in A must not approve it in B after a `cd B` (2026-09-29 audit, round 129,
+// F129-L1-1).
+func (b *Bash) ScopeUsesWorkingDir(map[string]any) bool { return true }
+
 func (b *Bash) ApprovalScope(args map[string]any) string {
 	name := b.Name()
 	if command, ok := args["command"].(string); ok {
@@ -76,6 +82,9 @@ func (b *Bash) Execute(ctx context.Context, toolCtx agent.ToolContext, args map[
 		return agent.ToolResult{}, fmt.Errorf("command parameter is required")
 	}
 	if err := rejectUnsafeShellCommand(command); err != nil {
+		return agent.ToolResult{}, err
+	}
+	if err := refuseCredentialWords(toolCtx.WorkingDir, command); err != nil {
 		return agent.ToolResult{}, err
 	}
 
@@ -177,16 +186,24 @@ func hasUnsafeRecursiveDelete(command string) bool {
 	// target") as an rm argument. Splitting on separators first restores
 	// command boundaries while still catching multi-target single commands
 	// like "rm -rf build /etc".
+	var earlier []string // words of the segments before this one, for `echo ~ | xargs rm -rf`
 	for _, segment := range shellSegments(command) {
-		fields := shellSafetyFields(segment)
-		for i, field := range fields {
-			if isRMCommand(field) && rmCommandDeletesUnsafeTarget(fields[i+1:]) {
-				return true
-			}
-			if isPowerShellDeleteCommand(field) && powerShellDeleteCommandDeletesUnsafeTarget(fields[i+1:]) {
-				return true
+		// `r\m` is rm to the shell; the backslash-to-slash rewrite turned it into `r/m`, while a Windows path needs
+		// that rewrite: scan both spellings.
+		for _, fields := range [][]string{shellSafetyFields(segment), shellSafetyFields(strings.ReplaceAll(segment, "\\", ""))} {
+			for i, field := range fields {
+				if isRMCommand(field) && rmCommandDeletesUnsafeTarget(fields[i+1:]) {
+					return true
+				}
+				if field == "xargs" && i+1 < len(fields) && isRMCommand(fields[i+1]) && rmCommandDeletesUnsafeTarget(append(append([]string{}, fields[i+2:]...), earlier...)) {
+					return true
+				}
+				if isPowerShellDeleteCommand(field) && powerShellDeleteCommandDeletesUnsafeTarget(fields[i+1:]) {
+					return true
+				}
 			}
 		}
+		earlier = append(earlier, shellSafetyFields(segment)...)
 	}
 	return false
 }
@@ -265,12 +282,72 @@ func readsCredentialPath(command string) bool {
 		return false
 	}
 	normalized := shellSafetyText(command)
+	// `~/.ssh/./id_rsa` and `~/.ssh//id_rsa` name the same file as `~/.ssh/id_rsa`.
+	for strings.Contains(normalized, "//") {
+		normalized = strings.ReplaceAll(normalized, "//", "/")
+	}
+	normalized = strings.ReplaceAll(normalized, "/./", "/")
 	for _, fragment := range credentialPathFragments {
 		if strings.Contains(normalized, fragment) {
 			return true
 		}
 	}
+	for _, field := range strings.Fields(normalized) {
+		if globNamesCredential(field) {
+			return true
+		}
+	}
 	return false
+}
+
+// globNamesCredential reports whether a shell glob word (`~/.ssh/id_rs?`, `~/.ssh/id_*`) can expand to a
+// credential path: its trailing segments match a fragment's segments one for one.
+func globNamesCredential(word string) bool {
+	if !strings.ContainsAny(word, "*?[") {
+		return false
+	}
+	segs := strings.Split(strings.Trim(word, "/"), "/")
+	for _, fragment := range credentialPathFragments {
+		want := strings.Split(strings.Trim(fragment, "/"), "/")
+		if len(segs) < len(want) {
+			continue
+		}
+		tail := segs[len(segs)-len(want):]
+		ok := true
+		for i := range want {
+			if m, err := path.Match(tail[i], want[i]); err != nil || !m {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseCredentialWords is the door-parity half of readsCredentialPath: a word that lands on a credential file
+// once relative paths and directory symlinks are resolved (`keys/id_rsa` with `keys -> ~/.ssh`) is refused,
+// as the Read tool refuses it (2026-09-29 audit, round 129, F129-L1-3).
+func refuseCredentialWords(workingDir, command string) error {
+	if !hasCredentialReadVerb(shellSafetyFields(command)) {
+		return nil
+	}
+	for _, word := range strings.Fields(strings.NewReplacer(";", " ", "&", " ", "|", " ", "(", " ", ")", " ", "\"", "", "'", "", "<", " ", ">", " ").Replace(command)) {
+		if strings.HasPrefix(word, "-") || strings.ContainsAny(word, "*?[$`") || !strings.Contains(word, "/") {
+			continue
+		}
+		if strings.HasPrefix(word, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				word = filepath.Join(home, word[2:])
+			}
+		}
+		if err := refuseCredentialPath(workingDir, word); err != nil {
+			return fmt.Errorf("refusing to run unsafe command: credential file reads are not allowed")
+		}
+	}
+	return nil
 }
 
 // credentialPathFragments name the files whose contents are credentials. The bash tool refuses to read
@@ -322,6 +399,10 @@ func refuseCredentialPath(workingDir, path string) error {
 
 func hasCredentialReadVerb(fields []string) bool {
 	for _, field := range fields {
+		// `/bin/cat` and `\cat` (normalised to `/cat`) are the verb too, exactly as isRMCommand accepts `/bin/rm`.
+		if i := strings.LastIndex(field, "/"); i >= 0 {
+			field = field[i+1:]
+		}
 		switch field {
 		case "cat", "less", "more", "head", "tail", "type", "get-content", "gc", "select-string", "grep", "rg", "sed", "awk":
 			return true
@@ -347,6 +428,10 @@ func isPowerShellDeleteCommand(field string) bool {
 
 func isUnsafeDeleteTarget(target string) bool {
 	if target == "." || target == "./" || target == "*" {
+		return true
+	}
+	// `**`, `?*` and `/**`, `/?*` expand to the same everything as `*` and `/*`.
+	if bare := strings.TrimPrefix(target, "/"); bare != "" && strings.Trim(bare, "*?") == "" && strings.Contains(bare, "*") {
 		return true
 	}
 	if target == "/*" {

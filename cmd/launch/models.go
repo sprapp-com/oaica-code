@@ -860,6 +860,11 @@ func isCloudModel(ctx context.Context, client *api.Client, name string) bool {
 
 // cloudStatusDisabled returns whether cloud usage is currently disabled.
 func cloudStatusDisabled(ctx context.Context, client *api.Client) (disabled bool, known bool) {
+	// The local policy first, as the agent door does: OLLAMA_NO_CLOUD binds this process whatever the daemon
+	// says (2026-09-29 audit, round 129, F129-L2-1).
+	if internalcloud.Disabled() {
+		return true, true
+	}
 	status, err := client.CloudStatusExperimental(ctx)
 	if err != nil {
 		var statusErr api.StatusError

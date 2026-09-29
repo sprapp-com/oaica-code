@@ -147,11 +147,17 @@ type meterHub struct {
 	tokens map[string]string // sha256 hex -> label
 }
 
+// sqliteURIPath escapes a file path for use in a `file:` URI: SQLite decodes %XX and stops at ? and #, so a
+// configured path containing them opened a different database (2026-09-29 audit, round 129, F129-L3-3).
+func sqliteURIPath(p string) string {
+	return strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(p)
+}
+
 func newMeterHub(cfg meterConfig) (*meterHub, error) {
 	// WAL and a busy timeout: on the default rollback journal any reader (the summary scans the whole table)
 	// makes a concurrent report fail at once with SQLITE_BUSY, and a reporter that gives up after three
 	// tries has lost the row for good (oaicalb keeps no ledger) (2026-09-29 audit, round 128, F128-L3-1).
-	dsn := (&url.URL{Scheme: "file", Opaque: cfg.DBPath, RawQuery: "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"}).String()
+	dsn := (&url.URL{Scheme: "file", Opaque: sqliteURIPath(cfg.DBPath), RawQuery: "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db %s: %w", cfg.DBPath, err)

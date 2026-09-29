@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -848,5 +849,21 @@ func TestRound128IngestSucceedsWhileAReaderIsScanning(t *testing.T) {
 	rows.Next()
 	if w := postIngest(t, hub, token, usageRecord{RequestID: "during-read", Model: "m"}); w.Code != http.StatusNoContent {
 		t.Errorf("a report during an open read answered %d, want 204", w.Code)
+	}
+}
+
+// F129-L3-3 (2026-09-29 audit, round 129): a configured db_path with URI-special characters opens THAT file.
+func TestRound129DBPathWithURISpecialCharactersOpensThatFile(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"pct%41.db", "q#hash.db", "what?.db"} {
+		path := filepath.Join(dir, name)
+		hub, err := newMeterHub(meterConfig{DBPath: path})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		hub.db.Close()
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s: the database was not created at the configured path: %v", name, err)
+		}
 	}
 }
