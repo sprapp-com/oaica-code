@@ -273,6 +273,9 @@ func validatePricingTiers(tiers []gwPricingTier) error {
 		if err != nil {
 			return fmt.Errorf("pricing_tiers[%d].prompt %q is not a decimal number", i, t.Prompt)
 		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("pricing_tiers[%d].prompt %q is not finite", i, t.Prompt)
+		}
 		if !(v > 0) {
 			return fmt.Errorf("pricing_tiers[%d].prompt %q must be positive", i, t.Prompt)
 		}
@@ -1141,6 +1144,10 @@ func (g *gateway) entitlementSnapshot() *entitlementCache {
 type usageReport struct {
 	ledgerEntry
 	Region string `json:"region"`
+	// flush, when set, marks a sentinel and not a report: the reporter closes it on reaching
+	// it, so everything queued before it has been delivered or given up on. Unexported, so
+	// it is never encoded.
+	flush chan struct{}
 }
 
 // meterReporterBackoff is the delay before retry N (1-indexed); a package
@@ -1175,6 +1182,10 @@ func runMeterReporter(ch <-chan usageReport, done <-chan struct{}, addr, token s
 			if !ok {
 				return
 			}
+		}
+		if rep.flush != nil {
+			close(rep.flush)
+			continue
 		}
 		body, err := json.Marshal(rep)
 		if err != nil {
@@ -1320,6 +1331,38 @@ func (g *gateway) reportUsage(e ledgerEntry) {
 		log.Printf("oaica-gateway: meterhub report channel full, dropping report for %s (local ledger still has it)", e.RequestID)
 	}
 }
+
+// flushMeterReports waits, up to timeout, for the reports queued at meterhub to be delivered.
+// Called once the server has drained: the handlers' ledger rows are written and their reports
+// queued, but main() returned straight after and the process ended with them still in the
+// channel — every deploy restart left meterhub's aggregate short of the ledger with no line
+// saying so (2026-09-29 audit, round 115, F115-L3-2). A sentinel rides the same FIFO, so its
+// arrival means everything before it is done.
+func (g *gateway) flushMeterReports(timeout time.Duration) {
+	g.mu.RLock()
+	ch := g.meterCh
+	g.mu.RUnlock()
+	if ch == nil {
+		return
+	}
+	flushed := make(chan struct{})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ch <- usageReport{flush: flushed}:
+	case <-timer.C:
+		log.Printf("oaica-gateway: shutting down with %d meterhub report(s) undelivered (the local ledger has them)", len(ch))
+		return
+	}
+	select {
+	case <-flushed:
+	case <-timer.C:
+		log.Printf("oaica-gateway: shutting down with meterhub reports undelivered after %s (the local ledger has them)", timeout)
+	}
+}
+
+// meterFlushGrace bounds the wait above; with shutdownGrace it stays inside systemd's 90 s stop timeout.
+const meterFlushGrace = 15 * time.Second
 
 // meterReportSendHook, when non-nil, runs inside reportUsage's critical
 // section, immediately before the send. A test seam, same shape as
@@ -1559,7 +1602,7 @@ func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
 	var found gwKey
 	ok := false
 	for _, k := range g.cfg.APIKeys {
-		if subtle.ConstantTimeCompare(presented, []byte(k.SHA256)) == 1 {
+		if subtle.ConstantTimeCompare(presented, []byte(strings.ToLower(k.SHA256))) == 1 {
 			found, ok = k, true
 		}
 	}
@@ -1704,7 +1747,10 @@ func (g *gateway) healthHandler(w http.ResponseWriter, r *http.Request) {
 const healthTrafficFreshness = 300 * time.Second
 
 func (g *gateway) healthFallbackDown(reason string) healthResult {
-	if last := g.lastOKAt.Load(); last > 0 && time.Since(time.Unix(last, 0)) < healthTrafficFreshness {
+	// A stamp in the FUTURE is not fresh: the wall clock was stepped back after it was taken,
+	// and the negative age read as "just now" for as long as the step was deep, so a dead
+	// upstream answered ok (2026-09-29 audit, round 115, F115-L3-5).
+	if last := g.lastOKAt.Load(); last > 0 && time.Since(time.Unix(last, 0)) >= 0 && time.Since(time.Unix(last, 0)) < healthTrafficFreshness {
 		return healthResult{http.StatusOK, map[string]any{
 			"status":            "ok",
 			"detail":            "probe timed out, but a real completion succeeded " + fmt.Sprintf("%.0f", time.Since(time.Unix(last, 0)).Seconds()) + "s ago",
@@ -2845,7 +2891,21 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req["model"] = m.upstreamID()
-	stream, _ := req["stream"].(bool)
+	// One reading of "stream" for the gateway AND the upstream. A value that is not a JSON
+	// bool ("true", 1, "yes") is coerced by a lax upstream (vLLM's pydantic bool) into a
+	// streamed turn, while this gateway read it as a document: no include_usage was forced,
+	// the recorder buffered an SSE body it could not parse, and the turn was booked 0/0 with
+	// cost 0 — an unmetered stream for any key holder (2026-09-29 audit, round 115, F115-L3-1).
+	// null is absent, as the upstream's Optional[bool] reads it.
+	stream := false
+	if sv, present := req["stream"]; present && sv != nil {
+		sb, isBool := sv.(bool)
+		if !isBool {
+			writeErr(w, http.StatusBadRequest, "invalid_request_error", "stream must be a boolean")
+			return
+		}
+		stream = sb
+	}
 	// Clamp the output budget to what is published in /models. Two reasons:
 	// max_tokens above max_completion_tokens was accepted verbatim (audit),
 	// and a NON-streaming reply must finish before Cloudflare's 100 s edge
@@ -3260,6 +3320,13 @@ func (g *gateway) entry(rec *usageRecorder, m gwModel, label, rid, path string, 
 	}
 	cached := u.cachedTokens()
 	cost, tier := computeCostUSDTiered(m.Pricing, m.PricingTiers, u.PromptTokens, cached, u.CompletionTokens)
+	// A price times a count can overflow to +Inf (1e308 passes the finite check), and json
+	// cannot encode it: the row vanished with no line. Booked as zero, and said once
+	// (2026-09-29 audit, round 115, F115-L3-3).
+	if math.IsNaN(cost) || math.IsInf(cost, 0) {
+		log.Printf("oaica-gateway: the cost of request %s on model %s is not a finite number (check the model's pricing); booked as 0", rid, m.ID)
+		cost = 0
+	}
 	// And a turn the client was told FAILED is not a turn this gateway may
 	// charge for at all, whatever the upstream stated about it. The guard above
 	// only ever suppressed this gateway's OWN estimate; the counts the upstream
@@ -3648,10 +3715,18 @@ func main() {
 	}
 	stop, cancelStop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancelStop()
-	if err := serveUntilDone(stop, srv, ln, shutdownGrace); err != nil {
+	if err := serveGateway(stop, g, srv, ln, shutdownGrace); err != nil {
 		log.Fatalf("oaica-gateway: %v", err)
 	}
 	log.Printf("oaica-gateway: shut down cleanly")
+}
+
+// serveGateway is serveUntilDone plus the wait for the meterhub reports the drained requests
+// queued; main() calls this and nothing else.
+func serveGateway(ctx context.Context, g *gateway, srv *http.Server, ln net.Listener, grace time.Duration) error {
+	err := serveUntilDone(ctx, srv, ln, grace)
+	g.flushMeterReports(meterFlushGrace)
+	return err
 }
 
 // shutdownGrace is how long in-flight streams get to finish after SIGTERM or SIGINT before they

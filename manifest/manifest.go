@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -156,12 +157,6 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 		return err
 	}
 
-	f, err := os.Create(p)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	m := Manifest{
 		SchemaVersion: 2,
 		MediaType:     "application/vnd.docker.distribution.manifest.v2+json",
@@ -169,7 +164,61 @@ func WriteManifest(name model.Name, config Layer, layers []Layer) error {
 		Layers:        layers,
 	}
 
-	return json.NewEncoder(f).Encode(m)
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(m); err != nil {
+		return err
+	}
+	return WriteFileAtomic(p, buf.Bytes(), 0o644)
+}
+
+// WriteFileAtomic writes data to path through a temporary file in the same directory and a
+// rename, so a reader sees the old manifest or the new one and never a truncated one, and a
+// write that fails part-way (a full disk) leaves the installed model as it was. os.WriteFile
+// truncates the live path first: a concurrent request for the model read EOF for the length of
+// the write, and a disk-full re-pull left an installed, working model as a 64-byte fragment
+// that no door could read (2026-09-29 audit, round 115, F115-L1-2).
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	// The temporary file lives under the manifests root but two levels short of where a
+	// manifest sits, so Manifests' `*/*/*/*` walk never sees it: in the manifest's own
+	// directory a listing that globbed it and then lost it to the rename failed outright
+	// (the os.Stat below returns the error even with continueOnError).
+	root, err := Path()
+	if err != nil {
+		return err
+	}
+	tmpDir := filepath.Join(root, ".tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(tmpDir, "manifest-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	fail := func(err error) error {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func Manifests(continueOnError bool) (map[model.Name]*Manifest, error) {

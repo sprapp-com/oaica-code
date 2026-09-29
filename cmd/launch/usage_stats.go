@@ -139,7 +139,18 @@ func LoadUsageStatsCountingUnreadable(filter UsageStatsFilter) ([]UsageStatsRow,
 			case truncated:
 				unreadable++
 			case json.Unmarshal(line, &e) != nil:
+				// A write cut short (a full disk) leaves a fragment with no newline and
+				// the next process's row lands on the same line. The fragment is one
+				// lost row; the whole line is not, so the row after it is still read.
+				// Done here and not by the writer, whose "start on a fresh line" check
+				// races another process's half-written row (2026-09-29 audit, round 115,
+				// F115-L2-1).
 				unreadable++
+				if tail, ok := trailingLogRow(line); ok {
+					if aggregateUsageRow(agg, &order, filter, tail) == rowUnreadable {
+						unreadable++
+					}
+				}
 			case isEmptyLogRow(e):
 				// `{}` and `null` parse into a zero row without error, and a
 				// zero row counted as one request under an empty model and an
@@ -291,6 +302,21 @@ func readLogLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
 // isEmptyLogRow reports whether a parsed line carries no row at all. Only `{}`,
 // `null` and whitespace parse into that shape — every row this package writes
 // has at least a timestamp and a backend.
+// trailingLogRow reads the row a line ends with when the line as a whole does
+// not parse: every row begins `{"ts":"` (requestLogEntry's first field), so the
+// last such start after offset 0 is where a row joined onto a fragment begins.
+func trailingLogRow(line []byte) (requestLogEntry, bool) {
+	i := bytes.LastIndex(line, []byte(`{"ts":"`))
+	if i <= 0 {
+		return requestLogEntry{}, false
+	}
+	var e requestLogEntry
+	if json.Unmarshal(line[i:], &e) != nil || isEmptyLogRow(e) {
+		return requestLogEntry{}, false
+	}
+	return e, true
+}
+
 func isEmptyLogRow(e requestLogEntry) bool {
 	return e.Timestamp == "" && e.Model == "" && e.Path == "" && e.Backend == ""
 }

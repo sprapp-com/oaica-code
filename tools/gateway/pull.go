@@ -209,7 +209,7 @@ func (g *gateway) licenseLabel(r *http.Request) (label string, presentedKey bool
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	for _, k := range g.cfg.PullLicenseKeys {
-		if subtle.ConstantTimeCompare(presented, []byte(k.SHA256)) == 1 {
+		if subtle.ConstantTimeCompare(presented, []byte(strings.ToLower(k.SHA256))) == 1 {
 			label = k.Label
 		}
 	}

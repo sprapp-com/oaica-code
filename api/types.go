@@ -1528,7 +1528,13 @@ func (d *Duration) UnmarshalJSON(b []byte) (err error) {
 		if t < 0 {
 			d.Duration = time.Duration(math.MaxInt64)
 		} else {
-			d.Duration = time.Duration(t * float64(time.Second))
+			// Beyond what a Duration holds is "forever", not a wrapped negative that the
+			// scheduler reads as "unload now" (2026-09-29 audit, round 115, F115-L1-3).
+			if ns := t * float64(time.Second); ns >= float64(math.MaxInt64) {
+				d.Duration = time.Duration(math.MaxInt64)
+			} else {
+				d.Duration = time.Duration(ns)
+			}
 		}
 	case string:
 		d.Duration, err = time.ParseDuration(t)

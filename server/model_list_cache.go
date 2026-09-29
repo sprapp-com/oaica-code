@@ -144,7 +144,13 @@ func (c *modelListCache) Wait(ctx context.Context) error {
 
 func (c *modelListCache) List(ctx context.Context) ([]api.ListModelResponse, error) {
 	if err := c.Wait(ctx); err != nil {
-		return nil, err
+		// A failed startup hydration is not sticky: the sync below fills the cache from the
+		// manifests as they are now. Returning it here kept /api/tags and /v1/models at 500
+		// until a restart after a directory that was unreadable at boot came back, while
+		// /api/show served the same model (2026-09-29 audit, round 115, F115-L1-1).
+		if ctx != nil && ctx.Err() != nil {
+			return nil, err
+		}
 	}
 	if err := c.syncManifests(ctx); err != nil {
 		return nil, err

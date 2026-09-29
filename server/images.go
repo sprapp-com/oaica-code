@@ -801,14 +801,11 @@ func CopyModel(src, dst model.Name) error {
 	}
 	defer srcfile.Close()
 
-	dstfile, err := os.Create(dstpath)
+	data, err := io.ReadAll(srcfile)
 	if err != nil {
 		return err
 	}
-	defer dstfile.Close()
-
-	_, err = io.Copy(dstfile, srcfile)
-	return err
+	return manifest.WriteFileAtomic(dstpath, data, 0o644)
 }
 
 func deleteUnusedLayers(deleteMap map[string]struct{}) error {
@@ -1069,7 +1066,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return err
 	}
 
-	err = os.WriteFile(fp, manifestData, 0o644)
+	err = manifest.WriteFileAtomic(fp, manifestData, 0o644)
 	if err != nil {
 		slog.Info(fmt.Sprintf("couldn't write to %s", fp))
 		return err

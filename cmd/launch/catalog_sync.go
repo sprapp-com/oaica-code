@@ -59,19 +59,24 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 		url = defaultCatalogSyncURL
 	}
 
+	// display is what any report or message may print: a --url may carry a mirror
+	// credential, and the same redacted form is the identity the cache and its ETag
+	// are bound to, as ProviderSync's are (2026-09-29 audit, round 115, F115-L2-2/3).
+	display := redactBaseURL(url)
+
 	cachePath, err := catalogCachePath()
 	if err != nil {
-		return CatalogSyncReport{URL: url}, err
+		return CatalogSyncReport{URL: display}, err
 	}
 
-	var etag string
-	if b, rerr := os.ReadFile(cachePath + ".etag"); rerr == nil {
-		etag = strings.TrimSpace(string(b))
-	}
+	etag := loadCatalogETag(cachePath+".etag", display, defaultCatalogSyncURL)
 
 	body, newEtag, fromCache, err := fetchCatalogBody(url, etag, cachePath)
 	if err != nil {
-		return CatalogSyncReport{URL: url}, err
+		return CatalogSyncReport{URL: display}, err
+	}
+	if fromCache && !catalogCacheSourceMatches(cachePath, display, defaultCatalogSyncURL) {
+		return CatalogSyncReport{URL: display}, fmt.Errorf("can't reach %s, and the catalog cached at %s came from a different source — run this again while online", display, cachePath)
 	}
 	// A cache that will not parse, with the ETag of the whole body beside it (an
 	// interrupted write left it), answers 304 for ever, and the byte-identical early
@@ -83,7 +88,7 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 		if _, perr := parseModelsDevCatalog(body); perr != nil {
 			body, newEtag, fromCache, err = fetchCatalogBody(url, "", cachePath)
 			if err != nil {
-				return CatalogSyncReport{URL: url}, err
+				return CatalogSyncReport{URL: display}, err
 			}
 		}
 	}
@@ -93,7 +98,7 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 	if prev, rerr := os.ReadFile(cachePath); rerr == nil && sameBytes(prev, body) {
 		f, _ := parseModelsDevCatalog(body)
 		pn, mn := f.counts()
-		return CatalogSyncReport{URL: url, Providers: pn, Models: mn, Unchanged: true}, nil
+		return CatalogSyncReport{URL: display, Providers: pn, Models: mn, Unchanged: true}, nil
 	}
 
 	// The contract check runs on the RAW body and before the parse, because a
@@ -110,9 +115,9 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 			}
 			lines = append(lines, fl.String())
 		}
-		return CatalogSyncReport{URL: url, Refused: true},
+		return CatalogSyncReport{URL: display, Refused: true},
 			fmt.Errorf("refused: %s does not match the fields oaica reads:\n  %s\n(cached catalog left in place)",
-				url, strings.Join(lines, "\n  "))
+				display, strings.Join(lines, "\n  "))
 	}
 
 	// Backstop for a shape the contract does not constrain (a field we read but
@@ -120,13 +125,13 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 	// unreadable body is never cached.
 	f, perr := parseModelsDevCatalog(body)
 	if perr != nil {
-		return CatalogSyncReport{URL: url, Refused: true},
-			fmt.Errorf("refused: %s is not readable as the models.dev catalog: %w (cached catalog left in place)", url, perr)
+		return CatalogSyncReport{URL: display, Refused: true},
+			fmt.Errorf("refused: %s is not readable as the models.dev catalog: %w (cached catalog left in place)", display, perr)
 	}
 
 	if !fromCache {
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-			return CatalogSyncReport{URL: url}, err
+			return CatalogSyncReport{URL: display}, err
 		}
 		// Atomic, as ProviderSync's cache is: os.WriteFile truncates the live path
 		// first, so a write that failed part-way (a full disk, Ctrl-C, SIGKILL during
@@ -134,15 +139,14 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 		// picker with none (2026-09-29 audit, round 112, F112-L2-2). The body goes
 		// first and the ETag after it, so an ETag never names a body that is not there.
 		if err := fileutil.WriteFileAtomic(cachePath, body, 0o600); err != nil {
-			return CatalogSyncReport{URL: url}, err
+			return CatalogSyncReport{URL: display}, err
 		}
-		if newEtag != "" {
-			_ = os.WriteFile(cachePath+".etag", []byte(newEtag), 0o600)
-		}
+		saveCatalogETag(cachePath+".etag", display, newEtag)
+		saveCatalogCacheSource(cachePath, display)
 	}
 
 	pn, mn := f.counts()
-	return CatalogSyncReport{URL: url, Providers: pn, Models: mn, FromCache: fromCache}, nil
+	return CatalogSyncReport{URL: display, Providers: pn, Models: mn, FromCache: fromCache}, nil
 }
 
 // loadModelsDevCatalog returns the cached catalog and whether one exists. It
