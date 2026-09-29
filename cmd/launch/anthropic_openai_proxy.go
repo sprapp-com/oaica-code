@@ -1553,7 +1553,7 @@ var proxyUpstreamClient = &http.Client{Transport: &http.Transport{
 	DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 	MaxIdleConnsPerHost: 8,
 	IdleConnTimeout:     90 * time.Second,
-}}
+}, CheckRedirect: credentialSafeRedirect}
 
 // proxyUpstreamMaxRetries bounds client-side retrying of transient upstream
 // failures, mirroring what the official Anthropic/OpenAI SDKs do client-side
@@ -5494,7 +5494,7 @@ func proxyPassThrough(w http.ResponseWriter, r *http.Request, target, key string
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 30 * time.Second, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return
@@ -5670,7 +5670,7 @@ func anthropicModelsPassthrough(w http.ResponseWriter, r *http.Request, upstream
 	// the header bare, so an OAuth-only machine's model list 401'd and Claude
 	// Code fell back to its built-in one (2026-09-26 audit, thirteenth round).
 	applyNativeAnthropicAuth(req, nativeAnthropicAuth{Header: headerName, Value: headerValue})
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 15 * time.Second, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "upstream request failed: "+redactErr(err).Error())
 		return
@@ -5866,7 +5866,7 @@ func fetchNativeModelCatalog(ctx context.Context) ([]nativeCatalogEntry, error) 
 	// request whose headers could supply it.
 	applyNativeAnthropicAuth(req, auth)
 	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := (&http.Client{Timeout: nativeModelCatalogTimeout}).Do(req)
+	resp, err := (&http.Client{Timeout: nativeModelCatalogTimeout, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		return nil, err
 	}

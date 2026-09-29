@@ -170,7 +170,7 @@ func defaultRemoteContextWindow(route proxyRoute) int {
 			req.Header.Set("anthropic-version", "2023-06-01")
 		}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := credentialSafeDefaultClient().Do(req)
 	if err != nil {
 		return 0
 	}

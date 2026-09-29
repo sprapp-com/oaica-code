@@ -916,7 +916,7 @@ func fetchRemoteModels(r userRemote) ([]string, error) {
 			req.Header.Set("Authorization", "Bearer "+k)
 		}
 	}
-	resp, err := (&http.Client{Timeout: remoteModelsFetchTimeout}).Do(req)
+	resp, err := (&http.Client{Timeout: remoteModelsFetchTimeout, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		return nil, redactErr(err)
 	}

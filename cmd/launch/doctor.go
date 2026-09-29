@@ -57,7 +57,7 @@ func probeRemote(r userRemote) string {
 			req.Header.Set("Authorization", "Bearer "+k)
 		}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := credentialSafeDefaultClient().Do(req)
 	if err != nil {
 		return "FAIL " + redactErr(err).Error()
 	}
