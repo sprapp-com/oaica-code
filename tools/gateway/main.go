@@ -78,6 +78,7 @@ import (
 	"os/signal"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1335,7 +1336,121 @@ func (g *gateway) calibrator() *promptCalibrator {
 	return g.calib
 }
 
+// unknownConfigKeys lists the keys of a config file that no field of gwConfig, gwKey,
+// gwModel or their nested structs accepts, as dotted paths (models[0].max_completion_token).
+// The match is case-insensitive, as json.Unmarshal's is, so a key the decoder would
+// read is never reported. loadConfig decodes without strictness and a typo in a
+// security or limit key (max_concurent, request_timeout_secs, larg_context_token_threshold)
+// was silently ignored, so the limit was silently off (2026-09-29 audit, round 113, F113-L3-2).
+func unknownConfigKeys(raw []byte) []string {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return nil
+	}
+	var out []string
+	walkUnknownKeys("", v, reflect.TypeOf(gwConfig{}), &out)
+	sort.Strings(out)
+	return out
+}
+
+func walkUnknownKeys(path string, v any, t reflect.Type, out *[]string) {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		m, ok := v.(map[string]any)
+		if !ok {
+			return
+		}
+		fields := map[string]reflect.Type{}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			name := strings.Split(f.Tag.Get("json"), ",")[0]
+			if name == "-" || !f.IsExported() {
+				continue
+			}
+			if name == "" {
+				name = f.Name
+			}
+			fields[strings.ToLower(name)] = f.Type
+		}
+		for k, val := range m {
+			child := k
+			if path != "" {
+				child = path + "." + k
+			}
+			ft, ok := fields[strings.ToLower(k)]
+			if !ok {
+				*out = append(*out, child)
+				continue
+			}
+			walkUnknownKeys(child, val, ft, out)
+		}
+	case reflect.Slice:
+		arr, ok := v.([]any)
+		if !ok {
+			return
+		}
+		for i, e := range arr {
+			walkUnknownKeys(fmt.Sprintf("%s[%d]", path, i), e, t.Elem(), out)
+		}
+	}
+}
+
+// warnUnknownConfigKeys logs one line per unknown key. It is a warning, not a refusal:
+// a live config may carry a key another version of the gateway reads, and refusing on
+// reload would take the last good config away over a comment. --check is the strict mode.
+func warnUnknownConfigKeys(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, k := range unknownConfigKeys(b) {
+		log.Printf("oaica-gateway: WARNING: unknown key %q in %s is IGNORED — if it is a typo, the setting it meant is not in effect", k, path)
+	}
+}
+
+// runCheck validates a config file without starting anything: it opens no ledger and
+// binds no port. It prints the resolved limits, fails on any error loadConfig would
+// refuse and on any unknown key, and returns the process exit code, so a deploy script can
+// gate on it and an operator can see what was actually resolved (2026-09-29 audit,
+// round 113, F113-L3-3). Key digests are never printed, only labels.
+func runCheck(path string, w io.Writer) int {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		fmt.Fprintf(w, "config INVALID: %v\n", err)
+		return 1
+	}
+	unknown := []string(nil)
+	if b, rerr := os.ReadFile(path); rerr == nil {
+		unknown = unknownConfigKeys(b)
+	}
+	for _, k := range unknown {
+		fmt.Fprintf(w, "unknown key %q is ignored by the gateway — a typo here means the setting is not in effect\n", k)
+	}
+	fmt.Fprintf(w, "upstream_addr: %s (%d distinct upstreams)\nlisten_addr: %s\nledger_path: %s\n", cfg.UpstreamAddr, distinctUpstreams(cfg), cfg.ListenAddr, cfg.LedgerPath)
+	fmt.Fprintf(w, "request_timeout_sec: %d\nlarge_context_token_threshold: %d\nmax_concurrent_large_context: %d\n", cfg.RequestTimeoutSec, cfg.LargeContextTokenThreshold, cfg.MaxConcurrentLargeContext)
+	for _, k := range cfg.APIKeys {
+		fmt.Fprintf(w, "key %q: max_concurrent=%d max_completion_tokens=%d priority=%v\n", k.Label, k.MaxConcurrent, k.MaxCompletionTokens, k.Priority)
+	}
+	for _, m := range cfg.Models {
+		up := m.UpstreamAddr
+		if up == "" {
+			up = "(default)"
+		}
+		fmt.Fprintf(w, "model %q: max_completion_tokens=%d context_length=%d upstream=%s\n", m.ID, m.MaxCompletionTokens, m.ContextLength, up)
+	}
+	if len(unknown) > 0 {
+		fmt.Fprintf(w, "%d unknown key(s): fix them or remove them before deploying\n", len(unknown))
+		return 1
+	}
+	fmt.Fprintln(w, "config OK")
+	return 0
+}
+
 func (g *gateway) reload(path string) {
+	warnUnknownConfigKeys(path)
 	cfg, err := loadConfig(path)
 	if err != nil {
 		log.Printf("oaica-gateway: reload REJECTED, keeping previous config: %v", err)
@@ -1719,6 +1834,32 @@ type ledgerEntry struct {
 	PriceTier int `json:"price_tier,omitempty"`
 }
 
+// appendRow appends one newline-terminated row to a JSONL file and, if the write
+// fails, cuts the file back to the row boundary. A write that put PART of a row on
+// the disk and then failed (a full disk that later frees up) left a newline-less
+// fragment, and the next row was appended straight onto it: the failed row was lost,
+// which is accepted, and the row AFTER it stopped parsing as well, because the
+// fragment and the row shared a line (2026-09-29 audit, round 112, F112-L3-1). The
+// upstream-error log had the same defect and dropped the error without a word
+// (round 113, F113-L3-1), so both files use this one helper. A "start the next row on
+// a fresh line" fallback for a truncate that itself fails was measured not
+// independently reachable and does not ship. The caller holds the file's lock.
+func appendRow(f *os.File, row []byte) error {
+	size := int64(-1)
+	if st, err := f.Stat(); err == nil {
+		size = st.Size()
+	}
+	if _, err := f.Write(row); err != nil {
+		if size >= 0 {
+			if terr := f.Truncate(size); terr != nil {
+				return fmt.Errorf("%w (and cutting the file back to the row boundary failed: %v)", err, terr)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 func (g *gateway) writeLedger(e ledgerEntry) {
 	b, err := json.Marshal(e)
 	if err != nil {
@@ -1727,27 +1868,7 @@ func (g *gateway) writeLedger(e ledgerEntry) {
 	g.ledgerMu.Lock()
 	var writeErr error
 	if g.ledger != nil {
-		row := append(b, '\n')
-		// A write that put PART of a row on the disk and then failed (a full disk
-		// that later frees up) left a newline-less fragment, and the next row was
-		// appended straight onto it: the failed row was lost, which is accepted,
-		// and the row AFTER it stopped parsing as well, because the fragment and the
-		// row shared a line. Cut the file back to the row boundary. A "start the next
-		// row on a fresh line" fallback for a truncate that itself fails was written
-		// alongside and measured not independently reachable, so it does not ship
-		// (2026-09-29 audit, round 112, F112-L3-1).
-		var size int64 = -1
-		if st, serr := g.ledger.Stat(); serr == nil {
-			size = st.Size()
-		}
-		if _, err := g.ledger.Write(row); err != nil {
-			writeErr = err
-			if size >= 0 {
-				if terr := g.ledger.Truncate(size); terr != nil {
-					writeErr = fmt.Errorf("%w (and cutting the ledger back to the row boundary failed: %v)", err, terr)
-				}
-			}
-		}
+		writeErr = appendRow(g.ledger, append(b, '\n'))
 	}
 	g.ledgerMu.Unlock()
 
@@ -1806,10 +1927,17 @@ func (g *gateway) logUpstreamError(info *errCaptureInfo, status int, code, msg s
 		return
 	}
 	g.errLogMu.Lock()
+	var werr error
 	if g.errLog != nil {
-		g.errLog.Write(append(b, '\n'))
+		werr = appendRow(g.errLog, append(b, '\n'))
 	}
 	g.errLogMu.Unlock()
+	if werr != nil {
+		// Logged after the lock, for the reason writeLedger's is: the sink is not
+		// ours. This is the diagnosis file for the context-overflow incidents, and
+		// its failures were silent (2026-09-29 audit, round 113, F113-L3-1).
+		log.Printf("upstream error log write failed: %v", werr)
+	}
 }
 
 type usage struct {
@@ -3480,8 +3608,13 @@ func mux(g *gateway) http.Handler {
 
 func main() {
 	configPath := flag.String("config", "", "path to oaica-gateway JSON config")
+	check := flag.Bool("check", false, "validate --config (unknown keys are errors), print the resolved limits and exit 0 or 1, without opening a ledger or binding a port")
 	flag.Parse()
 
+	if *check {
+		os.Exit(runCheck(*configPath, os.Stdout))
+	}
+	warnUnknownConfigKeys(*configPath)
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("oaica-gateway: %v", err)
