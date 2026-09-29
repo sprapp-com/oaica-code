@@ -3591,7 +3591,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 			// The blank line ends the event: what it held, joined, is the only
 			// reading of it that can recognise an object that spanned more than
 			// one line (2026-09-29 audit, round 87, F87-L2-2).
-				joined := eventBuf.String()
+			joined := eventBuf.String()
 			eventErr := eventErrorMessage(&eventBuf, secret)
 			// The event is over: text that never parsed is not this event's
 			// payload, and holding it into the next event would join two
@@ -6349,10 +6349,12 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	relayedBytes := 0
+	var frames errorFrameWatch
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
 			relayedBytes += n
+			frames.feed(buf[:n])
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				// The client's own connection failed. This is the caller's
 				// client-gone case, not evidence about the leg — nor a failed
@@ -6380,9 +6382,71 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 			// (handleNonStreamResponse fails to decode it, handleStreamResponse
 			// never sees a frame) — only this one, which does not parse the
 			// wire, had to say so explicitly.
-			delivered = relayedBytes > 0 && errors.Is(readErr, io.EOF)
+			//
+			// A body that ENDS in an error frame is the same dead turn: Anthropic
+			// reports a mid-stream overload as `event: error` after a 200 and a
+			// started message, the translated arm already counts that turn as
+			// undelivered (a 502 row, a recordFail on the breaker and the
+			// escalation), and this arm relayed it to a clean EOF and recorded
+			// OK — so a leg that fails every turn this way stayed "healthy", the
+			// breaker never opened and `auto` never escalated, while the client
+			// saw the failure (2026-09-29 audit, round 106, F106-L2-1). The relay
+			// itself is unchanged: the watcher only reads what already went out.
+			frames.finish()
+			delivered = relayedBytes > 0 && errors.Is(readErr, io.EOF) && !frames.sawError
 			return resp.StatusCode, delivered
 		}
+	}
+}
+
+// errorFrameWatch reads a relayed Anthropic-wire body for an in-band error: an
+// SSE `event: error` line, a `data:` line whose object is `{"type":"error"...`,
+// or a non-streamed body that opens with that object. It keeps only the first
+// bytes of each line, so a long frame costs nothing.
+type errorFrameWatch struct {
+	line     []byte
+	sawError bool
+}
+
+const errorFrameLineCap = 64
+
+func (e *errorFrameWatch) feed(p []byte) {
+	for _, b := range p {
+		if b == '\n' {
+			e.endLine()
+			continue
+		}
+		if len(e.line) < errorFrameLineCap {
+			e.line = append(e.line, b)
+		}
+	}
+}
+
+func (e *errorFrameWatch) finish() {
+	if len(e.line) > 0 {
+		e.endLine()
+	}
+}
+
+func (e *errorFrameWatch) endLine() {
+	line := bytes.TrimSpace(e.line)
+	e.line = e.line[:0]
+	if k, v, ok := bytes.Cut(line, []byte(":")); ok {
+		switch string(bytes.ToLower(bytes.TrimSpace(k))) {
+		case "event":
+			if strings.EqualFold(string(bytes.TrimSpace(v)), "error") {
+				e.sawError = true
+			}
+			return
+		case "data":
+			line = bytes.TrimSpace(v)
+		}
+	}
+	// A JSON object whose first key is type:"error" — the `data:` payload of an
+	// error frame, or a whole non-streamed body.
+	compact := bytes.ReplaceAll(line, []byte(" "), nil)
+	if bytes.HasPrefix(compact, []byte(`{"type":"error"`)) {
+		e.sawError = true
 	}
 }
 
