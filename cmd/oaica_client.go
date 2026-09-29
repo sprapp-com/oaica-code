@@ -121,7 +121,9 @@ func oaicaDiagnosisBody(body []byte) string {
 	// Redacted BEFORE it is cut: cut first, a key that crosses the boundary is left as a fragment the
 	// exact-match redaction cannot see, and 21 of its 40 characters printed (2026-09-29 audit,
 	// round 123, F123-L1-1).
-	return truncateForError([]byte(oaicaDiagnosis(string(body))))
+	// ... and quoted after: whether an escape sequence in a vendor's text reaches the terminal must not
+	// depend on the SHAPE of the body it came in (2026-09-29 audit, round 125, F125-L1-2).
+	return launch.PrintableCell(truncateForError([]byte(oaicaDiagnosis(string(body)))))
 }
 
 // oaicaPrintableCells renders each of a router-supplied list's entries for a

@@ -28,6 +28,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -778,13 +779,16 @@ func (u *usageRecorder) Write(p []byte) (int, error) {
 	if !u.decided {
 		u.decided = true
 		if ct := u.Header().Get("Content-Type"); ct != "" {
-			u.stream = strings.HasPrefix(ct, "text/event-stream")
+			// A media type is case-insensitive and may carry parameters, as the reverse proxy in front
+			// of this reads it (2026-09-29 audit, round 125, F125-L3-2).
+			mt, _, _ := mime.ParseMediaType(ct)
+			u.stream = mt == "text/event-stream"
 		}
 	}
 	n, err := u.ResponseWriter.Write(p)
 	if u.stream {
 		u.scanSSE(p)
-	} else if u.body.Len() < 4<<20 {
+	} else if u.body.Len() < docBufferLimit {
 		u.body.Write(p)
 	}
 	return n, err
@@ -855,6 +859,12 @@ func (u *usageRecorder) finish() {
 		u.seen = true
 	}
 }
+
+// docBufferLimit is how much of a non-stream JSON document is kept to read its usage from: the same
+// 8 MiB as the gateway meter, so one served turn is booked the same whichever way it was framed (a
+// document over the old 4 MiB was truncated and booked 0/0 while the streamed turn was booked in full;
+// 2026-09-29 audit, round 125, F125-L3-1).
+const docBufferLimit = 8 << 20
 
 // meterBodyLimit is how much of a request body this file reads to meter or size it: above the
 // 16 MiB the gateway itself accepts.

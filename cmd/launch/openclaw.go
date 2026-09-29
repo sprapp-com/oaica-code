@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -456,6 +457,7 @@ func openclawCredentialEnvNames() []string {
 			RemoteEndpoint: RemoteEndpoint{Name: "oaica", TokenEnv: "OAICA_API_KEY"},
 		},
 	}
+	var brokenNames []string
 	remotes, err := loadUserRemotes()
 	if err != nil {
 		// A remotes.json that will not parse still must not leak the launcher's own
@@ -465,6 +467,10 @@ func openclawCredentialEnvNames() []string {
 		// their real keys in the environment of every child (2026-09-29 audit,
 		// round 111, F111-L2-1).
 		remotes = builtinRemotes()
+		// The rows the user's own file names are unreadable, but the names in it are not secret from
+		// this scan: a trailing comma must not hand every child the keys the user named
+		// (2026-09-29 audit, round 125, F125-L2-1).
+		brokenNames = rawRemoteKeyEnvNames()
 	}
 	for _, r := range remotes {
 		// APIKeyEnv is the row's raw (possibly comma-joined) spec, which is
@@ -509,22 +515,12 @@ func openclawCredentialEnvNames() []string {
 	// them from every child (and an unsynced one did not): the scrub turned on a third party's file.
 	// They are scrubbed only when the user's own remotes.json names them (2026-09-29 audit, round
 	// 124, F124-L2-1).
-	explicit := map[string]bool{}
-	for _, r := range remotes {
-		if r.CatalogOrigin {
-			continue
-		}
-		for _, n := range strings.Split(r.APIKeyEnv, ",") {
-			explicit[strings.TrimSpace(n)] = true
-		}
+	explicit := explicitKeyEnvNames(remotes)
+	for _, n := range brokenNames {
+		explicit[n] = true
+		names = append(names, n)
 	}
-	kept := names[:0:0]
-	for _, n := range names {
-		if dualUseCredentialEnvNames[n] && !explicit[n] {
-			continue
-		}
-		kept = append(kept, n)
-	}
+	kept := dropUnconfiguredDualUse(names, explicit)
 	// OAICA_SERVE_API_KEY guards a network-exposed inference server (round 123 introduced it as the
 	// non-argv input for `oaica serve`) and is scrubbed like the other operator keys (F124-L1-3).
 	return append(kept, oaicaGatewayTokenEnv, "OAICA_ADMIN_KEY", "OAICA_SERVE_API_KEY")
@@ -1570,4 +1566,50 @@ func (c *Openclaw) DeclaresSelection(models []LaunchModel) bool {
 		return false
 	}
 	return openclawSessionsAgree(home, primary)
+}
+
+// explicitKeyEnvNames are the variables the user's OWN remotes name as an inference key.
+func explicitKeyEnvNames(remotes []userRemote) map[string]bool {
+	explicit := map[string]bool{}
+	for _, r := range remotes {
+		if r.CatalogOrigin {
+			continue
+		}
+		for _, n := range strings.Split(r.APIKeyEnv, ",") {
+			explicit[strings.TrimSpace(n)] = true
+		}
+	}
+	return explicit
+}
+
+// dropUnconfiguredDualUse removes the platform tokens the user's tooling reads unless the user's own
+// remotes.json names them as a key (see dualUseCredentialEnvNames).
+func dropUnconfiguredDualUse(names []string, explicit map[string]bool) []string {
+	kept := names[:0:0]
+	for _, n := range names {
+		if dualUseCredentialEnvNames[n] && !explicit[n] {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept
+}
+
+var rawKeyEnvRE = regexp.MustCompile(`"api_key_env"\s*:\s*"([^"]*)"`)
+
+// rawRemoteKeyEnvNames reads the api_key_env values out of a remotes.json that does not parse.
+func rawRemoteKeyEnvNames() []string {
+	b, err := os.ReadFile(userRemotesPath())
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, m := range rawKeyEnvRE.FindAllStringSubmatch(string(b), -1) {
+		for _, n := range strings.Split(m[1], ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
 }

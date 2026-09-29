@@ -125,3 +125,32 @@ func TestRound124InTreeConfigsBindLoopback(t *testing.T) {
 		}
 	}
 }
+
+// F125-L3-1 / F125-L3-2 (2026-09-29 audit, round 125).
+func TestRound125MeterBooksLargeDocumentsAndMixedCaseStreams(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	doc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"content":"`+strings.Repeat("x", 5<<20)+`"}}],"usage":{"prompt_tokens":11,"completion_tokens":5}}`)
+	}))
+	defer doc.Close()
+	sse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "Text/Event-Stream; charset=utf-8")
+		io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n")
+	}))
+	defer sse.Close()
+	for _, be := range []*httptest.Server{doc, sse} {
+		h := serveWith(newStaticPool([]*backend{newBackend(be.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+		h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":1}`)))
+	}
+	waitForRecords(t, records, 2)
+	for i, rec := range (*records)[:2] {
+		if rec.PromptTokens != 11 || rec.CompletionTokens != 5 || !rec.UsageSeen {
+			t.Errorf("row %d booked %+v, want 11/5", i, rec)
+		}
+	}
+}

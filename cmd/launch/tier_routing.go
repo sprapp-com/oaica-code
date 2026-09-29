@@ -993,7 +993,10 @@ func (p tierPlan) childEnv(anthropicBaseURL, clientToken string) []string {
 	// (the proxy attaches them), and this scrubbed only the legs the plan routes, so on a router
 	// launch OPENAI_API_KEY, DEEPSEEK_API_KEY and the like stayed readable by Claude Code's Bash
 	// tool, which the sibling doors already scrub (2026-09-29 audit, round 119, F119-L2-4).
-	names := append(p.credentialEnvNames(), openclawCredentialEnvNames()...)
+	// The same platform-token policy as every other door: a token the user's tooling reads is scrubbed only
+	// when their own remotes.json names it (2026-09-29 audit, round 125, F125-L2-2).
+	remotes, _ := loadUserRemotes()
+	names := append(dropUnconfiguredDualUse(p.credentialEnvNames(), explicitKeyEnvNames(remotes)), openclawCredentialEnvNames()...)
 	return append(scrubCredentialEnv(os.Environ(), names), p.envVars(anthropicBaseURL, clientToken)...)
 }
 

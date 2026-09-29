@@ -102,7 +102,7 @@ func (r routerLLM) Complete(ctx context.Context, req sitebuilder.Request) (strin
 			// the terminal and into whatever log or ticket the user pastes it
 			// into, while the branches either side of it capped theirs at 300
 			// bytes (2026-09-26 audit, sixteenth round).
-			return "", fmt.Errorf("%s (HTTP %d)", truncateForError([]byte(oaicaDiagnosis(out.Error.Message))), resp.StatusCode)
+			return "", fmt.Errorf("%s (HTTP %d)", oaicaRouterMessage(out.Error.Message), resp.StatusCode)
 		}
 		if len(out.Choices) == 0 {
 			return "", fmt.Errorf("empty response (HTTP %d): %s", resp.StatusCode, truncateForError([]byte(oaicaDiagnosisBody(raw))))

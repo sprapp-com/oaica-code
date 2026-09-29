@@ -53,3 +53,23 @@ func TestRound124ShimErrorIsCutOnARuneBoundary(t *testing.T) {
 		t.Fatalf("cut inside a rune")
 	}
 }
+
+func TestRound125ShimErrorHasNoRawEscape(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"\\u001b]0;pwned\\u0007 busy\"}}\n\n"))
+				return
+			}
+			w.WriteHeader(529)
+			w.Write([]byte("\x1b]0;pwned\a busy"))
+		}))
+		s := newShimClient(srv.URL, "tok", "m", launch.AgentModelMeta{})
+		err := s.Chat(context.Background(), &api.ChatRequest{Model: "m", Messages: []api.Message{{Role: "user", Content: "hi"}}}, func(api.ChatResponse) error { return nil })
+		srv.Close()
+		if err == nil || strings.ContainsRune(err.Error(), 0x1b) {
+			t.Errorf("stream=%v: raw escape (or no error): %v", stream, err)
+		}
+	}
+}

@@ -174,3 +174,34 @@ func TestRound124ServeKeyIsScrubbedFromChildren(t *testing.T) {
 		t.Errorf("OAICA_SERVE_API_KEY reached a child")
 	}
 }
+
+// F125-L2-1 / F125-L2-2 (2026-09-29 audit, round 125).
+func TestRound125BrokenRemotesFileStillScrubsWhatItNames(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("MYBOX_KEY", "mybox-secret")
+	t.Setenv("HF_TOKEN", "hf-named-by-user")
+	body := `{"remotes":[{"name":"mybox","base_url":"https://x.example/v1","api_key_env":"MYBOX_KEY"},{"name":"hf","base_url":"https://y.example/v1","api_key_env":"HF_TOKEN"},]}`
+	os.WriteFile(userRemotesPath(), []byte(body), 0o600) // trailing comma: does not parse
+	if _, err := loadUserRemotes(); err == nil {
+		t.Fatal("premise: the file should not parse")
+	}
+	env := strings.Join(directLaunchEnv(), "\n")
+	for _, gone := range []string{"MYBOX_KEY=", "HF_TOKEN="} {
+		if strings.Contains(env, gone) {
+			t.Errorf("a key the user's broken remotes.json names reached the child: %s", gone)
+		}
+	}
+}
+
+func TestRound125ClaudeDoorAppliesThePlatformTokenPolicy(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("GITHUB_TOKEN", "gh-tool-token")
+	plan := tierPlan{Primary: launchEndpoint{Source: sourceUserRemote, RemoteEndpoint: RemoteEndpoint{Name: "github-copilot", TokenEnv: "GITHUB_TOKEN", APIKeyEnv: "GITHUB_TOKEN"}}}
+	if !strings.Contains(strings.Join(plan.childEnv("http://127.0.0.1:1", "tok"), "\n"), "GITHUB_TOKEN=gh-tool-token") {
+		t.Errorf("the claude door scrubbed the platform token the other doors keep")
+	}
+	os.WriteFile(userRemotesPath(), []byte(`{"remotes":[{"name":"gh","base_url":"https://x.example/v1","api_key_env":"GITHUB_TOKEN"}]}`), 0o600)
+	if strings.Contains(strings.Join(plan.childEnv("http://127.0.0.1:1", "tok"), "\n"), "GITHUB_TOKEN=") {
+		t.Errorf("the user's own remote names GITHUB_TOKEN as a key, yet it reached the claude child")
+	}
+}

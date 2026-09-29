@@ -225,7 +225,7 @@ func (s *shimClient) safeErr(err error) error {
 		}
 		msg = msg[:cut] + "…"
 	}
-	return errors.New(msg)
+	return errors.New(launch.PrintableCell(msg))
 }
 
 func (s *shimClient) Chat(ctx context.Context, req *api.ChatRequest, fn api.ChatResponseFunc) error {
