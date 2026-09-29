@@ -158,6 +158,15 @@ func newTranslatedCallState() *translatedCallState {
 // surfaces may state. `calls` may be nil (a writer built outside a middleware),
 // in which case the chunk is passed through untouched.
 //
+// It answers the ordered run list of the chunk it just rewrote when it had to
+// rebuild one, and nil when the chunk already stated its own list, when nothing
+// was folded, and on the chat wire — which has no place to put one. The
+// Responses writer hands the list it gets back to the chunk, because the same
+// turn is written by two arms that read the order differently: the buffered arm
+// reads `Message.OutputRuns` and the streamed arm reads it through its converter,
+// and a chunk whose list this pass rebuilt reached the streamed arm with no list
+// at all (round 100, F100-L1-1).
+//
 // On the BUFFERED arm the writer is handed the turn the merge lane already
 // merged — one text string, one call list, and the ordered run list that lane
 // built while it still saw the chunks (`api.Message.OutputRuns`). The fold below
@@ -167,12 +176,13 @@ func newTranslatedCallState() *translatedCallState {
 // and states the run list for the turn it just rewrote so the Responses arm can
 // still read the order out of it (round 99, F99-L1-2: the folded entry used to
 // make the list stop accounting, which silently re-opened round 98's F98-L1-3
-// for every turn carrying a nameless entry). A streamed chunk carries no runs —
-// the fold then belongs at the end of THAT chunk's text, which is where the
-// Anthropic arm of the same handler puts it.
-func (c *translatedCallState) normalize(r *api.ChatResponse) {
+// for every turn carrying a nameless entry). A streamed chunk carries no runs,
+// and the fold lands where the entry stood — not at the end of the chunk's text,
+// which was this pass's reading until round 100 and is a position the same
+// chunk's buffered arm never agrees with (F100-L1-1).
+func (c *translatedCallState) normalize(r *api.ChatResponse) []api.OutputRun {
 	if c == nil || r == nil || len(r.Message.ToolCalls) == 0 {
-		return
+		return nil
 	}
 
 	// Every id this chunk states is spoken for before anything is minted, so a
@@ -188,21 +198,41 @@ func (c *translatedCallState) normalize(r *api.ChatResponse) {
 
 	if r.Message.OutputRunsAccountFor() {
 		c.normalizeRuns(r)
-		return
+		return nil
 	}
 
 	kept := make([]api.ToolCall, 0, len(r.Message.ToolCalls))
+	// The chunk's own order, rebuilt as this pass goes: reasoning, then the prose
+	// the chunk carried, then one run per entry in the order the entries stand —
+	// a nameless entry's bytes a text run where the ENTRY stood, not appended to
+	// the end of the chunk's text. Both arms of the Responses surface read this
+	// list, so it is built whether or not anything is folded into it.
+	runs := make([]api.OutputRun, 0, len(r.Message.ToolCalls)+2)
+	var content strings.Builder
+	folded := false
+	addText := func(s string) {
+		content.WriteString(s)
+		if n := len(runs); n > 0 && runs[n-1].Kind == "text" {
+			runs[n-1].Text += s
+			return
+		}
+		runs = append(runs, api.OutputRun{Kind: "text", Text: s})
+	}
+	if r.Message.Thinking != "" {
+		runs = append(runs, api.OutputRun{Kind: "thinking", Text: r.Message.Thinking})
+	}
+	if r.Message.Content != "" {
+		addText(r.Message.Content)
+	}
 	for _, tc := range r.Message.ToolCalls {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			// An entry the upstream never named is not a call (F98-L1-1 above):
 			// its bytes are the model's own output, relayed as prose at the
-			// position the entry stood — which on a wire that carries the text
-			// and the calls as separate fields is the end of this chunk's text,
-			// exactly where the Anthropic arm puts it (reasoning, then prose,
-			// then the calls a chunk carried).
+			// position the entry stood.
 			if tc.Function.Arguments.Len() > 0 {
 				if args, err := json.Marshal(tc.Function.Arguments); err == nil {
-					r.Message.Content += string(args)
+					addText(string(args))
+					folded = true
 				}
 			}
 			continue
@@ -213,8 +243,25 @@ func (c *translatedCallState) normalize(r *api.ChatResponse) {
 		}
 		tc.ID = id
 		kept = append(kept, tc)
+		runs = append(runs, api.OutputRun{Kind: "call"})
 	}
+	r.Message.Content = content.String()
 	r.Message.ToolCalls = kept
+	if !folded {
+		// Nothing moved, so there is no order to state that the wire did not
+		// already have (round 79, F79-L1-1: a list a reader must second-guess is
+		// a list no reader may be handed).
+		return nil
+	}
+	r.Message.OutputRuns = runs
+	if !r.Message.OutputRunsAccountFor() {
+		r.Message.OutputRuns = nil
+		return nil
+	}
+	// The callers put it where their own wire can carry it: the Responses writer
+	// states it for the chunk it is about to write, the chat writer has no runs.
+	r.Message.OutputRuns = nil
+	return runs
 }
 
 // normalizeRuns rewrites a merged turn that carries its ordered run list: each
@@ -826,7 +873,14 @@ func (w *ResponsesWriter) writeResponse(data []byte) (int, error) {
 	if err := json.Unmarshal(data, &chatResponse); err != nil {
 		return 0, err
 	}
-	w.calls.normalize(&chatResponse)
+	// The chunk's own order, when this pass had to rebuild it. Both arms of this
+	// surface read it — the buffered one through ToResponse and the streamed one
+	// through its converter — so a turn that reached here with no list reaches
+	// both of them with the same one (round 100, F100-L1-1). A chunk that stated
+	// its own list is left as it is: normalizeRuns has already restated it.
+	if runs := w.calls.normalize(&chatResponse); runs != nil {
+		chatResponse.Message.OutputRuns = runs
+	}
 
 	if w.stream {
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")

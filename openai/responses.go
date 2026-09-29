@@ -1076,6 +1076,21 @@ func (c *ResponsesStreamConverter) Process(r api.ChatResponse) []ResponsesStream
 	}
 
 	// Handle reasoning/thinking (before other content)
+	// A chunk that states its own order is written in it: the message item is
+	// announced where the chunk's first text run stands, so a model that states a
+	// call and THEN the bytes of an entry it never named announces the call first
+	// — the order the buffered arm of this surface gives the same turn (round
+	// 100, F100-L1-1). The list accounts for the turn exactly or it would not be
+	// read at all (OutputRunsAccountFor), so every item below is written: one
+	// reasoning item, one message item, and one call item per call run.
+	if r.Message.OutputRunsAccountFor() {
+		events = append(events, c.processInRunOrder(r)...)
+		if r.Done {
+			events = append(events, c.processCompletion(r)...)
+		}
+		return events
+	}
+
 	if hasThinking {
 		events = append(events, c.processThinking(r.Message.Thinking)...)
 	}
@@ -1295,6 +1310,42 @@ func (c *ResponsesStreamConverter) finishReasoning() []ResponsesStreamEvent {
 		}),
 	}
 
+	return events
+}
+
+// processInRunOrder states the chunk's items in the order the chunk gives them:
+// each kind written once, at the run that introduces it — the reasoning item at
+// the first thinking run, the message item at the first text run, and one call
+// item per call run. The list accounts for the turn exactly before this is
+// reached, so the walk spends it: the text runs join to Content, the thinking
+// runs to Thinking, and there is one call run per entry of ToolCalls. A chunk
+// with no list at all keeps the fixed reasoning-prose-calls order Process writes
+// (2026-09-29 audit, round 100, F100-L1-1).
+func (c *ResponsesStreamConverter) processInRunOrder(r api.ChatResponse) []ResponsesStreamEvent {
+	var events []ResponsesStreamEvent
+	wroteThinking, wroteText, written := false, false, 0
+	for _, run := range r.Message.OutputRuns {
+		switch run.Kind {
+		case "thinking":
+			if wroteThinking || r.Message.Thinking == "" {
+				continue
+			}
+			wroteThinking = true
+			events = append(events, c.processThinking(r.Message.Thinking)...)
+		case "text":
+			if wroteText || r.Message.Content == "" {
+				continue
+			}
+			wroteText = true
+			events = append(events, c.processTextContent(r.Message.Content)...)
+		case "call":
+			if written >= len(r.Message.ToolCalls) {
+				continue
+			}
+			events = append(events, c.processToolCalls(r.Message.ToolCalls[written:written+1])...)
+			written++
+		}
+	}
 	return events
 }
 
