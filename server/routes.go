@@ -123,6 +123,17 @@ var (
 	errTypicalPUnsupported = errors.New("typical_p is no longer supported")
 )
 
+// badRequestOptionsError is a request's OWN sampling options failing to decode (a
+// string where a number belongs). It is the caller's mistake and answers 400, as
+// the OpenAI and Anthropic doors already do at decode; it reached the native doors
+// as a bare error from Options.FromMap and became a 500, which a client's retry
+// policy reads as a server fault. A bad option in the MODEL's own configuration is
+// not wrapped: that one is the server's (2026-09-29 audit, round 111, F111-L1-1).
+type badRequestOptionsError struct{ err error }
+
+func (e badRequestOptionsError) Error() string { return e.err.Error() }
+func (e badRequestOptionsError) Unwrap() error { return e.err }
+
 func (s *Server) modelOptions(model *Model, requestOpts map[string]any) (api.Options, error) {
 	return s.modelOptionsWithEmbeddingBatchDefault(model, requestOpts, shouldApplyEmbeddingBatchDefault(model, requestOpts))
 }
@@ -145,7 +156,7 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 	}
 
 	if err := opts.FromMap(requestOpts); err != nil {
-		return api.Options{}, err
+		return api.Options{}, badRequestOptionsError{err}
 	}
 
 	if applyEmbeddingBatchDefault {
@@ -3587,7 +3598,7 @@ func countChatImages(msgs []api.Message) int {
 
 func handleScheduleError(c *gin.Context, name string, err error) {
 	switch {
-	case errors.Is(err, errCapabilities), errors.Is(err, errRequired), errors.Is(err, errTypicalPUnsupported):
+	case errors.Is(err, errCapabilities), errors.Is(err, errRequired), errors.Is(err, errTypicalPUnsupported), errors.As(err, new(badRequestOptionsError)):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, context.Canceled):
 		c.JSON(499, gin.H{"error": "request canceled"})
