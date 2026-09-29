@@ -458,9 +458,13 @@ func openclawCredentialEnvNames() []string {
 	}
 	remotes, err := loadUserRemotes()
 	if err != nil {
-		// A remotes.json that will not parse still must not openclaw the
-		// launcher's own credential: the router leg above is already named.
-		return plan.credentialEnvNames()
+		// A remotes.json that will not parse still must not leak the launcher's own
+		// credential (the router leg above is already named) NOR the built-in
+		// providers': every other reader of the store falls back to them on this
+		// error and they stay launchable, so one typo or a truncated write left
+		// their real keys in the environment of every child (2026-09-29 audit,
+		// round 111, F111-L2-1).
+		remotes = builtinRemotes()
 	}
 	for _, r := range remotes {
 		// APIKeyEnv is the row's raw (possibly comma-joined) spec, which is

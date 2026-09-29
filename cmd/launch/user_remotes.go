@@ -880,7 +880,10 @@ func (r userRemote) modelsPathIsCrossHost() bool {
 	if err != nil || bu.Hostname() == "" {
 		return true
 	}
-	return !strings.EqualFold(pu.Hostname(), bu.Hostname())
+	// The ORIGIN, not the hostname alone: another port of the same host, or cleartext
+	// http for an https base, is not the row's own endpoint, and the row's key goes
+	// wherever this says it may (2026-09-29 audit, round 111, F111-L2-4).
+	return originOf(pu) != originOf(bu)
 }
 
 // EndpointBase is openAIBase for callers outside this package — the base URL

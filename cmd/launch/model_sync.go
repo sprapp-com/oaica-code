@@ -309,7 +309,7 @@ func fetchModelCatalog(url, display string) (modelManifest, bool, error) {
 	if cached.ETag != "" {
 		req.Header.Set("If-None-Match", cached.ETag)
 	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 10 * time.Second, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		// Offline but we have a last-good copy: use it rather than failing.
 		if cached.usable() {

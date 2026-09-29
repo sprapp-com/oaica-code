@@ -222,7 +222,7 @@ func fetchCatalogBody(url, etag, cachePath string) (body []byte, newEtag string,
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 10 * time.Second, CheckRedirect: credentialSafeRedirect}).Do(req)
 	if err != nil {
 		if b, rerr := os.ReadFile(cachePath); rerr == nil {
 			return b, etag, true, nil
