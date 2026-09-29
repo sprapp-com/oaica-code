@@ -4455,7 +4455,23 @@ func handleStreamResponse(w http.ResponseWriter, body io.Reader, upstreamModel s
 							// same token (it states no id and no name), so the
 							// accumulator it gets relays its bytes as text
 							// (2026-09-28 audit, round 76, F76-L2-3).
-							(tc.ID == "" && tc.Function.Name == "" &&
+							//
+							// Requiring an EMPTY ID as well, as this clause did,
+							// left the indexed path's round-78 rescue unreached
+							// here: the same entry that names nothing and
+							// restates the call's id is prose on the indexed
+							// path and was appended to the call on this one, so
+							// `[{id c1, name Bash, args {"a":1}},{id c1, args
+							// {"a":1}}]` reached a streaming client as
+							// `{"_raw":"{\"a\":1}{\"a\":1}"}` under a
+							// stop_reason of tool_use where both document arms
+							// answer the call and the text — and under
+							// finish_reason length the flush's truncation gate
+							// then dropped the CALL too, so the client was told
+							// max_tokens with nothing at all, the same two
+							// failures round 78 closed one path over
+							// (2026-09-29 audit, round 102, F102-L2-1).
+							(strings.TrimSpace(tc.Function.Name) == "" &&
 								argsFinished(acc.args.String()) &&
 								!canExtend(acc.args.String(), tc.Function.Arguments))) {
 						slot = nextFreeToolSlot
