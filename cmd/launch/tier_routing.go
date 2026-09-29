@@ -988,7 +988,12 @@ func claudeCodeModelAlias(model string) string {
 // environment, minus every variable this launch reads an upstream credential
 // from, plus the plan's Claude Code variables.
 func (p tierPlan) childEnv(anthropicBaseURL, clientToken string) []string {
-	return append(scrubCredentialEnv(os.Environ(), p.credentialEnvNames()), p.envVars(anthropicBaseURL, clientToken)...)
+	// The plan's own names AND every other configured remote's: the child needs no real key
+	// (the proxy attaches them), and this scrubbed only the legs the plan routes, so on a router
+	// launch OPENAI_API_KEY, DEEPSEEK_API_KEY and the like stayed readable by Claude Code's Bash
+	// tool, which the sibling doors already scrub (2026-09-29 audit, round 119, F119-L2-4).
+	names := append(p.credentialEnvNames(), openclawCredentialEnvNames()...)
+	return append(scrubCredentialEnv(os.Environ(), names), p.envVars(anthropicBaseURL, clientToken)...)
 }
 
 // credentialEnvNames lists every environment variable this plan reads a REAL
@@ -1047,6 +1052,17 @@ func (p tierPlan) credentialEnvNames() []string {
 func scrubCredentialEnv(env []string, names []string) []string {
 	if len(names) == 0 {
 		return env
+	}
+	// OAICA_HOST may carry the router key as its userinfo (https://KEY@host), which the launcher
+	// reads as a credential and this scrub used to pass through untouched; the child gets the
+	// host without it (2026-09-29 audit, round 119, F119-L2-2).
+	env = append([]string(nil), env...)
+	for i, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "OAICA_HOST="); ok {
+			if clean, token := splitRemoteUserinfo(v); token != "" {
+				env[i] = "OAICA_HOST=" + clean
+			}
+		}
 	}
 	drop := make(map[string]bool, len(names))
 	for _, n := range names {

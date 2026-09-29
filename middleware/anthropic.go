@@ -1114,6 +1114,12 @@ func (w *WebSearchAnthropicWriter) callFollowUpChat(ctx context.Context, message
 		return api.ChatResponse{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// The follow-up is the same client turn on the same surface: the peer's own marks (which wire
+	// it arrived on, and the rule that lets an Anthropic client ask for thinking against a model
+	// that cannot think) are applied the way a relayed request gets them. The copy above carries
+	// Think, and the bare request was refused by the capability gate the first leg had passed
+	// (2026-09-29 audit, round 119, F119-L1-1).
+	httpReq.Header.Set(api.RelayedSurfaceHeader, "anthropic")
 
 	var resp *http.Response
 	if h := followUpHandler(); h != nil {

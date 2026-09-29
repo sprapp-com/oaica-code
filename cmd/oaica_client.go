@@ -250,7 +250,7 @@ func oaicaListModelsDetailedLive() ([]oaicaModelListEntry, error) {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
 	}
 	oaicaAuthorize(req)
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -443,7 +443,7 @@ func oaicaChatComplete(model string, messages []oaicaChatMessage) (string, oaica
 	}
 	req.Header.Set("Content-Type", "application/json")
 	oaicaAuthorize(req)
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", oaicaChatUsage{}, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -527,7 +527,7 @@ func oaicaListLoras() ([]oaicaLoraListEntry, error) {
 		return nil, err
 	}
 	oaicaAuthorize(req)
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -567,7 +567,7 @@ func oaicaLoraToggle(path, name string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	oaicaAuthorize(req)
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -647,7 +647,7 @@ func oaicaAuthList() ([]oaicaProviderEntry, error) {
 	if ok, _ := oaicaAdminAuthorize(req); !ok {
 		return nil, fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -705,7 +705,7 @@ func oaicaAuthLogin(name, origin, authHeaderName, upstreamModel string) error {
 	if ok, _ := oaicaAdminAuthorize(req); !ok {
 		return fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -746,7 +746,7 @@ func oaicaAuthLogout(name string) error {
 	if ok, _ := oaicaAdminAuthorize(req); !ok {
 		return fmt.Errorf("OAICA_ADMIN_KEY not set — auth commands need the operator admin key, not OAICA_API_KEY")
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return launch.RedactError(fmt.Errorf("couldn't reach %s: %w", launch.RedactBaseURL(oaicaHost()), err))
@@ -811,7 +811,7 @@ func oaicaAgentRun(task string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second, CheckRedirect: launch.CredentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", launch.RedactError(fmt.Errorf("couldn't reach agent sidecar at %s (is it running? see OAICA_AGENT_HOST): %w", launch.RedactBaseURL(oaicaAgentHost()), err))

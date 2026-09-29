@@ -47,15 +47,25 @@ func newHangBackend(t *testing.T) *hangBackend {
 			if err != nil {
 				return
 			}
-			h.accepted <- struct{}{}
 			go func(c net.Conn) {
 				defer c.Close()
 				_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
 				buf := make([]byte, 4096)
+				first := true
 				for {
 					if _, err := c.Read(buf); err != nil {
 						h.closed <- struct{}{}
 						return
+					}
+					// "Accepted" means the REQUEST reached the backend, not that a socket
+					// was accepted: a proxy whose client gave up while its dial was still
+					// in flight leaves that connection idle in the transport's pool, open
+					// by design until it is reaped, and a test that cancelled on the bare
+					// accept read that as a leak about one run in fifteen (seen in rounds
+					// 115-119, also at the previous commit).
+					if first {
+						first = false
+						h.accepted <- struct{}{}
 					}
 				}
 			}(c)

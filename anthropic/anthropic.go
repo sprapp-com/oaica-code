@@ -86,6 +86,11 @@ type MessagesRequest struct {
 	Thinking      *ThinkingConfig `json:"thinking,omitempty"`
 	Metadata      *Metadata       `json:"metadata,omitempty"`
 	OutputConfig  *OutputConfig   `json:"output_config,omitempty"`
+	// OutputFormat is the structured-outputs beta's spelling of OutputConfig.Format (the SDK's
+	// beta.messages `output_format`, header structured-outputs-2025-11-13): same object, top
+	// level. Decoded only under output_config, the schema was discarded and the turn answered
+	// free text with a 200 (2026-09-29 audit, round 119, F119-L1-3).
+	OutputFormat *OutputFormat `json:"output_format,omitempty"`
 }
 
 type OutputConfig struct {
@@ -664,6 +669,9 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 	if r.OutputConfig != nil && r.OutputConfig.Format != nil &&
 		strings.EqualFold(strings.TrimSpace(r.OutputConfig.Format.Type), "json_schema") && len(r.OutputConfig.Format.Schema) > 0 {
 		format = r.OutputConfig.Format.Schema
+	} else if r.OutputFormat != nil &&
+		strings.EqualFold(strings.TrimSpace(r.OutputFormat.Type), "json_schema") && len(r.OutputFormat.Schema) > 0 {
+		format = r.OutputFormat.Schema
 	}
 
 	stream := r.Stream

@@ -468,6 +468,13 @@ func copyProxyRequestHeaders(dst, src http.Header) {
 		if proxyIdentityRequestHeaders[http.CanonicalHeaderKey(key)] {
 			continue
 		}
+		// Not forwarded: with the header set explicitly Go's transport does not decompress,
+		// so a compressing cloud reached the web_search loop as gzip bytes it cannot parse and
+		// the client got an empty body labelled gzip. Left unset, the transport negotiates it
+		// and decompresses (2026-09-29 audit, round 119, F119-L1-2).
+		if http.CanonicalHeaderKey(key) == "Accept-Encoding" {
+			continue
+		}
 
 		dst.Del(key)
 		for _, value := range values {

@@ -476,6 +476,18 @@ func openclawCredentialEnvNames() []string {
 			RemoteEndpoint: RemoteEndpoint{Name: r.Name, APIKeyEnv: r.APIKeyEnv},
 		}))
 	}
+	// The catalog rows' own env[] lists, for the rows a launch can use: a row whose api_key_env
+	// (or the one variable that happened to be set) names ONE variable left the others models.dev
+	// lists for the same provider readable by the child (2026-09-29 audit, round 119, F119-L2-3).
+	for _, e := range providerCatalog() {
+		if e.Hidden || strings.TrimSpace(e.BaseURL) == "" || len(e.Env) == 0 {
+			continue
+		}
+		plan.Routes.Fallbacks = append(plan.Routes.Fallbacks, routeFor(launchEndpoint{
+			Source:         sourceUserRemote,
+			RemoteEndpoint: RemoteEndpoint{Name: e.Name, APIKeyEnv: strings.Join(e.Env, ",")},
+		}))
+	}
 	return plan.credentialEnvNames()
 }
 

@@ -152,11 +152,17 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := req["stream"].(bool)
 	openai["stream"] = stream
-	nb, err := json.Marshal(openai)
-	if err != nil {
+	// Not HTML-escaped: encoding/json writes < > & as six-byte escapes, which grew a markup-heavy
+	// body up to 6x past the cap it had already passed once (2026-09-29 audit, round 119,
+	// F119-L3-2).
+	var encoded bytes.Buffer
+	enc := json.NewEncoder(&encoded)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(openai); err != nil {
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "could not encode request")
 		return
 	}
+	nb := bytes.TrimRight(encoded.Bytes(), "\n")
 	r.Body = readCloserBytes(nb)
 	r.ContentLength = int64(len(nb))
 	r.Header.Set("Content-Length", fmt.Sprint(len(nb)))

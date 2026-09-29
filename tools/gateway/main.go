@@ -3145,6 +3145,10 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(nb))
 	r.ContentLength = int64(len(nb))
 	r.Header.Set("Content-Length", fmt.Sprint(len(nb)))
+	// The body is now the gateway's own JSON, whatever the client labelled it: a form or absent
+	// Content-Type on a body this gateway parsed, capped and billed as JSON was refused upstream
+	// (2026-09-29 audit, round 119, F119-L3-1).
+	r.Header.Set("Content-Type", "application/json")
 	// Never forward the caller's public key upstream; gatekeeper (if it is
 	// the upstream) has its own keys. Replace with the gateway's upstream
 	// credential when one is configured via env.
