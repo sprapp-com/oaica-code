@@ -103,6 +103,9 @@ func TestMine113AChildThatIgnoresTermIsKilledAfterTheGrace(t *testing.T) {
 // SIGINT is left to the terminal: the launcher must neither die nor kill the child on it, because
 // Ctrl-C already reaches the child through the foreground process group.
 func TestMine113SigintDoesNotEndTheLauncher(t *testing.T) {
+	old := runChildStdinIsTerminal
+	runChildStdinIsTerminal = func(*exec.Cmd) bool { return true } // the terminal delivers Ctrl-C to the group itself
+	t.Cleanup(func() { runChildStdinIsTerminal = old })
 	cmd, pidFile := r113Child(t, "exec sleep 60")
 	done := make(chan error, 1)
 	go func() { done <- runChild(cmd) }()
@@ -134,5 +137,40 @@ func TestMine113RunChildReturnsTheChildsExitStatus(t *testing.T) {
 	ee, ok := err.(*exec.ExitError)
 	if !ok || ee.ExitCode() != 7 {
 		t.Errorf("runChild returned %v, want the child's ExitError with code 7 (2026-09-29 audit, round 113, F113-L2-2)", err)
+	}
+}
+
+// F114-L2-3: with no terminal (a supervisor, a systemd unit with KillSignal=SIGINT, `kill -INT <pid>`)
+// nothing delivers SIGINT to the child but us, and absorbing it left the launcher and its child running
+// until something else stopped them. Without a terminal SIGINT is forwarded like SIGTERM. With one it is
+// still absorbed, because Ctrl-C already reached the child through the foreground process group and a
+// second delivery would be a double Ctrl-C, which Claude Code reads as "exit".
+func TestMine114ASigintWithoutATerminalReachesTheChild(t *testing.T) {
+	old := runChildStdinIsTerminal
+	runChildStdinIsTerminal = func(*exec.Cmd) bool { return false }
+	t.Cleanup(func() { runChildStdinIsTerminal = old })
+	oldGrace := childTermGrace
+	childTermGrace = 60 * time.Second
+	t.Cleanup(func() { childTermGrace = oldGrace })
+	cmd, pidFile := r113Child(t, "exec sleep 60")
+	done := make(chan error, 1)
+	go func() { done <- runChild(cmd) }()
+	pid := r113ReadPID(t, pidFile)
+	time.Sleep(100 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("a SIGINT sent to the launcher alone was swallowed: the child (pid %d) is still running and runChild still waiting (2026-09-29 audit, round 114, F114-L2-3)", pid)
+	}
+	for i := 0; i < 100 && r113Alive(pid); i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r113Alive(pid) {
+		syscall.Kill(pid, syscall.SIGKILL)
+		t.Errorf("the child (pid %d) outlived a forwarded SIGINT (2026-09-29 audit, round 114, F114-L2-3)", pid)
 	}
 }

@@ -6,7 +6,17 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"golang.org/x/term"
 )
+
+// runChildStdinIsTerminal reports whether the child shares our terminal, in which case Ctrl-C
+// reaches it through the foreground process group without our help. A variable so a test can say
+// either way.
+var runChildStdinIsTerminal = func(cmd *exec.Cmd) bool {
+	f, ok := cmd.Stdin.(*os.File)
+	return ok && term.IsTerminal(int(f.Fd()))
+}
 
 // childTermGrace is how long a child gets, after being sent SIGTERM, before it is killed.
 var childTermGrace = 10 * time.Second
@@ -29,6 +39,7 @@ func runChild(cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	interactive := runChildStdinIsTerminal(cmd)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	for {
@@ -36,7 +47,13 @@ func runChild(cmd *exec.Cmd) error {
 		case err := <-done:
 			return err
 		case sig := <-sigs:
-			if sig == syscall.SIGINT {
+			// SIGINT is absorbed only when a terminal delivered it: Ctrl-C already reached the
+			// child through the foreground process group, and a second delivery would be a
+			// double Ctrl-C, which Claude Code reads as "exit". With no terminal (a supervisor,
+			// `kill -INT <pid>`) nothing else will deliver it, and absorbing it left the launcher
+			// and its child running until something else stopped them (2026-09-29 audit, round
+			// 114, F114-L2-3).
+			if sig == syscall.SIGINT && interactive {
 				continue
 			}
 			if err := cmd.Process.Signal(sig); err != nil {

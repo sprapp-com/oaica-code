@@ -6394,6 +6394,20 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 			// itself is unchanged: the watcher only reads what already went out.
 			frames.finish()
 			delivered = relayedBytes > 0 && errors.Is(readErr, io.EOF) && !frames.sawError
+			// A stream that was cut, a reset or a read that failed after the headers went out,
+			// ends the client's body normally, so it saw a 200 that stops after message_start with
+			// no error frame and no message_stop: a truncated turn it cannot attribute. The
+			// translated arm states the same failure as an `event: error` frame, and the two now
+			// read alike (2026-09-29 audit, round 114, F114-L2-2). Only an event stream can carry
+			// the frame; the breaker is fed by the return below either way.
+			if !errors.Is(readErr, io.EOF) && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+				msg, _ := json.Marshal("upstream stream failed: " + redactErr(readErr).Error())
+				frame := `{"type":"error","error":{"type":"api_error","message":` + string(msg) + `}}`
+				_, _ = io.WriteString(w, "event: error\ndata: "+frame+"\n\n")
+				if canFlush {
+					flusher.Flush()
+				}
+			}
 			return resp.StatusCode, delivered
 		}
 	}
