@@ -3,7 +3,7 @@
 Effective: 2026-08-26
 
 These terms govern use of the inference API at https://api.oaica.com
-(the "Service") operated by BizTransit Sdn Bhd, Malaysia ("oaica", "we").
+(the "Service") operated by BizTransit Sdn Bhd (Company No. 891234-X), Level 28, Lingkaran Syed Putra, Mid Valley City, 59200 Kuala Lumpur, Malaysia ("oaica", "we").
 If you reach the Service through OpenRouter or another reseller, their terms
 govern your relationship with them; these terms govern what our Service does.
 

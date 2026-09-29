@@ -81,7 +81,7 @@ Gated models additionally need a one-off licence: `oaica activate <key>` once
 per machine (or `export OAICA_LICENSE_KEY=...`), which stores the activation in
 `~/.oaica/license.json` and revalidates in the background. The licence gate is
 a convenience paywall on the prebuilt binary, not DRM — the source is MIT, so a
-self-build needs no key.
+self-build needs no key. Licensor, terms and refunds: [docs/LICENSING.md](docs/LICENSING.md).
 
 `--yes` is the launcher's own confirm flag, and the command above does not pass
 it: a non-interactive launch without it errors `Claude Code is not installed;

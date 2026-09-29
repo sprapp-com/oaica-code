@@ -2,7 +2,7 @@
 
 Effective: 2026-08-26
 
-Operator: BizTransit Sdn Bhd, Malaysia ("oaica", "we").
+Operator: BizTransit Sdn Bhd (Company No. 891234-X), Level 28, Lingkaran Syed Putra, Mid Valley City, 59200 Kuala Lumpur, Malaysia ("oaica", "we").
 Contact: oaica@sprapp.com
 
 ## What this covers
