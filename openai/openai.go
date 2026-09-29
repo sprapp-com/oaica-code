@@ -667,13 +667,24 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 			if len(messages) == first {
 				messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning})
 			}
-			if msg.ToolCallID != "" {
-				for i := first; i < len(messages); i++ {
+			for i := first; i < len(messages); i++ {
+				if msg.ToolCallID != "" {
 					messages[i].ToolCallID = msg.ToolCallID
-					if messages[i].ToolName == "" {
-						messages[i].ToolName = toolName
-					}
 				}
+				// The name a tool result states is the turn's own (`name`) or the
+				// call it answers; it does not depend on the turn carrying an id
+				// (2026-09-29 audit, round 106, F106-L1-2).
+				if messages[i].ToolName == "" {
+					messages[i].ToolName = toolName
+				}
+			}
+			// The reasoning a turn states belongs to the turn in either spelling
+			// of its content; the array branch kept it only when the turn also
+			// carried calls or was empty, so the string spelling replayed the
+			// prior turn's thinking and the array spelling did not
+			// (2026-09-29 audit, round 106, F106-L1-1).
+			if msg.Reasoning != "" && len(messages) > first && messages[len(messages)-1].Thinking == "" {
+				messages[len(messages)-1].Thinking = msg.Reasoning
 			}
 		default:
 			// content is only optional if tool calls are present

@@ -644,6 +644,8 @@ func FromMessagesRequest(r MessagesRequest) (*api.ChatRequest, error) {
 		}
 	}
 
+	nameToolResults(messages)
+
 	stream := r.Stream
 	convertedRequest := &api.ChatRequest{
 		Model:    r.Model,
@@ -4679,4 +4681,27 @@ func ConvertOllamaToAnthropicResults(ollamaResults *OllamaWebSearchResponse) []W
 		})
 	}
 	return results
+}
+
+// nameToolResults states, on every tool result that carries only the id of the
+// call it answers, the name of that call — the nearest call BEFORE it that
+// carries the id. The chat converter has always derived it, so the same history
+// reached the renderers (which read ToolName) named on chat and unnamed on the
+// other two surfaces (2026-09-29 audit, round 106, F106-L1-3).
+func nameToolResults(messages []api.Message) {
+	for i := range messages {
+		m := &messages[i]
+		if m.Role != "tool" || m.ToolName != "" || m.ToolCallID == "" {
+			continue
+		}
+	find:
+		for j := i - 1; j >= 0; j-- {
+			for _, tc := range messages[j].ToolCalls {
+				if tc.ID == m.ToolCallID {
+					m.ToolName = tc.Function.Name
+					break find
+				}
+			}
+		}
+	}
 }
