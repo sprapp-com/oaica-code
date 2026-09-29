@@ -29,3 +29,33 @@ func TestRound130ClassifierStillCatchesTheSpellings(t *testing.T) {
 		}
 	}
 }
+
+// F131-L1-1/2/4/5 (2026-09-29 audit, round 131).
+func TestRound131ClassifierRefusesPartlyQuotedAndBackslashGlobs(t *testing.T) {
+	for _, c := range []string{
+		`cat ~/.ssh/"id_"*`, `cat ~/".ssh"/id_*`, `cat ~/.ssh/id_'rs'?`,
+		`gc ~\.ssh\id_*`, `cat ~\.ssh\id_*`, `Get-Content $HOME\.ssh\id_rs?`, `type %USERPROFILE%\.ssh\id_*`,
+		`cat ~/.ss\h/id_rsa`, `cat ~/.ollama/id_ed25519`, `cat ~/.oaica/api_key`, `cat ~/.oaica/remotes.json`,
+	} {
+		if rejectUnsafeShellCommand(c) == nil {
+			t.Errorf("%q must be refused", c)
+		}
+	}
+}
+
+func TestRound131PublicKeysAreReadable(t *testing.T) {
+	for _, c := range []string{"cat ~/.ssh/id_ed25519.pub", "cat ~/.ssh/id_rsa.pub | pbcopy", "grep -o '.*' file.txt"} {
+		if err := rejectUnsafeShellCommand(c); err != nil {
+			t.Errorf("%q must pass: %v", c, err)
+		}
+	}
+	if err := refuseCredentialPath("/tmp", "/home/u/.ssh/id_ed25519.pub"); err != nil {
+		t.Errorf("Read of a .pub refused: %v", err)
+	}
+	if err := refuseCredentialPath("/tmp", "/home/u/.ssh/id_ed25519"); err == nil {
+		t.Error("Read of the private key must be refused")
+	}
+	if err := refuseCredentialPath("/tmp", "/home/u/.ssh/id_rsa.pub.bak"); err == nil {
+		t.Error("a .pub.bak is not the public key")
+	}
+}

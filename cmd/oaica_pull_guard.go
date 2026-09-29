@@ -17,6 +17,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"github.com/ollama/ollama/cmd/launch"
 	"io"
 	"net/http"
 	"net/url"
@@ -254,7 +255,9 @@ func readPullErrorBody(body io.Reader) string {
 	if err == nil && int64(len(b)) == maxPullErrorBodyBytes {
 		msg += "… (truncated)"
 	}
-	return msg
+	// The body is the server's: it can echo the licence bearer this request carried and it can carry terminal
+	// escapes (2026-09-29 audit, round 131, F131-L2-3).
+	return launch.PrintableCell(oaicaDiagnosis(msg))
 }
 
 // validateModelName refuses a model name that would address anything other

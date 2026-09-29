@@ -1275,7 +1275,11 @@ func formatDisplayArgs(args map[string]any) string {
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
 		value := truncateRunes(fmt.Sprintf("%v", args[key]), 100)
-		parts = append(parts, fmt.Sprintf("%s=%s", key, strconv.Quote(value)))
+		name := key
+		if termsafe.Text(key) != key {
+			name = strconv.Quote(key)
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", name, strconv.Quote(value)))
 	}
 	return strings.Join(parts, ", ")
 }

@@ -300,6 +300,16 @@ func (h *meterHub) ingestHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"request_id is required"}`, http.StatusBadRequest)
 		return
 	}
+	// A count outside any real turn's range poisons every aggregate that sums it (5e18 overflowed a key's group
+	// and dropped or failed the summary) (2026-09-29 audit, round 131, F131-L3-2). The ts is left free-form:
+	// existing readers and tests pin that.
+	const maxTokens = 1_000_000_000_000
+	for _, n := range []int64{int64(rec.PromptTokens), int64(rec.CompletionTokens), int64(rec.CachedTokens)} {
+		if n < 0 || n > maxTokens {
+			http.Error(w, `{"error":"token count out of range"}`, http.StatusBadRequest)
+			return
+		}
+	}
 	// INSERT OR IGNORE: request_id is the idempotency key. A gateway
 	// retrying a report after a timeout must not double-count usage — the
 	// second (identical) insert silently no-ops instead of erroring, so

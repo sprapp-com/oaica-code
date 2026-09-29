@@ -287,7 +287,7 @@ func fetchCatalogBody(url, etag, cachePath string) (body []byte, newEtag string,
 		return b, etag, true, nil
 	case resp.StatusCode != http.StatusOK:
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, PrintableCell(redactCredentials(strings.TrimSpace(string(errBody)))))
+		return nil, "", false, fmt.Errorf("%s: HTTP %d: %s", display, resp.StatusCode, PrintableCell(redactURLUserinfo(url, redactCredentials(strings.TrimSpace(string(errBody))))))
 	}
 
 	// 16 MiB cap: the live payload is ~5 MB, and the cap exists so a hostile or

@@ -74,7 +74,7 @@ func safeURL(raw string) (string, bool) {
 	}
 	// Browsers delete tab, LF and CR from anywhere in a URL, so `/<TAB>/evil.example` is `//evil.example`
 	// (2026-09-29 audit, round 130, F130-L2-2).
-	if strings.ContainsAny(u, "\t\n\r") {
+	if strings.ContainsAny(u, "\t\n\r") || strings.ContainsFunc(u, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return "", false
 	}
 	if isProtocolRelative(u) {

@@ -376,7 +376,7 @@ type oaicaRouterError struct {
 }
 
 func (e *oaicaRouterError) Error() string {
-	return fmt.Sprintf("HTTP %d from %s: %s", e.Status, redactBaseURL(e.Host), e.Body)
+	return fmt.Sprintf("HTTP %d from %s: %s", e.Status, redactBaseURL(e.Host), PrintableCell(e.Body))
 }
 
 // isOaicaRouterAuthErr reports whether err is the router rejecting the

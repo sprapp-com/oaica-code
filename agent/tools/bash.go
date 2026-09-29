@@ -301,9 +301,11 @@ func readsCredentialPath(command string) bool {
 		normalized = strings.ReplaceAll(normalized, "//", "/")
 	}
 	normalized = strings.ReplaceAll(normalized, "/./", "/")
-	for _, fragment := range credentialPathFragments {
-		if strings.Contains(normalized, fragment) {
-			return true
+	for _, text := range []string{normalized, shellSafetyText(strings.ReplaceAll(command, "\\", ""))} {
+		for _, fragment := range credentialPathFragments {
+			if containsCredentialFragment(text, fragment) {
+				return true
+			}
 		}
 	}
 	// A glob only matters in the segment that reads, and a quoted word is not expanded by the shell.
@@ -311,13 +313,71 @@ func readsCredentialPath(command string) bool {
 		if !commandHasCredentialReadVerb(segment) {
 			continue
 		}
-		for _, word := range strings.Fields(strings.NewReplacer("(", " ", ")", " ", "<", " ", ">", " ").Replace(segment)) {
-			if !strings.ContainsAny(word, "'\"`") && globNamesCredential(word) {
+		for _, word := range shellWords(strings.NewReplacer("(", " ", ")", " ", "<", " ", ">", " ").Replace(segment)) {
+			if globNamesCredential(unquotedGlobPattern(word)) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// shellWords splits on whitespace outside quotes, so a quoted argument (`awk '$1 ~ /.*/'`) stays one word.
+func shellWords(s string) []string {
+	var words []string
+	var cur strings.Builder
+	var quote rune
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			cur.WriteRune(r)
+			if r == quote {
+				quote = 0
+			}
+		case r == '\'' || r == '"' || r == '`':
+			quote = r
+			cur.WriteRune(r)
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			if cur.Len() > 0 {
+				words = append(words, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		words = append(words, cur.String())
+	}
+	return words
+}
+
+// unquotedGlobPattern turns a shell word into a path.Match pattern the way the shell reads it: characters inside
+// quotes are literal (escaped), unquoted `*?[` stay live, and `\` outside quotes is the Windows separator. A
+// word with quotes AND a live glob (`~/.ssh/"id_"*`) is still a glob (2026-09-29 audit, round 131, F131-L1-1/2).
+func unquotedGlobPattern(word string) string {
+	var b strings.Builder
+	var quote rune
+	for _, r := range word {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else if strings.ContainsRune(`*?[\`, r) {
+				b.WriteRune('\\')
+				b.WriteRune(r)
+			} else {
+				b.WriteRune(r)
+			}
+		case r == '\'' || r == '"' || r == '`':
+			quote = r
+		case r == '\\':
+			b.WriteRune('/')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // commandHasCredentialReadVerb asks both spellings: `ca\t` is cat to the shell, while the backslash-to-slash
@@ -329,7 +389,7 @@ func commandHasCredentialReadVerb(command string) bool {
 // globNamesCredential reports whether a shell glob word (`~/.ssh/id_rs?`, `~/.ssh/id_*`) can expand to a
 // credential path: its trailing segments match a fragment's segments one for one.
 func globNamesCredential(word string) bool {
-	if !strings.ContainsAny(word, "*?[") {
+	if !strings.ContainsAny(word, "*?[") || !strings.Contains(word, "/") {
 		return false
 	}
 	segs := strings.Split(strings.Trim(word, "/"), "/")
@@ -384,7 +444,37 @@ func refuseCredentialWords(workingDir, command string) error {
 // credentialPathFragments name the files whose contents are credentials. The bash tool refuses to read
 // them; the read and edit tools apply the same list to the path they are given, absolute or not
 // (2026-09-29 audit, round 127, F127-L1-4).
+// containsCredentialFragment: the fragment names a credential file unless it is the start of a `.pub` name — the
+// public half of a key pair is meant to be read and copied (2026-09-29 audit, round 131, F131-L1-5).
+func containsCredentialFragment(text, fragment string) bool {
+	for from := 0; ; {
+		i := strings.Index(text[from:], fragment)
+		if i < 0 {
+			return false
+		}
+		end := from + i + len(fragment)
+		after := text[end:]
+		if !strings.HasSuffix(fragment, "/") && strings.HasPrefix(after, ".pub") {
+			if rest := after[len(".pub"):]; rest == "" || !isNameByte(rest[0]) {
+				from = end
+				continue
+			}
+		}
+		return true
+	}
+}
+
+func isNameByte(b byte) bool {
+	return b == '.' || b == '_' || b == '-' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
 var credentialPathFragments = []string{
+	"/.ollama/id_ed25519",
+	"/.oaica/api_key",
+	"/.oaica/license_key",
+	"/.oaica/license.json",
+	"/.oaica/auth.json",
+	"/.oaica/remotes.json",
 	"/.ssh/id_rsa",
 	"/.ssh/id_dsa",
 	"/.ssh/id_ecdsa",
@@ -420,7 +510,7 @@ func refuseCredentialPath(workingDir, path string) error {
 	for _, c := range candidates {
 		c = strings.ToLower(filepath.ToSlash(c))
 		for _, fragment := range credentialPathFragments {
-			if strings.Contains(c, fragment) || strings.HasSuffix(c, strings.TrimSuffix(fragment, "/")) {
+			if containsCredentialFragment(c, fragment) || strings.HasSuffix(c, strings.TrimSuffix(fragment, "/")) {
 				return fmt.Errorf("refusing to touch %s: credential file reads are not allowed", path)
 			}
 		}

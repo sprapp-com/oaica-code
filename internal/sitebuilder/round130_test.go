@@ -77,3 +77,12 @@ func TestRound130PreviewServerAnswersOnlyThisMachine(t *testing.T) {
 		t.Errorf("own Host -> %d, want 200", got)
 	}
 }
+
+// F131-L2-2: a leading C0 control is stripped by the URL parser, so `\x01//evil` is protocol-relative.
+func TestRound131SafeURLRefusesLeadingC0(t *testing.T) {
+	for _, u := range []string{"\x01//evil.example/x", "\x1f//evil.example", "/\x01/evil.example"} {
+		if got, ok := safeURL(u); ok {
+			t.Errorf("safeURL(%q) = %q, want refused", u, got)
+		}
+	}
+}

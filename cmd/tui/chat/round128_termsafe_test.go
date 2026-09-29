@@ -64,3 +64,14 @@ func TestRound130EntryArgsCarryNoControlSequences(t *testing.T) {
 		t.Errorf("entry args carry a control sequence: %q", v)
 	}
 }
+
+// F131-L1-3: approval entries and the multi-call detail carry no control sequences from argument keys.
+func TestRound131ApprovalLabelsAreTerminalSafe(t *testing.T) {
+	args := map[string]any{"command": "ls", "\x1b]52;c;AAAA\a\x1b[2J": "x"}
+	if got := formatDisplayArgs(args); strings.ContainsAny(got, "\x1b\a") {
+		t.Errorf("formatDisplayArgs: %q", got)
+	}
+	if got := toolInvocationLabel("bash", termsafeArgs(args)); strings.ContainsAny(got, "\x1b\a") {
+		t.Errorf("label: %q", got)
+	}
+}

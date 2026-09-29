@@ -867,3 +867,21 @@ func TestRound129DBPathWithURISpecialCharactersOpensThatFile(t *testing.T) {
 		}
 	}
 }
+
+// F131-L3-2 (2026-09-29 audit, round 131): a count outside any real turn's range is refused at ingest.
+func TestRound131IngestRefusesOutOfRangeCounts(t *testing.T) {
+	hub, token := testHub(t)
+	for i, rec := range []usageRecord{
+		{RequestID: "big", TS: "t", PromptTokens: 5_000_000_000_000_000_000 / 1_000_000},
+		{RequestID: "neg", TS: "t", PromptTokens: -1000000},
+	} {
+		body, _ := json.Marshal(rec)
+		req := httptest.NewRequest("POST", "/ingest", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		hub.ingestHandler(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("case %d: status %d, want 400", i, w.Code)
+		}
+	}
+}

@@ -16,6 +16,7 @@ package launch
 // processes and libraries.
 
 import (
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -601,4 +602,22 @@ func redactErr(err error) error {
 		return err
 	}
 	return redactedError{err: err, text: text}
+}
+
+// redactURLUserinfo removes a --url's userinfo credential (and the Basic header built from it) from text a
+// server wrote: an error body that echoes the key in prose or repeats the Authorization header is not caught by
+// credential SHAPES (2026-09-29 audit, round 131, F131-L2-5).
+func redactURLUserinfo(rawURL, text string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.User == nil {
+		return text
+	}
+	name := u.User.Username()
+	pass, _ := u.User.Password()
+	for _, secret := range []string{pass, name, base64.StdEncoding.EncodeToString([]byte(name + ":" + pass))} {
+		if secret != "" && secret != ":" {
+			text = redactSecret(text, secret)
+		}
+	}
+	return text
 }

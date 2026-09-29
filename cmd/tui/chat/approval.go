@@ -108,7 +108,7 @@ func (m *chatModel) upsertApprovalToolEntries(request coreagent.ApprovalRequest)
 			idx = len(m.entries) - 1
 		}
 		m.entries[idx].detail = call.ToolName
-		m.entries[idx].label = toolInvocationLabel(call.ToolName, call.Args)
+		m.entries[idx].label = toolInvocationLabel(call.ToolName, termsafeArgs(call.Args))
 		m.entries[idx].status = "approval"
 		m.entries[idx].toolID = call.ToolCallID
 		m.entries[idx].args = termsafeArgs(call.Args)
@@ -243,7 +243,7 @@ func approvalRequestDetail(request coreagent.ApprovalRequest, width int) string 
 	}
 	lines := make([]string, 0, len(request.Calls))
 	for _, call := range request.Calls {
-		lines = append(lines, toolInvocationLabel(call.ToolName, call.Args))
+		lines = append(lines, toolInvocationLabel(call.ToolName, termsafeArgs(call.Args)))
 	}
 	return chatMetaStyle.Render(strings.Join(lines, "\n"))
 }

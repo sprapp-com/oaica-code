@@ -456,7 +456,7 @@ func oaicaFetchManifest(model string) (*oaicaManifest, error) {
 			// itself was unbounded, up to the 8 MiB body cap, while the same
 			// file's other readers cap at 4 KiB (2026-09-26 audit, sixteenth
 			// round).
-			msg := truncateForError([]byte(oaicaDiagnosis(e.Error.Message)))
+			msg := launch.PrintableCell(truncateForError([]byte(oaicaDiagnosis(e.Error.Message))))
 			if e.Error.Type == "license_required" || e.Error.Type == "license_invalid" {
 				return nil, fmt.Errorf("%s\n\nSet a license key: OAICA_LICENSE_KEY=<key> or save one to ~/.oaica/license_key", msg)
 			}
@@ -625,11 +625,12 @@ func oaicaPullModel(model string) (string, error) {
 	// One temp file per pull: two concurrent pulls of a model shared `<dest>.partial`, each truncating the other's
 	// bytes, and the winner installed a file whose hash it had checked on the wire, not on disk (2026-09-29 audit,
 	// round 130, F130-L2-1).
-	f, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+".partial-*")
+	f, stopWatch, err := createPullTemp(destPath)
 	if err != nil {
 		return "", err
 	}
 	tmpPath := f.Name()
+	defer stopWatch()
 	defer f.Close()
 
 	fmt.Fprintf(os.Stderr, "pulling %s (%s)...\n", model, humanBytes(manifest.SizeBytes))
@@ -726,11 +727,12 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	// One temp file per pull: two concurrent pulls of a model shared `<dest>.partial`, each truncating the other's
 	// bytes, and the winner installed a file whose hash it had checked on the wire, not on disk (2026-09-29 audit,
 	// round 130, F130-L2-1).
-	f, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+".partial-*")
+	f, stopWatch, err := createPullTemp(destPath)
 	if err != nil {
 		return "", err
 	}
 	tmpPath := f.Name()
+	defer stopWatch()
 	defer f.Close()
 
 	body := io.Reader(newStallGuard(resp.Body, pullStallTimeout))
@@ -1217,3 +1219,39 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("local proxy failed: %w", err)
 	}
 }
+
+// createPullTemp makes this pull's own temp file next to destPath. Ctrl-C or SIGTERM during the copy removes it
+// (every interrupted pull used to leave a multi-GB file), and stale siblings from crashed pulls are swept first:
+// an active pull rewrites its file continuously, so only one untouched for a while is abandoned (2026-09-29
+// audit, round 131, F131-L2-1).
+func createPullTemp(destPath string) (*os.File, func(), error) {
+	dir, base := filepath.Dir(destPath), filepath.Base(destPath)
+	if old, _ := filepath.Glob(filepath.Join(dir, base+".partial*")); len(old) > 0 {
+		for _, p := range old {
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() && time.Since(fi.ModTime()) > pullStaleTempAge {
+				os.Remove(p)
+			}
+		}
+	}
+	f, err := os.CreateTemp(dir, base+".partial-*")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	name := f.Name()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sigCh:
+			f.Close()
+			os.Remove(name)
+			os.Exit(130)
+		case <-done:
+		}
+	}()
+	return f, func() { signal.Stop(sigCh); close(done) }, nil
+}
+
+// pullStaleTempAge: a temp file untouched this long belongs to a pull that is gone.
+var pullStaleTempAge = 10 * time.Minute
