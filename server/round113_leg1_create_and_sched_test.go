@@ -80,48 +80,16 @@ func TestMine113AFailedBasePullWritesNoManifest(t *testing.T) {
 	}
 }
 
-// F113-L1-2: a request cancelled while it waits in the scheduler's queue was dropped by
-// processPending without an answer, and scheduleRunner waits on success and error
-// channels only, so the handler goroutine (with its request body and gin context) blocked
-// for the life of the process: one per impatient client behind a slow model load. The
-// dropped request is now answered with its context's error, and the wait also selects on
-// the context.
-func TestMine113ACancelledQueuedRequestIsAnswered(t *testing.T) {
-	ctx, done := context.WithTimeout(t.Context(), 10*time.Second)
-	defer done()
-	s := InitScheduler(ctx)
-	s.waitForRecovery = 10 * time.Millisecond
-	s.getGpuFn = getGpuFn
-	s.getSystemInfoFn = getSystemInfoFn
-	a := newScenarioRequest(t, ctx, "ollama-model-1", 10, &api.Duration{Duration: time.Minute}, nil)
-	s.newServerFn = a.newServer
-
-	reqCtx, cancel := context.WithCancel(ctx)
-	runnerCh, errCh := s.getRunner(reqCtx, a.req.model, api.DefaultOptions(), nil, false, false, nil)
-	returned := make(chan string, 1)
-	go func() {
-		select {
-		case <-runnerCh:
-			returned <- "runner"
-		case err := <-errCh:
-			returned <- "err " + err.Error()
-		}
-	}()
-	cancel() // the client leaves while queued
-	s.Run(ctx)
-	select {
-	case r := <-returned:
-		if !strings.HasPrefix(r, "err") {
-			t.Errorf("the caller of a cancelled queued request was answered %q, want its context's error (2026-09-29 audit, round 113, F113-L1-2)", r)
-		}
-	case <-time.After(3 * time.Second):
-		t.Errorf("the caller of a cancelled queued request was never answered (2026-09-29 audit, round 113, F113-L1-2)")
-	}
-}
-
-// TestMine113ScheduleRunnerStopsWaitingWhenItsContextIsDone pins the other half: the wait
-// in scheduleRunner itself selects on the context, so a request whose answer never comes
-// (a scheduler that is not running) does not block its handler for ever.
+// F113-L1-2: a request cancelled while it waits in the scheduler's queue behind a slow model
+// load is dropped by processPending without an answer (TestSchedAlreadyCanceled pins that: the
+// caller has gone, so the scheduler owes it nothing), and scheduleRunner waited on the success
+// and error channels only, so the handler goroutine, with its request body and gin context,
+// blocked for the life of the process: one per impatient client. The wait now selects on the
+// request's context, which is what ends it; answering from the scheduler as well was written and
+// reddened that pinned decision, and did not ship.
+// TestMine113ScheduleRunnerStopsWaitingWhenItsContextIsDone: the wait in scheduleRunner itself
+// selects on the context, so a request whose answer never comes (a scheduler that is not
+// running, or one that dropped the request as cancelled) does not block its handler for ever.
 func TestMine113ScheduleRunnerStopsWaitingWhenItsContextIsDone(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 10*time.Second)
 	defer done()
