@@ -56,8 +56,11 @@ A subscriber's `oaica-sk-…` key exists only in oaica-saas. With `api_key_valid
 (`https://<saas>/keys/validate`) and `api_key_validate_token` (the saas `ENTITLEMENT_TOKEN`) set, a Bearer key of
 exactly that shape that matches no configured `api_keys` entry is checked there; the saas answers
 `{valid, label}` for a live (`active`/`past_due`) subscription, the gateway uses `label` as the key's label, and
-the usual entitlement check against meterhub follows. Answers are cached 60 s (30 s when refused) so a
-cancellation lands within a minute; concurrent lookups of one key make one call, at most 4 calls are in flight,
+the usual entitlement check against meterhub follows. Answers are cached 60 s (30 s when refused). A key that was valid keeps serving for up to 15 min past that
+while a refresh runs in the background (or the saas is down), so a subscriber never waits behind junk-key
+traffic or gets a 401 for an outage; a definite "invalid" from the refresh replaces it at once, so a cancellation
+lands within a refresh. A key the saas could not judge at all (first sight during an outage) gets `503`
+(`key_check_unavailable`, `Retry-After: 5`), not `401`; concurrent lookups of one key make one call, at most 4 calls are in flight,
 a timeout/429/5xx is refused but never remembered, and keys of any other shape never leave the gateway.
 Without these two settings subscribers cannot authenticate. `gateway --check` validates both URLs.
 
@@ -66,7 +69,7 @@ Without these two settings subscribers cannot authenticate. `gateway --check` va
 `oaica pull` of a `license_required` model sends the buyer's licence as a Bearer. The gateway accepts (a) a key
 whose SHA-256 is in `pull_license_keys` (hand-edited, e.g. an enterprise customer), or (b) when
 `pull_license_validate_url` is set (`https://<saas>/license/validate`, https or loopback only), an
-`oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) shares the subscriber-key cache: 60 s when valid, 30 s when refused, one call per key at a time, at most 4
+`oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) shares the subscriber-key cache (60 s when valid, 30 s when refused, stale-while-revalidate as above), one call per key at a time, at most 4
 calls in flight (a lookup waits up to 3 s for a slot, and a lookup nobody waits for any more is dropped), and
 fails closed when the licence server is unreachable. Leave it unset until oaica-saas is live; a refund revokes
 the key within the cache window.

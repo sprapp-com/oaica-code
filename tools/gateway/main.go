@@ -1663,9 +1663,16 @@ func presentedCredential(r *http.Request) string {
 // digest as before, and it deliberately does NOT break early on a match so
 // the comparison count stays independent of which key was presented.
 func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
+	k, ok, _ := g.lookupKeyEx(r)
+	return k, ok
+}
+
+// lookupKeyEx also says whether the key could not be judged at all (the oaica-saas bridge gave no answer): that
+// is a 503 for the caller to retry, not a 401 telling a subscriber their key is bad (round 136, F136-L3-2).
+func (g *gateway) lookupKeyEx(r *http.Request) (gwKey, bool, bool) {
 	key := presentedCredential(r)
 	if key == "" {
-		return gwKey{}, false
+		return gwKey{}, false, false
 	}
 	sum := sha256.Sum256([]byte(key))
 	presented := []byte(hex.EncodeToString(sum[:]))
@@ -1679,6 +1686,7 @@ func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
 	}
 	validateURL, validateToken := g.cfg.APIKeyValidateURL, g.cfg.APIKeyValidateToken
 	g.mu.RUnlock() // never held across the network call below
+	unavailable := false
 	if !ok && validateURL != "" && apiKeyShape.MatchString(key) {
 		res := g.remote.check(r.Context(), "key\x00"+validateURL+"\x00"+key, func(ctx context.Context) (remoteResult, bool) {
 			return callAPIKeyValidate(ctx, validateURL, validateToken, key)
@@ -1686,9 +1694,11 @@ func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
 		if res.ok {
 			// A subscriber: the label is the subscription's; every per-key limit is the gateway default.
 			found, ok = gwKey{Label: res.label}, true
+		} else {
+			unavailable = res.unavailable
 		}
 	}
-	return found, ok
+	return found, ok, unavailable
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
@@ -2830,9 +2840,14 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
 		return
 	}
-	apiKey, _ := g.lookupKey(r)
+	apiKey, _, unavailable := g.lookupKeyEx(r)
 	label := apiKey.Label
 	if label == "" {
+		if unavailable {
+			w.Header().Set("Retry-After", "5")
+			writeErr(w, http.StatusServiceUnavailable, "key_check_unavailable", "could not check this API key right now; retry shortly")
+			return
+		}
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 		return
 	}

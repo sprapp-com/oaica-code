@@ -448,3 +448,99 @@ func TestRound135InflightIsBounded(t *testing.T) {
 		t.Error("a new lookup started with the in-flight table full")
 	}
 }
+
+// F136-L3-1/2: a once-valid subscriber keeps being served while the saas is slow or down, a cancellation still
+// lands within a refresh, and an unjudgeable key is a 503, not a 401.
+func TestRound136StaleWhileRevalidate(t *testing.T) {
+	var mode atomic.Value
+	mode.Store("valid")
+	var calls atomic.Int32
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch mode.Load() {
+		case "down":
+			w.WriteHeader(503)
+		case "slow":
+			time.Sleep(1500 * time.Millisecond)
+			w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+		case "revoked":
+			w.Write([]byte(`{"valid":false}`))
+		default:
+			w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+		}
+	}))
+	defer saas.Close()
+	g, _ := bridgeGateway(t, saas.URL)
+	look := func() (gwKey, bool, bool) {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer "+goodSK)
+		return g.lookupKeyEx(r)
+	}
+	expire := func() {
+		g.remote.mu.Lock()
+		for k, e := range g.remote.m {
+			e.expires = time.Now().Add(-time.Second)
+			g.remote.m[k] = e
+		}
+		g.remote.mu.Unlock()
+	}
+	if _, ok, _ := look(); !ok {
+		t.Fatal("first lookup failed")
+	}
+	// slow saas: the expired-but-valid answer is served at once
+	mode.Store("slow")
+	expire()
+	start := time.Now()
+	if _, ok, _ := look(); !ok || time.Since(start) > 300*time.Millisecond {
+		t.Errorf("expired valid answer not served immediately: ok=%v in %v", ok, time.Since(start))
+	}
+	time.Sleep(1800 * time.Millisecond) // let the refresh finish
+	// outage: still served, not a 401
+	mode.Store("down")
+	expire()
+	if _, ok, _ := look(); !ok {
+		t.Error("a 503 from the saas turned a known subscriber into a refusal")
+	}
+	time.Sleep(200 * time.Millisecond)
+	// ...and a failed refresh is not retried on every request
+	n := calls.Load()
+	look()
+	look()
+	time.Sleep(300 * time.Millisecond)
+	if calls.Load() != n {
+		t.Errorf("a failed refresh was retried at once (%d extra saas calls)", calls.Load()-n)
+	}
+	// revocation: the refresh fetches the definite invalid, the next lookup refuses
+	mode.Store("revoked")
+	expire()
+	look() // served stale; triggers the refresh
+	time.Sleep(300 * time.Millisecond)
+	if _, ok, _ := look(); ok {
+		t.Error("a revoked subscriber kept being served after the refresh")
+	}
+}
+
+func TestRound136UnjudgeableKeyIs503NotA401(t *testing.T) {
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	defer saas.Close()
+	_, srv := bridgeGateway(t, saas.URL)
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"kat-awq","messages":[]}`))
+	_ = resp
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"kat-awq","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+goodSK)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 503 || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("status %d Retry-After %q, want 503 with Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	req2, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{}`))
+	req2.Header.Set("Authorization", "Bearer sk-nonsense")
+	resp2, _ := http.DefaultClient.Do(req2)
+	resp2.Body.Close()
+	if resp2.StatusCode != 401 {
+		t.Errorf("a key that is not ours: status %d, want 401", resp2.StatusCode)
+	}
+}

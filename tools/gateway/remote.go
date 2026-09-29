@@ -30,11 +30,16 @@ var (
 type remoteResult struct {
 	ok    bool
 	label string
+	// unavailable: no clear answer came back (timeout, 429/5xx, no slot). Not a verdict on the key.
+	unavailable bool
 }
 
 type remoteEntry struct {
 	res     remoteResult
 	expires time.Time
+	// staleUntil: a VALID answer keeps serving past `expires` until this time while a refresh runs in the
+	// background or the saas is unreachable (round 136, F136-L3-1/2).
+	staleUntil time.Time
 }
 
 type remoteFlight struct {
@@ -54,6 +59,7 @@ type remoteCache struct {
 
 const (
 	remoteValidTTL   = 60 * time.Second // a cancellation or refund reaches the gateway within a minute
+	remoteStaleTTL   = 15 * time.Minute // how long a once-valid answer may keep serving when the saas cannot be asked
 	remoteInvalidTTL = 30 * time.Second
 	remoteMaxEntries = 4096
 	remoteMaxCalls   = 4
@@ -74,13 +80,30 @@ func (c *remoteCache) init() {
 
 // check returns the cached answer for id, or runs fn once for every concurrent caller of the same id. fn returns
 // (result, definite): only a definite answer is remembered.
+//
+// A VALID answer that has expired is still served (up to remoteStaleTTL) while a refresh runs in the background,
+// and when the refresh gets no clear answer: a subscriber must not wait seconds behind a flood of junk keys or get
+// a 401 because the saas is down for a minute (2026-09-30 audit, round 136, F136-L3-1/2). A definite "invalid"
+// answer replaces it at once, so a cancellation still lands within a refresh.
 func (c *remoteCache) check(ctx context.Context, idSource string, fn func(context.Context) (remoteResult, bool)) remoteResult {
 	sum := sha256.Sum256([]byte(idSource))
 	id := hex.EncodeToString(sum[:])
 	now := time.Now()
 	c.mu.Lock()
 	c.init()
-	if e, ok := c.m[id]; ok && now.Before(e.expires) {
+	e, have := c.m[id]
+	if have && now.Before(e.expires) {
+		c.mu.Unlock()
+		return e.res
+	}
+	if have && e.res.ok && now.Before(e.staleUntil) {
+		if f, ok := c.inflight[id]; !ok || f.gone {
+			if len(c.inflight) < remoteMaxEntries {
+				f := &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{})}
+				c.inflight[id] = f
+				go c.run(id, f, fn)
+			}
+		}
 		c.mu.Unlock()
 		return e.res
 	}
@@ -91,61 +114,73 @@ func (c *remoteCache) check(ctx context.Context, idSource string, fn func(contex
 	}
 	if len(c.inflight) >= remoteMaxEntries { // bound the goroutines an unauthenticated flood can hold
 		c.mu.Unlock()
-		return remoteResult{}
+		return remoteResult{unavailable: true}
 	}
 	f := &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{}), waiters: 1}
 	c.inflight[id] = f
 	c.mu.Unlock()
-
 	// The lookup runs on its own goroutine and its own clock: it is SHARED by every waiter of this key, so no one
-	// caller's context may end it (2026-09-30 audit, round 134, F134-L3-2). But a lookup NOBODY is waiting for must
-	// not hold a slot either: junk keys sent by clients that hang up at once kept all four slots busy for 3-7 s
-	// each and locked subscribers out (round 135, F135-L3-1). The last waiter to leave abandons the flight.
-	go func() {
-		var res remoteResult
-		definite := false
-		// At most remoteMaxCalls in flight. The lookup WAITS for a slot (bounded by remoteSlotWait) instead of being
-		// refused at once: refusing let four unauthenticated junk keys lock every paying subscriber out (F134-L3-1).
-		slot := time.NewTimer(remoteSlotWait)
-		select {
-		case c.sem <- struct{}{}:
-			slot.Stop()
-			callCtx, cancel := context.WithTimeout(context.Background(), remoteTimeout)
-			stop := make(chan struct{})
-			go func() {
-				select {
-				case <-f.abandoned:
-					cancel()
-				case <-stop:
-				}
-			}()
-			res, definite = fn(callCtx)
-			close(stop)
-			cancel()
-			<-c.sem
-		case <-f.abandoned:
-			slot.Stop()
-		case <-slot.C:
-		}
-		c.mu.Lock()
-		if definite {
-			if len(c.m) >= remoteMaxEntries {
-				c.evictLocked(time.Now())
-			}
-			ttl := remoteInvalidTTL
-			if res.ok {
-				ttl = remoteValidTTL
-			}
-			c.m[id] = remoteEntry{res: res, expires: time.Now().Add(ttl)}
-		}
-		if c.inflight[id] == f {
-			delete(c.inflight, id)
-		}
-		f.res = res
-		close(f.done)
-		c.mu.Unlock()
-	}()
+	// caller's context may end it (round 134, F134-L3-2). But a lookup NOBODY is waiting for must not hold a slot
+	// either: the last waiter to leave abandons the flight (round 135, F135-L3-1).
+	go c.run(id, f, fn)
 	return c.wait(ctx, f)
+}
+
+func (c *remoteCache) run(id string, f *remoteFlight, fn func(context.Context) (remoteResult, bool)) {
+	var res remoteResult
+	definite := false
+	// At most remoteMaxCalls in flight. The lookup WAITS for a slot (bounded by remoteSlotWait) instead of being
+	// refused at once (round 134, F134-L3-1).
+	slot := time.NewTimer(remoteSlotWait)
+	select {
+	case c.sem <- struct{}{}:
+		slot.Stop()
+		callCtx, cancel := context.WithTimeout(context.Background(), remoteTimeout)
+		stop := make(chan struct{})
+		go func() {
+			select {
+			case <-f.abandoned:
+				cancel()
+			case <-stop:
+			}
+		}()
+		res, definite = fn(callCtx)
+		close(stop)
+		cancel()
+		<-c.sem
+	case <-f.abandoned:
+		slot.Stop()
+	case <-slot.C:
+	}
+	now := time.Now()
+	c.mu.Lock()
+	if definite {
+		if len(c.m) >= remoteMaxEntries {
+			c.evictLocked(now)
+		}
+		ttl := remoteInvalidTTL
+		ent := remoteEntry{res: res}
+		if res.ok {
+			ttl = remoteValidTTL
+			ent.staleUntil = now.Add(remoteStaleTTL)
+		}
+		ent.expires = now.Add(ttl)
+		c.m[id] = ent
+	} else {
+		res.unavailable = true
+		// No clear answer: a once-valid key keeps serving (and is retried shortly) instead of turning into a 401.
+		if e, ok := c.m[id]; ok && e.res.ok && now.Before(e.staleUntil) {
+			e.expires = now.Add(10 * time.Second)
+			c.m[id] = e
+			res = e.res
+		}
+	}
+	if c.inflight[id] == f {
+		delete(c.inflight, id)
+	}
+	f.res = res
+	close(f.done)
+	c.mu.Unlock()
 }
 
 // wait blocks for the flight's answer or the caller's own context; the last caller to give up abandons the flight.
@@ -161,7 +196,7 @@ func (c *remoteCache) wait(ctx context.Context, f *remoteFlight) remoteResult {
 			close(f.abandoned)
 		}
 		c.mu.Unlock()
-		return remoteResult{}
+		return remoteResult{unavailable: true}
 	}
 }
 
@@ -169,7 +204,7 @@ func (c *remoteCache) wait(ctx context.Context, f *remoteFlight) remoteResult {
 // keys cannot push a paying customer's cached answer out (they are refused answers).
 func (c *remoteCache) evictLocked(now time.Time) {
 	for k, e := range c.m {
-		if !now.Before(e.expires) {
+		if !now.Before(e.expires) && !(e.res.ok && now.Before(e.staleUntil)) {
 			delete(c.m, k)
 		}
 	}
