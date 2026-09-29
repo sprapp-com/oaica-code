@@ -93,6 +93,21 @@ func CatalogSync(url string) (CatalogSyncReport, error) {
 		}
 	}
 
+	// The body IS the cache — a 304, or the transport fell back to it because the source
+	// could not be reached. That is not "unchanged": a sync that did not hear from its
+	// source must not say it did, and a cache that will not parse must not be reported as
+	// a good catalog (ProviderSync refuses the same state). The byte-identical check below
+	// always matched here, so an offline run over a torn cache answered "unchanged, 0
+	// providers" with exit 0 (2026-09-29 audit, round 116, F116-L2-1).
+	if fromCache {
+		f, perr := parseModelsDevCatalog(body)
+		if perr != nil {
+			return CatalogSyncReport{URL: display}, fmt.Errorf("the cached catalog at %s is not readable as a models.dev payload (%v) — run this again while online", cachePath, perr)
+		}
+		pn, mn := f.counts()
+		return CatalogSyncReport{URL: display, Providers: pn, Models: mn, FromCache: true}, nil
+	}
+
 	// Byte-identical to what we already hold: nothing to validate, nothing to
 	// write. (The ETag path usually catches this; file:// has no ETag.)
 	if prev, rerr := os.ReadFile(cachePath); rerr == nil && sameBytes(prev, body) {

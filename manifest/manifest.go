@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/ollama/ollama/types/model"
 )
@@ -187,12 +190,22 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	tmpDir := filepath.Join(root, ".tmp")
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(tmpDir, "manifest-*.tmp")
-	if err != nil {
-		return err
+	// A model delete prunes empty directories under the root, and .tmp is empty between
+	// writes: a prune landing between the MkdirAll and the CreateTemp failed the write at
+	// its last step, after a download that may be gigabytes (2026-09-29 audit, round 116,
+	// F116-L1-2). Made again a few times instead.
+	var tmp *os.File
+	for attempt := 0; ; attempt++ {
+		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+			return err
+		}
+		tmp, err = os.CreateTemp(tmpDir, "manifest-*.tmp")
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) || attempt >= 5 {
+			return err
+		}
 	}
 	tmpName := tmp.Name()
 	fail := func(err error) error {
@@ -216,9 +229,41 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
+		// A host or namespace directory symlinked onto another filesystem cannot be renamed
+		// into from .tmp. Write beside the target instead: the window in which a listing can
+		// see the temporary name is short and Manifests skips a file that vanished
+		// (2026-09-29 audit, round 116, F116-L1-3).
+		if errors.Is(err, syscall.EXDEV) {
+			return writeBesideAndRename(path, data, perm)
+		}
 		return err
 	}
 	return nil
+}
+
+func writeBesideAndRename(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, werr := tmp.Write(data)
+	if werr == nil {
+		werr = tmp.Sync()
+	}
+	if cerr := tmp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(name, perm)
+	}
+	if werr == nil {
+		werr = os.Rename(name, path)
+	}
+	if werr != nil {
+		os.Remove(name)
+	}
+	return werr
 }
 
 func Manifests(continueOnError bool) (map[model.Name]*Manifest, error) {

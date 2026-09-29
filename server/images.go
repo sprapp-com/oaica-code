@@ -1165,7 +1165,7 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 		return err
 	}
 
-	if err := os.WriteFile(fp, manifestData, 0o644); err != nil {
+	if err := manifest.WriteFileAtomic(fp, manifestData, 0o644); err != nil {
 		return err
 	}
 

@@ -2938,6 +2938,16 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// A batched `prompt` fans out the same way: a list of strings, or of token-id lists,
+		// is one completion PER ELEMENT on the OpenAI wire and on vLLM, each with its own
+		// max_tokens, so a 100-token ceiling became ~6,400 through the field n and best_of
+		// were refused for. A flat list of integers is one tokenised prompt and stays
+		// (2026-09-29 audit, round 116, F116-L3-1).
+		if batchedPrompt(req["prompt"]) {
+			writeErr(w, http.StatusBadRequest, "invalid_request_error",
+				"a batched prompt is not supported: output is capped per request")
+			return
+		}
 		// A body that does not state a positive numeric cap is held to the
 		// ceiling all the same. The clamp below rewrites a key only when it holds
 		// a positive number, so the field absent (the default shape of most
@@ -3775,6 +3785,18 @@ func serveUntilDone(ctx context.Context, srv *http.Server, ln net.Listener, grac
 // choiceFanOut reports whether a request field asks for more than one completion.
 // The number may be spelled as a JSON number or as a numeric string an upstream
 // coerces; anything else is left for the upstream to refuse.
+func batchedPrompt(v any) bool {
+	list, ok := v.([]any)
+	if !ok || len(list) < 2 {
+		return false
+	}
+	switch list[0].(type) {
+	case string, []any:
+		return true
+	}
+	return false
+}
+
 func choiceFanOut(v any) bool {
 	switch n := v.(type) {
 	case float64:
