@@ -225,4 +225,3 @@ func TestMine102AnIndexlessNamelessEntryRestatingTheCallsBytesIsProse(t *testing
 			r102L2Whole(call+","+twin, "length"))
 	})
 }
-

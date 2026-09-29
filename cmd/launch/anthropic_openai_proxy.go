@@ -6400,19 +6400,23 @@ func anthropicPassthrough(w http.ResponseWriter, r *http.Request, body []byte, u
 }
 
 // errorFrameWatch reads a relayed Anthropic-wire body for an in-band error: an
-// SSE `event: error` line, a `data:` line whose object is `{"type":"error"...`,
-// or a non-streamed body that opens with that object. It keeps only the first
-// bytes of each line, so a long frame costs nothing.
+// SSE `event: error` line, a `data:` line whose object is an error, or a
+// non-streamed body that is one. An error object is decoded rather than matched
+// by its first key, because JSON key order carries no meaning and a gateway that
+// marshals a map states `{"error":{...},"type":"error"}` — this tree's own does
+// (2026-09-29 audit, round 107, F107-L2-1). It keeps at most errorFrameLineCap
+// bytes of a line, so a long content frame is skipped rather than buffered, and it
+// ends a line at `\r` as well as `\n`: CR-only endings are legal SSE.
 type errorFrameWatch struct {
 	line     []byte
 	sawError bool
 }
 
-const errorFrameLineCap = 64
+const errorFrameLineCap = 8 << 10
 
 func (e *errorFrameWatch) feed(p []byte) {
 	for _, b := range p {
-		if b == '\n' {
+		if b == '\n' || b == '\r' {
 			e.endLine()
 			continue
 		}
@@ -6442,10 +6446,22 @@ func (e *errorFrameWatch) endLine() {
 			line = bytes.TrimSpace(v)
 		}
 	}
-	// A JSON object whose first key is type:"error" — the `data:` payload of an
-	// error frame, or a whole non-streamed body.
-	compact := bytes.ReplaceAll(line, []byte(" "), nil)
-	if bytes.HasPrefix(compact, []byte(`{"type":"error"`)) {
+	// A line longer than the cap is cut mid-object and does not decode, which is
+	// how a long content frame is skipped; an "over" flag and a pre-scan for the
+	// word "error" were measured NOT load-bearing and do not ship.
+	if len(line) == 0 || line[0] != '{' {
+		return
+	}
+	var frame struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(line, &frame) != nil {
+		return
+	}
+	// A message, a delta or a ping never states a top-level `error`; a body that
+	// states one, with or without `type`, is the vendor saying the turn failed.
+	if frame.Type == "error" || (len(frame.Error) > 0 && string(frame.Error) != "null") {
 		e.sawError = true
 	}
 }

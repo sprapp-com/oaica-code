@@ -113,3 +113,38 @@ func TestMine106EitherSignalOfAnErrorFrameIsEnough(t *testing.T) {
 		}
 	}
 }
+
+// TestMine107TheErrorObjectIsReadInAnyKeyOrder is F107-L2-1's pin: JSON key order
+// carries no meaning, and a gateway that marshals a map states the object as
+// {"error":{...},"type":"error"} — this tree's own does.
+func TestMine107TheErrorObjectIsReadInAnyKeyOrder(t *testing.T) {
+	start := strings.SplitN(r106AnthropicErrorStream, "event: error", 2)[0]
+	rev := `{"error":{"message":"Overloaded","type":"overloaded_error"},"type":"error"}`
+	for name, raw := range map[string]string{
+		"reversed keys, data line":  start + "data: " + rev + "\n\n",
+		"reversed keys, whole body": rev,
+		"error object with no type": `{"error":{"message":"bad key"}}`,
+		"type alone, no object":     start + "data: {\"type\":\"error\"}\n\n",
+		"CR-only line endings":      strings.ReplaceAll(r106AnthropicErrorStream, "\n", "\r"),
+	} {
+		if open, statuses := r106Turns(t, raw); !open || statuses != "502 502 502 502" {
+			t.Errorf("%s: breakerOpen=%v rows=%q, want open and 502 rows (2026-09-29 audit, round 107, F107-L2-1)", name, open, statuses)
+		}
+	}
+}
+
+// TestMine107AHealthyStreamThatMentionsErrorsStaysDelivered is the false-positive
+// control the decode must not break: the word "error" in a delta's text, and a
+// long frame the watcher skips, are not an error frame.
+func TestMine107AHealthyStreamThatMentionsErrorsStaysDelivered(t *testing.T) {
+	start := strings.SplitN(r106AnthropicOKStream, "event: message_stop", 2)[0]
+	long := strings.Repeat("x", errorFrameLineCap+100)
+	raw := start +
+		"event: content_block_delta\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"an \"error\" occurred: {\"type\":\"error\"}"}}` + "\n\n" +
+		"event: content_block_delta\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + long + `\"error\""}}` + "\n\n" +
+		"event: ping\n" + `data: {"type": "ping"}` + "\n\n" +
+		"event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	if open, statuses := r106Turns(t, raw); open || statuses != "200 200 200 200" {
+		t.Errorf("breakerOpen=%v rows=%q, want closed and 200 rows for a healthy stream (2026-09-29 audit, round 107, F107-L2-1)", open, statuses)
+	}
+}
