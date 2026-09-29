@@ -582,6 +582,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 			}
 			messages = append(messages, api.Message{Role: msg.Role, Content: content, Thinking: msg.Reasoning, ToolCalls: toolCalls, ToolName: toolName, ToolCallID: msg.ToolCallID})
 		case []any:
+			first := len(messages)
 			for _, c := range content {
 				data, ok := c.(map[string]any)
 				if !ok {
@@ -631,16 +632,39 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 				}
 			}
 			// since we might have added multiple messages above, if we have tools
-			// calls we'll add them to the last message
-			if len(messages) > 0 && len(msg.ToolCalls) > 0 {
+			// calls we'll add them to the last message OF THIS TURN. A turn whose
+			// array held no part (`content: []`) emitted none, and the calls were
+			// handed to whatever message came before it — the user's — so the
+			// assistant turn vanished and the user message gained a tool call,
+			// where `content: null` states the same turn as its own message
+			// (2026-09-29 audit, round 104, F104-L1-2).
+			if len(msg.ToolCalls) > 0 {
 				toolCalls, err := FromCompletionToolCall(msg.ToolCalls)
 				if err != nil {
 					return nil, err
 				}
-				messages[len(messages)-1].ToolCalls = toolCalls
-				messages[len(messages)-1].ToolName = toolName
-				messages[len(messages)-1].ToolCallID = msg.ToolCallID
-				messages[len(messages)-1].Thinking = msg.Reasoning
+				if len(messages) == first {
+					messages = append(messages, api.Message{Role: msg.Role, Thinking: msg.Reasoning, ToolCalls: toolCalls})
+				} else {
+					messages[len(messages)-1].ToolCalls = toolCalls
+					messages[len(messages)-1].ToolName = toolName
+					messages[len(messages)-1].ToolCallID = msg.ToolCallID
+					messages[len(messages)-1].Thinking = msg.Reasoning
+				}
+			}
+			// The id and the name a tool result answers are stated by the turn,
+			// not by its calls: a `tool` message never carries tool_calls, so
+			// hanging them on the calls' branch left the array spelling of the
+			// same result unpaired with its call while the string spelling kept
+			// both — the upstream body differed by `tool_call_id`, and the model
+			// saw an answer to nothing (2026-09-29 audit, round 104, F104-L1-1).
+			if msg.ToolCallID != "" {
+				for i := first; i < len(messages); i++ {
+					messages[i].ToolCallID = msg.ToolCallID
+					if messages[i].ToolName == "" {
+						messages[i].ToolName = toolName
+					}
+				}
 			}
 		default:
 			// content is only optional if tool calls are present
