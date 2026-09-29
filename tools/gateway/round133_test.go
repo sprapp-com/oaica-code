@@ -372,3 +372,79 @@ func TestRound134OneCallerHangingUpDoesNotFailTheOthers(t *testing.T) {
 		t.Errorf("%d/3 waiters with live contexts were refused after the first caller hung up", refused.Load())
 	}
 }
+
+// F135-L3-1: lookups nobody waits for any more must not hold the outbound slots.
+func TestRound135AbandonedLookupsReleaseTheirSlots(t *testing.T) {
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		if r.FormValue("api_key") == goodSK {
+			w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+			return
+		}
+		w.Write([]byte(`{"valid":false}`))
+	}))
+	defer saas.Close()
+	g, _ := bridgeGateway(t, saas.URL)
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var sent atomic.Int32
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+				r := httptest.NewRequest("GET", "/v1/models", nil).WithContext(dead)
+				r.Header.Set("Authorization", fmt.Sprintf("Bearer oaica-sk-%048x", w*1000000+i))
+				g.lookupKey(r)
+				sent.Add(1)
+			}
+		}(w)
+	}
+	time.Sleep(500 * time.Millisecond)
+	served := 0
+	var worst time.Duration
+	for i := 0; i < 5; i++ {
+		g.remote.mu.Lock()
+		g.remote.m = map[string]remoteEntry{}
+		g.remote.mu.Unlock()
+		start := time.Now()
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer "+goodSK)
+		if _, ok := g.lookupKey(r); ok {
+			served++
+		}
+		if d := time.Since(start); d > worst {
+			worst = d
+		}
+	}
+	close(stop)
+	wg.Wait()
+	if served != 5 || worst > 2*time.Second {
+		t.Errorf("subscriber served %d/5, worst latency %v, with %d hang-up junk lookups", served, worst, sent.Load())
+	}
+}
+
+func TestRound135InflightIsBounded(t *testing.T) {
+	var c remoteCache
+	c.init()
+	for i := 0; i < remoteMaxEntries; i++ {
+		c.inflight[fmt.Sprint(i)] = &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{})}
+	}
+	called := false
+	res := c.check(context.Background(), "new", func(context.Context) (remoteResult, bool) { called = true; return remoteResult{ok: true}, true })
+	if res.ok || called {
+		t.Error("a new lookup started with the in-flight table full")
+	}
+}

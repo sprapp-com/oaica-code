@@ -313,7 +313,10 @@ func activateLicenseLive(key, instanceName string) (licenseFile, error) {
 	if err != nil {
 		var he *licenseHTTPError
 		if errors.As(err, &he) {
-			return licenseFile{}, fmt.Errorf("license activation failed: %w (try again in a minute)", he)
+			if he.Status == http.StatusTooManyRequests || he.Status >= 500 {
+				return licenseFile{}, fmt.Errorf("license activation failed: %w (try again in a minute)", he)
+			}
+			return licenseFile{}, fmt.Errorf("license activation failed: %w", he)
 		}
 		return licenseFile{}, fmt.Errorf("could not reach license server: %w", err)
 	}
@@ -571,7 +574,14 @@ machine; after that, 'oaica launch ...' works without any extra step.`, oaicaPur
 			// takes one of the key's (three) seats and nothing gives one back, so re-running the README step burned
 			// the buyer's second and third machine (2026-09-30 audit, round 134, F134-L1-1).
 			if cur, lerr := loadLicenseFile(); lerr == nil && cur.Key == key && cur.InstanceID != "" && !isTestLicenseKey(key) {
-				if ok, verr := validateLicenseLive(key, cur.InstanceID); verr == nil && ok {
+				ok, verr := validateLicenseLive(key, cur.InstanceID)
+				if verr != nil {
+					// No verdict (429, 5xx, timeout): spending a seat on /activate now would strand the one this
+					// machine already holds, and three flaps lock every other machine out (2026-09-30 audit,
+					// round 135, F135-L1-1).
+					return fmt.Errorf("could not verify this machine's existing activation (%w); no new seat was used — try again shortly", verr)
+				}
+				if ok {
 					cur.ValidatedAt = time.Now()
 					_ = saveLicenseFile(cur)
 					fmt.Printf("This machine (%q) is already activated with that key.\n", cur.InstanceName)

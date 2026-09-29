@@ -66,9 +66,10 @@ Without these two settings subscribers cannot authenticate. `gateway --check` va
 `oaica pull` of a `license_required` model sends the buyer's licence as a Bearer. The gateway accepts (a) a key
 whose SHA-256 is in `pull_license_keys` (hand-edited, e.g. an enterprise customer), or (b) when
 `pull_license_validate_url` is set (`https://<saas>/license/validate`, https or loopback only), an
-`oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) is cached 10 min when valid and
-1 min when refused, and fails closed when the licence server is unreachable. Leave it unset until oaica-saas is
-live; a refund revokes the key within the cache window.
+`oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) shares the subscriber-key cache: 60 s when valid, 30 s when refused, one call per key at a time, at most 4
+calls in flight (a lookup waits up to 3 s for a slot, and a lookup nobody waits for any more is dropped), and
+fails closed when the licence server is unreachable. Leave it unset until oaica-saas is live; a refund revokes
+the key within the cache window.
 
 ## The second condition: rolling-window caps
 

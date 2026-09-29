@@ -142,3 +142,55 @@ func TestRound134ActivationRefusalKeepsTheServersWords(t *testing.T) {
 		t.Errorf("err = %v; want the server's own words, not 'could not reach'", err)
 	}
 }
+
+// F135-L1-1: a validate that gives no verdict must not fall through to /activate and strand the held seat.
+func TestRound135ValidateFlapSpendsNoSeat(t *testing.T) {
+	for _, status := range []int{429, 500, 503} {
+		setLaunchTestHome(t, t.TempDir())
+		var activations atomic.Int32
+		stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/activate":
+				activations.Add(1)
+				w.Write([]byte(`{"activated":true,"valid":true,"instance":{"id":"inst-2","name":"h"},"meta":{"product":"oaica-code"}}`))
+			case "/validate":
+				w.WriteHeader(status)
+				w.Write([]byte(`{"error":"flap"}`))
+			}
+		})
+		key := "oaica-lic-" + strings.Repeat("d", 32)
+		saveLicenseFile(licenseFile{Key: key, InstanceID: "inst-1", InstanceName: "h", ValidatedAt: time.Now()})
+		cmd := ActivateCmd()
+		cmd.SetArgs([]string{key})
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("validate %d: activate reported success without a verdict", status)
+		}
+		if n := activations.Load(); n != 0 {
+			t.Errorf("validate %d spent %d seat(s)", status, n)
+		}
+		if f, _ := loadLicenseFile(); f.InstanceID != "inst-1" {
+			t.Errorf("validate %d replaced the stored instance with %q", status, f.InstanceID)
+		}
+	}
+	// control: a definite valid:false (revoked instance) DOES re-activate
+	setLaunchTestHome(t, t.TempDir())
+	var activations atomic.Int32
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/activate":
+			activations.Add(1)
+			w.Write([]byte(`{"activated":true,"valid":true,"instance":{"id":"inst-9","name":"h"},"meta":{"product":"oaica-code"}}`))
+		case "/validate":
+			w.Write([]byte(`{"valid":false,"activated":false,"error":"this machine is not activated for that key"}`))
+		}
+	})
+	key := "oaica-lic-" + strings.Repeat("e", 32)
+	saveLicenseFile(licenseFile{Key: key, InstanceID: "inst-1", InstanceName: "h", ValidatedAt: time.Now()})
+	cmd := ActivateCmd()
+	cmd.SetArgs([]string{key})
+	if err := cmd.Execute(); err != nil || activations.Load() != 1 {
+		t.Errorf("a definite refusal must re-activate once: err=%v activations=%d", err, activations.Load())
+	}
+}

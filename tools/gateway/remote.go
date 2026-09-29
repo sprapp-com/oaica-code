@@ -38,8 +38,11 @@ type remoteEntry struct {
 }
 
 type remoteFlight struct {
-	done chan struct{}
-	res  remoteResult
+	done      chan struct{}
+	abandoned chan struct{} // closed when the last waiter has left
+	waiters   int
+	gone      bool
+	res       remoteResult
 }
 
 type remoteCache struct {
@@ -81,43 +84,53 @@ func (c *remoteCache) check(ctx context.Context, idSource string, fn func(contex
 		c.mu.Unlock()
 		return e.res
 	}
-	if f, ok := c.inflight[id]; ok {
+	if f, ok := c.inflight[id]; ok && !f.gone {
+		f.waiters++
 		c.mu.Unlock()
-		select {
-		case <-f.done:
-			return f.res
-		case <-ctx.Done():
-			return remoteResult{}
-		}
+		return c.wait(ctx, f)
 	}
-	f := &remoteFlight{done: make(chan struct{})}
+	if len(c.inflight) >= remoteMaxEntries { // bound the goroutines an unauthenticated flood can hold
+		c.mu.Unlock()
+		return remoteResult{}
+	}
+	f := &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{}), waiters: 1}
 	c.inflight[id] = f
 	c.mu.Unlock()
 
 	// The lookup runs on its own goroutine and its own clock: it is SHARED by every waiter of this key, so no one
-	// caller's context may end it. Each caller — the first included — stops WAITING on its own context, and the
-	// lookup finishes for the others (2026-09-30 audit, round 134, F134-L3-2; the request-bound rule of round 133
-	// still holds for every caller's wait).
+	// caller's context may end it (2026-09-30 audit, round 134, F134-L3-2). But a lookup NOBODY is waiting for must
+	// not hold a slot either: junk keys sent by clients that hang up at once kept all four slots busy for 3-7 s
+	// each and locked subscribers out (round 135, F135-L3-1). The last waiter to leave abandons the flight.
 	go func() {
 		var res remoteResult
 		definite := false
 		// At most remoteMaxCalls in flight. The lookup WAITS for a slot (bounded by remoteSlotWait) instead of being
-		// refused at once: refusing let four unauthenticated junk keys lock every paying subscriber out, and five
-		// subscribers re-validating together refused the fifth (F134-L3-1).
+		// refused at once: refusing let four unauthenticated junk keys lock every paying subscriber out (F134-L3-1).
 		slot := time.NewTimer(remoteSlotWait)
 		select {
 		case c.sem <- struct{}{}:
 			slot.Stop()
 			callCtx, cancel := context.WithTimeout(context.Background(), remoteTimeout)
+			stop := make(chan struct{})
+			go func() {
+				select {
+				case <-f.abandoned:
+					cancel()
+				case <-stop:
+				}
+			}()
 			res, definite = fn(callCtx)
+			close(stop)
 			cancel()
 			<-c.sem
+		case <-f.abandoned:
+			slot.Stop()
 		case <-slot.C:
 		}
 		c.mu.Lock()
 		if definite {
 			if len(c.m) >= remoteMaxEntries {
-				c.evictLocked(now)
+				c.evictLocked(time.Now())
 			}
 			ttl := remoteInvalidTTL
 			if res.ok {
@@ -125,16 +138,29 @@ func (c *remoteCache) check(ctx context.Context, idSource string, fn func(contex
 			}
 			c.m[id] = remoteEntry{res: res, expires: time.Now().Add(ttl)}
 		}
-		delete(c.inflight, id)
+		if c.inflight[id] == f {
+			delete(c.inflight, id)
+		}
 		f.res = res
 		close(f.done)
 		c.mu.Unlock()
 	}()
+	return c.wait(ctx, f)
+}
 
+// wait blocks for the flight's answer or the caller's own context; the last caller to give up abandons the flight.
+func (c *remoteCache) wait(ctx context.Context, f *remoteFlight) remoteResult {
 	select {
 	case <-f.done:
 		return f.res
 	case <-ctx.Done():
+		c.mu.Lock()
+		f.waiters--
+		if f.waiters == 0 && !f.gone {
+			f.gone = true
+			close(f.abandoned)
+		}
+		c.mu.Unlock()
 		return remoteResult{}
 	}
 }
