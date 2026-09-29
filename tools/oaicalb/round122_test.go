@@ -154,3 +154,55 @@ func TestRound125MeterBooksLargeDocumentsAndMixedCaseStreams(t *testing.T) {
 		}
 	}
 }
+
+// F126-L3-1 (2026-09-29 audit, round 126): a streamed turn whose client did not ask for usage is still
+// metered, because the meter asks for it.
+func TestRound126MeterForcesIncludeUsageOnStreams(t *testing.T) {
+	meterSrv, records := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	var lastBody atomic.Value
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		lastBody.Store(string(b))
+		var req struct {
+			StreamOptions struct {
+				IncludeUsage bool `json:"include_usage"`
+			} `json:"stream_options"`
+		}
+		json.Unmarshal(b, &req)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+		if req.StreamOptions.IncludeUsage { // vLLM sends the usage frame only when asked
+			io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n")
+		}
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer be.Close()
+	h := serveWith(newStaticPool([]*backend{newBackend(be.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+	bodies := []string{
+		`{"model":"m","stream":true,"messages":[{"role":"user","content":"a<b"}]}`,
+		`{"model":"m","stream":true,"stream_options":{"include_usage":false,"x":1}}`,
+		`{"model":"m","stream":"true"}`,
+		`{"model":"m","stream":1}`,
+	}
+	for _, b := range bodies {
+		h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(b)))
+	}
+	waitForRecords(t, records, 4)
+	for i, rec := range (*records)[:4] {
+		if rec.PromptTokens != 11 || rec.CompletionTokens != 5 || !rec.UsageSeen {
+			t.Errorf("body %d booked %+v, want 11/5", i, rec)
+		}
+	}
+	if lb, _ := lastBody.Load().(string); !strings.Contains(lb, `"include_usage":true`) {
+		t.Errorf("the backend was not asked for usage: %s", lb)
+	}
+	// a non-stream body is forwarded untouched
+	lastBody.Store("")
+	plain := `{"model":"m","messages":[]}`
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(plain)))
+	if lb, _ := lastBody.Load().(string); lb != plain {
+		t.Errorf("a non-stream body was rewritten: %s", lb)
+	}
+}

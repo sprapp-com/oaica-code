@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -1106,13 +1107,22 @@ func ServeHandler(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "%s\n", llamaServer+" "+strings.Join(serveArgs, " "))
 
 	proc := exec.Command(llamaServer, serveArgs...)
+	// llama-server's own port is on loopback for every local user to see in `ps`: it gets a random
+	// per-launch key of its own, in the environment and never in argv, and only the proxy holds it
+	// (2026-09-29 audit, round 126, F126-L1-2).
+	var kb [24]byte
+	if _, err := rand.Read(kb[:]); err != nil {
+		return fmt.Errorf("could not make a backend key: %w", err)
+	}
+	backendKey := hex.EncodeToString(kb[:])
+	proc.Env = append(os.Environ(), "LLAMA_API_KEY="+backendKey)
 	proc.Stdout = os.Stdout
 	proc.Stderr = os.Stderr
 	proc.Stdin = os.Stdin
 
 	proxyErrCh := make(chan error, 1)
 	go func() {
-		proxyErrCh <- launch.RunNormalizingProxyOn(bindHost, port, internalPort, apiKey)
+		proxyErrCh <- launch.RunNormalizingProxyOnKeyed(bindHost, port, internalPort, apiKey, backendKey)
 	}()
 
 	// Registers this model in ~/.oaica/local_servers.json so `oaica launch`'s

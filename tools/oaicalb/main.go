@@ -866,6 +866,30 @@ func (u *usageRecorder) finish() {
 // 2026-09-29 audit, round 125, F125-L3-1).
 const docBufferLimit = 8 << 20
 
+// laxTruthy reads a request's `stream` the way the backend does: a JSON bool, a number, or the strings
+// pydantic accepts as true.
+func laxTruthy(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	switch t := v.(type) {
+	case bool:
+		return t
+	case float64:
+		return t == 1
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes", "on", "t", "y":
+			return true
+		}
+	}
+	return false
+}
+
 // meterBodyLimit is how much of a request body this file reads to meter or size it: above the
 // 16 MiB the gateway itself accepts.
 const meterBodyLimit = 20 << 20
@@ -956,6 +980,32 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		json.Unmarshal(fields["stream"], &reqDoc.Stream)
 		if !whole {
 			reqDoc.Model = "(request too large to read)"
+		}
+		// Usage on a stream is a frame vLLM sends only when the request asks for it. The gateway forces
+		// it; a direct or non-gateway client that never asked (the OpenAI SDKs' default streaming request,
+		// or an explicit include_usage:false) was served and booked 0/0 here (2026-09-29 audit,
+		// round 126, F126-L3-1).
+		if whole && fields != nil && laxTruthy(fields["stream"]) {
+			so := map[string]json.RawMessage{}
+			if raw, ok := fields["stream_options"]; ok {
+				json.Unmarshal(raw, &so)
+				if so == nil {
+					so = map[string]json.RawMessage{}
+				}
+			}
+			so["include_usage"] = json.RawMessage("true")
+			if soRaw, err := json.Marshal(so); err == nil {
+				fields["stream_options"] = soRaw
+				var enc bytes.Buffer
+				e := json.NewEncoder(&enc)
+				e.SetEscapeHTML(false)
+				if e.Encode(fields) == nil {
+					nb := bytes.TrimRight(enc.Bytes(), "\n")
+					r.Body = io.NopCloser(bytes.NewReader(nb))
+					r.ContentLength = int64(len(nb))
+					r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
+				}
+			}
 		}
 
 		rec := &usageRecorder{ResponseWriter: w, stream: reqDoc.Stream}

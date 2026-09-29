@@ -29,6 +29,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -240,8 +241,45 @@ func RunLocalNormalizingProxy(listenPort, backendPort int) error {
 var normalizingProxyHeaderTimeout = 10 * time.Second
 
 func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey string) error {
+	return RunNormalizingProxyOnKeyed(bindHost, listenPort, backendPort, apiKey, "")
+}
+
+// loopbackOrigin reports whether an Origin header names a page served from this machine.
+func loopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	h := u.Hostname()
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// RunNormalizingProxyOnKeyed is RunNormalizingProxyOn with a key the proxy presents to the backend in
+// place of whatever the client sent: llama-server is started with it, so its internal port is no longer
+// an unauthenticated way around the proxy's own key for any other local user (2026-09-29 audit,
+// round 126, F126-L1-2).
+func RunNormalizingProxyOnKeyed(bindHost string, listenPort, backendPort int, apiKey, backendKey string) error {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", backendPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A web page is not this machine's client. The backend answers every Origin with
+		// Access-Control-Allow-Origin: <that origin> and serves a text/plain POST it never preflights,
+		// so on a loopback bind with no key any site the operator visited could drive the model and
+		// read its answers. Pages served from this machine (a local chat UI) still work (2026-09-29
+		// audit, round 126, F126-L1-1).
+		if isLoopbackBind(bindHost) {
+			if o := r.Header.Get("Origin"); o != "" && !loopbackOrigin(o) {
+				http.Error(w, `{"error":{"message":"cross-origin request refused","type":"forbidden"}}`, http.StatusForbidden)
+				return
+			}
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				http.Error(w, `{"error":{"message":"cross-site request refused","type":"forbidden"}}`, http.StatusForbidden)
+				return
+			}
+		}
 		// /health stays unauthenticated ONLY on a loopback bind — on a
 		// network-facing bind (0.0.0.0) it is behind the same bearer check
 		// as everything else, so it leaks nothing (liveness, backend
@@ -279,6 +317,9 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 		}
 		req.Header = r.Header.Clone()
 		req.ContentLength = int64(len(body))
+		if backendKey != "" {
+			req.Header.Set("Authorization", "Bearer "+backendKey)
+		}
 
 		resp, err := proxyUpstreamClient.Do(req)
 		if err != nil {

@@ -205,3 +205,21 @@ func TestRound125ClaudeDoorAppliesThePlatformTokenPolicy(t *testing.T) {
 		t.Errorf("the user's own remote names GITHUB_TOKEN as a key, yet it reached the claude child")
 	}
 }
+
+// F126-L2-1 (2026-09-29 audit, round 126): the lenient scan reads the spellings the parser accepts.
+func TestRound126BrokenRemotesScanIsCaseAndEscapeAware(t *testing.T) {
+	setLaunchTestHome(t, t.TempDir())
+	t.Setenv("MY_BOX_KEY", "box-real")
+	t.Setenv("OTHER_BOX_KEY", "other-real")
+	body := `{"remotes":[{"name":"a","base_url":"https://x.example/v1","API_KEY_ENV":"MY_BOX_KEY"},{"name":"b","base_url":"https://y.example/v1","api_key_env":"OTHER\u005fBOX_KEY"},]}`
+	os.WriteFile(userRemotesPath(), []byte(body), 0o600)
+	if _, err := loadUserRemotes(); err == nil {
+		t.Fatal("premise: the file should not parse")
+	}
+	env := strings.Join(directLaunchEnv(), "\n")
+	for _, gone := range []string{"MY_BOX_KEY=", "OTHER_BOX_KEY="} {
+		if strings.Contains(env, gone) {
+			t.Errorf("a key a broken remotes.json names in a valid spelling reached the child: %s", gone)
+		}
+	}
+}

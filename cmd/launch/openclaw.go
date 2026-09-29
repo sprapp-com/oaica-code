@@ -1595,7 +1595,9 @@ func dropUnconfiguredDualUse(names []string, explicit map[string]bool) []string 
 	return kept
 }
 
-var rawKeyEnvRE = regexp.MustCompile(`"api_key_env"\s*:\s*"([^"]*)"`)
+// Case-insensitive and escape-aware, as the JSON decoder that reads the file when it does parse is
+// (2026-09-29 audit, round 126, F126-L2-1).
+var rawKeyEnvRE = regexp.MustCompile(`(?i)"api_key_env"\s*:\s*("(?:[^"\\]|\\.)*")`)
 
 // rawRemoteKeyEnvNames reads the api_key_env values out of a remotes.json that does not parse.
 func rawRemoteKeyEnvNames() []string {
@@ -1605,7 +1607,11 @@ func rawRemoteKeyEnvNames() []string {
 	}
 	var out []string
 	for _, m := range rawKeyEnvRE.FindAllStringSubmatch(string(b), -1) {
-		for _, n := range strings.Split(m[1], ",") {
+		var val string
+		if json.Unmarshal([]byte(m[1]), &val) != nil {
+			continue
+		}
+		for _, n := range strings.Split(val, ",") {
 			if n = strings.TrimSpace(n); n != "" {
 				out = append(out, n)
 			}
