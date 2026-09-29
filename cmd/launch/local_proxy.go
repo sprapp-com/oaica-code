@@ -296,7 +296,7 @@ func RunNormalizingProxyOn(bindHost string, listenPort, backendPort int, apiKey 
 	if err != nil {
 		return err
 	}
-	return http.Serve(ln, handler)
+	return http.Serve(ln, rebindingGuard(isLoopbackBind(bindHost), handler))
 }
 
 // isLoopbackBind reports whether bindHost is a loopback-only bind.

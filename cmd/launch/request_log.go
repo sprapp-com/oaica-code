@@ -320,7 +320,7 @@ func RunLocalLoggingProxy(ln net.Listener, targetBaseURL string) error {
 		}
 	})
 
-	return http.Serve(ln, handler)
+	return http.Serve(ln, rebindingGuard(isLoopbackListener(ln), handler))
 }
 
 // ListenLocalLoggingProxy binds a local listener on an auto-assigned port
