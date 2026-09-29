@@ -131,6 +131,18 @@ type translatedCallState struct {
 	// (round 40, A40-6). The counter is TURN-scoped, not chunk-scoped, so the
 	// answer does not depend on the runner's flush boundary (round 67, F67-L1-1).
 	seenInCall map[string]int
+	// sentKey holds every call this turn has already stated to the client, keyed
+	// as the Anthropic converter keys it (`anthropic/anthropic.go` `sentKey`): a
+	// stated id for a call the turn already wrote is that call RESTATED, and a
+	// restatement is one call, not two — while an id-less call repeated is a
+	// second call with its own id, because a minted id is this leg's own
+	// synthesis rather than the upstream's correlation key (round 46, A46-4).
+	// Without this the two OpenAI surfaces handed the client two calls under one
+	// id for a restatement the Anthropic arm wrote once ("two tool_use blocks
+	// with one id cannot be answered separately"): measured on round 99's
+	// auditor's `model/parsers/cohere.go` shape, a model repeating one action of
+	// its `actions` array — 2026-09-29 audit, round 99, F99-L1-4.
+	sentKey map[string]bool
 }
 
 func newTranslatedCallState() *translatedCallState {
@@ -138,12 +150,26 @@ func newTranslatedCallState() *translatedCallState {
 		statedIDOwner: make(map[string]string),
 		mintedIDs:     make(map[string]bool),
 		seenInCall:    make(map[string]int),
+		sentKey:       make(map[string]bool),
 	}
 }
 
 // normalize rewrites one upstream chunk in place into the turn these two
 // surfaces may state. `calls` may be nil (a writer built outside a middleware),
 // in which case the chunk is passed through untouched.
+//
+// On the BUFFERED arm the writer is handed the turn the merge lane already
+// merged — one text string, one call list, and the ordered run list that lane
+// built while it still saw the chunks (`api.Message.OutputRuns`). The fold below
+// must land where the entry stood, so when that list accounts for the turn the
+// run-aware path places each entry's bytes between the prose that arrived before
+// it and the prose that arrived after (2026-09-29 audit, round 99, F99-L1-1),
+// and states the run list for the turn it just rewrote so the Responses arm can
+// still read the order out of it (round 99, F99-L1-2: the folded entry used to
+// make the list stop accounting, which silently re-opened round 98's F98-L1-3
+// for every turn carrying a nameless entry). A streamed chunk carries no runs —
+// the fold then belongs at the end of THAT chunk's text, which is where the
+// Anthropic arm of the same handler puts it.
 func (c *translatedCallState) normalize(r *api.ChatResponse) {
 	if c == nil || r == nil || len(r.Message.ToolCalls) == 0 {
 		return
@@ -157,6 +183,12 @@ func (c *translatedCallState) normalize(r *api.ChatResponse) {
 		if tc.ID != "" {
 			c.mintedIDs[tc.ID] = true
 		}
+	}
+
+
+	if r.Message.OutputRunsAccountFor() {
+		c.normalizeRuns(r)
+		return
 	}
 
 	kept := make([]api.ToolCall, 0, len(r.Message.ToolCalls))
@@ -175,42 +207,127 @@ func (c *translatedCallState) normalize(r *api.ChatResponse) {
 			}
 			continue
 		}
-		tc.ID = c.idFor(tc)
+		id, ok := c.idFor(tc)
+		if !ok {
+			continue
+		}
+		tc.ID = id
 		kept = append(kept, tc)
 	}
 	r.Message.ToolCalls = kept
 }
 
-// idFor answers the id this call reaches the client under: the one the upstream
-// stated, unless that id is already spoken for by a different call, in which
-// case — and for every call the upstream stated no id for — this repo's mint,
-// keyed on the call's own identity.
-func (c *translatedCallState) idFor(tc api.ToolCall) string {
+// normalizeRuns rewrites a merged turn that carries its ordered run list: each
+// entry is stated where its own run stands, a nameless entry's bytes are spliced
+// into the text at that position rather than at the end of it, and the run list
+// is restated for the turn that comes out so it still accounts for it.
+func (c *translatedCallState) normalizeRuns(r *api.ChatResponse) {
+	next := 0
+	var content strings.Builder
+	calls := make([]api.ToolCall, 0, len(r.Message.ToolCalls))
+	runs := make([]api.OutputRun, 0, len(r.Message.OutputRuns))
+	// addText writes prose into the turn AND into the list, because the list is
+	// what a reader counts a text run against — a splice that reached Content
+	// alone left the list no longer joining to it, so the Responses arm threw
+	// the list away and fell back to the fixed order it was written to leave
+	// behind (2026-09-29 audit, round 99, F99-L1-2). Prose that follows prose
+	// extends the run it follows: on the streaming arm the bytes of a nameless
+	// entry are one more text delta inside the block already open, because no
+	// block is written for the entry.
+	addText := func(s string) {
+		content.WriteString(s)
+		if n := len(runs); n > 0 && runs[n-1].Kind == "text" {
+			runs[n-1].Text += s
+			return
+		}
+		runs = append(runs, api.OutputRun{Kind: "text", Text: s})
+	}
+	for _, run := range r.Message.OutputRuns {
+		switch run.Kind {
+		case "text":
+			addText(run.Text)
+		case "thinking":
+			runs = append(runs, run)
+		case "call":
+			// One call run stands for one entry of ToolCalls (round 79/80), and
+			// OutputRunsAccountFor tied the two together before this walk.
+			if next >= len(r.Message.ToolCalls) {
+				break
+			}
+			tc := r.Message.ToolCalls[next]
+			next++
+			if strings.TrimSpace(tc.Function.Name) == "" {
+				if tc.Function.Arguments.Len() > 0 {
+					if args, err := json.Marshal(tc.Function.Arguments); err == nil {
+						addText(string(args))
+					}
+				}
+				continue
+			}
+			id, ok := c.idFor(tc)
+			if !ok {
+				continue
+			}
+			tc.ID = id
+			calls = append(calls, tc)
+			runs = append(runs, api.OutputRun{Kind: "call"})
+		}
+	}
+	r.Message.Content = content.String()
+	r.Message.ToolCalls = calls
+	r.Message.OutputRuns = runs
+	if !r.Message.OutputRunsAccountFor() {
+		// A list that no longer accounts is one no reader may trust, and the
+		// readers fall back to the merged fields rather than second-guess it
+		// (round 79, F79-L1-1).
+		r.Message.OutputRuns = nil
+	}
+}
+
+// idFor answers the id this call reaches the client under, and whether the turn
+// states it at all: the one the upstream stated, unless that id is already
+// spoken for by a different call or the call is one the turn has already written
+// — in which case, and for every call the upstream stated no id for, this repo's
+// mint, keyed on the call's own identity.
+func (c *translatedCallState) idFor(tc api.ToolCall) (string, bool) {
 	argsSeed, err := json.Marshal(tc.Function.Arguments)
 	if err != nil {
-		return tc.ID
+		return tc.ID, true
 	}
 	base := "\x00" + tc.Function.Name + "\x00" + string(argsSeed)
+	key := ""
+	id := tc.ID
 	if tc.ID != "" {
-		key := "\x01" + tc.ID
-		if owner, ok := c.statedIDOwner[key]; !ok || owner == base {
-			c.statedIDOwner[key] = base
-			return tc.ID
+		stated := "\x01" + tc.ID
+		if owner, ok := c.statedIDOwner[stated]; ok && owner != base {
+			id = ""
+		} else {
+			c.statedIDOwner[stated] = base
+			key = stated
 		}
 	}
 
-	n := c.seenInCall[base]
-	c.seenInCall[base] = n + 1
-	mintedKey := string(argsSeed)
-	if n > 0 {
-		mintedKey += "#" + strconv.Itoa(n)
+	if id == "" {
+		n := c.seenInCall[base]
+		c.seenInCall[base] = n + 1
+		mintedKey := string(argsSeed)
+		key = "\x00" + base
+		if n > 0 {
+			mintedKey += "#" + strconv.Itoa(n)
+			key = "\x00" + base + "\x00#" + strconv.Itoa(n)
+		}
+		id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey)
+		for k := 0; c.mintedIDs[id]; k++ {
+			id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+		}
+		c.mintedIDs[id] = true
 	}
-	id := anthropic.ToolCallIDFor(tc.Function.Name, mintedKey)
-	for k := 0; c.mintedIDs[id]; k++ {
-		id = anthropic.ToolCallIDFor(tc.Function.Name, mintedKey+"\x00#"+strconv.Itoa(k))
+
+	if c.sentKey[key] {
+		return "", false
 	}
-	c.mintedIDs[id] = true
-	return id
+	c.sentKey[key] = true
+	return id, true
 }
 
 func (w *ChatWriter) writeResponse(data []byte) (int, error) {

@@ -2774,7 +2774,18 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 					if t.Message.Content != "" {
 						appendOutputRun("text", t.Message.Content)
 					}
-					if len(t.Message.ToolCalls) > 0 && (len(req.Tools) > 0 || anthropicSurface) {
+					// The run list is built over the calls the accumulation
+					// below KEEPS, so this gate is that one exactly
+					// (2026-09-29 audit, round 99, F99-L1-3): the translated
+					// surfaces relay a call their client never declared (round
+					// 73, F73-L1-1 / round 92, F92-L1-2) and they are the
+					// readers of this list, so leaving them off it handed the
+					// Responses arm a list that did not account for the turn —
+					// it fell back to the fixed order and stated a call-first
+					// turn with the call after the prose that followed it,
+					// where the streaming arm of the same surface stated it
+					// first.
+					if len(t.Message.ToolCalls) > 0 && (len(req.Tools) > 0 || c.GetBool("anthropic_messages") || c.GetBool(middleware.TranslatedSurfaceKey)) {
 						for range t.Message.ToolCalls {
 							appendOutputRun("call", "")
 						}
