@@ -2084,6 +2084,25 @@ func (u *usageRecorder) finish() {
 	// B-F3).
 }
 
+// maxSessionIDLen bounds the X-Session-Id the gateway keeps.
+const maxSessionIDLen = 128
+
+// boundedSessionID returns the client's session id when it is a sane length and
+// otherwise a bounded form of it that is still stable per id: its first 95 bytes,
+// a "~", and 128 bits of its SHA-256. X-Session-Id is client-chosen and was stored
+// at full length, up to the 64 KiB header limit, in the ledger row, the upstream
+// error log and the calibrator's key: a holder of any valid key grew the ledger
+// about 180x faster than an ordinary request does and pinned 4096 keys of that size
+// in a map whose bound counts entries, not bytes. The id keeps its identity, so a
+// session still groups (2026-09-29 audit, round 110, F110-L3-1).
+func boundedSessionID(s string) string {
+	if len(s) <= maxSessionIDLen {
+		return s
+	}
+	sum := sha256.Sum256([]byte(s))
+	return s[:maxSessionIDLen-33] + "~" + hex.EncodeToString(sum[:16])
+}
+
 func newRequestID() string {
 	var b [12]byte
 	// crypto/rand, not /dev/urandom-by-hand (2026-09-01 audit L10): the old
@@ -2530,8 +2549,9 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	// X-Session-Id is client-controlled, and an un-namespaced map let one
 	// valid key spray unique ids to evict every other key's calibrated
 	// sessions. Same label+model fallback as before when no session header.
-	calibKey := label + "\x00" + r.Header.Get("X-Session-Id")
-	if r.Header.Get("X-Session-Id") == "" {
+	sessionHeader := boundedSessionID(r.Header.Get("X-Session-Id"))
+	calibKey := label + "\x00" + sessionHeader
+	if sessionHeader == "" {
 		calibKey = label + "\x00" + modelID
 	}
 	// Admission control for large-context requests — see
@@ -2769,7 +2789,7 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", rid)
 	rec := &usageRecorder{ResponseWriter: w, status: http.StatusOK, stream: stream}
 	start := time.Now()
-	sessionID := r.Header.Get("X-Session-Id")
+	sessionID := sessionHeader
 	// backend is filled in by ModifyResponse (see ctxKeyBackend) once the
 	// upstream actually answers -- stays empty if the request never
 	// reached a backend (blocked earlier, or the error path never set

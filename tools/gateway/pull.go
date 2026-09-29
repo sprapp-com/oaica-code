@@ -48,6 +48,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 // gwPullEntry is one downloadable model in `pull_catalog`.
@@ -321,6 +322,10 @@ func (g *gateway) manifestHandler(w http.ResponseWriter, r *http.Request) {
 // starving a legit CLI pull; further requests get 429 and retry.
 var pullStreamSem = make(chan struct{}, 4)
 
+// pullStallTimeout is how long a pull stream may go without the client accepting a
+// write before it is dropped and its slot released.
+var pullStallTimeout = 60 * time.Second
+
 func (g *gateway) pullHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writePullErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET")
@@ -373,7 +378,15 @@ func (g *gateway) pullHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	// ServeContent sets Content-Length (or Content-Range for a Range
 	// request) and handles 206/416 for us.
-	http.ServeContent(w, r, e.Model+".gguf", fi.ModTime(), f)
+	// Every write carries its own deadline. The server has no WriteTimeout (a
+	// pull is a multi-gigabyte body that legitimately runs for an hour), so four
+	// anonymous sockets that requested a public file and never read held all four
+	// slots for as long as they stayed open, and every legitimate pull got "retry
+	// shortly" that never became true (2026-09-29 audit, round 110, F110-L3-3). A
+	// client that accepts nothing for pullStallTimeout is dropped and its slot
+	// released; a slow one that keeps reading is untouched.
+	http.ServeContent(&stallDeadlineWriter{ResponseWriter: w, rc: http.NewResponseController(w), timeout: pullStallTimeout},
+		r, e.Model+".gguf", fi.ModTime(), f)
 }
 
 // catalogHandler serves GET /v1/catalog: the public "what can I pull"
@@ -404,3 +417,19 @@ func (g *gateway) catalogHandler(w http.ResponseWriter, r *http.Request) {
 	// site, and there is no pagination or metadata to hang off an envelope.
 	json.NewEncoder(w).Encode(out)
 }
+
+// stallDeadlineWriter sets a fresh write deadline before every write, so a stream
+// dies only when the client stops accepting bytes, never merely for being long.
+type stallDeadlineWriter struct {
+	http.ResponseWriter
+	rc      *http.ResponseController
+	timeout time.Duration
+}
+
+func (s *stallDeadlineWriter) Write(p []byte) (int, error) {
+	_ = s.rc.SetWriteDeadline(time.Now().Add(s.timeout))
+	return s.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.NewResponseController and the server reach the real writer.
+func (s *stallDeadlineWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }

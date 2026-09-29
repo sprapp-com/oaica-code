@@ -52,6 +52,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -73,10 +74,32 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	// where /v1/chat/completions and /v1/completions answer 401 before reading a
 	// byte (2026-09-29 audit, round 108, F108-L3-1). The refusal is the bytes the
 	// bridge has always given it, so a client sees no change.
-	if k, _ := g.lookupKey(r); k.Label == "" {
+	key, _ := g.lookupKey(r)
+	if key.Label == "" {
 		writeAnthropicErrorVal(w, http.StatusUnauthorized, map[string]any{
 			"code": "invalid_api_key", "message": "missing or invalid API key", "type": "invalid_api_key"})
 		return
+	}
+	// A key already at its MaxConcurrent is refused BEFORE the body is read. The
+	// admission proper is completionHandler's atomic compare-and-swap, which this
+	// bridge reaches last, so the refusal cost nothing on the OpenAI doors and a
+	// full 16 MiB buffer-parse-convert on this one, per connection and unbounded in
+	// number, and a caller at its cap got body-content feedback (a 400 for bad JSON)
+	// instead of the refusal. This is a peek, not an acquire: the slot is still
+	// taken, and the cap still enforced, where it always was (2026-09-29 audit,
+	// round 110, F110-L3-2).
+	if key.MaxConcurrent > 0 {
+		if v, ok := g.keyInflight.Load(key.Label); ok {
+			if cur := v.(*atomic.Int32).Load(); cur >= int32(key.MaxConcurrent) {
+				w.Header().Set("Retry-After", "1")
+				w.Header().Set("x-ratelimit-limit-requests", strconv.Itoa(key.MaxConcurrent))
+				w.Header().Set("x-ratelimit-remaining-requests", "0")
+				writeAnthropicErrorVal(w, http.StatusTooManyRequests, map[string]any{
+					"code": "concurrency_limited", "type": "concurrency_limited",
+					"message": fmt.Sprintf("key %q has %d concurrent requests in flight (limit %d); wait for one to finish", key.Label, cur, key.MaxConcurrent)})
+				return
+			}
+		}
 	}
 	body, err := readCappedBody(w, r)
 	if err != nil {
