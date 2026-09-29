@@ -1394,8 +1394,20 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 
 	converted := ToToolCalls(toolCalls)
 
+	// The ordinal an item's id carries is the call's place in the TURN, not in
+	// this chunk: the buffered arm numbers the turn's calls from zero
+	// (`callItems` below, over `chatResponse.Message.ToolCalls`), and a stream
+	// that delivers them one chunk at a time must number them the same way.
+	// Numbered per chunk, the second call's item said `fc_…_0` while the same
+	// event stated `output_index:1` — the one piece of per-item identity the
+	// wire has contradicted the index beside it, and the id a `/v1/responses`
+	// client correlates `function_call_arguments` events by. `c.toolCallItems`
+	// is the turn's calls already written, and grows inside the loop below, so
+	// the ordinal is read once (2026-09-29 audit, round 102, F102-L1-1).
+	callOrdinal := len(c.toolCallItems)
+
 	for i, tc := range converted {
-		fcItemID := fmt.Sprintf("fc_%d_%d", rand.Intn(999999), i)
+		fcItemID := fmt.Sprintf("fc_%d_%d", rand.Intn(999999), callOrdinal+i)
 		// Each call is an item of the RESPONSE, and outputIndex is the index of
 		// the next one — the same counter the reasoning and message items take
 		// from. Nothing else advances it for a function_call, so a stream that
