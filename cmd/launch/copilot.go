@@ -63,7 +63,7 @@ func (c *Copilot) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	cmd.Env = append(os.Environ(), c.envVars(model)...)
+	cmd.Env = directLaunchEnv(c.envVars(model)...)
 
 	return cmd.Run()
 }

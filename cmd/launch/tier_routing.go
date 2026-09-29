@@ -1754,3 +1754,21 @@ func applyRouteOverrides(plan *tierPlan, oversizeModel string, shardWeights map[
 	}
 	return nil
 }
+
+// directLaunchEnv is the child environment for a launch door that runs the agent
+// directly and hands it ONE key explicitly (extra, appended after the scrub).
+//
+// `oaica launch claude` and `oaica launch openclaw` keep every real key oaica could
+// have read out of the child's environment, because the agent's Bash tool, or a
+// command a prompt injection wrote, can read it. The doors that started from
+// os.Environ() and appended their own key — codex, copilot, kimi's env-config CLI,
+// the codex app's terminal path — passed every OTHER configured remote's key and the
+// router's OAICA_API_KEY through, so an injected session could read and spend
+// accounts it was never launched against (2026-09-29 audit, round 110, F110-L2-2).
+// The scrubbed names are the same derived set openclaw uses, so the paths cannot
+// drift; everything else the user exported is untouched. Doors that do NOT hand the
+// child a key (a native run under the user's own login, and tools that may resolve
+// a key from a variable named in their own config) are deliberately not routed here.
+func directLaunchEnv(extra ...string) []string {
+	return append(scrubCredentialEnv(os.Environ(), openclawCredentialEnvNames()), extra...)
+}

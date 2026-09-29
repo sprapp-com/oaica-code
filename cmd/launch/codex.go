@@ -133,9 +133,7 @@ func (c *Codex) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"OPENAI_API_KEY="+codexAPIKeyFor(model),
-	)
+	cmd.Env = directLaunchEnv("OPENAI_API_KEY=" + codexAPIKeyFor(model))
 	return cmd.Run()
 }
 

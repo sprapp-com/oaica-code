@@ -931,7 +931,7 @@ func defaultCodexAppOpenApp(args []string) error {
 		cmd := exec.Command("codex", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		cmd.Env = append(os.Environ(), "OPENAI_API_KEY=ollama")
+		cmd.Env = directLaunchEnv("OPENAI_API_KEY=ollama")
 		return cmd.Run()
 	}
 

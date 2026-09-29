@@ -60,7 +60,7 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 		// Kimi Code CLI: the provider (key included) goes in the child's
 		// environment, which only its owner can read.
 		cmd := exec.Command(bin, args...)
-		cmd.Env = append(os.Environ(), kimiModelEnv(model, maxContextSize)...)
+		cmd.Env = directLaunchEnv(kimiModelEnv(model, maxContextSize)...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
