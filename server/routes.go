@@ -1922,6 +1922,36 @@ func allowedHostsMiddleware(addr net.Addr) gin.HandlerFunc {
 	}
 }
 
+// serverShutdownGrace is how long requests in flight get to finish after SIGINT or SIGTERM.
+const serverShutdownGrace = 30 * time.Second
+
+// drainServer stops srvr accepting connections, gives the requests in flight up to grace to
+// finish, and then closes whatever is left. Serve()'s signal goroutine called srvr.Close(), so a
+// restart, a deploy or a Ctrl-C cut every request in flight at once: each stream ended in a bare
+// TCP EOF with no terminal frame (no message_stop, [DONE], response.completed or error event) and
+// a non-stream request lost its whole answer, when a generation seconds from finishing was in
+// progress (2026-09-29 audit, round 114, F114-L1-1).
+func drainServer(srvr *http.Server, grace time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := srvr.Shutdown(ctx); err != nil {
+		srvr.Close()
+	}
+}
+
+// handleShutdownSignals waits for the first signal, drains srvr, then runs after. A second signal
+// while the drain is under way forces an immediate close, so an operator is never stuck behind the
+// grace period; the drain being interruptible is what makes a graceful default safe.
+func handleShutdownSignals(signals <-chan os.Signal, srvr *http.Server, grace time.Duration, after func()) {
+	<-signals
+	go func() {
+		<-signals
+		srvr.Close()
+	}()
+	drainServer(srvr, grace)
+	after()
+}
+
 func (s *Server) GenerateRoutes() (http.Handler, error) {
 	corsConfig := cors.DefaultConfig()
 	corsConfig.AllowWildcard = true
@@ -2105,13 +2135,11 @@ func Serve(ln net.Listener) error {
 	// listen for a ctrl+c and stop any loaded llm
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-signals
-		srvr.Close()
+	go handleShutdownSignals(signals, srvr, serverShutdownGrace, func() {
 		schedDone()
 		sched.unloadAllRunners()
 		done()
-	}()
+	})
 
 	s.sched.Run(schedCtx)
 
