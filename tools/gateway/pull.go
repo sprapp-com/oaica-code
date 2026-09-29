@@ -51,7 +51,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -210,18 +209,21 @@ func (g *gateway) licenseLabel(r *http.Request) (label string, presentedKey bool
 	}
 	sum := sha256.Sum256([]byte(key))
 	presented := []byte(hex.EncodeToString(sum[:]))
+	// Read what is needed under ONE short lock and release it BEFORE any network call. Holding the read lock
+	// across the licence-server call, and taking it a second time, deadlocked every request behind a SIGHUP
+	// reload (a pending writer blocks the second RLock) (2026-09-29 audit, round 133, F133-L3-1).
 	g.mu.RLock()
-	defer g.mu.RUnlock()
 	for _, k := range g.cfg.PullLicenseKeys {
 		if subtle.ConstantTimeCompare(presented, []byte(strings.ToLower(k.SHA256))) == 1 {
 			label = k.Label
 		}
 	}
-	if label == "" {
-		g.mu.RLock()
-		validateURL := g.cfg.PullLicenseValidateURL
-		g.mu.RUnlock()
-		if validateURL != "" && strings.HasPrefix(key, "oaica-lic-") && g.licCache.valid(validateURL, key) {
+	validateURL := g.cfg.PullLicenseValidateURL
+	g.mu.RUnlock()
+	if label == "" && validateURL != "" && licenceKeyShape.MatchString(key) {
+		if res := g.remote.check(r.Context(), "lic\x00"+validateURL+"\x00"+key, func(ctx context.Context) (remoteResult, bool) {
+			return callLicenseValidate(ctx, validateURL, key)
+		}); res.ok {
 			label = "licence:" + string(presented[:12])
 		}
 	}
@@ -465,79 +467,4 @@ func validatePullLicenseURL(raw string) error {
 		}
 	}
 	return fmt.Errorf("must be https (or http to loopback): %q", raw)
-}
-
-type remoteLicenseEntry struct {
-	ok      bool
-	expires time.Time
-}
-
-// remoteLicenseCache remembers validate answers: 10 minutes for a valid key (a refund revokes within that),
-// 1 minute for a refused one (so a wrong key cannot turn every pull into a network call). Bounded.
-type remoteLicenseCache struct {
-	mu sync.Mutex
-	m  map[string]remoteLicenseEntry
-}
-
-const (
-	remoteLicenseValidTTL   = 10 * time.Minute
-	remoteLicenseInvalidTTL = time.Minute
-	remoteLicenseMaxEntries = 4096
-)
-
-// remoteLicenseHTTP is a var so tests can shorten the timeout.
-var remoteLicenseTimeout = 4 * time.Second
-
-func (c *remoteLicenseCache) valid(validateURL, key string) bool {
-	sum := sha256.Sum256([]byte(validateURL + "\x00" + key))
-	id := hex.EncodeToString(sum[:])
-	now := time.Now()
-	c.mu.Lock()
-	if e, ok := c.m[id]; ok && now.Before(e.expires) {
-		c.mu.Unlock()
-		return e.ok
-	}
-	c.mu.Unlock()
-	ok := callLicenseValidate(validateURL, key)
-	ttl := remoteLicenseInvalidTTL
-	if ok {
-		ttl = remoteLicenseValidTTL
-	}
-	c.mu.Lock()
-	if c.m == nil || len(c.m) >= remoteLicenseMaxEntries {
-		c.m = make(map[string]remoteLicenseEntry)
-	}
-	c.m[id] = remoteLicenseEntry{ok: ok, expires: now.Add(ttl)}
-	c.mu.Unlock()
-	return ok
-}
-
-// callLicenseValidate asks the oaica-saas licence API. Any error, non-200 or non-`valid` answer is a refusal.
-func callLicenseValidate(validateURL, key string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), remoteLicenseTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, validateURL, strings.NewReader(url.Values{"license_key": {key}}.Encode()))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var out struct {
-		Valid bool `json:"valid"`
-		Meta  struct {
-			Product string `json:"product"`
-		} `json:"meta"`
-	}
-	if json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 64<<10)).Decode(&out) != nil {
-		return false
-	}
-	return out.Valid && out.Meta.Product == "oaica-code"
 }

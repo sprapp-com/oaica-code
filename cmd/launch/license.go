@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -219,6 +220,9 @@ func licenseIssuedForUs(r licenseResponse) bool {
 	return r.Meta.Product == "" || r.Meta.Product == licenseProduct
 }
 
+// licenseHTTPClient never follows a redirect: see callLicenseAPI.
+var licenseHTTPClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
 func callLicenseAPI(path string, form url.Values) (licenseResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), licenseHTTPTimeout)
 	defer cancel()
@@ -228,17 +232,32 @@ func callLicenseAPI(path string, form url.Values) (licenseResponse, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	// No redirects (the key is in the body; a 307/308 would re-send it to any host, even over http), and a bounded
+	// body (2026-09-29 audit, round 133, F133-L1-2).
+	resp, err := licenseHTTPClient.Do(req)
 	if err != nil {
 		return licenseResponse{}, err
 	}
 	defer resp.Body.Close()
+	// Only a 200 is an answer. A 429/5xx/404 or a redirect is the server or the network failing, not a verdict on
+	// the key: returning it as an error routes the caller to the offline grace instead of a lockout that claims
+	// the licence was "refunded or revoked" (F133-L1-1).
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return licenseResponse{}, fmt.Errorf("license server: HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return licenseResponse{}, err
+	}
 	var parsed licenseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return licenseResponse{}, fmt.Errorf("bad response from license server: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK && parsed.Error == "" {
-		return parsed, fmt.Errorf("license server: HTTP %d", resp.StatusCode)
+	// A 200 that states neither verdict (`null`, `{}`, an error page that happens to be JSON) is not an answer.
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || (fields["valid"] == nil && fields["activated"] == nil) {
+		return licenseResponse{}, errors.New("bad response from license server: no verdict")
 	}
 	if (parsed.Activated || parsed.Valid) && !licenseIssuedForUs(parsed) {
 		parsed.Activated, parsed.Valid = false, false

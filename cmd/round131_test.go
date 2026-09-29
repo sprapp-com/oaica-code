@@ -69,3 +69,20 @@ func TestRound132PullErrorBodyRedactsAcrossTheCap(t *testing.T) {
 		t.Errorf("part of the licence key survived the cut: %q", got[len(got)-60:])
 	}
 }
+
+// F133-L1-3: what `oaica activate` saved is what `oaica pull` sends.
+func TestRound133PullSendsTheActivatedLicence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("OAICA_LICENSE_KEY", "")
+	os.MkdirAll(filepath.Join(home, ".oaica"), 0o700)
+	os.WriteFile(filepath.Join(home, ".oaica", "license.json"), []byte(`{"key":"oaica-lic-`+strings.Repeat("a", 32)+`","instance_id":"i"}`), 0o600)
+	if got := oaicaLicenseKey(); got != "oaica-lic-"+strings.Repeat("a", 32) {
+		t.Errorf("oaicaLicenseKey() = %q after activation, want the activated key", got)
+	}
+	os.WriteFile(filepath.Join(home, ".oaica", "license_key"), []byte("explicit-file-key\n"), 0o600)
+	if got := oaicaLicenseKey(); got != "explicit-file-key" {
+		t.Errorf("license_key file must win over license.json: %q", got)
+	}
+}

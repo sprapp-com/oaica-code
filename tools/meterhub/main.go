@@ -217,6 +217,12 @@ func newMeterHub(cfg meterConfig) (*meterHub, error) {
 		!strings.Contains(err.Error(), "duplicate column") {
 		return nil, fmt.Errorf("migrate reset_at: %w", err)
 	}
+	// event_created: the Stripe event time of the last pushed change, so a late, older push cannot win
+	// (2026-09-29 audit, round 133, F133-L3-4).
+	if _, err := db.Exec(`ALTER TABLE subscribers ADD COLUMN event_created INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, fmt.Errorf("migrate event_created: %w", err)
+	}
 	// Same pattern for cached_tokens on usage (added 2026-08-29).
 	if _, err := db.Exec(`ALTER TABLE usage ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`); err != nil &&
 		!strings.Contains(err.Error(), "duplicate column") {
@@ -577,6 +583,9 @@ type subscriberStatus struct {
 	ExternalID string `json:"external_id,omitempty"`
 	UpdatedAt  string `json:"updated_at,omitempty"`
 	Note       string `json:"note,omitempty"`
+	// EventCreated: optional (unix seconds) time of the upstream event this state comes from. A push older than the
+	// stored one is ignored; 0/absent = an operator's manual write, always applied.
+	EventCreated int64 `json:"event_created,omitempty"`
 }
 
 var validSubscriberStatuses = map[string]bool{
@@ -598,7 +607,7 @@ func (h *meterHub) subscriberSetHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var s subscriberStatus
-	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxIngestBytes)).Decode(&s); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
@@ -613,13 +622,19 @@ func (h *meterHub) subscriberSetHandler(w http.ResponseWriter, r *http.Request) 
 	if s.Source == "" {
 		s.Source = "manual"
 	}
+	// An automated source (Stripe, via oaica-saas) must not undo an operator's manual suspension, and an older
+	// event must not replace a newer one. Manual writes (source manual / no event time) always apply.
 	_, err := h.db.Exec(`
-		INSERT INTO subscribers (key_label, status, plan, source, external_id, updated_at, note)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO subscribers (key_label, status, plan, source, external_id, updated_at, note, event_created)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key_label) DO UPDATE SET
 			status=excluded.status, plan=excluded.plan, source=excluded.source,
-			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note`,
-		s.KeyLabel, s.Status, s.Plan, s.Source, s.ExternalID, time.Now().UTC().Format(time.RFC3339), s.Note,
+			external_id=excluded.external_id, updated_at=excluded.updated_at, note=excluded.note,
+			event_created=excluded.event_created
+		WHERE (excluded.source = 'manual' OR excluded.event_created = 0
+		       OR (excluded.event_created >= subscribers.event_created
+		           AND NOT (subscribers.source = 'manual' AND subscribers.status = 'suspended')))`,
+		s.KeyLabel, s.Status, s.Plan, s.Source, s.ExternalID, time.Now().UTC().Format(time.RFC3339), s.Note, s.EventCreated,
 	)
 	if err != nil {
 		log.Printf("meterhub: subscriber set failed: %v", err)

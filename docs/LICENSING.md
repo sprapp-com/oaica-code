@@ -23,7 +23,7 @@ BizTransit Sdn Bhd sells a **one-off licence** for the convenience of using the 
 | Price and tax | Shown at checkout. Tax (SST/VAT/GST/sales tax) is calculated by Stripe Tax from your billing address and shown before you pay; a business tax ID can be entered for B2B. |
 | Seller and payment | BizTransit Sdn Bhd, through Stripe. Card data never reaches our servers. |
 | Key | `oaica-lic-…`, shown once after payment (and receipted by email from Stripe). Keep it like a password; we store only its hash. |
-| Activations | Up to three machines per key (`oaica activate <key>`, or `OAICA_LICENSE_KEY` for a deployment that injects it). |
+| Activations | Up to three machines per key through `oaica activate <key>`. A key injected as `OAICA_LICENSE_KEY` (a secret-manager or CI deployment) is checked as a key — valid, not refunded — without binding a machine, so the three-machine limit applies to `oaica activate`. |
 | Checking | The binary revalidates against the licence server at most every 7 days, sending the key and the machine's activation id (see `docs/ENTERPRISE.md`, row 7). It keeps working for up to 30 days if the server is unreachable. |
 | Revocation | A refunded or charged-back payment revokes the key; the next revalidation reports it. |
 | Transfer | The key is for the purchaser's use across their own machines; do not publish or resell it. |

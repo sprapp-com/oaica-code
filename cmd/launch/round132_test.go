@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,5 +39,65 @@ func TestRound132UnauthenticatedStalledBodyIsAnswered(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status %d, want 401", resp.StatusCode)
+	}
+}
+
+// F133-L1-1: a server failure is not a verdict on the key — it gets the offline grace, not a "revoked" lockout.
+func TestRound133ServerFailuresGetTheOfflineGraceNotALockout(t *testing.T) {
+	for name, h := range map[string]http.HandlerFunc{
+		"500": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(500)
+			w.Write([]byte(`{"error":"internal_error"}`))
+		},
+		"429": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(429)
+			w.Write([]byte(`{"error":"too many requests"}`))
+		},
+		"404": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(404)
+			w.Write([]byte(`{"error":"not_found"}`))
+		},
+		"null":      func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`null`)) },
+		"emptyjson": func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			setLaunchTestHome(t, t.TempDir())
+			stubLicenseServer(t, h)
+			if err := saveLicenseFile(licenseFile{Key: "K", InstanceID: "I", ValidatedAt: time.Now().Add(-licenseRevalidateTTL - time.Hour)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := requireLicenseLive(nil, nil); err != nil {
+				t.Errorf("a %s from the licence server locked out a licence inside its grace: %v", name, err)
+			}
+		})
+	}
+	// and a server error must not open a licence that is past its grace, whatever its body says
+	setLaunchTestHome(t, t.TempDir())
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(403)
+		w.Write([]byte(`{"valid":true,"error":"forbidden"}`))
+	})
+	saveLicenseFile(licenseFile{Key: "K", InstanceID: "I", ValidatedAt: time.Now().Add(-licenseOfflineGrace - time.Hour)})
+	if err := requireLicenseLive(nil, nil); err == nil {
+		t.Error("a 403 with valid:true opened a licence past its grace")
+	}
+}
+
+// F133-L1-2: the key is in the request body; a redirect must not carry it to another host.
+func TestRound133LicenceClientDoesNotFollowRedirects(t *testing.T) {
+	var leaked atomic.Bool
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Store(true)
+		w.Write([]byte(`{"valid":true,"activated":true}`))
+	}))
+	defer foreign.Close()
+	stubLicenseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL+"/x", http.StatusTemporaryRedirect)
+	})
+	if _, err := callLicenseAPI("/validate", url.Values{"license_key": {"oaica-lic-secret"}}); err == nil {
+		t.Error("a redirect was accepted as an answer")
+	}
+	if leaked.Load() {
+		t.Error("the licence key was re-sent to the redirect target")
 	}
 }

@@ -44,9 +44,22 @@ about the gateway's read path changes when a real processor is wired up:
 - Stripe does not talk to meterhub. It talks to **oaica-saas**
   (`POST /billing/webhook`: signature-verified, idempotent per event id,
   ignores out-of-order events), which pushes each subscription's state to
-  `POST /subscribers/set` here and answers `GET /entitlement/:key_label`.
+  `POST /subscribers/set` here (with `event_created`, so an older push never
+  replaces a newer one and a Stripe push never lifts a manual `suspended`) and
+  answers `GET /entitlement/:key_label` and `POST /keys/validate`.
   See `oaica-saas/docs/stripe-setup.md`. (The old unsigned
   `/subscribers/webhook` route was removed in round 132.)
+
+## Subscriber API keys at the gateway
+
+A subscriber's `oaica-sk-…` key exists only in oaica-saas. With `api_key_validate_url`
+(`https://<saas>/keys/validate`) and `api_key_validate_token` (the saas `ENTITLEMENT_TOKEN`) set, a Bearer key of
+exactly that shape that matches no configured `api_keys` entry is checked there; the saas answers
+`{valid, label}` for a live (`active`/`past_due`) subscription, the gateway uses `label` as the key's label, and
+the usual entitlement check against meterhub follows. Answers are cached 60 s (30 s when refused) so a
+cancellation lands within a minute; concurrent lookups of one key make one call, at most 4 calls are in flight,
+a timeout/429/5xx is refused but never remembered, and keys of any other shape never leave the gateway.
+Without these two settings subscribers cannot authenticate. `gateway --check` validates both URLs.
 
 ## Licensed weights and the Stripe licence
 

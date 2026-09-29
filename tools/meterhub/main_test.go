@@ -855,3 +855,42 @@ func TestRound132MeterhubHasNoStripeWebhookRoute(t *testing.T) {
 		t.Errorf("status = %d, want 404", w.Code)
 	}
 }
+
+// F133-L3-4: an older push does not replace a newer one; an automated push does not lift a manual suspension;
+// a manual write always applies.
+func TestRound133SubscriberPushOrderingAndManualSuspension(t *testing.T) {
+	hub, token := testHub(t)
+	set := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/subscribers/set", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		hub.subscriberSetHandler(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("set %s -> %d", body, w.Code)
+		}
+	}
+	status := func(label string) string {
+		var s string
+		hub.db.QueryRow(`SELECT status FROM subscribers WHERE key_label = ?`, label).Scan(&s)
+		return s
+	}
+	set(`{"key_label":"a","status":"canceled","source":"stripe","event_created":200}`)
+	set(`{"key_label":"a","status":"active","source":"stripe","event_created":100}`) // older, late
+	if got := status("a"); got != "canceled" {
+		t.Errorf("an older push replaced a newer one: %s", got)
+	}
+	set(`{"key_label":"a","status":"active","source":"stripe","event_created":300}`)
+	if got := status("a"); got != "active" {
+		t.Errorf("a newer push was ignored: %s", got)
+	}
+	set(`{"key_label":"b","status":"suspended","source":"manual","note":"fraud"}`)
+	set(`{"key_label":"b","status":"active","source":"stripe","event_created":999}`)
+	if got := status("b"); got != "suspended" {
+		t.Errorf("a Stripe push lifted an operator suspension: %s", got)
+	}
+	set(`{"key_label":"b","status":"active","source":"manual"}`)
+	if got := status("b"); got != "active" {
+		t.Errorf("a manual write was refused: %s", got)
+	}
+}

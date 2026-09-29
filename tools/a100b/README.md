@@ -51,10 +51,10 @@ sha256 of which is in `meterhub.json`'s `report_tokens`):
   (active|past_due|canceled|suspended),"plan","note"}`. This is how to
   block/unblock a key TODAY, no Stripe account needed.
 - `GET /subscribers/list?status=X` — audit view
-- `POST /subscribers/webhook` — Stripe-event-shaped receiver, NOT yet safe
-  to point a real Stripe webhook at: auth is still the same bearer report
-  token, not Stripe's per-endpoint signing-secret verification. Swap that
-  in before connecting a live Stripe account.
+- (There is no Stripe webhook here any more: Stripe talks to oaica-saas,
+  which pushes each subscription's state to `/subscribers/set` with an
+  `event_created` so a late, older push cannot win and a Stripe push cannot
+  lift an operator's manual `suspended`.)
 
 Gateway-side entitlement enforcement (`entitlement_enabled` in
 `oaica-gateway.json`, currently **unset/false** — capability is deployed

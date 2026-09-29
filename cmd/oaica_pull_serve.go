@@ -116,11 +116,24 @@ func oaicaLicenseKey() string {
 	if err != nil {
 		return ""
 	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+	if b, err := os.ReadFile(path); err == nil {
+		if k := strings.TrimSpace(string(b)); k != "" {
+			return k
+		}
 	}
-	return strings.TrimSpace(string(b))
+	// What `oaica activate` saved: ~/.oaica/license.json. Nothing writes license_key, so a buyer who followed the
+	// README and then pulled a licensed model sent no licence at all (2026-09-29 audit, round 133, F133-L1-3).
+	if dir, err := oaicaConfigDir(); err == nil {
+		if b, err := os.ReadFile(filepath.Join(dir, "license.json")); err == nil {
+			var f struct {
+				Key string `json:"key"`
+			}
+			if json.Unmarshal(b, &f) == nil {
+				return strings.TrimSpace(f.Key)
+			}
+		}
+	}
+	return ""
 }
 
 // oaicaModelsDir defaults to ~/.oaica/models but honors OAICA_MODELS_DIR —

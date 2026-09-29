@@ -510,6 +510,13 @@ type gwConfig struct {
 	// also opens licensed weights without anyone editing this file. Empty = static keys only. Unreachable or
 	// refusing = refused (fail closed); answers are cached briefly.
 	PullLicenseValidateURL string `json:"pull_license_validate_url,omitempty"`
+	// APIKeyValidateURL / APIKeyValidateToken: the oaica-saas route (`https://…/keys/validate`, Bearer =
+	// ENTITLEMENT_TOKEN) that says whether an `oaica-sk-…` key minted for a Stripe subscription is live, and under
+	// which label (the one meterhub keys the subscription on). A subscriber's key never appears in api_keys, so
+	// without this bridge every paying customer got 401. Unknown keys of any other shape never leave this box.
+	// Empty = static api_keys only. Answers are cached 60 s (30 s when refused); unreachable = refused.
+	APIKeyValidateURL   string `json:"api_key_validate_url,omitempty"`
+	APIKeyValidateToken string `json:"api_key_validate_token,omitempty"`
 
 	// UpstreamErrorLogPath: every non-2xx response from upstream (excluding
 	// SSE streams, which already 200 by the time an error could occur mid-
@@ -636,6 +643,12 @@ func loadConfig(path string) (gwConfig, error) {
 	}
 	if err := validatePullLicenseURL(cfg.PullLicenseValidateURL); err != nil {
 		return cfg, fmt.Errorf("pull_license_validate_url: %w", err)
+	}
+	if err := validatePullLicenseURL(cfg.APIKeyValidateURL); err != nil {
+		return cfg, fmt.Errorf("api_key_validate_url: %w", err)
+	}
+	if cfg.APIKeyValidateURL != "" && cfg.APIKeyValidateToken == "" {
+		return cfg, errors.New("api_key_validate_url needs api_key_validate_token")
 	}
 	if cfg.UpstreamAddr == "" {
 		cfg.UpstreamAddr = defaultConfig().UpstreamAddr
@@ -898,10 +911,10 @@ func newProxy(upstream string, onUpstreamError func(info *errCaptureInfo, status
 }
 
 type gateway struct {
-	licCache remoteLicenseCache // pull.go: results of pull_license_validate_url
-	mu       sync.RWMutex
-	cfg      gwConfig
-	proxy    *httputil.ReverseProxy // the default (top-level upstream_addr) proxy
+	remote remoteCache // remote.go: answers from oaica-saas (licence + subscriber API keys)
+	mu     sync.RWMutex
+	cfg    gwConfig
+	proxy  *httputil.ReverseProxy // the default (top-level upstream_addr) proxy
 	// proxies holds one reverse proxy per DISTINCT upstream address, so a
 	// model with its own upstream_addr reuses connections/transport state
 	// per backend instead of getting a fresh proxy per request. Always
@@ -1657,12 +1670,22 @@ func (g *gateway) lookupKey(r *http.Request) (gwKey, bool) {
 	sum := sha256.Sum256([]byte(key))
 	presented := []byte(hex.EncodeToString(sum[:]))
 	g.mu.RLock()
-	defer g.mu.RUnlock()
 	var found gwKey
 	ok := false
 	for _, k := range g.cfg.APIKeys {
 		if subtle.ConstantTimeCompare(presented, []byte(strings.ToLower(k.SHA256))) == 1 {
 			found, ok = k, true
+		}
+	}
+	validateURL, validateToken := g.cfg.APIKeyValidateURL, g.cfg.APIKeyValidateToken
+	g.mu.RUnlock() // never held across the network call below
+	if !ok && validateURL != "" && apiKeyShape.MatchString(key) {
+		res := g.remote.check(r.Context(), "key\x00"+validateURL+"\x00"+key, func(ctx context.Context) (remoteResult, bool) {
+			return callAPIKeyValidate(ctx, validateURL, validateToken, key)
+		})
+		if res.ok {
+			// A subscriber: the label is the subscription's; every per-key limit is the gateway default.
+			found, ok = gwKey{Label: res.label}, true
 		}
 	}
 	return found, ok
