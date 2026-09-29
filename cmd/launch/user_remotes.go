@@ -59,6 +59,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -448,6 +449,7 @@ func loadUserRemotes() ([]userRemote, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	warnUnknownRemoteKeys(path, b)
 	out := make([]userRemote, 0, len(f.Remotes))
 	for i, r := range f.Remotes {
 		r.Name = strings.TrimSpace(r.Name)
@@ -480,6 +482,49 @@ func loadUserRemotes() ([]userRemote, error) {
 		}
 	}
 	return out, nil
+}
+
+// warnUnknownRemoteKeys reports a key of a remotes.json row that no field of userRemote reads
+// (route_polcy, api_key_evn, wieght): the row was dropped-in-part in silence, including keys that
+// carry policy. A warning, not a refusal, because a newer oaica may have written a member this one
+// does not model and the rewrite paths keep such members (2026-09-29 audit, round 113, F113-L2-3).
+func warnUnknownRemoteKeys(path string, raw []byte) {
+	var doc struct {
+		Remotes []map[string]json.RawMessage `json:"remotes"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return
+	}
+	known := map[string]bool{}
+	rt := reflect.TypeOf(userRemote{})
+	for i := 0; i < rt.NumField(); i++ {
+		if name := strings.Split(rt.Field(i).Tag.Get("json"), ",")[0]; name != "" && name != "-" {
+			known[strings.ToLower(name)] = true
+		}
+	}
+	for i, row := range doc.Remotes {
+		var name string
+		_ = json.Unmarshal(row["name"], &name)
+		keys := make([]string, 0, len(row))
+		for k := range row {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if known[strings.ToLower(k)] {
+				continue
+			}
+			who := fmt.Sprintf("row %d", i+1)
+			if name != "" {
+				who += " (" + printableName(name) + ")"
+			}
+			// %q escapes a control character in the key, so the hand-edited file cannot
+			// forge a line in this warning; a printableName on the key measured redundant.
+			fmt.Fprintf(noticeWriter(),
+				"%sWarning: %s %s has an unknown key %q that this oaica does not read, so it has no effect — if it is a misspelling, the setting it meant is not in force.%s\n",
+				ansiYellow, path, who, k, ansiReset)
+		}
+	}
 }
 
 // warnSkippedRemoteRow reports a remotes.json row that loadUserRemotes could

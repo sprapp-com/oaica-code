@@ -68,7 +68,7 @@ func RunNative(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = nativeClaudeEnv()
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 // nativeClaudeEnv is the environment the native Claude Code paths run with:
@@ -140,7 +140,7 @@ func (c *Claude) runNative(tier string, extra []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = nativeClaudeEnv()
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func hasClaudeModelFlag(args []string) bool {

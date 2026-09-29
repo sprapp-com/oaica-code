@@ -64,7 +64,7 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		return cmd.Run()
+		return runChild(cmd)
 	}
 
 	// Archived kimi-cli: it takes the config as an argument and nothing else,
@@ -78,7 +78,7 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 // How the installed CLI is configured. Kimi Code CLI synthesizes a provider

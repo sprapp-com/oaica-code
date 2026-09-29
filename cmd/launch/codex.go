@@ -69,7 +69,7 @@ func (c *Codex) runNative(modelID string, extra []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ() // deliberately untouched — Codex reads ~/.codex/auth.json
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 const (
@@ -134,7 +134,7 @@ func (c *Codex) Run(model string, models []LaunchModel, args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = directLaunchEnv("OPENAI_API_KEY=" + codexAPIKeyFor(model))
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 func (c *Codex) Restore() error {

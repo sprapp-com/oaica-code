@@ -65,7 +65,7 @@ func (c *Copilot) Run(model string, _ []LaunchModel, args []string) error {
 
 	cmd.Env = directLaunchEnv(c.envVars(model)...)
 
-	return cmd.Run()
+	return runChild(cmd)
 }
 
 // copilotBaseURLFor is the provider base URL Copilot should use: the remote's

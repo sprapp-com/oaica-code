@@ -237,6 +237,10 @@ func TestBuildTierPlan_CrossSourceTiers(t *testing.T) {
 // text ahead of everything cached and the prefix cache misses on every request
 // of the turn. The child environment must disable it.
 func TestTierPlanEnvDisablesClaudeCodeTokenReminder(t *testing.T) {
+	// The daemon is stubbed: resolving a -cloud model asks the local daemon over the
+	// network, and without this the test's result depended on an unrelated process on
+	// 127.0.0.1:11434 (2026-09-29 audit, round 113, F113-L2-1).
+	stubDaemon(t, "deepseek-v4-flash:0731-cloud")
 	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "deepseek-v4-flash:0731-cloud", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -1305,6 +1309,7 @@ func TestRun_EmptyTierValueIsRefusedNotInherited(t *testing.T) {
 // environment is the user's own (scrubbed) plus this list. An unconditional
 // literal entry would shadow what they exported.
 func TestTierPlanEnvDefaultsAutoModeServer(t *testing.T) {
+	stubDaemon(t, "deepseek-v4-flash:0731-cloud") // see TestTierPlanEnvDisablesClaudeCodeTokenReminder
 	plan, err := buildTierPlan("deepseek-v4-flash:0731-cloud", "deepseek-v4-flash:0731-cloud", "", false)
 	if err != nil {
 		t.Fatal(err)
