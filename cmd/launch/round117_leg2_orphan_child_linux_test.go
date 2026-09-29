@@ -82,6 +82,15 @@ func TestRound117LaunchDoorsStartTheirChildThroughRunChild(t *testing.T) {
 			}
 		}
 	}
+	// openclaw starts its launch children under other variable names (round 118, F118-L2-1):
+	// its passthrough and its TUI must both go through runChild.
+	ob, err := os.ReadFile("openclaw.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(ob), "runChild("); n != 2 || strings.Contains(string(ob), "tui.Run()") {
+		t.Errorf("openclaw.go: %d runChild launches (want 2) or a bare tui.Run() remains", n)
+	}
 	// hermes' setup, update and gateway subcommands may stay attached to plain Run; its two
 	// launch paths must not.
 	b, err := os.ReadFile("hermes.go")

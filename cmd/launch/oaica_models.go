@@ -517,7 +517,7 @@ func oaicaFetchCloudModelEntriesLiveUncached(host, etag string) ([]oaicaModelEnt
 		req.Header.Set("If-None-Match", etag)
 	}
 	oaicaLaunchAuthorize(req)
-	client := &http.Client{Timeout: routerModelFetchTimeout}
+	client := &http.Client{Timeout: routerModelFetchTimeout, CheckRedirect: credentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", redactErr(fmt.Errorf("couldn't reach %s: %w", redactBaseURL(host), err))
@@ -686,7 +686,7 @@ func oaicaLiveLoraEntries() []oaicaLoraEntry {
 		return nil
 	}
 	oaicaLaunchAuthorize(req)
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: 8 * time.Second, CheckRedirect: credentialSafeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil

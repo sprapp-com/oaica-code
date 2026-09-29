@@ -62,6 +62,12 @@ func BlobsPath(digest string) (string, error) {
 
 // PruneDirectory removes empty directories recursively.
 func PruneDirectory(path string) error {
+	// The writer's temp directory is kept: it is empty between writes, so pruning it made a
+	// write racing a delete fail at MkdirAll/CreateTemp, and the bounded retry alone still
+	// lost a few of thousands under a tight delete loop (2026-09-29 audit, round 118).
+	if filepath.Base(path) == ".tmp" {
+		return nil
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err

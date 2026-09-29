@@ -141,7 +141,7 @@ func (c *Openclaw) Run(model string, _ []LaunchModel, args []string) error {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := runChild(cmd); err != nil {
 			return windowsHint(err)
 		}
 		return nil
@@ -173,7 +173,7 @@ func (c *Openclaw) Run(model string, _ []LaunchModel, args []string) error {
 	tui.Stdin = os.Stdin
 	tui.Stdout = os.Stdout
 	tui.Stderr = os.Stderr
-	if err := tui.Run(); err != nil {
+	if err := runChild(tui); err != nil {
 		return windowsHint(err)
 	}
 

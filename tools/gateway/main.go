@@ -3172,6 +3172,13 @@ func (g *gateway) completionHandler(w http.ResponseWriter, r *http.Request) {
 			r.Header.Del(k)
 		}
 	}
+	// The client's Accept-Encoding is not passed on. Go's Transport decompresses a reply only
+	// when IT added the header, so a client's "gzip" reached a compressing upstream and the
+	// compressed body reached the usage recorder unread: the OpenAI doors booked the turn 0/0
+	// with cost 0 and /v1/messages answered 502 with the body still labelled gzip. Left to
+	// the Transport, the upstream may still compress and the meter and the bridge read
+	// plaintext, which is what the client is then sent (2026-09-29 audit, round 118, F118-L3-1).
+	r.Header.Del("Accept-Encoding")
 	// A third-party upstream is sent what it needs and nothing else. Round 109 kept
 	// the gateway's key and the caller's X-Forwarded-For from it and left every other
 	// header through: Cloudflare's Cf-Connecting-Ip and True-Client-Ip, Forwarded,

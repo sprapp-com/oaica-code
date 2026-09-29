@@ -76,7 +76,9 @@ func (p *Poolside) Run(model string, _ []LaunchModel, args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
+	// Scrubbed of every other remote's credential, as the copilot and kimi doors are; only the
+	// key this door chose is handed over (2026-09-29 audit, round 118, F118-L2-3).
+	cmd.Env = directLaunchEnv(
 		"POOLSIDE_STANDALONE_BASE_URL="+poolsideBaseURLFor(model),
 		"POOLSIDE_API_KEY="+poolsideKeyFor(model),
 	)

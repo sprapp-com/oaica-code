@@ -8,9 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -199,6 +201,19 @@ func (w *AnthropicWriter) Write(data []byte) (int, error) {
 // It is a variable so a test can hold the two arms to one window in milliseconds
 // rather than living through five minutes; production never writes it.
 var webSearchLoopWindow = 5 * time.Minute
+
+var followUpHandlerValue atomic.Value // http.Handler
+
+// SetFollowUpHandler gives the web_search loop the server's own handler, so its follow-up chat
+// turn is served in-process rather than through the listener.
+func SetFollowUpHandler(h http.Handler) { followUpHandlerValue.Store(&h) }
+
+func followUpHandler() http.Handler {
+	if p, ok := followUpHandlerValue.Load().(*http.Handler); ok && p != nil {
+		return *p
+	}
+	return nil
+}
 
 type WebSearchAnthropicWriter struct {
 	BaseWriter
@@ -1074,13 +1089,15 @@ func loopServerToolUseID(messageID string, loop int) string {
 
 func (w *WebSearchAnthropicWriter) callFollowUpChat(ctx context.Context, messages []api.Message, tools api.Tools) (api.ChatResponse, error) {
 	streaming := false
-	followUp := api.ChatRequest{
-		Model:    w.chatReq.Model,
-		Messages: messages,
-		Stream:   &streaming,
-		Tools:    tools,
-		Options:  w.chatReq.Options,
-	}
+	// The follow-up is the same request with a new conversation: a fresh struct kept the
+	// model and options and lost the rest, so the final answer — the one the client reads —
+	// was generated with thinking on after the client turned it off, and without the JSON
+	// schema it asked for (2026-09-29 audit, round 118, F118-L1-2). Copied, so a field added
+	// later carries over too.
+	followUp := *w.chatReq
+	followUp.Messages = messages
+	followUp.Stream = &streaming
+	followUp.Tools = tools
 
 	body, err := json.Marshal(followUp)
 	if err != nil {
@@ -1098,9 +1115,21 @@ func (w *WebSearchAnthropicWriter) callFollowUpChat(ctx context.Context, message
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return api.ChatResponse{}, err
+	var resp *http.Response
+	if h := followUpHandler(); h != nil {
+		// In-process: dialling the server's own listener failed for every web_search turn
+		// in flight when the drain closed it, while a plain turn finished — the follow-up
+		// is part of the turn that was admitted (2026-09-29 audit, round 118, F118-L1-1).
+		httpReq.Host = envconfig.Host().Host
+		httpReq.RemoteAddr = "127.0.0.1:0"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httpReq)
+		resp = rec.Result()
+	} else {
+		resp, err = http.DefaultClient.Do(httpReq)
+		if err != nil {
+			return api.ChatResponse{}, err
+		}
 	}
 	defer resp.Body.Close()
 

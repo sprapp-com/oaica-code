@@ -2112,6 +2112,7 @@ func Serve(ln net.Listener) error {
 	}
 
 	http.Handle("/", h)
+	middleware.SetFollowUpHandler(h)
 
 	ctx, done := context.WithCancel(context.Background())
 	schedCtx, schedDone := context.WithCancel(ctx)

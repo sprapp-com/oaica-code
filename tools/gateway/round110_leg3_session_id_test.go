@@ -116,6 +116,17 @@ func TestMine110AHugeSessionIdIsBoundedInTheCalibrator(t *testing.T) {
 		resp.Body.Close()
 	}
 	c := g.calibrator()
+	// The calibrator is fed after the response has been written (the ledger row is too), so
+	// the count is waited for, not read at once: under a loaded suite the third turn's record
+	// landed after the assertion (seen in round 118).
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		c.mu.Lock()
+		n := len(c.samples)
+		c.mu.Unlock()
+		if n >= 3 {
+			break
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.samples) != 3 {

@@ -75,6 +75,10 @@ func (k *Kimi) Run(model string, _ []LaunchModel, args []string) error {
 		return fmt.Errorf("failed to build kimi config: %w", err)
 	}
 	cmd := exec.Command(bin, k.args(config, args)...)
+	// The key is in argv, unavoidably, but that is no reason to hand the child every OTHER
+	// credential in the shell as well: the env-config branch above scrubs them (2026-09-29
+	// audit, round 118, F118-L2-2).
+	cmd.Env = directLaunchEnv()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
