@@ -558,6 +558,18 @@ func oaicaPullModel(model string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// An encrypted model is compared by the digest it was installed from, not by size or by hashing the
+	// plaintext against the ciphertext's digest: those never matched, so every pull re-downloaded it.
+	if manifest.Source == "hf" && manifest.DecryptKeyHex != nil {
+		if want := manifestDigest(manifest); want != "" {
+			if rec, rerr := os.ReadFile(destPath + encryptedSourceDigestSuffix); rerr == nil && strings.EqualFold(strings.TrimSpace(string(rec)), want) {
+				if _, serr := os.Stat(destPath); serr == nil {
+					fmt.Fprintf(os.Stderr, "%s already downloaded, skipping\n", model)
+					return destPath, nil
+				}
+			}
+		}
+	}
 	if fi, err := os.Stat(destPath); err == nil && fi.Size() == manifest.SizeBytes {
 		// The length is not the check. A file of the right size and the wrong
 		// content — a download that was truncated and padded, a corrupted
@@ -760,11 +772,16 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	// authenticates each chunk, but a blob that stops exactly on a chunk
 	// boundary decrypts cleanly and is not complete (2026-09-26 audit).
 	// Counting what came off the wire is what tells the two apart.
-	ct := &countingReader{r: body}
+	// The manifest's sha256 describes the blob AS DOWNLOADED (tools/gateway/pull.go), i.e. the
+	// ciphertext; the plaintext digest is accepted too, so a manifest stated either way installs. GCM
+	// authenticates each chunk alone with no index, so reordered chunks decrypted cleanly and installed;
+	// the plaintext and router arms already checked their digest (2026-09-29 audit, round 127, F127-L1-6).
+	ctHasher, plainHasher := sha256.New(), sha256.New()
+	ct := &countingReader{r: io.TeeReader(body, ctHasher)}
 	if manifest.SizeBytes > 0 {
 		ct.r = newCappedReader(ct.r, manifest.SizeBytes)
 	}
-	written, err := decryptChunkedAESGCMStream(&progressReader{r: ct, total: manifest.SizeBytes, label: model}, f, key)
+	written, err := decryptChunkedAESGCMStream(&progressReader{r: ct, total: manifest.SizeBytes, label: model}, io.MultiWriter(f, plainHasher), key)
 	if err != nil {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("pull/decrypt interrupted: %w", err)
@@ -778,12 +795,27 @@ func oaicaPullFromHF(model string, manifest *oaicaManifest, destPath string) (st
 	}
 	_ = written
 
+	if want := manifestDigest(manifest); want != "" {
+		gotCT, gotPlain := hex.EncodeToString(ctHasher.Sum(nil)), hex.EncodeToString(plainHasher.Sum(nil))
+		if !strings.EqualFold(gotCT, want) && !strings.EqualFold(gotPlain, want) {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("sha256 mismatch: got %s (downloaded) / %s (decrypted), expected %s", gotCT, gotPlain, want)
+		}
+	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return "", err
+	}
+	// So the next pull can tell this model is the one the manifest names without re-downloading it.
+	if want := manifestDigest(manifest); want != "" {
+		_ = os.WriteFile(destPath+encryptedSourceDigestSuffix, []byte(want+"\n"), 0o600)
 	}
 	fmt.Fprintf(os.Stderr, "%s saved to %s\n", model, destPath)
 	return destPath, nil
 }
+
+// encryptedSourceDigestSuffix names the record of which manifest digest an encrypted model was installed
+// from: its size and digest describe the ciphertext, which the installed plaintext file cannot be compared to.
+const encryptedSourceDigestSuffix = ".src-sha256"
 
 // decryptChunkedAESGCMStream reads the chunked AES-256-GCM frame format
 // (matches the encryption tool used to prepare HF-hosted models):

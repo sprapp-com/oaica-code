@@ -23,6 +23,11 @@ var ErrWebAuthRequired = errors.New("Not authenticated. Run `ollama signin` and 
 
 type WebSearch struct{}
 
+// ApprovalScope binds a "yes" to the query (F127-L1-3).
+func (w *WebSearch) ApprovalScope(args map[string]any) string {
+	return scopeOn(w.Name(), args, "query")
+}
+
 func (w *WebSearch) Name() string {
 	return "web_search"
 }
@@ -100,6 +105,9 @@ func (w *WebSearch) Execute(ctx context.Context, _ agent.ToolContext, args map[s
 }
 
 type WebFetch struct{}
+
+// ApprovalScope binds a "yes" to the URL: approving one fetch approved a silent exfiltration path to any other (F127-L1-3).
+func (w *WebFetch) ApprovalScope(args map[string]any) string { return scopeOn(w.Name(), args, "url") }
 
 func (w *WebFetch) Name() string {
 	return "web_fetch"

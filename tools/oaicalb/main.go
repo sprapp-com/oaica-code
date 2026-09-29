@@ -866,6 +866,12 @@ func (u *usageRecorder) finish() {
 // 2026-09-29 audit, round 125, F125-L3-1).
 const docBufferLimit = 8 << 20
 
+func writeMeterRefusal(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": "invalid_request_error"}})
+}
+
 // laxTruthy reads a request's `stream` the way the backend does: a JSON bool, a number, or the strings
 // pydantic accepts as true.
 func laxTruthy(raw json.RawMessage) bool {
@@ -963,24 +969,30 @@ func meterAndServe(next http.HandlerFunc) http.HandlerFunc {
 		}
 		start := time.Now()
 		rawBody, whole := peekBody(r, meterBodyLimit)
-		// A body too big to read here goes on unchanged (it used to be replaced by its first 8 MiB
-		// with the Content-Length left alone, so the same body was served metered-upstream and
-		// refused 502 otherwise, F122-L3-4) and is still METERED, from its response: padding a
-		// request with 20 MiB of whitespace booked nothing (F124-L3-2).
+		// A body this meter cannot read whole and parse as a JSON object is refused, not forwarded: the
+		// backend's Python parser accepts spellings Go's refuses (NaN, Infinity, a BOM, UTF-16) and
+		// bodies past the read limit, and a stream served for such a body carries no usage frame the
+		// meter could have asked for — one ignored `"x":NaN` field erased the only record of a served
+		// turn. The gateway refuses the same bodies with a 400 (2026-09-29 audit, round 127,
+		// F127-L3-1). It used to be forwarded, cut at 8 MiB with the Content-Length unchanged (F122-L3-4).
+		if !whole {
+			writeMeterRefusal(w, http.StatusRequestEntityTooLarge, "request body is larger than the meter reads")
+			return
+		}
 		// Exact key names, as the backend reads them: encoding/json matches "STREAM" to a `stream`
 		// field, vLLM does not, so a client could make this meter parse a JSON reply as SSE and
 		// book a served turn 0/0 (F122-L3-3).
 		var fields map[string]json.RawMessage
-		json.Unmarshal(rawBody, &fields)
+		if err := json.Unmarshal(rawBody, &fields); err != nil || fields == nil {
+			writeMeterRefusal(w, http.StatusBadRequest, "request body is not a JSON object")
+			return
+		}
 		var reqDoc struct {
 			Model  string
 			Stream bool
 		}
 		json.Unmarshal(fields["model"], &reqDoc.Model)
 		json.Unmarshal(fields["stream"], &reqDoc.Stream)
-		if !whole {
-			reqDoc.Model = "(request too large to read)"
-		}
 		// Usage on a stream is a frame vLLM sends only when the request asks for it. The gateway forces
 		// it; a direct or non-gateway client that never asked (the OpenAI SDKs' default streaming request,
 		// or an explicit include_usage:false) was served and booked 0/0 here (2026-09-29 audit,

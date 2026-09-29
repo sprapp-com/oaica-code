@@ -584,6 +584,17 @@ func checkStateDir(st string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("%s exists but is not a directory", st)
 	}
+	// The sections directory inside it is followed by MkdirAll, ReadDir, Remove and every fragment write
+	// just the same: a clone with `sections -> ~` had Save delete every file of that directory that was
+	// not a section id and write hero.html into it (2026-09-29 audit, round 127, F127-L1-7).
+	sec := filepath.Join(st, sectionsDir)
+	if sfi, err := os.Lstat(sec); err == nil {
+		if !sfi.IsDir() { // Lstat: a symlink is not a directory here
+			return fmt.Errorf("%s is not a plain directory (a symlink?) — refusing to read or write state through it", sec)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return nil
 }
 

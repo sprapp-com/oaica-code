@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/agent"
@@ -66,13 +68,28 @@ func (p *terminalApprovalPrompter) PromptApproval(ctx context.Context, req agent
 	return agent.Approval{Allow: true, AllowScopes: allowed}, nil
 }
 
+func quoteArg(v any) string {
+	if s, ok := v.(string); ok {
+		return strconv.Quote(s)
+	}
+	return strconv.Quote(fmt.Sprintf("%v", v))
+}
+
 func compactMap(m map[string]any) string {
 	if len(m) == 0 {
 		return "(no args)"
 	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	parts := make([]string, 0, len(m))
-	for k, v := range m {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+	for _, k := range keys {
+		// %q: the values are written by the MODEL, and a raw CR or escape sequence in one redraws the
+		// question line, so the user approves a command other than the one shown (2026-09-29 audit,
+		// round 127, F127-L1-5).
+		parts = append(parts, fmt.Sprintf("%s=%s", k, quoteArg(m[k])))
 	}
 	return strings.Join(parts, " ")
 }

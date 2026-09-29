@@ -265,29 +265,50 @@ func readsCredentialPath(command string) bool {
 		return false
 	}
 	normalized := shellSafetyText(command)
-	for _, fragment := range []string{
-		"/.ssh/id_rsa",
-		"/.ssh/id_dsa",
-		"/.ssh/id_ecdsa",
-		"/.ssh/id_ed25519",
-		"/.ssh/config",
-		"/.ssh/known_hosts",
-		"/.aws/credentials",
-		"/.aws/config",
-		"/.config/gcloud/application_default_credentials.json",
-		"/.kube/config",
-		"/.netrc",
-		"/.npmrc",
-		"/.docker/config.json",
-		"/.config/gh/hosts.yml",
-		"/.gnupg/",
-		"/etc/shadow",
-	} {
+	for _, fragment := range credentialPathFragments {
 		if strings.Contains(normalized, fragment) {
 			return true
 		}
 	}
 	return false
+}
+
+// credentialPathFragments name the files whose contents are credentials. The bash tool refuses to read
+// them; the read and edit tools apply the same list to the path they are given, absolute or not
+// (2026-09-29 audit, round 127, F127-L1-4).
+var credentialPathFragments = []string{
+	"/.ssh/id_rsa",
+	"/.ssh/id_dsa",
+	"/.ssh/id_ecdsa",
+	"/.ssh/id_ed25519",
+	"/.ssh/config",
+	"/.ssh/known_hosts",
+	"/.aws/credentials",
+	"/.aws/config",
+	"/.config/gcloud/application_default_credentials.json",
+	"/.kube/config",
+	"/.netrc",
+	"/.npmrc",
+	"/.docker/config.json",
+	"/.config/gh/hosts.yml",
+	"/.gnupg/",
+	"/etc/shadow",
+}
+
+// refuseCredentialPath is the file tools' form of the bash denylist: path is resolved against
+// workingDir when relative.
+func refuseCredentialPath(workingDir, path string) error {
+	p := filepath.Clean(strings.TrimSpace(path))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(workingDir, p)
+	}
+	p = filepath.ToSlash(p)
+	for _, fragment := range credentialPathFragments {
+		if strings.Contains(p, fragment) || strings.HasSuffix(p, strings.TrimSuffix(fragment, "/")) {
+			return fmt.Errorf("refusing to touch %s: credential file reads are not allowed", path)
+		}
+	}
+	return nil
 }
 
 func hasCredentialReadVerb(fields []string) bool {

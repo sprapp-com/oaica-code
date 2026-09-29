@@ -57,6 +57,11 @@ func (r *Read) RequiresApproval(map[string]any) bool {
 	return true
 }
 
+// ApprovalScope binds a "yes" to the path asked about, as bash's binds to the command: approving
+// `read README.md` used to approve every later read, including of absolute paths outside the working
+// directory (2026-09-29 audit, round 127, F127-L1-3).
+func (r *Read) ApprovalScope(args map[string]any) string { return scopeOn(r.Name(), args, "path") }
+
 func (r *Read) Execute(ctx context.Context, toolCtx agent.ToolContext, args map[string]any) (agent.ToolResult, error) {
 	// TODO: use shared agent.RequiredStringArg / agent.OptionalIntArg for args (see agent package cleanup plan).
 	path, ok := args["path"].(string)
@@ -64,6 +69,9 @@ func (r *Read) Execute(ctx context.Context, toolCtx agent.ToolContext, args map[
 		return agent.ToolResult{}, fmt.Errorf("path parameter is required")
 	}
 
+	if err := refuseCredentialPath(toolCtx.WorkingDir, path); err != nil {
+		return agent.ToolResult{}, err
+	}
 	file, info, err := openRegularFile(toolCtx.WorkingDir, path, true)
 	if err != nil {
 		return agent.ToolResult{}, err
@@ -141,6 +149,19 @@ func (e *Edit) RequiresApproval(map[string]any) bool {
 	return true
 }
 
+// ApprovalScope binds a "yes" to the path being edited (F127-L1-3).
+func (e *Edit) ApprovalScope(args map[string]any) string { return scopeOn(e.Name(), args, "path") }
+
+// scopeOn is "<tool>\x00<argument>" for the named argument, or the bare tool name when it is absent.
+func scopeOn(tool string, args map[string]any, key string) string {
+	if v, ok := args[key].(string); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return tool + "\x00" + v
+		}
+	}
+	return tool
+}
+
 func (e *Edit) Execute(ctx context.Context, toolCtx agent.ToolContext, args map[string]any) (agent.ToolResult, error) {
 	// TODO: use shared agent.RequiredStringArg / agent.OptionalBoolArg for args (see agent package cleanup plan).
 	path, ok := args["path"].(string)
@@ -160,6 +181,9 @@ func (e *Edit) Execute(ctx context.Context, toolCtx agent.ToolContext, args map[
 
 	replaceAll, _ := args["replace_all"].(bool)
 
+	if err := refuseCredentialPath(toolCtx.WorkingDir, path); err != nil {
+		return agent.ToolResult{}, err
+	}
 	if err := rejectFinalSymlink(toolCtx.WorkingDir, path); err != nil {
 		return agent.ToolResult{}, err
 	}

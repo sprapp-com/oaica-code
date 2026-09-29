@@ -14,6 +14,7 @@ package launch
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,7 +61,18 @@ func installerSHAEnv(u string) string {
 // SHA-256 when a pin exists (built-in map or OAICA_INSTALL_SHA256_* env).
 // Returns the temp file path; the caller runs it and removes it.
 func fetchInstallerScript(scriptURL string) (string, error) {
-	client := &http.Client{Timeout: 120 * time.Second}
+	// A script fetched over https is not accepted from a redirect to plain http: TLS to the named
+	// upstream is the only protection on the unpinned path, and the warning names the ORIGINAL url
+	// (2026-09-29 audit, round 127, F127-L2-2).
+	client := &http.Client{Timeout: 120 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errors.New("too many redirects")
+		}
+		if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing a redirect from https to %s", req.URL.Scheme)
+		}
+		return nil
+	}}
 	resp, err := client.Get(scriptURL)
 	if err != nil {
 		return "", fmt.Errorf("download installer %s: %w", scriptURL, err)

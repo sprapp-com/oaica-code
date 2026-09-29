@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -250,8 +251,12 @@ func loopbackOrigin(origin string) bool {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	h := u.Hostname()
-	if h == "localhost" {
+	h := strings.ToLower(u.Hostname())
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	// The machine's own name is a page served from this machine (localHostHeader accepts it too).
+	if name, err := os.Hostname(); err == nil && h != "" && h == strings.ToLower(name) {
 		return true
 	}
 	ip := net.ParseIP(h)
@@ -270,12 +275,22 @@ func RunNormalizingProxyOnKeyed(bindHost string, listenPort, backendPort int, ap
 		// so on a loopback bind with no key any site the operator visited could drive the model and
 		// read its answers. Pages served from this machine (a local chat UI) still work (2026-09-29
 		// audit, round 126, F126-L1-1).
-		if isLoopbackBind(bindHost) {
-			if o := r.Header.Get("Origin"); o != "" && !loopbackOrigin(o) {
+		//
+		// Origin decides when there is one. Sec-Fetch-Site does not: a browser treats localhost and
+		// 127.0.0.1 (and http and https) as different SITES, so a chat UI on http://localhost:3000
+		// pointed at the printed http://127.0.0.1:PORT is `cross-site` by the browser's reckoning and
+		// still a page from this machine. `same-origin` cannot be forged by a page, so a page served
+		// through this proxy's own origin (behind nginx or a tunnel) passes on it (2026-09-29 audit,
+		// round 127, F127-L2-1).
+		// Only when no key is set: with one, a blind page cannot authenticate, and refusing a page behind
+		// nginx or a tunnel that presents it broke that setup for nothing (F127-L1-2).
+		if apiKey == "" && isLoopbackBind(bindHost) && r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			o := r.Header.Get("Origin")
+			if o != "" && !loopbackOrigin(o) {
 				http.Error(w, `{"error":{"message":"cross-origin request refused","type":"forbidden"}}`, http.StatusForbidden)
 				return
 			}
-			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			if o == "" && r.Header.Get("Sec-Fetch-Site") == "cross-site" {
 				http.Error(w, `{"error":{"message":"cross-site request refused","type":"forbidden"}}`, http.StatusForbidden)
 				return
 			}

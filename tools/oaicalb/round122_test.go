@@ -68,8 +68,9 @@ func TestRound122OversizeBodyIsForwardedWholeAndUnmetered(t *testing.T) {
 	req.ContentLength = int64(len(body))
 	w := httptest.NewRecorder()
 	h(w, req)
-	if w.Code != http.StatusOK || got.Load() != int64(len(body)) {
-		t.Errorf("status %d, backend received %d of %d bytes: an oversize body was cut", w.Code, got.Load(), len(body))
+	// Refused whole, never forwarded cut (round 127: the meter cannot read it, so it must not serve it).
+	if w.Code != http.StatusRequestEntityTooLarge || got.Load() != 0 {
+		t.Errorf("status %d, backend received %d bytes: an oversize body was served unmetered or cut", w.Code, got.Load())
 	}
 	_ = records
 }
@@ -91,17 +92,11 @@ func TestRound124MeterFramingComesFromTheResponse(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":`+stream+`}`))
 		h(httptest.NewRecorder(), req)
 	}
-	// and a body too large to read is metered from its response
-	pad := `{"model":"m","stream":true,"pad":"` + strings.Repeat("x", meterBodyLimit+1024) + `"}`
-	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(pad)))
-	waitForRecords(t, records, 3)
-	for i, rec := range (*records)[:3] {
+	waitForRecords(t, records, 2)
+	for i, rec := range (*records)[:2] {
 		if rec.PromptTokens != 11 || rec.CompletionTokens != 5 || !rec.UsageSeen {
 			t.Errorf("row %d booked %+v, want 11/5", i, rec)
 		}
-	}
-	if m := (*records)[2].Model; m != "(request too large to read)" {
-		t.Errorf("the oversize request's row names model %q", m)
 	}
 }
 
@@ -204,5 +199,44 @@ func TestRound126MeterForcesIncludeUsageOnStreams(t *testing.T) {
 	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(plain)))
 	if lb, _ := lastBody.Load().(string); lb != plain {
 		t.Errorf("a non-stream body was rewritten: %s", lb)
+	}
+}
+
+// F127-L3-1 (2026-09-29 audit, round 127): a body the meter cannot fully read as a JSON object is refused,
+// including the spellings Python's parser accepts and Go's does not.
+func TestRound127MeterRefusesBodiesItCannotRead(t *testing.T) {
+	var reached atomic.Int32
+	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		reached.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer be.Close()
+	meterSrv, _ := fakeMeterHub(t)
+	metered = newMeterHub(meterSrv.URL, "tok", "test-region")
+	t.Cleanup(func() { metered = nil })
+	h := serveWith(newStaticPool([]*backend{newBackend(be.URL)}), func(bs []*backend, _ int) *backend { return bs[0] })
+	for name, body := range map[string]string{
+		"NaN":      `{"model":"m","stream":true,"pad":NaN}`,
+		"Infinity": `{"model":"m","stream":true,"pad":Infinity}`,
+		"BOM":      "\xef\xbb\xbf" + `{"model":"m","stream":true}`,
+		"array":    `[1,2]`,
+		"null":     `null`,
+	} {
+		w := httptest.NewRecorder()
+		h(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, w.Code)
+		}
+	}
+	if reached.Load() != 0 {
+		t.Errorf("%d unreadable bodies reached the backend", reached.Load())
+	}
+	// a normal body still goes through
+	w := httptest.NewRecorder()
+	h(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`)))
+	if w.Code != http.StatusOK {
+		t.Errorf("a normal body answered %d", w.Code)
 	}
 }

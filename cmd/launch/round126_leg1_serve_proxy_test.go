@@ -62,6 +62,11 @@ func TestRound126ServeProxyRefusesForeignWebPages(t *testing.T) {
 		{"null", "", 403},
 		{"", "cross-site", 403},
 		{"http://localhost:3000", "same-site", 200},
+		{"http://localhost:3000", "cross-site", 200}, // a browser calls localhost vs 127.0.0.1 cross-site
+		{"https://localhost:3000", "cross-site", 200},
+		{"http://app.localhost:3000", "cross-site", 200},
+		{"https://box.tailnet.ts.net", "same-origin", 200}, // through nginx/tunnel on the proxy's own origin
+		{"https://evil.example", "same-site", 403},
 		{"http://127.0.0.1:8080", "", 200},
 		{"", "", 200}, // curl, an SDK: no Origin at all
 	} {
@@ -103,5 +108,28 @@ func TestRound126ServeHandlerWiresTheBackendKey(t *testing.T) {
 	}
 	if strings.Contains(src, `"--api-key", backendKey`) {
 		t.Errorf("the backend key is on the command line")
+	}
+}
+
+// F127-L1-2: with a key set, a page that presents it is not refused for its Origin.
+func TestRound127KeyedLoopbackProxyDoesNotRefuseAPageThatHasTheKey(t *testing.T) {
+	base, _, _ := round126Proxy(t, "the-key", "")
+	req, _ := http.NewRequest("POST", base+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[]}`))
+	req.Header.Set("Origin", "https://chat.lan")
+	req.Header.Set("Authorization", "Bearer the-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("a page presenting the key answered %d", resp.StatusCode)
+	}
+	req2, _ := http.NewRequest("POST", base+"/v1/chat/completions", strings.NewReader(`{}`))
+	req2.Header.Set("Origin", "https://chat.lan")
+	resp2, _ := http.DefaultClient.Do(req2)
+	resp2.Body.Close()
+	if resp2.StatusCode != 401 {
+		t.Errorf("a page without the key answered %d, want 401", resp2.StatusCode)
 	}
 }
