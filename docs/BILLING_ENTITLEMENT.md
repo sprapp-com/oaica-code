@@ -71,8 +71,10 @@ whose SHA-256 is in `pull_license_keys` (hand-edited, e.g. an enterprise custome
 `pull_license_validate_url` is set (`https://<saas>/license/validate`, https or loopback only), an
 `oaica-lic-…` key that oaica-saas reports `valid` for product `oaica-code`. (b) shares the subscriber-key cache (60 s when valid, 30 s when refused, stale-while-revalidate as above), one call per key at a time, at most 4
 calls in flight (a lookup waits up to 3 s for a slot, and a lookup nobody waits for any more is dropped), and
-fails closed when the licence server is unreachable. Leave it unset until oaica-saas is live; a refund revokes
-the key within the cache window.
+is refused when the licence server cannot be asked and the key was never seen valid. A key that WAS valid keeps
+opening licensed weights for up to 15 min past its 60 s cache (stale-while-revalidate, as for API keys), so a refund
+takes effect within one refresh and at the latest 15 min after an outage begins. Leave it unset until oaica-saas
+is live.
 
 ## The second condition: rolling-window caps
 

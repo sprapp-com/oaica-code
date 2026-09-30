@@ -97,12 +97,13 @@ func (c *remoteCache) check(ctx context.Context, idSource string, fn func(contex
 		return e.res
 	}
 	if have && e.res.ok && now.Before(e.staleUntil) {
+		// NOT subject to the in-flight cap: a refresh exists only for an entry already cached as valid, which an
+		// attacker cannot create, and skipping it under a flood of junk lookups left a revoked key served for the
+		// whole stale window (2026-09-30 audit, round 137, F137-A-1).
 		if f, ok := c.inflight[id]; !ok || f.gone {
-			if len(c.inflight) < remoteMaxEntries {
-				f := &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{})}
-				c.inflight[id] = f
-				go c.run(id, f, fn)
-			}
+			f := &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{})}
+			c.inflight[id] = f
+			go c.run(id, f, fn)
 		}
 		c.mu.Unlock()
 		return e.res
@@ -219,9 +220,11 @@ func (c *remoteCache) evictLocked(now time.Time) {
 			}
 		}
 	}
+	// Last resort (the cache is full of valid entries): drop only a few, not a quarter of the subscribers
+	// (round 137, F137-A-3).
 	for k := range c.m {
 		delete(c.m, k)
-		if len(c.m) < remoteMaxEntries*3/4 {
+		if len(c.m) < remoteMaxEntries-64 {
 			return
 		}
 	}

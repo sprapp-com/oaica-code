@@ -544,3 +544,67 @@ func TestRound136UnjudgeableKeyIs503NotA401(t *testing.T) {
 		t.Errorf("a key that is not ours: status %d, want 401", resp2.StatusCode)
 	}
 }
+
+// F137-A-1: a flood that fills the in-flight table must not keep a revoked key served for the stale window.
+func TestRound137RevokedKeyIsCutOffEvenUnderAnInflightFlood(t *testing.T) {
+	var valid atomic.Bool
+	valid.Store(true)
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if valid.Load() {
+			w.Write([]byte(`{"valid":true,"label":"sub_ABC"}`))
+			return
+		}
+		w.Write([]byte(`{"valid":false}`))
+	}))
+	defer saas.Close()
+	g, _ := bridgeGateway(t, saas.URL)
+	look := func() bool {
+		r := httptest.NewRequest("GET", "/v1/models", nil)
+		r.Header.Set("Authorization", "Bearer "+goodSK)
+		_, ok := g.lookupKey(r)
+		return ok
+	}
+	if !look() {
+		t.Fatal("subscriber not accepted")
+	}
+	// fill the in-flight table as a flood would
+	g.remote.mu.Lock()
+	for i := 0; i < remoteMaxEntries; i++ {
+		g.remote.inflight[fmt.Sprint("flood", i)] = &remoteFlight{done: make(chan struct{}), abandoned: make(chan struct{})}
+	}
+	for k, e := range g.remote.m {
+		e.expires = time.Now().Add(-time.Second)
+		g.remote.m[k] = e
+	}
+	g.remote.mu.Unlock()
+	valid.Store(false)
+	look() // stale answer; must still start the refresh
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !look() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Error("a revoked key was still served 3 s after the refresh should have replaced it (in-flight table full)")
+}
+
+// F137-A-2: the Anthropic door answers an unjudgeable key with a retryable 503 in the Anthropic error envelope.
+func TestRound137MessagesDoorAnswers503ForAnUnjudgeableKey(t *testing.T) {
+	saas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	defer saas.Close()
+	_, srv := bridgeGateway(t, saas.URL)
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/messages", strings.NewReader(`{"model":"kat-awq","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-api-key", goodSK)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b := make([]byte, 512)
+	n, _ := resp.Body.Read(b)
+	if resp.StatusCode != 503 || resp.Header.Get("Retry-After") == "" || !strings.Contains(string(b[:n]), `"type":"error"`) {
+		t.Errorf("status %d, Retry-After %q, body %s; want 503 + Retry-After + an Anthropic error envelope", resp.StatusCode, resp.Header.Get("Retry-After"), b[:n])
+	}
+}

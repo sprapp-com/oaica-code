@@ -76,7 +76,15 @@ func (g *gateway) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	// where /v1/chat/completions and /v1/completions answer 401 before reading a
 	// byte (2026-09-29 audit, round 108, F108-L3-1). The refusal is the bytes the
 	// bridge has always given it, so a client sees no change.
-	key, _ := g.lookupKey(r)
+	key, _, unavailable := g.lookupKeyEx(r)
+	if key.Label == "" && unavailable {
+		// The saas could not judge the key: the caller retries (Claude Code treats a 401 as "log in again")
+		// (2026-09-30 audit, round 137, F137-A-2).
+		w.Header().Set("Retry-After", "5")
+		writeAnthropicErrorVal(w, http.StatusServiceUnavailable, map[string]any{
+			"code": "key_check_unavailable", "message": "could not check this API key right now; retry shortly", "type": "api_error"})
+		return
+	}
 	if key.Label == "" {
 		writeAnthropicErrorVal(w, http.StatusUnauthorized, map[string]any{
 			"code": "invalid_api_key", "message": "missing or invalid API key", "type": "invalid_api_key"})
