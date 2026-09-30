@@ -277,22 +277,43 @@ assert_contains "$out" "ERROR: download failed (curl exit 22) for does-not-exist
 assert_not_contains "$out" "UNREACHABLE" "404: script stops"
 
 # Archive not listed in SHA256SUMS: warn and continue.
-rc=0; out=$(run_sh "fetch_archive '$BASE' nosum.tgz \"\$TEMP_DIR/u.tgz\" && echo CONTINUED") || rc=$?
+rc=0; out=$(run_sh "export OAICA_DOWNLOAD_BASE='$BASE'; fetch_archive '$BASE' nosum.tgz \"\$TEMP_DIR/u.tgz\" && echo CONTINUED") || rc=$?
 assert_eq "$rc" "0" "unlisted archive: exit 0"
 assert_contains "$out" "WARNING: SHA256SUMS has no entry for nosum.tgz; skipping checksum verification" "unlisted archive: warning"
 assert_contains "$out" "CONTINUED" "unlisted archive: install continues"
 
 # No SHA256SUMS on the server: warn and continue.
-rc=0; out=$(run_sh "fetch_archive '$BASE/nosums' oaica-linux-amd64.tgz \"\$TEMP_DIR/u.tgz\" && echo CONTINUED") || rc=$?
+rc=0; out=$(run_sh "export OAICA_DOWNLOAD_BASE='$BASE'; fetch_archive '$BASE/nosums' oaica-linux-amd64.tgz \"\$TEMP_DIR/u.tgz\" && echo CONTINUED") || rc=$?
 assert_eq "$rc" "0" "missing SHA256SUMS: exit 0"
 assert_contains "$out" "WARNING: Could not download SHA256SUMS; skipping checksum verification of oaica-linux-amd64.tgz" "missing SHA256SUMS: warning"
 assert_contains "$out" "CONTINUED" "missing SHA256SUMS: install continues"
 
 # Neither sha256sum nor shasum available: warn and continue (even for a bad file).
-rc=0; out=$(run_sh "available() { case \$1 in sha256sum|shasum) return 1 ;; esac; command -v \"\$1\" >/dev/null; }; fetch_archive '$BASE' corrupt-always.tgz \"\$TEMP_DIR/t.tgz\" && echo CONTINUED") || rc=$?
+rc=0; out=$(run_sh "export OAICA_DOWNLOAD_BASE='$BASE'; available() { case \$1 in sha256sum|shasum) return 1 ;; esac; command -v \"\$1\" >/dev/null; }; fetch_archive '$BASE' corrupt-always.tgz \"\$TEMP_DIR/t.tgz\" && echo CONTINUED") || rc=$?
 assert_eq "$rc" "0" "no sha256 tool: exit 0"
 assert_contains "$out" "WARNING: Neither sha256sum nor shasum is available; skipping checksum verification of corrupt-always.tgz" "no sha256 tool: warning"
 assert_contains "$out" "CONTINUED" "no sha256 tool: install continues"
+
+# Round 139: on the DEFAULT origin (no OAICA_DOWNLOAD_BASE) missing checksums are a failure, and a mirror can opt in
+# with OAICA_REQUIRE_CHECKSUM=1. (The three cases above ran as a mirror: fail-open is for mirrors only.)
+rc=0; out=$(run_sh "unset OAICA_DOWNLOAD_BASE; fetch_archive '$BASE' nosum.tgz \"\$TEMP_DIR/u.tgz\"; echo UNREACHABLE") || rc=$?
+assert_eq "$rc" "1" "default origin, unlisted archive: refused"
+assert_not_contains "$out" "UNREACHABLE" "default origin, unlisted archive: script stops"
+rc=0; out=$(run_sh "unset OAICA_DOWNLOAD_BASE; fetch_archive '$BASE/nosums' oaica-linux-amd64.tgz \"\$TEMP_DIR/u.tgz\"; echo UNREACHABLE") || rc=$?
+assert_eq "$rc" "1" "default origin, missing SHA256SUMS: refused"
+rc=0; out=$(run_sh "export OAICA_DOWNLOAD_BASE='$BASE' OAICA_REQUIRE_CHECKSUM=1; fetch_archive '$BASE' nosum.tgz \"\$TEMP_DIR/u.tgz\"; echo UNREACHABLE") || rc=$?
+assert_eq "$rc" "1" "mirror with OAICA_REQUIRE_CHECKSUM=1, unlisted archive: refused"
+rc=0; out=$(run_sh "unset OAICA_DOWNLOAD_BASE; available() { case \$1 in sha256sum|shasum) return 1 ;; esac; command -v \"\$1\" >/dev/null; }; fetch_archive '$BASE' oaica-linux-amd64.tgz \"\$TEMP_DIR/t.tgz\"; echo UNREACHABLE") || rc=$?
+assert_eq "$rc" "1" "default origin, no sha256 tool: refused"
+
+# SHA256SUMS with CRLF line ends and uppercase digests (Windows / autocrlf / Get-FileHash) still verifies.
+mkdir -p "$WORK/crlf"
+cp "$DL/oaica-linux-amd64.tgz" "$WORK/crlf/"
+GS="$(sha256sum "$DL/oaica-linux-amd64.tgz" | cut -d' ' -f1 | tr a-f A-F)"
+printf '%s  oaica-linux-amd64.tgz\r\n' "$GS" > "$WORK/crlf/SHA256SUMS"
+rc=0; out=$(run_sh "expected_sha256 '$WORK/crlf/SHA256SUMS' oaica-linux-amd64.tgz") || rc=$?
+assert_eq "$rc" "0" "CRLF SHA256SUMS: entry found"
+assert_eq "$out" "$(printf %s "$GS" | tr A-F a-f)" "CRLF SHA256SUMS: digest normalised to lowercase, no CR"
 
 # shasum -a 256 (macOS) is used when sha256sum is absent.
 if command -v shasum >/dev/null; then

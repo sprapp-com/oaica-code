@@ -43,6 +43,11 @@
     https://oaica.com
 #>
 
+# `irm ... | iex` runs in the CALLER'S session: these two preferences must not outlive the install (the next ordinary
+# error in the user's own command line would abort it). Remembered here, restored in the finally at the bottom
+# (2026-09-30 audit, round 139, F139-A-6).
+$script:OaicaPrevEAP = $ErrorActionPreference
+$script:OaicaPrevProgress = $ProgressPreference
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
@@ -140,6 +145,12 @@ function Invoke-Download {
         $request = [System.Net.HttpWebRequest]::Create($Url)
         $request.AllowAutoRedirect = $true
         $response = $request.GetResponse()
+        # An https request that ended on a plain-http URL was downgraded by a redirect (Windows PowerShell 5.1 follows
+        # it): refuse (F139-A-9).
+        if ($Url.StartsWith("https://") -and $response.ResponseUri.Scheme -ne "https") {
+            $response.Close()
+            throw "refusing a redirect from https to $($response.ResponseUri.Scheme)"
+        }
         $totalBytes = $response.ContentLength
         $stream = $response.GetResponseStream()
         $fileStream = [System.IO.FileStream]::new($OutFile, [System.IO.FileMode]::Create)
@@ -212,10 +223,16 @@ function Test-ArchiveChecksum {
         [string]$Path
     )
 
+    # On the default origin (the GitHub release) SHA256SUMS always exists, so missing checksums there are a failure,
+    # not a reason to install unchecked; a mirror (OAICA_DOWNLOAD_BASE) may still fall back to a warning unless
+    # OAICA_REQUIRE_CHECKSUM=1 (F139-A-2).
+    $strict = (-not $env:OAICA_DOWNLOAD_BASE) -or ($env:OAICA_REQUIRE_CHECKSUM -eq "1")
+
     $sumsFile = Join-Path $TempDir "oaica-SHA256SUMS"
     try {
         Invoke-Download -Url "$UrlBase/SHA256SUMS" -OutFile $sumsFile
     } catch {
+        if ($strict) { throw "Could not download SHA256SUMS for $Name; refusing to install it unverified" }
         Write-Warning "Could not download SHA256SUMS; skipping checksum verification of $Name"
         return
     }
@@ -229,10 +246,12 @@ function Test-ArchiveChecksum {
         }
     }
     if (-not $expected) {
+        if ($strict) { throw "SHA256SUMS has no entry for $Name; refusing to install it unverified" }
         Write-Warning "SHA256SUMS has no entry for $Name; skipping checksum verification"
         return
     }
     if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        if ($strict) { throw "SHA256SUMS entry for $Name is unreadable; refusing to install it unverified" }
         Write-Warning "SHA256SUMS entry for $Name is unreadable; skipping checksum verification"
         return
     }
@@ -266,7 +285,12 @@ function Invoke-Uninstall {
         return
     }
 
-    Remove-Item $oaicaDir -Recurse -Force
+    # The binary, then the directory only if nothing else is left in it: OAICA_INSTALL_DIR may be a folder the user
+    # keeps other tools in (F139-A-5).
+    Remove-Item (Join-Path $oaicaDir "oaica.exe") -Force -ErrorAction SilentlyContinue
+    if (-not (Get-ChildItem -LiteralPath $oaicaDir -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $oaicaDir -Force
+    }
 
     $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
     $newPath = ($userPath -split ';' | Where-Object { $_ -ne $oaicaDir }) -join ';'
@@ -331,7 +355,9 @@ function Invoke-Install {
 
     # Persist PATH for future sessions (user scope, no admin needed)
     $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-    if ($userPath -notlike "*$oaicaDir*") {
+    # Exact entry comparison: `-notlike "*dir*"` skipped the add when another entry merely CONTAINED this path, and
+    # treated `[` in a path as a wildcard (F139-A-7).
+    if (@($userPath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $oaicaDir.TrimEnd('\')) {
         [Environment]::SetEnvironmentVariable("PATH", "$userPath;$oaicaDir", "User")
         Write-Status "  Added $oaicaDir to persistent user PATH"
     }
@@ -347,8 +373,13 @@ function Invoke-Install {
 # Main
 # --------------------------------------------------------------------------
 
-if ($Uninstall) {
-    Invoke-Uninstall
-} else {
-    Invoke-Install
+try {
+    if ($Uninstall) {
+        Invoke-Uninstall
+    } else {
+        Invoke-Install
+    }
+} finally {
+    $ErrorActionPreference = $script:OaicaPrevEAP
+    $ProgressPreference = $script:OaicaPrevProgress
 }

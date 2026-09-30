@@ -16,7 +16,7 @@ error() { echo "${red}ERROR:${plain} $*"; exit 1; }
 warning() { echo "${red}WARNING:${plain} $*"; }
 
 TEMP_DIR=$(mktemp -d)
-cleanup() { rm -rf $TEMP_DIR; }
+cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
 available() { command -v $1 >/dev/null; }
@@ -117,9 +117,12 @@ sha256_of() {
 expected_sha256() {
     local sum name
     while read -r sum name; do
+        # A SHA256SUMS that went through Windows / git autocrlf ends its lines in CR: the entry was never found and
+        # the archive installed unchecked (2026-09-30 audit, round 139, F139-A-1).
+        name="${name%$(printf '\r')}"
         name="${name#\*}"
         if [ "$name" = "$2" ]; then
-            echo "$sum"
+            printf '%s\n' "$sum" | tr -d '\r' | tr 'A-F' 'a-f'
             return 0
         fi
     done < "$1"
@@ -135,19 +138,28 @@ verify_archive() {
     local file="$1" name="$2" url_base="$3"
     local actual expected
 
-    actual=$(sha256_of "$file")
+    # On the default origin (the GitHub release) SHA256SUMS always exists, so a missing file, a missing entry or a
+    # missing sha256 tool there is a failure, not a reason to install unchecked; a mirror (OAICA_DOWNLOAD_BASE) may
+    # still fall back to a warning unless OAICA_REQUIRE_CHECKSUM=1 (round 139, F139-A-2).
+    local strict=""
+    if [ -z "${OAICA_DOWNLOAD_BASE:-}" ] || [ "${OAICA_REQUIRE_CHECKSUM:-}" = "1" ]; then strict=1; fi
+
+    actual=$(sha256_of "$file" | tr 'A-F' 'a-f')
     if [ -z "$actual" ]; then
+        if [ -n "$strict" ]; then error "Neither sha256sum nor shasum is available; refusing to install $name unverified"; fi
         warning "Neither sha256sum nor shasum is available; skipping checksum verification of $name"
         return 0
     fi
 
     if ! curl --fail --silent --show-error --location $(redirect_guard "$url_base") --retry 3 \
             -o "$TEMP_DIR/SHA256SUMS" "${url_base}/SHA256SUMS"; then
+        if [ -n "$strict" ]; then status "Could not download SHA256SUMS for $name"; return 1; fi
         warning "Could not download SHA256SUMS; skipping checksum verification of $name"
         return 0
     fi
 
     if ! expected=$(expected_sha256 "$TEMP_DIR/SHA256SUMS" "$name"); then
+        if [ -n "$strict" ]; then status "SHA256SUMS has no entry for $name"; return 1; fi
         warning "SHA256SUMS has no entry for $name; skipping checksum verification"
         return 0
     fi
@@ -269,6 +281,7 @@ if [ "$OS" = "Darwin" ]; then
 
     status "Installing OAICA to $BINDIR..."
     unzip -q "$TEMP_DIR/oaica-darwin.zip" -d "$TEMP_DIR"
+    if [ ! -f "$TEMP_DIR/bin/oaica" ] || [ -L "$TEMP_DIR/bin/oaica" ]; then error "the archive did not contain a regular bin/oaica"; fi
     mkdir -p "$BINDIR" 2>/dev/null || sudo mkdir -p "$BINDIR"
     if [ -w "$BINDIR" ]; then
         install -m755 "$TEMP_DIR/bin/oaica" "$BINDIR/oaica"
@@ -374,8 +387,9 @@ $SUDO install -o0 -g0 -m755 -d $BINDIR
 # directory older versions of this installer left behind (2026-09-26 audit).
 UNPACK_DIR="$TEMP_DIR/oaica-unpack"
 download_and_extract "$DOWNLOAD_BASE" "$UNPACK_DIR" "oaica-linux-${ARCH}"
-if [ ! -f "$UNPACK_DIR/bin/oaica" ]; then
-    error "the archive did not contain bin/oaica"
+if [ ! -f "$UNPACK_DIR/bin/oaica" ] || [ -L "$UNPACK_DIR/bin/oaica" ]; then
+    # A symlink would be copied as root with the target's content (a 600-mode file made world-readable).
+    error "the archive did not contain a regular bin/oaica"
 fi
 $SUDO install -o0 -g0 -m755 "$UNPACK_DIR/bin/oaica" "$BINDIR/oaica"
 
