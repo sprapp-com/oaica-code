@@ -193,22 +193,32 @@ func hasUnsafeRecursiveDelete(command string) bool {
 		// `r\m` is rm to the shell; the backslash-to-slash rewrite turned it into `r/m`, while a Windows path needs
 		// that rewrite: scan both spellings.
 		for _, fields := range [][]string{shellSafetyFields(segment), shellSafetyFields(strings.ReplaceAll(segment, "\\", ""))} {
+			// One pass per spelling: an rm at index i is unsafe iff an unsafe target follows it with both -r and -f
+			// between them; a PowerShell delete iff recurse, force and an unsafe target all follow it. Rescanning the
+			// tail for every rm word was cubic: `rm -a rm -a …` took 1.2 s at 12 KB and two minutes at 48 KB, with no
+			// timeout (2026-09-30 audit, round 138, F138-A-3).
+			rmBoundary, psR, psF, psT := deleteBoundaries(fields)
+			nextRm := make([]int, len(fields)) // nextRm[i] = the first rm word after i, or -1
+			nxt := -1
+			for k := len(fields) - 1; k >= 0; k-- {
+				nextRm[k] = nxt
+				if isRMCommand(fields[k]) {
+					nxt = k
+				}
+			}
+			xargsBoundary, _, _, _ := deleteBoundaries(append(append([]string{}, fields...), piped...))
 			for i, field := range fields {
-				if isRMCommand(field) && rmCommandDeletesUnsafeTarget(fields[i+1:]) {
+				if isRMCommand(field) && i < rmBoundary {
 					return true
 				}
 				if field == "xargs" {
-					// Flags and wrappers (`-0`, `-I{} `, `sudo`) sit between xargs and the rm it runs.
-					for j := i + 1; j < len(fields); j++ {
-						if isRMCommand(fields[j]) {
-							if rmCommandDeletesUnsafeTarget(append(append([]string{}, fields[j+1:]...), piped...)) {
-								return true
-							}
-							break
-						}
+					// Flags and wrappers (`-0`, `-I{} `, `sudo`) sit between xargs and the rm it runs; the words
+					// echo/printf piped in extend the rm's arguments. Both answers come from one precomputed pass.
+					if j := nextRm[i]; j >= 0 && j < xargsBoundary {
+						return true
 					}
 				}
-				if isPowerShellDeleteCommand(field) && powerShellDeleteCommandDeletesUnsafeTarget(fields[i+1:]) {
+				if isPowerShellDeleteCommand(field) && psR > i && psF > i && psT > i {
 					return true
 				}
 			}
@@ -250,17 +260,58 @@ func shellSegments(command string) []string {
 	return segments
 }
 
+// deleteBoundaries: for fields, (a) M such that an rm word at index i deletes an unsafe target iff i < M (a target t
+// counts when a -r flag and a -f flag both stand between i and t: M = max over unsafe t of min(last r-flag before t,
+// last f-flag before t)); (b) the last index of a PowerShell recurse flag, of a force flag, and of an unsafe target.
+func deleteBoundaries(fields []string) (rm, psRecurse, psForce, psTarget int) {
+	rm, psRecurse, psForce, psTarget = -1, -1, -1, -1
+	lastR, lastF := -1, -1
+	for i, f := range fields {
+		switch f {
+		case "-r", "-recurse", "-recursive":
+			psRecurse = i
+		case "-f", "-force":
+			psForce = i
+		}
+		if f == "--" {
+			continue
+		}
+		if strings.HasPrefix(f, "-") {
+			if strings.Contains(f, "r") {
+				lastR = i
+			}
+			if strings.Contains(f, "f") {
+				lastF = i
+			}
+			continue
+		}
+		if isUnsafeDeleteTarget(f) {
+			psTarget = i
+			if m := min(lastR, lastF); m > rm {
+				rm = m
+			}
+		}
+	}
+	return
+}
+
 func rmCommandDeletesUnsafeTarget(fields []string) bool {
-	var flags string
+	// Booleans, not a growing string (used for `xargs rm`, whose targets come from elsewhere).
+	var sawR, sawF bool
 	for _, field := range fields {
 		if field == "--" {
 			continue
 		}
 		if strings.HasPrefix(field, "-") {
-			flags += field
+			if strings.Contains(field, "r") {
+				sawR = true
+			}
+			if strings.Contains(field, "f") {
+				sawF = true
+			}
 			continue
 		}
-		if strings.Contains(flags, "r") && strings.Contains(flags, "f") && isUnsafeDeleteTarget(field) {
+		if sawR && sawF && isUnsafeDeleteTarget(field) {
 			return true
 		}
 	}

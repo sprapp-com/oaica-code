@@ -156,7 +156,8 @@ func (c *remoteCache) run(id string, f *remoteFlight, fn func(context.Context) (
 	now := time.Now()
 	c.mu.Lock()
 	if definite {
-		if len(c.m) >= remoteMaxEntries {
+		// Only an insert that GROWS the map needs room: a refresh replaces an existing entry (F138-A-2).
+		if _, exists := c.m[id]; !exists && len(c.m) >= remoteMaxEntries {
 			c.evictLocked(now)
 		}
 		ttl := remoteInvalidTTL
@@ -219,6 +220,11 @@ func (c *remoteCache) evictLocked(now time.Time) {
 				return
 			}
 		}
+	}
+	// Refused answers freed the room that was needed: valid subscribers are never touched while there is any
+	// (a flood of junk keys dropped one about every 600 keys) (round 138, F138-A-1).
+	if len(c.m) < remoteMaxEntries {
+		return
 	}
 	// Last resort (the cache is full of valid entries): drop only a few, not a quarter of the subscribers
 	// (round 137, F137-A-3).

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -606,5 +608,60 @@ func TestRound137MessagesDoorAnswers503ForAnUnjudgeableKey(t *testing.T) {
 	n, _ := resp.Body.Read(b)
 	if resp.StatusCode != 503 || resp.Header.Get("Retry-After") == "" || !strings.Contains(string(b[:n]), `"type":"error"`) {
 		t.Errorf("status %d, Retry-After %q, body %s; want 503 + Retry-After + an Anthropic error envelope", resp.StatusCode, resp.Header.Get("Retry-After"), b[:n])
+	}
+}
+
+// F138-A-1/2: a flood of junk answers, or a refresh of an existing entry, never evicts a valid subscriber.
+func TestRound138EvictionNeverTouchesValidSubscribersWhileRefusedEntriesFreeRoom(t *testing.T) {
+	var c remoteCache
+	c.init()
+	now := time.Now()
+	for i := 0; i < 3500; i++ {
+		c.m[fmt.Sprint("sub", i)] = remoteEntry{res: remoteResult{ok: true, label: "x"}, expires: now.Add(time.Hour), staleUntil: now.Add(time.Hour)}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 5000; i++ {
+		id := fmt.Sprint("junk", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.check(context.Background(), id, func(context.Context) (remoteResult, bool) { return remoteResult{}, true })
+		}()
+	}
+	wg.Wait()
+	valid := 0
+	c.mu.Lock()
+	for _, e := range c.m {
+		if e.res.ok {
+			valid++
+		}
+	}
+	c.mu.Unlock()
+	// (check() hashes ids, so the seeded "subN" keys are distinct from the junk ones; count only what we seeded)
+	if valid < 3500 {
+		t.Errorf("valid subscribers dropped by a junk flood: %d of 3500 left", valid)
+	}
+}
+
+func TestRound138RefreshOfAnExistingEntryEvictsNothing(t *testing.T) {
+	var c remoteCache
+	c.init()
+	now := time.Now()
+	for i := 0; i < remoteMaxEntries; i++ {
+		c.m[fmt.Sprint("k", i)] = remoteEntry{res: remoteResult{ok: true}, expires: now.Add(time.Hour), staleUntil: now.Add(time.Hour)}
+	}
+	// make one stale and refresh it through check()
+	sum := sha256.Sum256([]byte("target"))
+	id := hex.EncodeToString(sum[:])
+	c.m[id] = remoteEntry{res: remoteResult{ok: true, label: "t"}, expires: now.Add(-time.Second), staleUntil: now.Add(time.Hour)}
+	delete(c.m, "k0") // keep the map exactly at the cap
+	before := len(c.m)
+	c.check(context.Background(), "target", func(context.Context) (remoteResult, bool) { return remoteResult{ok: true, label: "t"}, true })
+	time.Sleep(200 * time.Millisecond)
+	c.mu.Lock()
+	after := len(c.m)
+	c.mu.Unlock()
+	if after < before {
+		t.Errorf("a refresh evicted %d valid subscribers (map %d -> %d)", before-after, before, after)
 	}
 }
