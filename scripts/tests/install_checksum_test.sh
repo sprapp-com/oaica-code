@@ -344,3 +344,14 @@ assert_contains "$out" "oaica-fake" "download_and_extract tgz fallback: extracte
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
+
+# Round 140: the install must refuse an archive whose bin/ or bin/oaica is a symlink (it would be copied as root with
+# the target's content). The check sits in the main flow, so this pins that both guards exist on the Linux and macOS
+# paths, and that a real symlink is detected by the same test expressions.
+n=$(grep -c -F '[ -L "$UNPACK_DIR/bin" ]' "$INSTALL_SH"); assert_eq "$n" "1" "linux path guards a symlinked bin/"
+n=$(grep -c -F '[ -L "$UNPACK_DIR/bin/oaica" ]' "$INSTALL_SH"); assert_eq "$n" "1" "linux path guards a symlinked bin/oaica"
+n=$(grep -c -F '[ -L "$TEMP_DIR/bin" ]' "$INSTALL_SH"); assert_eq "$n" "1" "macOS path guards a symlinked bin/"
+n=$(grep -c -F '[ -L "$TEMP_DIR/bin/oaica" ]' "$INSTALL_SH"); assert_eq "$n" "1" "macOS path guards a symlinked bin/oaica"
+mkdir -p "$WORK/sl/victim" "$WORK/sl/u"; printf secret > "$WORK/sl/victim/oaica"; ln -s "$WORK/sl/victim" "$WORK/sl/u/bin"
+rc=0; ( [ ! -f "$WORK/sl/u/bin/oaica" ] || [ -L "$WORK/sl/u/bin/oaica" ] || [ -L "$WORK/sl/u/bin" ] ) || rc=1
+assert_eq "$rc" "0" "a bin/ symlink to a directory is caught by the guard expression"

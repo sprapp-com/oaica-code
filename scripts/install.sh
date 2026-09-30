@@ -281,7 +281,7 @@ if [ "$OS" = "Darwin" ]; then
 
     status "Installing OAICA to $BINDIR..."
     unzip -q "$TEMP_DIR/oaica-darwin.zip" -d "$TEMP_DIR"
-    if [ ! -f "$TEMP_DIR/bin/oaica" ] || [ -L "$TEMP_DIR/bin/oaica" ]; then error "the archive did not contain a regular bin/oaica"; fi
+    if [ ! -f "$TEMP_DIR/bin/oaica" ] || [ -L "$TEMP_DIR/bin/oaica" ] || [ -L "$TEMP_DIR/bin" ]; then error "the archive did not contain a regular bin/oaica"; fi
     mkdir -p "$BINDIR" 2>/dev/null || sudo mkdir -p "$BINDIR"
     if [ -w "$BINDIR" ]; then
         install -m755 "$TEMP_DIR/bin/oaica" "$BINDIR/oaica"
@@ -387,7 +387,7 @@ $SUDO install -o0 -g0 -m755 -d $BINDIR
 # directory older versions of this installer left behind (2026-09-26 audit).
 UNPACK_DIR="$TEMP_DIR/oaica-unpack"
 download_and_extract "$DOWNLOAD_BASE" "$UNPACK_DIR" "oaica-linux-${ARCH}"
-if [ ! -f "$UNPACK_DIR/bin/oaica" ] || [ -L "$UNPACK_DIR/bin/oaica" ]; then
+if [ ! -f "$UNPACK_DIR/bin/oaica" ] || [ -L "$UNPACK_DIR/bin/oaica" ] || [ -L "$UNPACK_DIR/bin" ]; then
     # A symlink would be copied as root with the target's content (a 600-mode file made world-readable).
     error "the archive did not contain a regular bin/oaica"
 fi

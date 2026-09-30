@@ -226,7 +226,7 @@ function Test-ArchiveChecksum {
     # On the default origin (the GitHub release) SHA256SUMS always exists, so missing checksums there are a failure,
     # not a reason to install unchecked; a mirror (OAICA_DOWNLOAD_BASE) may still fall back to a warning unless
     # OAICA_REQUIRE_CHECKSUM=1 (F139-A-2).
-    $strict = (-not $env:OAICA_DOWNLOAD_BASE) -or ($env:OAICA_REQUIRE_CHECKSUM -eq "1")
+    $strict = ((-not $env:OAICA_DOWNLOAD_BASE) -and (-not $env:OAICA_DOWNLOAD_URL)) -or ($env:OAICA_REQUIRE_CHECKSUM -eq "1") # OAICA_DOWNLOAD_URL is the documented alias of _BASE (round 140, F140-A-1)
 
     $sumsFile = Join-Path $TempDir "oaica-SHA256SUMS"
     try {
@@ -280,14 +280,19 @@ function Invoke-Uninstall {
     # install dir directly and strip it from the persistent user PATH.
     $oaicaDir = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "Programs\OAICA" }
 
-    if (-not (Test-Path $oaicaDir)) {
+    if (-not (Test-Path -LiteralPath $oaicaDir)) {
         Write-Host ">>> OAICA is not installed."
         return
     }
 
     # The binary, then the directory only if nothing else is left in it: OAICA_INSTALL_DIR may be a folder the user
     # keeps other tools in (F139-A-5).
-    Remove-Item (Join-Path $oaicaDir "oaica.exe") -Force -ErrorAction SilentlyContinue
+    # LiteralPath (a `[` in the directory is not a wildcard) and a hard failure when the binary cannot be removed —
+    # a running oaica.exe is locked by Windows; saying "uninstalled" and stripping PATH for it was wrong (F140-A-2/3).
+    $exe = Join-Path $oaicaDir "oaica.exe"
+    if (Test-Path -LiteralPath $exe) {
+        Remove-Item -LiteralPath $exe -Force -ErrorAction Stop
+    }
     if (-not (Get-ChildItem -LiteralPath $oaicaDir -Force -ErrorAction SilentlyContinue)) {
         Remove-Item -LiteralPath $oaicaDir -Force
     }
@@ -344,10 +349,10 @@ function Invoke-Install {
     if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force }
     Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
 
-    if (-not (Test-Path $oaicaDir)) {
+    if (-not (Test-Path -LiteralPath $oaicaDir)) {
         New-Item -ItemType Directory -Path $oaicaDir -Force | Out-Null
     }
-    Copy-Item -Path (Join-Path $tempExtract "bin\oaica.exe") -Destination (Join-Path $oaicaDir "oaica.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $tempExtract "bin\oaica.exe") -Destination (Join-Path $oaicaDir "oaica.exe") -Force
 
     # Cleanup
     Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
