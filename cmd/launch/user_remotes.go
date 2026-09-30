@@ -241,6 +241,15 @@ func (r userRemote) authSource() string {
 		if set := keyEnvNameSet(env); set != "" {
 			return "env:" + set
 		}
+		// The variable is NOT set: report where the key actually comes from (stored / via), matching key()'s
+		// order. Naming an unset variable implied a credential this shell does not have while the row worked via
+		// opencode — the two columns disagreed (2026-09-30 audit, round 141, F141-A).
+		if storedAuthKey(r.Name) != "" {
+			return "stored"
+		}
+		if via := strings.TrimSpace(r.AuthVia); via != "" && externalAuthKey(via, r.Name) != "" {
+			return "via:" + via
+		}
 		return "env:" + splitKeyEnvNames(env)[0]
 	}
 	if storedAuthKey(r.Name) != "" {

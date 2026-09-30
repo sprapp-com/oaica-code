@@ -65,3 +65,38 @@ func TestRound131SyncBodyDoesNotEchoTheMirrorKey(t *testing.T) {
 		t.Errorf("error echoes the mirror key: %v", err)
 	}
 }
+
+// Round 141 (F141-A/B): authSource reports where the key REALLY comes from, and doctor does not call a dead key ok.
+func TestRound141AuthSourceFallsThroughToViaWhenEnvUnset(t *testing.T) {
+	r := userRemote{Name: "mm-plan", APIKeyEnv: "MINIMAX_API_KEY", AuthVia: "opencode"}
+	if k := r.key(); k == "" {
+		t.Skip("no opencode key for this row on this host")
+	}
+	if got := r.authSource(); got != "via:opencode" {
+		t.Errorf("authSource = %q with the env var unset, want via:opencode", got)
+	}
+	set := userRemote{Name: "mm-plan", APIKeyEnv: "MINIMAX_API_KEY"}
+	t.Setenv("MINIMAX_API_KEY", "k123")
+	if got := set.authSource(); got != "env:MINIMAX_API_KEY" {
+		t.Errorf("authSource = %q with the env var set, want env:MINIMAX_API_KEY", got)
+	}
+}
+
+func TestRound141DoctorSniffsAVendorErrorInsideA200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"code":401,"msg":"token expired or incorrect","success":false}`))
+	}))
+	defer srv.Close()
+	r := userRemote{Name: "zai-plan", BaseURL: srv.URL + "/anthropic", Wire: "anthropic"}
+	if got := probeRemote(r); strings.HasPrefix(got, "ok") {
+		t.Errorf("doctor reported %q for a 200 that carries an auth error", got)
+	}
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[{"id":"MiniMax-M3"}]}`))
+	}))
+	defer good.Close()
+	r2 := userRemote{Name: "mm-plan", BaseURL: good.URL + "/anthropic", Wire: "anthropic"}
+	if got := probeRemote(r2); got != "ok" {
+		t.Errorf("doctor reported %q for a healthy anthropic remote", got)
+	}
+}

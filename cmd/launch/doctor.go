@@ -63,6 +63,17 @@ func probeRemote(r userRemote) string {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
+		// Some Anthropic-wire vendors answer a DEAD key with 200 and the error in the body (z.ai: {"code":401,
+		// "success":false}) — "ok" on that sent a user into launch 401s with a doctor's blessing (2026-09-30
+		// audit, round 141, F141-B). Bounded sniff, only on the anthropic wire.
+		if r.Descriptor().Wire == "anthropic" {
+			b := make([]byte, 4096)
+			n, _ := io.ReadFull(resp.Body, b)
+			s := strings.ToLower(string(b[:n]))
+			if strings.Contains(s, `"success":false`) || strings.Contains(s, `"code":401`) || strings.Contains(s, "token expired") || strings.Contains(s, "invalid api key") {
+				return "FAIL the remote answered 200 with an authentication error in the body (check the key)"
+			}
+		}
 		return "ok"
 	}
 	return fmt.Sprintf("FAIL http %d", resp.StatusCode)
